@@ -1,0 +1,33 @@
+# Bedrock Internal Testnet — Zebra Configuration
+# PoW disabled, fully isolated, all network upgrades active from block 1
+
+[mining]
+miner_address = 't27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v'
+
+[network]
+network = "Testnet"
+initial_testnet_peers = []
+listen_addr = "0.0.0.0:18233"
+
+[network.testnet_parameters]
+network_name = "BedrockTestnet"
+network_magic = [0, 1, 0, 255]
+slow_start_interval = 0
+target_difficulty_limit = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
+disable_pow = true
+
+[network.testnet_parameters.activation_heights]
+NU5 = 1
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+enable_cookie_auth = false
+
+[mempool]
+debug_enable_at_height = 0
+
+[state]
+ephemeral = false
+
+[consensus]
+checkpoint_sync = false

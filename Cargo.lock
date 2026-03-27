@@ -3743,6 +3743,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zcash-test-miner"
+version = "0.1.0"
+dependencies = [
+ "byteorder",
+ "clap",
+ "rand 0.8.5",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "zcash-mining-protocol",
+]
+
+[[package]]
 name = "zerocopy"
 version = "0.8.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
