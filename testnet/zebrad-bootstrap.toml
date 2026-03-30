@@ -1,0 +1,17 @@
+# PHASE 1 BOOTSTRAP ONLY — Standard Zcash testnet, used once to commit genesis block to state.
+# Run this until blocks > 0, then switch to zebrad.toml for isolated testnet.
+
+[network]
+network = "Testnet"
+listen_addr = "0.0.0.0:18233"
+
+[rpc]
+listen_addr = "0.0.0.0:18232"
+enable_cookie_auth = false
+
+[state]
+ephemeral = false
+cache_dir = "/data/zebra"
+
+[consensus]
+checkpoint_sync = true

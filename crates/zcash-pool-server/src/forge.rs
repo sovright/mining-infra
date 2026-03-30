@@ -1,14 +1,17 @@
 //! Forge relay integration for low-latency block propagation
 //!
 //! Wraps bedrock-forge library for compact block relay over UDP/FEC.
+//!
+//! The relay client runs as a background tokio task, sending and receiving
+//! compact blocks over authenticated UDP with Reed-Solomon FEC.
 
 use std::sync::Arc;
 
 use bedrock_forge::{
-    BlockChunker, BlockSender, ClientConfig, CompactBlock,
+    BlockChunker, BlockReceiver, BlockSender, ClientConfig, CompactBlock,
     PrefilledTx, RelayClient, ShortId, WtxId, AuthDigest, TxId,
 };
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use crate::config::PoolConfig;
@@ -20,9 +23,9 @@ const EQUIHASH_SOLUTION_SIZE: usize = 1344;
 
 /// Forge relay wrapper for the pool server
 pub struct ForgeRelay {
-    /// Relay client for sending blocks
-    client: Arc<RwLock<RelayClient>>,
-    /// Block sender handle
+    /// Relay client — Option so we can take ownership when spawning the run loop
+    client: Mutex<Option<RelayClient>>,
+    /// Block sender handle (cloneable, works after client is moved to run task)
     sender: BlockSender,
     /// Block chunker for manual operations
     #[allow(dead_code)]
@@ -54,16 +57,18 @@ impl ForgeRelay {
             .map_err(|e| PoolError::Config(format!("forge chunker creation failed: {}", e)))?;
 
         Ok(Self {
-            client: Arc::new(RwLock::new(client)),
+            client: Mutex::new(Some(client)),
             sender,
             chunker,
             nonce: 0,
         })
     }
 
-    /// Initialize the relay client (bind socket)
+    /// Initialize the relay client (bind UDP socket)
     pub async fn init(&self) -> Result<()> {
-        let mut client = self.client.write().await;
+        let mut guard = self.client.lock().await;
+        let client = guard.as_mut()
+            .ok_or_else(|| PoolError::Config("forge client already started".into()))?;
         client.bind().await
             .map_err(|e| PoolError::Config(format!("forge bind failed: {}", e)))?;
         info!("Forge relay bound to {:?}", client.local_addr());
@@ -72,14 +77,27 @@ impl ForgeRelay {
 
     /// Start the relay client run loop
     ///
-    /// Returns a handle that can be used to stop the client.
-    pub async fn start(&self) -> Result<()> {
-        let mut client = self.client.write().await;
-        // Take the receiver to allow the run loop to work
-        if client.take_receiver().is_none() {
-            warn!("Forge relay receiver already taken");
-        }
-        Ok(())
+    /// Takes ownership of the RelayClient and spawns it as a background task.
+    /// Returns a BlockReceiver for incoming compact blocks from the relay network.
+    /// Must be called after `init()`.
+    pub async fn start(&self) -> Result<BlockReceiver> {
+        let mut client = self.client.lock().await
+            .take()
+            .ok_or_else(|| PoolError::Config("forge client already started or not created".into()))?;
+
+        let (block_receiver, _outgoing_rx) = client.take_receiver()
+            .ok_or_else(|| PoolError::Config("forge relay receiver already taken".into()))?;
+
+        // Spawn the relay client run loop as a background task.
+        // The run loop handles both sending (via outgoing channel fed by BlockSender)
+        // and receiving (incoming UDP packets reassembled via FEC).
+        tokio::spawn(async move {
+            if let Err(e) = client.run().await {
+                warn!("Forge relay run loop exited: {}", e);
+            }
+        });
+
+        Ok(block_receiver)
     }
 
     /// Announce a new block template to the relay network

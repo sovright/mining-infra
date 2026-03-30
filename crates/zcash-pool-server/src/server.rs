@@ -275,13 +275,29 @@ impl PoolServer {
             if let Err(e) = forge.init().await {
                 warn!("Failed to initialize forge relay: {}. Continuing without relay.", e);
             } else {
-                let forge = Arc::clone(forge);
-                tokio::spawn(async move {
-                    if let Err(e) = forge.start().await {
-                        warn!("Forge relay start error: {}", e);
+                match forge.start().await {
+                    Ok(mut block_receiver) => {
+                        // Spawn a task to handle incoming compact blocks from the relay network
+                        tokio::spawn(async move {
+                            while let Some(block) = block_receiver.recv().await {
+                                info!(
+                                    tx_count = block.tx_count(),
+                                    header_len = block.header.len(),
+                                    "Received compact block from forge relay"
+                                );
+                                // TODO: In a full implementation, we would:
+                                // 1. Reconstruct the full block using our mempool
+                                // 2. Submit it to Zebra via submitblock RPC
+                                // 3. Update our template if it represents a new chain tip
+                            }
+                            warn!("Forge relay block receiver closed");
+                        });
+                        info!("Forge relay started");
                     }
-                });
-                info!("Forge relay started");
+                    Err(e) => {
+                        warn!("Forge relay start error: {}. Continuing without relay.", e);
+                    }
+                }
             }
         }
 
