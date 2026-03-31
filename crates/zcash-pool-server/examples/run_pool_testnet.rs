@@ -9,8 +9,6 @@ use zcash_pool_server::{PoolConfig, PoolServer};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt::init();
-
     let config = PoolConfig {
         listen_addr: "0.0.0.0:3333".parse()?,
         zebra_url: "http://127.0.0.1:18232".to_string(),
