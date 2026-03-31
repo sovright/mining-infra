@@ -1,11 +1,15 @@
 # Bedrock Internal Testnet — Deployment Status
 
 ## Phase 1: Zebra Node ✅ Complete
-
-A Zebra full node is running on GCP serving live block templates.
+## Phase 2: Pool Server ✅ Complete
+## Phase 3: Test Miner — Next
 
 **GCP VM:** `zebra-testnet` — `34.72.217.47`, project `mining-pool-491623`, zone `us-central1-a`
 **SSH:** `gcloud compute ssh zebra-testnet --project mining-pool-491623 --zone us-central1-a`
+
+---
+
+## Phase 1: Zebra Node
 
 ### What's running
 
@@ -14,7 +18,7 @@ A Zebra full node is running on GCP serving live block templates.
 - State at `/data/zebra`, synced to height ~3.2M
 - RPC live on `:18232`, `getblocktemplate` returning valid templates
 
-### Verify it's healthy
+### Verify
 
 ```bash
 # Block height + chain
@@ -22,10 +26,22 @@ curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"getblockchaininfo","params":[],"id":1}' \
   http://34.72.217.47:18232
 
-# Block template (pool server needs this)
+# Block template
 curl -s -X POST -H 'Content-Type: application/json' \
   -d '{"jsonrpc":"2.0","method":"getblocktemplate","params":[],"id":1}' \
   http://34.72.217.47:18232
+```
+
+### Redeploy
+
+```bash
+# On GCP VM — rebuild and restart Zebra container
+docker build -t zebra-internal-miner testnet/
+docker stop zebra-testnet || true
+docker run -d --name zebra-testnet \
+  -v /data/zebra:/data/zebra \
+  -p 18232:18232 -p 18233:18233 \
+  zebra-internal-miner start --config /config/zebrad.toml
 ```
 
 ### Files
@@ -38,27 +54,48 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 ---
 
-## Phase 2: Pool Server — Next
+## Phase 2: Pool Server
 
-Point `zcash-pool-server` at the live Zebra node on GCP.
+### What's running
+
+- `zcash-pool-server` running in a `screen` session on the GCP VM
+- Connects to Zebra at `http://127.0.0.1:18232`
+- Stratum V2 listening on `0.0.0.0:3333` (external test miners can connect)
+- Prometheus metrics on `127.0.0.1:9090`
+- Pool logs show "new template" messages as Zebra mines blocks
+
+### Verify
 
 ```bash
-# On the GCP VM
-cargo build --release --example run_pool_testnet -p zcash-pool-server
-cargo run --release --example run_pool_testnet -p zcash-pool-server
-# Connects to Zebra at http://127.0.0.1:18232
-# Stratum V2 on :3333 | Prometheus on :9090
+# Attach to pool screen session
+gcloud compute ssh zebra-testnet --project mining-pool-491623 --zone us-central1-a
+screen -r pool
+
+# Prometheus metrics
+curl http://127.0.0.1:9090/metrics
 ```
 
-Expected: pool logs show "new template" messages, Prometheus metrics exposed.
-
-## Phase 3: Test Miner — After Phase 2
+### Redeploy
 
 ```bash
+# On GCP VM
+screen -dmS pool bash -c 'cd ~/bedrock && cargo run --release --example run_pool_testnet -p zcash-pool-server 2>&1 | tee /tmp/pool.log'
+```
+
+---
+
+## Phase 3: Test Miner — Next
+
+Run `zcash-test-miner` pointing at the live pool to verify share submission end-to-end.
+
+```bash
+# From any machine with the repo
 cargo run --release -p zcash-test-miner -- --pool-addr 34.72.217.47:3333
 ```
 
-Expected: pool logs show accepted shares, `pool_shares_accepted_total` incrementing.
+Expected: pool logs show accepted shares, `pool_shares_accepted_total` incrementing in Prometheus.
+
+---
 
 ## Phase 4–5: Product Stack + Payouts
 
