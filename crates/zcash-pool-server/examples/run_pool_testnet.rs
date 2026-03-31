@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let config = PoolConfig {
-        listen_addr: "127.0.0.1:3333".parse()?,
+        listen_addr: "0.0.0.0:3333".parse()?,
         zebra_url: "http://127.0.0.1:18232".to_string(),
         initial_difficulty: 1.0,
         target_shares_per_minute: 5.0,
