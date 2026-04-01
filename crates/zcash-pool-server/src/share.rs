@@ -141,7 +141,7 @@ impl ShareProcessor {
                 })
             }
             Err(zcash_equihash_validator::ValidationError::TargetNotMet) => {
-                debug!("Share below target difficulty");
+                debug!("Share below target difficulty (target={})", hex::encode(share_target));
                 Ok(ShareValidationResult {
                     accepted: false,
                     result: ShareResult::Rejected(RejectReason::LowDifficulty),

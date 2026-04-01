@@ -17,4 +17,5 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 byteorder = { workspace = true }
 rand = "0.8"
+hex = "0.4"
 clap = { version = "4", features = ["derive"] }

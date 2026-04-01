@@ -140,6 +140,13 @@ pub fn difficulty_to_target_with_max(difficulty: f64, max: &Target) -> Target {
     let max_val = target_to_f64(max);
     let target_val = max_val / difficulty;
 
+    // When difficulty < 1.0, target exceeds max which can overflow 256 bits
+    // in f64_to_target. Clamp to all-ones (easiest possible target).
+    let max_256 = target_to_f64(&Target([0xff; 32]));
+    if target_val >= max_256 {
+        return Target([0xff; 32]);
+    }
+
     f64_to_target(target_val)
 }
 

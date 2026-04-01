@@ -11,6 +11,7 @@
 
 use clap::Parser;
 use rand::RngCore;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -32,10 +33,6 @@ struct Args {
     /// Worker name (for logging)
     #[arg(long, default_value = "testminer.worker1")]
     worker: String,
-
-    /// Number of solver threads
-    #[arg(long, default_value = "1")]
-    threads: usize,
 }
 
 /// Read exactly one framed SV2 message from the stream.
@@ -62,14 +59,29 @@ async fn read_message(
     }
 }
 
-/// Solve Equihash for the given job, returning (nonce_2, solution) pairs.
-/// Tries one nonce at a time so we know exactly which nonce produced each solution.
-fn solve_job(job: &NewEquihashJob) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// Solve Equihash for a single nonce attempt. Returns solutions if found.
+fn try_solve_nonce(header_prefix: &[u8; 108], full_nonce: [u8; 32]) -> Vec<Vec<u8>> {
+    let mut used = false;
+    equihash::tromp::solve_200_9::<32>(header_prefix, || {
+        if used {
+            return None;
+        }
+        used = true;
+        Some(full_nonce)
+    })
+}
+
+/// Solve Equihash for the given job, checking for cancellation between nonce attempts.
+/// Returns (nonce_2, solution) pairs, or empty vec if cancelled.
+fn solve_job(
+    job: &NewEquihashJob,
+    current_job_id: &AtomicU32,
+) -> Vec<(Vec<u8>, Vec<u8>)> {
     let nonce_1_len = job.nonce_1.len();
     let nonce_2_len = job.nonce_2_len as usize;
     let nonce_1 = &job.nonce_1;
+    let my_job_id = job.job_id;
 
-    // Build the 108-byte header prefix (everything before the nonce)
     let mut header_prefix = [0u8; 108];
     header_prefix[0..4].copy_from_slice(&job.version.to_le_bytes());
     header_prefix[4..36].copy_from_slice(&job.prev_hash);
@@ -85,40 +97,38 @@ fn solve_job(job: &NewEquihashJob) -> Vec<(Vec<u8>, Vec<u8>)> {
         u64::from_le_bytes(buf)
     };
 
-    // Try nonces one at a time. solve_200_9 calls next_nonce repeatedly;
-    // we give it exactly ONE nonce per call so solutions map 1:1 to nonces.
     loop {
+        // Check if job has changed (new block arrived)
+        if current_job_id.load(Ordering::Relaxed) != my_job_id {
+            debug!("Job {} superseded, aborting solve", my_job_id);
+            return vec![];
+        }
+
         nonce_counter = nonce_counter.wrapping_add(1);
 
-        // Build the nonce_2 for this attempt
         let mut nonce_2 = vec![0u8; nonce_2_len];
         let counter_bytes = nonce_counter.to_le_bytes();
         for i in 0..nonce_2_len {
             nonce_2[i] = counter_bytes[i % 8];
         }
 
-        // Build the full 32-byte nonce
         let mut full_nonce = [0u8; 32];
         full_nonce[..nonce_1_len].copy_from_slice(nonce_1);
         full_nonce[nonce_1_len..nonce_1_len + nonce_2_len].copy_from_slice(&nonce_2);
 
-        // Give the solver exactly one nonce
-        let mut used = false;
-        let solutions = equihash::tromp::solve_200_9::<32>(&header_prefix, || {
-            if used {
-                return None; // Only one nonce per solver call
-            }
-            used = true;
-            Some(full_nonce)
-        });
+        let solutions = try_solve_nonce(&header_prefix, full_nonce);
 
         if !solutions.is_empty() {
+            // Check again that job is still current before returning
+            if current_job_id.load(Ordering::Relaxed) != my_job_id {
+                debug!("Job {} superseded after solving, discarding solutions", my_job_id);
+                return vec![];
+            }
             return solutions
                 .into_iter()
                 .map(|sol| (nonce_2.clone(), sol))
                 .collect();
         }
-        // No solution with this nonce, try next one
     }
 }
 
@@ -134,21 +144,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut read_buf = Vec::with_capacity(4096);
     let mut sequence_number: u32 = 0;
 
-    // Channel for solver results -> network sender: (channel_id, job_id, nonce_2, time, solution)
+    // (channel_id, job_id, nonce_2, time, solution)
     let (solution_tx, mut solution_rx) = mpsc::channel::<(u32, u32, Vec<u8>, u32, Vec<u8>)>(32);
 
-    // Track current job and channel for the solver
+    // Current job for the solver thread
     let current_job: Arc<tokio::sync::Mutex<Option<NewEquihashJob>>> =
         Arc::new(tokio::sync::Mutex::new(None));
-    let mut current_channel_id: u32 = 0;
 
-    // Spawn solver thread(s)
+    // Atomic job ID for fast cancellation checks
+    let current_job_id = Arc::new(AtomicU32::new(0));
+
+    // Spawn solver thread
     let solver_job = current_job.clone();
+    let solver_job_id = current_job_id.clone();
     let solver_tx = solution_tx.clone();
-    let _num_threads = args.threads; // TODO: spawn multiple solver threads
     std::thread::spawn(move || {
         loop {
-            // Get current job
             let job = {
                 let rt = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -167,11 +178,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
             debug!("Solving job_id={}", job_id);
 
-            let results = solve_job(&job);
+            let results = solve_job(&job, &solver_job_id);
             let elapsed = start.elapsed();
 
             if results.is_empty() {
-                debug!("No solution found for job_id={} in {:?}", job_id, elapsed);
+                debug!("No solution for job_id={} in {:?} (may be cancelled)", job_id, elapsed);
             } else {
                 info!(
                     "Found {} solution(s) for job_id={} in {:?}",
@@ -180,23 +191,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     elapsed
                 );
                 for (nonce_2, solution) in results {
-                    let time = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs() as u32;
-                    if solver_tx.blocking_send((channel_id, job_id, nonce_2, time, solution)).is_err() {
-                        return; // Channel closed
+                    // Use the job's timestamp, not current time.
+                    // The pool rejects shares with timestamps outside ±2h of the job time.
+                    let time = job.time;
+                    if solver_tx
+                        .blocking_send((channel_id, job_id, nonce_2, time, solution))
+                        .is_err()
+                    {
+                        return;
                     }
                 }
             }
         }
     });
 
-    drop(solution_tx); // Drop our copy so channel closes when solver exits
+    drop(solution_tx);
 
     loop {
+        // Biased: always check pool messages first so we don't miss new jobs
         tokio::select! {
-            // Read messages from pool
+            biased;
             msg_result = read_message(&mut stream, &mut read_buf) => {
                 match msg_result {
                     Ok(Some(msg)) => {
@@ -211,14 +225,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 match decode_new_equihash_job(&msg) {
                                     Ok(job) => {
                                         info!(
-                                            "New job: id={}, channel={}, nonce_1_len={}, nonce_2_len={}, clean={}",
+                                            "New job: id={}, channel={}, nonce_1={}, nonce_2_len={}, clean={}",
                                             job.job_id,
                                             job.channel_id,
-                                            job.nonce_1.len(),
+                                            hex::encode(&job.nonce_1),
                                             job.nonce_2_len,
                                             job.clean_jobs,
                                         );
-                                        current_channel_id = job.channel_id;
+                                        // Update atomic job ID FIRST to cancel solver
+                                        current_job_id.store(job.job_id, Ordering::Relaxed);
+                                        // Then update the full job
                                         *current_job.lock().await = Some(job);
                                     }
                                     Err(e) => {
@@ -258,8 +274,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // Submit solutions from solver
             Some((chan_id, job_id, nonce_2, time, solution)) = solution_rx.recv() => {
+                // Only submit if this job is still current
+                if current_job_id.load(Ordering::Relaxed) != job_id {
+                    debug!("Discarding stale solution for job_id={}", job_id);
+                    continue;
+                }
+
                 let solution_arr: [u8; 1344] = match solution.as_slice().try_into() {
                     Ok(arr) => arr,
                     Err(_) => {
