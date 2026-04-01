@@ -319,6 +319,7 @@ impl PoolServer {
 
                 // Update metrics
                 metrics.set_hashrate(hashrate);
+                metrics.set_pool_aggregates(hashrate, active_miners as i64, session_count as i64);
 
                 info!(
                     "Pool stats: {} connections, {} active miners, {:.2} H/s",
@@ -1008,17 +1009,24 @@ impl PoolServer {
                         }
                     }
 
+                    let worker_label = format!("channel_{}", channel_id);
                     self.metrics.record_share_accepted();
+                    self.metrics.record_worker_share_accepted(&worker_label);
+                    if validation.is_block {
+                        self.metrics.record_worker_block_found(&worker_label);
+                    }
                     debug!(
                         "Share accepted from channel {} (diff: {:?})",
                         channel_id, validation.difficulty
                     );
                 } else {
+                    let worker_label = format!("channel_{}", channel_id);
                     let reason = match &validation.result {
                         zcash_mining_protocol::messages::ShareResult::Rejected(r) => format!("{:?}", r),
                         _ => "unknown".to_string(),
                     };
                     self.metrics.record_share_rejected(&reason);
+                    self.metrics.record_worker_share_rejected(&worker_label);
                 }
 
                 validation.result
