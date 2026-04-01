@@ -903,12 +903,14 @@ impl PoolServer {
         };
 
         // Validate share without holding the channel lock
+        let validation_start = std::time::Instant::now();
         let result = self.share_processor.validate_share_with_job(
             &share,
             &job,
             self.duplicate_detector.as_ref(),
             &block_target,
         );
+        self.metrics.observe_share_validation(validation_start.elapsed().as_secs_f64());
 
         // Apply vardiff update and record payout atomically under one lock.
         // This prevents the channel from being removed between the two operations.
@@ -1006,15 +1008,23 @@ impl PoolServer {
                         }
                     }
 
+                    self.metrics.record_share_accepted();
                     debug!(
                         "Share accepted from channel {} (diff: {:?})",
                         channel_id, validation.difficulty
                     );
+                } else {
+                    let reason = match &validation.result {
+                        zcash_mining_protocol::messages::ShareResult::Rejected(r) => format!("{:?}", r),
+                        _ => "unknown".to_string(),
+                    };
+                    self.metrics.record_share_rejected(&reason);
                 }
 
                 validation.result
             }
             Err(e) => {
+                self.metrics.record_share_rejected("validation_error");
                 warn!("Share validation error: {}", e);
                 zcash_mining_protocol::messages::ShareResult::Rejected(
                     zcash_mining_protocol::messages::RejectReason::InvalidSolution,
