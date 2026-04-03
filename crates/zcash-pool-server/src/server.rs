@@ -561,6 +561,7 @@ impl PoolServer {
             max_difficulty: 1e12,
             retarget_interval: Duration::from_secs(90),
             variance_tolerance: 0.25,
+            ..Default::default()
         };
 
         // Create channel

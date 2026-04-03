@@ -3695,6 +3695,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "zcash-coinbase",
  "zcash-mining-protocol",
  "zcash-pool-common",
 ]
