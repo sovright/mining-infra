@@ -9,8 +9,8 @@ description = "Zcash coinbase transaction construction and validation"
 blake2b_simd.workspace = true
 sha2.workspace = true
 byteorder.workspace = true
+hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-hex.workspace = true

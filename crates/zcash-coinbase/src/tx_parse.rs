@@ -228,54 +228,55 @@ pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
     })
 }
 
+/// Build a minimal v4 coinbase transaction for testing.
+#[cfg(test)]
+pub fn minimal_v4_coinbase() -> Vec<u8> {
+    let mut tx = Vec::new();
+
+    // Version 4 with overwinter flag set (0x80000004)
+    tx.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+    // Version group ID (Sapling: 0x892F2085)
+    tx.extend_from_slice(&0x892F_2085u32.to_le_bytes());
+
+    // 1 input (coinbase)
+    push_compact_size(&mut tx, 1);
+    // Prevout hash: all zeros (coinbase)
+    tx.extend_from_slice(&[0u8; 32]);
+    // Prevout index: 0xFFFFFFFF (coinbase)
+    tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    // Script sig: block height encoding (e.g. height 1)
+    let script_sig = vec![0x01, 0x01]; // minimal coinbase script
+    push_compact_size(&mut tx, script_sig.len() as u64);
+    tx.extend_from_slice(&script_sig);
+    // Sequence
+    tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+
+    // 2 outputs
+    push_compact_size(&mut tx, 2);
+
+    // Output 0: miner reward
+    tx.extend_from_slice(&250_000_000u64.to_le_bytes());
+    let script0 = vec![0x76, 0xa9, 0x14]; // OP_DUP OP_HASH160 PUSH20 (truncated for test)
+    push_compact_size(&mut tx, script0.len() as u64);
+    tx.extend_from_slice(&script0);
+
+    // Output 1: dev fund
+    tx.extend_from_slice(&62_500_000u64.to_le_bytes());
+    let script1 = vec![0xa9, 0x14]; // OP_HASH160 PUSH20 (truncated for test)
+    push_compact_size(&mut tx, script1.len() as u64);
+    tx.extend_from_slice(&script1);
+
+    // Lock time
+    tx.extend_from_slice(&0u32.to_le_bytes());
+    // Expiry height
+    tx.extend_from_slice(&0u32.to_le_bytes());
+
+    tx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Build a minimal v4 coinbase transaction for testing.
-    pub fn minimal_v4_coinbase() -> Vec<u8> {
-        let mut tx = Vec::new();
-
-        // Version 4 with overwinter flag set (0x80000004)
-        tx.extend_from_slice(&0x8000_0004u32.to_le_bytes());
-        // Version group ID (Sapling: 0x892F2085)
-        tx.extend_from_slice(&0x892F_2085u32.to_le_bytes());
-
-        // 1 input (coinbase)
-        push_compact_size(&mut tx, 1);
-        // Prevout hash: all zeros (coinbase)
-        tx.extend_from_slice(&[0u8; 32]);
-        // Prevout index: 0xFFFFFFFF (coinbase)
-        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        // Script sig: block height encoding (e.g. height 1)
-        let script_sig = vec![0x01, 0x01]; // minimal coinbase script
-        push_compact_size(&mut tx, script_sig.len() as u64);
-        tx.extend_from_slice(&script_sig);
-        // Sequence
-        tx.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-
-        // 2 outputs
-        push_compact_size(&mut tx, 2);
-
-        // Output 0: miner reward
-        tx.extend_from_slice(&250_000_000u64.to_le_bytes());
-        let script0 = vec![0x76, 0xa9, 0x14]; // OP_DUP OP_HASH160 PUSH20 (truncated for test)
-        push_compact_size(&mut tx, script0.len() as u64);
-        tx.extend_from_slice(&script0);
-
-        // Output 1: dev fund
-        tx.extend_from_slice(&62_500_000u64.to_le_bytes());
-        let script1 = vec![0xa9, 0x14]; // OP_HASH160 PUSH20 (truncated for test)
-        push_compact_size(&mut tx, script1.len() as u64);
-        tx.extend_from_slice(&script1);
-
-        // Lock time
-        tx.extend_from_slice(&0u32.to_le_bytes());
-        // Expiry height
-        tx.extend_from_slice(&0u32.to_le_bytes());
-
-        tx
-    }
 
     #[test]
     fn parse_v4_coinbase_extracts_outputs() {
