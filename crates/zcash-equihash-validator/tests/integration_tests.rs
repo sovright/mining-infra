@@ -59,6 +59,7 @@ fn test_vardiff_integration_with_protocol() {
         max_difficulty: 1_000_000.0,
         retarget_interval: std::time::Duration::from_secs(60),
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let controller = VardiffController::new(config);
 
