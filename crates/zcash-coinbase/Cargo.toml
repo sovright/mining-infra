@@ -1,0 +1,16 @@
+[package]
+name = "zcash-coinbase"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zcash coinbase transaction construction and validation"
+
+[dependencies]
+blake2b_simd.workspace = true
+sha2.workspace = true
+byteorder.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

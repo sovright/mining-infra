@@ -3632,6 +3632,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "zcash-coinbase"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "byteorder",
+ "hex",
+ "sha2",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "zcash-equihash-validator"
 version = "0.1.0"
 dependencies = [
