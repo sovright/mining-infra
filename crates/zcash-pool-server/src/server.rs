@@ -37,7 +37,7 @@ use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
 use bedrock_noise::{Keypair, NoiseResponder};
 use bedrock_strata::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
 use zcash_template_provider::types::BlockTemplate;
-use zcash_template_provider::{TemplateProvider, TemplateProviderConfig};
+use zcash_template_provider::{SubmitBlockResult, SubmitMode, TemplateProvider, TemplateProviderConfig};
 use zcash_mining_protocol::messages::SubmitEquihashShare;
 use hex;
 
@@ -1077,12 +1077,33 @@ impl PoolServer {
         let block_bytes = build_block_bytes(job, share, &template)?;
         let block_hex = hex::encode(block_bytes);
 
-        match self.template_provider.submit_block(&block_hex).await {
-            Ok(None) => {
-                info!("Submitted block for job {} successfully", share.job_id);
+        // Two-stage: validate via proposal mode first
+        match self.template_provider.submit_block(&block_hex, Some(SubmitMode::Proposal)).await {
+            Ok(SubmitBlockResult::Accepted) => {
+                info!("Block proposal accepted for job {}, submitting for real...", share.job_id);
             }
-            Ok(Some(err)) => {
-                warn!("Zebra rejected block for job {}: {}", share.job_id, err);
+            Ok(SubmitBlockResult::Rejected(reason)) => {
+                warn!("Block proposal rejected for job {}: {}", share.job_id, reason);
+                return Err(PoolError::TemplateProvider(format!("block proposal rejected: {}", reason)));
+            }
+            Ok(_) | Err(_) => {
+                warn!("Block proposal check inconclusive for job {}, submitting anyway", share.job_id);
+            }
+        }
+
+        // Submit for real
+        match self.template_provider.submit_block(&block_hex, None).await {
+            Ok(SubmitBlockResult::Accepted) => {
+                info!("BLOCK SUBMITTED SUCCESSFULLY for job {}", share.job_id);
+            }
+            Ok(SubmitBlockResult::Duplicate) => {
+                warn!("Block already known (duplicate) for job {}", share.job_id);
+            }
+            Ok(SubmitBlockResult::Rejected(reason)) => {
+                warn!("Zebra rejected block for job {}: {}", share.job_id, reason);
+            }
+            Ok(SubmitBlockResult::Inconclusive) => {
+                warn!("Block submission inconclusive for job {}", share.job_id);
             }
             Err(e) => {
                 return Err(PoolError::TemplateProvider(e.to_string()));

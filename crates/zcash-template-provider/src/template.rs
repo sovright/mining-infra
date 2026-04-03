@@ -2,6 +2,7 @@
 
 use crate::error::{Error, Result};
 use crate::header::{assemble_header, parse_target};
+use crate::rpc;
 use crate::rpc::ZebraRpc;
 use crate::types::{BlockTemplate, GetBlockTemplateResponse};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -69,8 +70,8 @@ impl TemplateProvider {
     }
 
     /// Submit a solved block to Zebra
-    pub async fn submit_block(&self, block_hex: &str) -> Result<Option<String>> {
-        self.rpc.submit_block(block_hex).await
+    pub async fn submit_block(&self, block_hex: &str, mode: Option<rpc::SubmitMode>) -> Result<rpc::SubmitBlockResult> {
+        self.rpc.submit_block(block_hex, mode).await
     }
 
     /// Process a getblocktemplate response into a BlockTemplate
