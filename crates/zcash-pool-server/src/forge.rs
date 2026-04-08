@@ -5,8 +5,6 @@
 //! The relay client runs as a background tokio task, sending and receiving
 //! compact blocks over authenticated UDP with Reed-Solomon FEC.
 
-use std::sync::Arc;
-
 use bedrock_forge::{
     BlockChunker, BlockReceiver, BlockSender, ClientConfig, CompactBlock,
     PrefilledTx, RelayClient, ShortId, WtxId, AuthDigest, TxId,
