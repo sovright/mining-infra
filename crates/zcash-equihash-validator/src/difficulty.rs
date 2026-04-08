@@ -137,6 +137,13 @@ pub fn difficulty_to_target_with_max(difficulty: f64, max: &Target) -> Target {
         return *max;
     }
 
+    // When difficulty < 1.0, the target would exceed max_target.
+    // f64_to_target silently overflows at values > 2^256, producing garbage.
+    // Clamp to all-ones (accept any valid Equihash solution).
+    if difficulty < 1.0 {
+        return Target([0xff; 32]);
+    }
+
     let max_val = target_to_f64(max);
     let target_val = max_val / difficulty;
 
@@ -231,5 +238,39 @@ mod tests {
         // Valid positive difficulty should NOT return max target
         let valid_target = difficulty_to_target_with_max(100.0, &max);
         assert_ne!(valid_target, max);
+    }
+
+    #[test]
+    fn test_difficulty_to_target_sub_one() {
+        // At difficulty < 1.0, target should overflow and clamp to all-ones
+        let diffs = [0.5, 0.1, 0.01, 0.001, 0.0001];
+        for d in diffs {
+            let t = difficulty_to_target(d);
+            let bytes = t.to_le_bytes();
+            println!("diff={}: target={}", d, hex::encode(bytes));
+        }
+        // Difficulty 1.0 should equal max_mainnet
+        let t1 = difficulty_to_target(1.0);
+        let max = Target::max_mainnet();
+        println!("diff=1.0: target={}", hex::encode(t1.to_le_bytes()));
+        println!("max_mainnet:     {}", hex::encode(max.to_le_bytes()));
+
+        // At difficulty 0.0001, target should be all-0xff (clamped)
+        let t_low = difficulty_to_target(0.0001);
+        assert_eq!(t_low.to_le_bytes(), [0xff; 32],
+            "diff=0.0001 should produce all-ones target, got: {}",
+            hex::encode(t_low.to_le_bytes()));
+    }
+
+    #[test]
+    fn test_f64_to_target_overflow() {
+        // Test what f64_to_target does with a value > 2^256
+        let huge = 1.0e78; // way bigger than 2^256
+        let t = f64_to_target(huge);
+        println!("f64_to_target(1e78) = {}", hex::encode(t.to_le_bytes()));
+
+        let max_256_f64 = target_to_f64(&Target([0xff; 32]));
+        println!("max_256 as f64 = {:.6e}", max_256_f64);
+        println!("1e78 >= max_256? {}", huge >= max_256_f64);
     }
 }

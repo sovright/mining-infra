@@ -40,7 +40,7 @@ use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
 use bedrock_noise::{Keypair, NoiseResponder};
 use bedrock_strata::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
 use zcash_template_provider::types::BlockTemplate;
-use zcash_template_provider::{TemplateProvider, TemplateProviderConfig};
+use zcash_template_provider::{SubmitBlockResult, SubmitMode, TemplateProvider, TemplateProviderConfig};
 use zcash_mining_protocol::messages::SubmitEquihashShare;
 use hex;
 
@@ -312,13 +312,33 @@ impl PoolServer {
             if let Err(e) = forge.init().await {
                 warn!("Failed to initialize forge relay: {}. Continuing without relay.", e);
             } else {
-                let forge = Arc::clone(forge);
-                tokio::spawn(async move {
-                    if let Err(e) = forge.start().await {
-                        warn!("Forge relay start error: {}", e);
+                match forge.start().await {
+                    Ok(mut block_receiver) => {
+                        // Spawn a task to handle incoming compact blocks from the relay network
+                        tokio::spawn(async move {
+                            while let Some(block) = block_receiver.recv().await {
+                                info!(
+                                    tx_count = block.tx_count(),
+                                    header_len = block.header.len(),
+                                    "Received compact block from forge relay"
+                                );
+                                // NOTE(deferred): Compact block reconstruction is intentionally
+                                // deferred for the internal-testnet milestone. The pool currently
+                                // relies on Zebra's internal miner for block production, so relay
+                                // blocks are logged but not processed. A full implementation would:
+                                // 1. Reconstruct the full block from compact block + mempool
+                                // 2. Submit it to Zebra via submitblock RPC
+                                // 3. Update our template if it represents a new chain tip
+                                // Tracked for the mainnet-ready milestone.
+                            }
+                            warn!("Forge relay block receiver closed");
+                        });
+                        info!("Forge relay started");
                     }
-                });
-                info!("Forge relay started");
+                    Err(e) => {
+                        warn!("Forge relay start error: {}. Continuing without relay.", e);
+                    }
+                }
             }
         }
 
@@ -341,6 +361,7 @@ impl PoolServer {
 
                 // Update metrics
                 metrics.set_hashrate(hashrate);
+                metrics.set_pool_aggregates(hashrate, active_miners as i64, session_count as i64);
 
                 info!(
                     "Pool stats: {} connections, {} active miners, {:.2} H/s",
@@ -603,6 +624,7 @@ impl PoolServer {
             max_difficulty: 1e12,
             retarget_interval: Duration::from_secs(90),
             variance_tolerance: 0.25,
+            ..Default::default()
         };
 
         // Create channel
@@ -979,12 +1001,14 @@ impl PoolServer {
         };
 
         // Validate share without holding the channel lock
+        let validation_start = std::time::Instant::now();
         let result = self.share_processor.validate_share_with_job(
             &share,
             &job,
             self.duplicate_detector.as_ref(),
             &block_target,
         );
+        self.metrics.observe_share_validation(validation_start.elapsed().as_secs_f64());
 
         // Apply vardiff update and record payout atomically under one lock.
         // This prevents the channel from being removed between the two operations.
@@ -1088,15 +1112,30 @@ impl PoolServer {
                         }
                     }
 
+                    let worker_label = format!("channel_{}", channel_id);
+                    self.metrics.record_share_accepted();
+                    self.metrics.record_worker_share_accepted(&worker_label);
+                    if validation.is_block {
+                        self.metrics.record_worker_block_found(&worker_label);
+                    }
                     debug!(
                         "Share accepted from channel {} (diff: {:?})",
                         channel_id, validation.difficulty
                     );
+                } else {
+                    let worker_label = format!("channel_{}", channel_id);
+                    let reason = match &validation.result {
+                        zcash_mining_protocol::messages::ShareResult::Rejected(r) => format!("{:?}", r),
+                        _ => "unknown".to_string(),
+                    };
+                    self.metrics.record_share_rejected(&reason);
+                    self.metrics.record_worker_share_rejected(&worker_label);
                 }
 
                 validation.result
             }
             Err(e) => {
+                self.metrics.record_share_rejected("validation_error");
                 warn!("Share validation error: {}", e);
                 zcash_mining_protocol::messages::ShareResult::Rejected(
                     zcash_mining_protocol::messages::RejectReason::InvalidSolution,
@@ -1141,12 +1180,37 @@ impl PoolServer {
         let block_bytes = build_block_bytes(job, share, &template)?;
         let block_hex = hex::encode(block_bytes);
 
-        match self.template_provider.submit_block(&block_hex).await {
-            Ok(None) => {
-                info!("Submitted block for job {} successfully", share.job_id);
+        // Two-stage: validate via proposal mode first
+        match self.template_provider.submit_block(&block_hex, Some(SubmitMode::Proposal)).await {
+            Ok(SubmitBlockResult::Accepted) => {
+                info!("Block proposal accepted for job {}, submitting for real...", share.job_id);
             }
-            Ok(Some(err)) => {
-                warn!("Zebra rejected block for job {}: {}", share.job_id, err);
+            Ok(SubmitBlockResult::Rejected(reason)) => {
+                warn!("Block proposal rejected for job {}: {}", share.job_id, reason);
+                return Err(PoolError::TemplateProvider(format!("block proposal rejected: {}", reason)));
+            }
+            Ok(_) => {
+                warn!("Block proposal check inconclusive for job {}, submitting anyway", share.job_id);
+            }
+            Err(e) => {
+                warn!("Block proposal RPC error for job {}: {}, not submitting", share.job_id, e);
+                return Err(PoolError::TemplateProvider(format!("block proposal RPC error: {}", e)));
+            }
+        }
+
+        // Submit for real
+        match self.template_provider.submit_block(&block_hex, None).await {
+            Ok(SubmitBlockResult::Accepted) => {
+                info!("BLOCK SUBMITTED SUCCESSFULLY for job {}", share.job_id);
+            }
+            Ok(SubmitBlockResult::Duplicate) => {
+                warn!("Block already known (duplicate) for job {}", share.job_id);
+            }
+            Ok(SubmitBlockResult::Rejected(reason)) => {
+                warn!("Zebra rejected block for job {}: {}", share.job_id, reason);
+            }
+            Ok(SubmitBlockResult::Inconclusive) => {
+                warn!("Block submission inconclusive for job {}", share.job_id);
             }
             Err(e) => {
                 return Err(PoolError::TemplateProvider(e.to_string()));

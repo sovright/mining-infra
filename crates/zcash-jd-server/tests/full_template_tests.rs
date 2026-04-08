@@ -136,7 +136,10 @@ fn set_merkle_root(job: &mut SetFullTemplateJob) {
 
 fn minimal_tx_with_script(script: &[u8]) -> Vec<u8> {
     let mut tx = Vec::new();
-    tx.extend_from_slice(&1u32.to_le_bytes()); // version
+    // Version 4 with overwinter flag (Zcash v4 format)
+    tx.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+    // Version group ID (Sapling)
+    tx.extend_from_slice(&0x892F_2085u32.to_le_bytes());
     tx.push(0x01); // vin count
     tx.extend_from_slice(&[0u8; 32]); // prevout hash
     tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
@@ -153,6 +156,7 @@ fn minimal_tx_with_script(script: &[u8]) -> Vec<u8> {
     }
     tx.extend_from_slice(script);
     tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+    tx.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
     tx
 }
 

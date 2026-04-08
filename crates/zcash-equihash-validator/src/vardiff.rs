@@ -22,6 +22,15 @@ pub struct VardiffConfig {
     pub retarget_interval: Duration,
     /// Tolerance for share rate variance (0.25 = 25%)
     pub variance_tolerance: f64,
+    /// Ratio threshold for ramp-up mode. When share rate ratio exceeds this
+    /// (or falls below 1/threshold), use aggressive adjustment without smoothing.
+    pub ramp_threshold: f64,
+    /// Dead zone lower bound. No adjustment when ratio is above this.
+    pub dead_zone_lower: f64,
+    /// Dead zone upper bound. No adjustment when ratio is below this.
+    pub dead_zone_upper: f64,
+    /// EMA smoothing factor for steady-state adjustments (0.0 to 1.0).
+    pub ema_alpha: f64,
 }
 
 impl Default for VardiffConfig {
@@ -34,6 +43,10 @@ impl Default for VardiffConfig {
             max_difficulty: 1_000_000_000.0,
             retarget_interval: Duration::from_secs(60),
             variance_tolerance: 0.25,
+            ramp_threshold: 4.0,
+            dead_zone_lower: 0.8,
+            dead_zone_upper: 1.2,
+            ema_alpha: 0.3,
         }
     }
 }
@@ -84,8 +97,53 @@ impl VardiffConfig {
             );
             self.variance_tolerance = 0.25;
         }
+        if !self.ramp_threshold.is_finite() || self.ramp_threshold <= 1.0 {
+            tracing::warn!(
+                "Invalid ramp_threshold {}, using default 4.0",
+                self.ramp_threshold
+            );
+            self.ramp_threshold = 4.0;
+        }
+        if !self.dead_zone_lower.is_finite() || self.dead_zone_lower <= 0.0 || self.dead_zone_lower >= 1.0 {
+            tracing::warn!(
+                "Invalid dead_zone_lower {}, using default 0.8",
+                self.dead_zone_lower
+            );
+            self.dead_zone_lower = 0.8;
+        }
+        if !self.dead_zone_upper.is_finite() || self.dead_zone_upper <= 1.0 {
+            tracing::warn!(
+                "Invalid dead_zone_upper {}, using default 1.2",
+                self.dead_zone_upper
+            );
+            self.dead_zone_upper = 1.2;
+        }
+        if !self.ema_alpha.is_finite() || self.ema_alpha <= 0.0 || self.ema_alpha >= 1.0 {
+            tracing::warn!(
+                "Invalid ema_alpha {}, using default 0.3",
+                self.ema_alpha
+            );
+            self.ema_alpha = 0.3;
+        }
+        if self.dead_zone_lower >= self.dead_zone_upper {
+            tracing::warn!(
+                "dead_zone_lower {} >= dead_zone_upper {}, using defaults",
+                self.dead_zone_lower, self.dead_zone_upper
+            );
+            self.dead_zone_lower = 0.8;
+            self.dead_zone_upper = 1.2;
+        }
         self
     }
+}
+
+/// Phase of the vardiff controller's operation
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VardiffPhase {
+    /// Aggressive adjustment without smoothing for fast convergence
+    RampUp,
+    /// EMA-smoothed adjustments for stability
+    SteadyState,
 }
 
 /// Per-miner vardiff state
@@ -96,6 +154,7 @@ pub struct VardiffController {
     shares_since_retarget: u32,
     last_retarget: Instant,
     window_start: Instant,
+    phase: VardiffPhase,
 }
 
 impl VardiffController {
@@ -115,6 +174,7 @@ impl VardiffController {
             shares_since_retarget: 0,
             last_retarget: now,
             window_start: now,
+            phase: VardiffPhase::RampUp,
         }
     }
 
@@ -148,13 +208,27 @@ impl VardiffController {
         self.shares_since_retarget += 1;
     }
 
+    /// Get the current phase of the controller
+    pub fn phase(&self) -> VardiffPhase {
+        self.phase
+    }
+
     /// Check if retargeting is needed and adjust difficulty
+    ///
+    /// Uses a two-phase approach:
+    /// - **RampUp**: Aggressive adjustment without smoothing for fast convergence
+    /// - **SteadyState**: EMA-smoothed adjustments for stability
     ///
     /// Returns `Some(new_difficulty)` if difficulty changed, `None` otherwise
     pub fn maybe_retarget(&mut self) -> Option<f64> {
         let elapsed = self.last_retarget.elapsed();
 
-        if elapsed < self.config.retarget_interval {
+        // Early retarget: if shares far exceed expected count, retarget now
+        let expected_shares_in_interval = self.config.target_shares_per_minute
+            * (self.config.retarget_interval.as_secs_f64() / 60.0);
+        let early_retarget = self.shares_since_retarget as f64 > 4.0 * expected_shares_in_interval;
+
+        if elapsed < self.config.retarget_interval && !early_retarget {
             return None;
         }
 
@@ -167,54 +241,90 @@ impl VardiffController {
         let target_rate = self.config.target_shares_per_minute;
 
         debug!(
-            "Vardiff check: {} shares in {:.1}s = {:.2}/min (target: {:.2}/min)",
+            "Vardiff check: {} shares in {:.1}s = {:.2}/min (target: {:.2}/min, phase: {:?})",
             self.shares_since_retarget,
             elapsed.as_secs_f64(),
             actual_rate,
-            target_rate
+            target_rate,
+            self.phase
         );
 
-        // Check if we're within tolerance
         let ratio = if target_rate > 0.0 {
             actual_rate / target_rate
         } else {
             0.0
         };
-        let lower_bound = 1.0 - self.config.variance_tolerance;
-        let upper_bound = 1.0 + self.config.variance_tolerance;
 
-        if ratio >= lower_bound && ratio <= upper_bound {
-            // Within tolerance, no change needed
+        // Zero shares: full 50% cut regardless of phase (preserve regression fix)
+        if self.shares_since_retarget == 0 {
+            let new_difficulty = (self.current_difficulty * 0.5).clamp(
+                self.config.min_difficulty,
+                self.config.max_difficulty,
+            );
+            if (new_difficulty - self.current_difficulty).abs() > 0.01 {
+                info!(
+                    "Vardiff adjustment (zero shares): {:.2} -> {:.2}",
+                    self.current_difficulty, new_difficulty
+                );
+                self.current_difficulty = new_difficulty;
+                self.reset_window();
+                return Some(new_difficulty);
+            }
             self.reset_window();
             return None;
         }
 
-        // Calculate new difficulty
-        // If shares are coming too fast (ratio > 1), increase difficulty
-        // If shares are coming too slow (ratio < 1), decrease difficulty
-        let adjustment = if ratio > 0.0 { ratio } else { 0.5 };
-        let new_difficulty = (self.current_difficulty * adjustment).clamp(
+        // Dead zone: no adjustment when ratio is close to 1.0
+        if ratio >= self.config.dead_zone_lower && ratio <= self.config.dead_zone_upper {
+            self.reset_window();
+            return None;
+        }
+
+        // Phase-dependent adjustment
+        let final_difficulty = match self.phase {
+            VardiffPhase::RampUp => {
+                if ratio > self.config.ramp_threshold
+                    || ratio < 1.0 / self.config.ramp_threshold
+                {
+                    // Aggressive jump, no smoothing
+                    self.current_difficulty * ratio
+                } else {
+                    // Transition to steady state, apply EMA
+                    self.phase = VardiffPhase::SteadyState;
+                    let raw = self.current_difficulty * ratio;
+                    self.config.ema_alpha * raw
+                        + (1.0 - self.config.ema_alpha) * self.current_difficulty
+                }
+            }
+            VardiffPhase::SteadyState => {
+                // Re-enter RampUp if the share rate has diverged wildly,
+                // e.g. after a miner reconnects with very different hashrate.
+                if ratio > self.config.ramp_threshold
+                    || ratio < 1.0 / self.config.ramp_threshold
+                {
+                    info!(
+                        "Vardiff re-entering RampUp: ratio {:.2} exceeds ramp_threshold {:.2}",
+                        ratio, self.config.ramp_threshold
+                    );
+                    self.phase = VardiffPhase::RampUp;
+                    self.current_difficulty * ratio
+                } else {
+                    let raw = self.current_difficulty * ratio;
+                    self.config.ema_alpha * raw
+                        + (1.0 - self.config.ema_alpha) * self.current_difficulty
+                }
+            }
+        };
+
+        let final_difficulty = final_difficulty.clamp(
             self.config.min_difficulty,
             self.config.max_difficulty,
         );
 
-        // Apply smoothing to avoid large jumps, but only when there IS share
-        // data to smooth against. With zero shares (ratio == 0), take the full
-        // cut immediately: smoothing on top of the halving only produces a 25%
-        // drop per interval, making offline miners take 5+ intervals to converge.
-        let final_difficulty = if ratio > 0.0 {
-            (self.current_difficulty * 0.5 + new_difficulty * 0.5).clamp(
-                self.config.min_difficulty,
-                self.config.max_difficulty,
-            )
-        } else {
-            new_difficulty
-        };
-
         if (final_difficulty - self.current_difficulty).abs() > 0.01 {
             info!(
-                "Vardiff adjustment: {:.2} -> {:.2} (share rate: {:.2}/min)",
-                self.current_difficulty, final_difficulty, actual_rate
+                "Vardiff adjustment ({:?}): {:.2} -> {:.2} (share rate: {:.2}/min)",
+                self.phase, self.current_difficulty, final_difficulty, actual_rate
             );
             self.current_difficulty = final_difficulty;
             self.reset_window();
@@ -361,6 +471,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
         assert_eq!(controller.current_difficulty(), 100.0);
@@ -587,6 +698,111 @@ mod tests {
             "without smoothing, difficulty should be 50.0, got {:.2}",
             diff
         );
+    }
+
+    #[test]
+    fn dead_zone_prevents_adjustment_when_close_to_target() {
+        let config = VardiffConfig {
+            initial_difficulty: 100.0,
+            min_difficulty: 1.0,
+            max_difficulty: 1000.0,
+            retarget_interval: Duration::from_secs(60),
+            target_shares_per_minute: 5.0,
+            dead_zone_lower: 0.8,
+            dead_zone_upper: 1.2,
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        for _ in 0..5 {
+            controller.record_share();
+        }
+        // 5 shares is below early-retarget threshold (4 * 5 = 20)
+        // Interval hasn't elapsed either
+        let result = controller.maybe_retarget();
+        assert!(result.is_none(), "should not retarget before interval elapses");
+        assert_eq!(controller.current_difficulty(), 100.0);
+    }
+
+    #[test]
+    fn ramp_up_converges_fast_for_high_ratio() {
+        let config = VardiffConfig {
+            initial_difficulty: 1.0,
+            min_difficulty: 1.0,
+            max_difficulty: 100_000.0,
+            retarget_interval: Duration::from_millis(1),
+            target_shares_per_minute: 5.0,
+            ramp_threshold: 4.0,
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        for _ in 0..50 {
+            controller.record_share();
+        }
+        std::thread::sleep(Duration::from_millis(5));
+        let new_diff = controller.maybe_retarget();
+        assert!(new_diff.is_some(), "should retarget with high share rate");
+        let diff = new_diff.unwrap();
+        assert!(diff > 10.0, "ramp-up should produce large jump, got {}", diff);
+    }
+
+    #[test]
+    fn early_retarget_triggers_on_share_flood() {
+        let config = VardiffConfig {
+            initial_difficulty: 1.0,
+            min_difficulty: 1.0,
+            max_difficulty: 100_000.0,
+            retarget_interval: Duration::from_secs(60),
+            target_shares_per_minute: 5.0,
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        for _ in 0..21 { // > 4 * 5 = 20
+            controller.record_share();
+        }
+        let new_diff = controller.maybe_retarget();
+        assert!(new_diff.is_some(), "early retarget should trigger at 4x shares");
+    }
+
+    #[test]
+    fn phase_transitions_from_ramp_up_to_steady_state() {
+        // Use a high target rate so that a small number of shares produces
+        // a ratio within [1/ramp_threshold, ramp_threshold], triggering transition.
+        let config = VardiffConfig {
+            initial_difficulty: 100.0,
+            min_difficulty: 1.0,
+            max_difficulty: 100_000.0,
+            retarget_interval: Duration::from_millis(1),
+            // With ~5ms elapsed, 1 share = ~12000 shares/min.
+            // target of 6000 gives ratio ~2.0, within ramp_threshold of 4.0.
+            target_shares_per_minute: 6000.0,
+            ramp_threshold: 4.0,
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        assert_eq!(controller.phase(), VardiffPhase::RampUp);
+
+        // Submit just 1 share so the ratio is moderate (~2x)
+        controller.record_share();
+        std::thread::sleep(Duration::from_millis(5));
+        let _ = controller.maybe_retarget();
+        // Ratio ~2x is within ramp_threshold of 4.0, so should transition
+        assert_eq!(controller.phase(), VardiffPhase::SteadyState);
+    }
+
+    #[test]
+    fn new_config_fields_validation() {
+        let config = VardiffConfig {
+            ramp_threshold: 0.5, // invalid: <= 1.0
+            dead_zone_lower: -1.0, // invalid: <= 0.0
+            dead_zone_upper: 0.5, // invalid: <= 1.0
+            ema_alpha: 2.0, // invalid: >= 1.0
+            ..Default::default()
+        };
+        let validated = config.validated();
+        assert_eq!(validated.ramp_threshold, 4.0);
+        assert_eq!(validated.dead_zone_lower, 0.8);
+        assert_eq!(validated.dead_zone_upper, 1.2);
+        assert_eq!(validated.ema_alpha, 0.3);
     }
 
     /// Kills mutant on line 214: (final - current).abs() > 0.01 threshold.

@@ -1,0 +1,23 @@
+# Bedrock test miner — multi-stage build
+# Submits dummy shares to the pool for protocol-level testing.
+#
+# Build:  docker build -f testnet/Dockerfile.test-miner -t bedrock-test-miner .
+# Run:    docker run --network host bedrock-test-miner --pool 127.0.0.1:3333 --rate 5
+
+FROM rust:1.85-slim AS builder
+
+RUN apt-get update && apt-get install -y \
+    pkg-config libssl-dev clang cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY . .
+
+RUN cargo build --release -p zcash-test-miner
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /build/target/release/zcash-test-miner /usr/local/bin/zcash-test-miner
+
+ENTRYPOINT ["zcash-test-miner"]
+CMD ["--pool", "127.0.0.1:3333", "--rate", "5"]

@@ -8,13 +8,45 @@ use serde::{de::DeserializeOwned, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// Whether to submit a block for real or just validate it.
+#[derive(Debug, Clone, Copy)]
+pub enum SubmitMode {
+    /// Submit the block for inclusion in the chain.
+    Submit,
+    /// Validate the block without submitting (proposal mode).
+    Proposal,
+}
+
+impl SubmitMode {
+    /// Returns the JSON-RPC parameter string for this mode.
+    pub fn as_param(&self) -> &'static str {
+        match self {
+            Self::Submit => "",
+            Self::Proposal => "proposal",
+        }
+    }
+}
+
+/// Result of a submitblock RPC call.
+#[derive(Debug)]
+pub enum SubmitBlockResult {
+    /// Block was accepted.
+    Accepted,
+    /// Block was rejected with the given reason.
+    Rejected(String),
+    /// Block was already known (duplicate).
+    Duplicate,
+    /// Result was inconclusive.
+    Inconclusive,
+}
+
 /// Trait abstracting RPC calls to a Zcash node, enabling mock implementations for testing.
 #[async_trait]
 pub trait RpcProvider: Send + Sync {
     /// Get a block template from the node
     async fn get_block_template(&self) -> Result<GetBlockTemplateResponse>;
     /// Submit a solved block to the node
-    async fn submit_block(&self, block_hex: &str) -> Result<Option<String>>;
+    async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult>;
     /// Get the best block hash
     async fn get_best_block_hash(&self) -> Result<String>;
 }
@@ -92,8 +124,19 @@ impl RpcProvider for ZebraRpc {
         self.request("getblocktemplate", serde_json::json!([])).await
     }
 
-    async fn submit_block(&self, block_hex: &str) -> Result<Option<String>> {
-        self.request("submitblock", vec![block_hex]).await
+    /// Submit a solved block to Zebra
+    async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult> {
+        let params = match mode {
+            Some(m) if !m.as_param().is_empty() => serde_json::json!([block_hex, m.as_param()]),
+            _ => serde_json::json!([block_hex]),
+        };
+        let result: Option<String> = self.request("submitblock", params).await?;
+        Ok(match result.as_deref() {
+            None => SubmitBlockResult::Accepted,
+            Some("duplicate") => SubmitBlockResult::Duplicate,
+            Some("inconclusive") => SubmitBlockResult::Inconclusive,
+            Some(reason) => SubmitBlockResult::Rejected(reason.to_string()),
+        })
     }
 
     async fn get_best_block_hash(&self) -> Result<String> {
@@ -109,5 +152,11 @@ mod tests {
     fn test_client_creation() {
         let rpc = ZebraRpc::new("http://127.0.0.1:8232", None, None);
         assert!(rpc.is_ok());
+    }
+
+    #[test]
+    fn test_submit_mode_serialization() {
+        assert_eq!(SubmitMode::Proposal.as_param(), "proposal");
+        assert_eq!(SubmitMode::Submit.as_param(), "");
     }
 }

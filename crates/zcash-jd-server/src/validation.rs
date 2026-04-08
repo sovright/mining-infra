@@ -176,102 +176,11 @@ impl TemplateValidator {
         if self.pool_payout_script.is_empty() {
             return true;
         }
-        let script = &self.pool_payout_script;
-        if self.min_pool_payout == 0 {
-            return coinbase.windows(script.len()).any(|w| w == script.as_slice());
-        }
-
-        // Best-effort parse: look for the payout script as a txout scriptPubKey and
-        // verify the preceding value meets min_pool_payout. This is a heuristic and
-        // does not fully parse Zcash transaction formats.
-        for start in 0..=coinbase.len().saturating_sub(script.len()) {
-            if &coinbase[start..start + script.len()] != script.as_slice() {
-                continue;
-            }
-            if let Some(value) = Self::try_read_output_value(coinbase, start, script.len()) {
-                if value >= self.min_pool_payout {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    fn try_read_output_value(
-        coinbase: &[u8],
-        script_start: usize,
-        script_len: usize,
-    ) -> Option<u64> {
-        // CompactSize length directly preceding script (1 byte)
-        if script_start > 8 {
-            let len = coinbase[script_start - 1] as usize;
-            if len == script_len {
-                let value_start = script_start - 1 - 8;
-                let mut value_bytes = [0u8; 8];
-                value_bytes.copy_from_slice(&coinbase[value_start..value_start + 8]);
-                return Some(u64::from_le_bytes(value_bytes));
-            }
-        }
-
-        // CompactSize length (0xfd + u16)
-        if script_start >= 3 + 8 {
-            let marker = coinbase[script_start - 3];
-            if marker == 0xfd {
-                let len = u16::from_le_bytes([coinbase[script_start - 2], coinbase[script_start - 1]])
-                    as usize;
-                if len == script_len {
-                    let value_start = script_start - 3 - 8;
-                    let mut value_bytes = [0u8; 8];
-                    value_bytes.copy_from_slice(&coinbase[value_start..value_start + 8]);
-                    return Some(u64::from_le_bytes(value_bytes));
-                }
-            }
-        }
-
-        // CompactSize length (0xfe + u32)
-        if script_start >= 5 + 8 {
-            let marker = coinbase[script_start - 5];
-            if marker == 0xfe {
-                let len = u32::from_le_bytes([
-                    coinbase[script_start - 4],
-                    coinbase[script_start - 3],
-                    coinbase[script_start - 2],
-                    coinbase[script_start - 1],
-                ]) as usize;
-                if len == script_len {
-                    let value_start = script_start - 5 - 8;
-                    let mut value_bytes = [0u8; 8];
-                    value_bytes.copy_from_slice(&coinbase[value_start..value_start + 8]);
-                    return Some(u64::from_le_bytes(value_bytes));
-                }
-            }
-        }
-
-        // CompactSize length (0xff + u64)
-        if script_start >= 9 + 8 {
-            let marker = coinbase[script_start - 9];
-            if marker == 0xff {
-                let len = u64::from_le_bytes([
-                    coinbase[script_start - 8],
-                    coinbase[script_start - 7],
-                    coinbase[script_start - 6],
-                    coinbase[script_start - 5],
-                    coinbase[script_start - 4],
-                    coinbase[script_start - 3],
-                    coinbase[script_start - 2],
-                    coinbase[script_start - 1],
-                ]) as usize;
-                if len == script_len {
-                    let value_start = script_start - 9 - 8;
-                    let mut value_bytes = [0u8; 8];
-                    value_bytes.copy_from_slice(&coinbase[value_start..value_start + 8]);
-                    return Some(u64::from_le_bytes(value_bytes));
-                }
-            }
-        }
-
-        None
+        let validator = zcash_coinbase::validator::CoinbaseValidator::new(
+            self.pool_payout_script.clone(),
+            self.min_pool_payout,
+        );
+        validator.validate_payout_outputs(coinbase).is_ok()
     }
 
     /// Standard validation: check for missing transactions
@@ -467,7 +376,10 @@ mod tests {
 
     fn minimal_tx_with_script(script: &[u8]) -> Vec<u8> {
         let mut tx = Vec::new();
-        tx.extend_from_slice(&1u32.to_le_bytes()); // version
+        // Version 4 with overwinter flag (Zcash v4 format)
+        tx.extend_from_slice(&0x8000_0004u32.to_le_bytes());
+        // Version group ID (Sapling)
+        tx.extend_from_slice(&0x892F_2085u32.to_le_bytes());
         tx.push(0x01); // vin count
         tx.extend_from_slice(&[0u8; 32]); // prevout hash
         tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
@@ -484,6 +396,7 @@ mod tests {
         }
         tx.extend_from_slice(script);
         tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        tx.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
         tx
     }
 

@@ -18,6 +18,7 @@ rand = "0.8"
 # Local dependencies
 zcash-mining-protocol = { path = "../zcash-mining-protocol" }
 zcash-pool-common = { path = "../zcash-pool-common" }
+zcash-coinbase = { path = "../zcash-coinbase" }
 bedrock-noise = { path = "../bedrock-noise" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 

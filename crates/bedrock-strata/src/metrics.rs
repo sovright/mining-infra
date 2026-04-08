@@ -40,6 +40,24 @@ pub struct PoolMetrics {
     /// Total rejected shares, labeled by rejection reason
     pub shares_rejected: IntCounterVec,
 
+    // Per-worker metrics (for Bedrock API ingest)
+    /// Per-worker hashrate in sol/s
+    pub worker_hashrate: prometheus::GaugeVec,
+    /// Per-worker accepted shares (counter)
+    pub worker_shares_accepted: IntCounterVec,
+    /// Per-worker rejected shares (counter)
+    pub worker_shares_rejected: IntCounterVec,
+    /// Per-worker blocks found (counter)
+    pub worker_blocks_found: IntCounterVec,
+    /// Pool-level aggregate hashrate
+    pub pool_total_hashrate: Gauge,
+    /// Pool-level connected miners count
+    pub pool_connected_miners: IntGauge,
+    /// Pool-level connected workers count
+    pub pool_connected_workers: IntGauge,
+    /// Network difficulty
+    pub network_difficulty: Gauge,
+
     // Block metrics
     /// Total blocks found by the pool
     pub blocks_found: IntCounter,
@@ -131,6 +149,54 @@ impl PoolMetrics {
             Opts::new("pool_shares_rejected_total", "Total rejected shares")
                 .namespace("bedrock"),
             &["reason"],
+        )
+        .expect("metric can be created");
+
+        // Per-worker metrics (names match what Bedrock API ingest expects)
+        let worker_hashrate = prometheus::GaugeVec::new(
+            Opts::new("hashrate_sol_s", "Worker hashrate in solutions per second"),
+            &["worker"],
+        )
+        .expect("metric can be created");
+
+        // Per-worker share/block counters use a `worker_` prefix to distinguish
+        // them from the pool-level `pool_shares_*` / `pool_blocks_*` counters.
+        // Each metric carries a `worker` label for per-miner breakdowns.
+        let worker_shares_accepted = IntCounterVec::new(
+            Opts::new("worker_shares_accepted_total", "Per-worker accepted shares"),
+            &["worker"],
+        )
+        .expect("metric can be created");
+
+        let worker_shares_rejected = IntCounterVec::new(
+            Opts::new("worker_shares_rejected_total", "Per-worker rejected shares"),
+            &["worker"],
+        )
+        .expect("metric can be created");
+
+        let worker_blocks_found = IntCounterVec::new(
+            Opts::new("worker_blocks_found_total", "Per-worker blocks found"),
+            &["worker"],
+        )
+        .expect("metric can be created");
+
+        let pool_total_hashrate = Gauge::with_opts(
+            Opts::new("pool_total_hashrate_sol_s", "Pool aggregate hashrate in sol/s"),
+        )
+        .expect("metric can be created");
+
+        let pool_connected_miners = IntGauge::with_opts(
+            Opts::new("pool_connected_miners", "Number of connected miners"),
+        )
+        .expect("metric can be created");
+
+        let pool_connected_workers = IntGauge::with_opts(
+            Opts::new("pool_connected_workers", "Number of connected workers"),
+        )
+        .expect("metric can be created");
+
+        let network_difficulty = Gauge::with_opts(
+            Opts::new("network_difficulty", "Current network difficulty"),
         )
         .expect("metric can be created");
 
@@ -253,6 +319,16 @@ impl PoolMetrics {
         )
         .expect("metric can be created");
 
+        // Register per-worker and pool-level metrics
+        registry.register(Box::new(worker_hashrate.clone())).expect("metric can be registered");
+        registry.register(Box::new(worker_shares_accepted.clone())).expect("metric can be registered");
+        registry.register(Box::new(worker_shares_rejected.clone())).expect("metric can be registered");
+        registry.register(Box::new(worker_blocks_found.clone())).expect("metric can be registered");
+        registry.register(Box::new(pool_total_hashrate.clone())).expect("metric can be registered");
+        registry.register(Box::new(pool_connected_miners.clone())).expect("metric can be registered");
+        registry.register(Box::new(pool_connected_workers.clone())).expect("metric can be registered");
+        registry.register(Box::new(network_difficulty.clone())).expect("metric can be registered");
+
         // Register all metrics
         registry
             .register(Box::new(connections_total.clone()))
@@ -324,6 +400,14 @@ impl PoolMetrics {
             shares_submitted,
             shares_accepted,
             shares_rejected,
+            worker_hashrate,
+            worker_shares_accepted,
+            worker_shares_rejected,
+            worker_blocks_found,
+            pool_total_hashrate,
+            pool_connected_miners,
+            pool_connected_workers,
+            network_difficulty,
             blocks_found,
             blocks_submitted,
             estimated_hashrate,
@@ -388,6 +472,38 @@ impl PoolMetrics {
     /// Record a rejected share with the given reason
     pub fn record_share_rejected(&self, reason: &str) {
         self.shares_rejected.with_label_values(&[reason]).inc();
+    }
+
+    /// Record an accepted share for a specific worker
+    pub fn record_worker_share_accepted(&self, worker: &str) {
+        self.worker_shares_accepted.with_label_values(&[worker]).inc();
+    }
+
+    /// Record a rejected share for a specific worker
+    pub fn record_worker_share_rejected(&self, worker: &str) {
+        self.worker_shares_rejected.with_label_values(&[worker]).inc();
+    }
+
+    /// Record a block found for a specific worker
+    pub fn record_worker_block_found(&self, worker: &str) {
+        self.worker_blocks_found.with_label_values(&[worker]).inc();
+    }
+
+    /// Set the hashrate for a specific worker
+    pub fn set_worker_hashrate(&self, worker: &str, hashrate: f64) {
+        self.worker_hashrate.with_label_values(&[worker]).set(hashrate);
+    }
+
+    /// Update pool-level aggregate metrics
+    pub fn set_pool_aggregates(&self, hashrate: f64, miners: i64, workers: i64) {
+        self.pool_total_hashrate.set(hashrate);
+        self.pool_connected_miners.set(miners);
+        self.pool_connected_workers.set(workers);
+    }
+
+    /// Set network difficulty
+    pub fn set_network_difficulty(&self, difficulty: f64) {
+        self.network_difficulty.set(difficulty);
     }
 
     /// Record a block found

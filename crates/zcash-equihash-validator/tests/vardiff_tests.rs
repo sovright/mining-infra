@@ -18,6 +18,7 @@ fn test_vardiff_adjusts_up_on_fast_shares() {
         max_difficulty: 1_000_000.0,
         retarget_interval: Duration::from_millis(50), // Very short for testing
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let mut controller = VardiffController::new(config);
 
@@ -48,6 +49,7 @@ fn test_vardiff_adjusts_down_on_slow_shares() {
         max_difficulty: 1_000_000.0,
         retarget_interval: Duration::from_millis(100), // Short interval for testing
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let mut controller = VardiffController::new(config);
 
@@ -77,6 +79,7 @@ fn test_vardiff_respects_min_difficulty() {
         max_difficulty: 1_000_000.0,
         retarget_interval: Duration::from_millis(50),
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let mut controller = VardiffController::new(config);
 
@@ -97,6 +100,7 @@ fn test_vardiff_respects_max_difficulty() {
         max_difficulty: 100.0,
         retarget_interval: Duration::from_millis(50),
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let mut controller = VardiffController::new(config);
 
@@ -114,6 +118,7 @@ fn test_vardiff_stats() {
         max_difficulty: 1_000_000.0,
         retarget_interval: Duration::from_secs(60),
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let mut controller = VardiffController::new(config);
 
