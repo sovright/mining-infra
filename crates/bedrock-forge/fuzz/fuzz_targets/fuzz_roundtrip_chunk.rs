@@ -9,7 +9,8 @@ fuzz_target!(|data: &[u8]| {
 
     // Normalize to valid protocol constraints
     chunk.header.magic = CHUNK_MAGIC;
-    chunk.header.version = if u.arbitrary().unwrap_or(false) { 2 } else { 1 };
+    let Ok(use_v2) = u.arbitrary::<bool>() else { return };
+    chunk.header.version = if use_v2 { 2 } else { 1 };
     if chunk.header.total_chunks == 0 {
         chunk.header.total_chunks = 1;
     }

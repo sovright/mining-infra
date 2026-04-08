@@ -1,11 +1,11 @@
-//! One-shot test to generate seed corpus files for fuzzing.
-//! Run: cargo test -p bedrock-forge --test generate_corpus -- --ignored
+//! One-shot utility to generate seed corpus files for fuzzing.
+//! Run: cargo test -p bedrock-forge --features generate-corpus --test generate_corpus
+#![cfg(feature = "generate-corpus")]
 
 use bedrock_forge::{ChunkHeader, Chunk, CHUNK_MAGIC};
 use std::fs;
 
 #[test]
-#[ignore]
 fn generate_fuzz_corpus() {
     let corpus_base = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/corpus");
 

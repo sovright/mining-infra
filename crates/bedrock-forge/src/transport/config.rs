@@ -93,9 +93,15 @@ impl RelayConfig {
         self.data_shards + self.parity_shards
     }
 
-    /// Whether relay authentication is required for inbound peers
+    /// Whether relay authentication is required for inbound peers.
+    ///
+    /// Auth is required when `allow_unauthenticated_peers` is false.
+    /// When auth IS required, `authorized_keys` is used to validate
+    /// peer credentials -- but the presence of keys alone does not
+    /// force auth on (a relay may keep a key list for optional
+    /// verification while still allowing unauthenticated peers).
     pub fn auth_required(&self) -> bool {
-        !self.authorized_keys.is_empty() || !self.allow_unauthenticated_peers
+        !self.allow_unauthenticated_peers
     }
 
     /// Validate the configuration

@@ -316,6 +316,14 @@ impl<V: PowValidator> RelayNode<V> {
         let is_new = assembly.chunks.get(chunk_id).is_none_or(|c| c.is_none());
         assembly.add_chunk(chunk_id, chunk.payload.clone());
 
+        // PoW validation gate: we check PoW eagerly on each new chunk rather
+        // than waiting until the full block is assembled.  This is intentional --
+        // it lets the relay reject invalid streams early and avoid accumulating
+        // (and forwarding) chunks for blocks that will never pass validation.
+        // `validate_pow_from_assembly` may return `None` when there aren't enough
+        // chunks yet to extract a header; in that case we keep the current
+        // `pow_validated` state (false) and suppress forwarding until a future
+        // chunk provides enough data to decide.
         if is_new && !assembly.pow_validated {
             if let Some(valid) = self.validate_pow_from_assembly(assembly) {
                 assembly.pow_validated = valid;
