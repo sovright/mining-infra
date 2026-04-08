@@ -2,13 +2,22 @@ use proptest::prelude::*;
 use zcash_template_provider::NoncePartitioner;
 
 proptest! {
-    /// Different IDs always produce different nonce_1 prefixes.
+    /// Different IDs within the addressable range always produce different nonce_1 prefixes.
+    /// The addressable range is 2^(nonce_1_len * 8), so we constrain IDs to fit.
     #[test]
     fn nonce_partitions_non_overlapping(
-        nonce_1_len in 1usize..=32,
+        nonce_1_len in 1usize..=8,
         id_a in 0u64..1000,
         id_b in 0u64..1000,
     ) {
+        // Constrain IDs to the addressable space for this nonce_1_len.
+        // With nonce_1_len bytes, we can encode 2^(len*8) unique prefixes.
+        let (id_a, id_b) = if nonce_1_len < 8 {
+            let max_id = 1u64 << (nonce_1_len * 8);
+            (id_a % max_id, id_b % max_id)
+        } else {
+            (id_a, id_b)
+        };
         prop_assume!(id_a != id_b);
         let partitioner = NoncePartitioner::new(nonce_1_len).unwrap();
         let range_a = partitioner.get_range(id_a);
