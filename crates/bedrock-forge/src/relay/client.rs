@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use sha2::{Sha256, Digest};
 use tokio::net::UdpSocket;
@@ -17,6 +18,7 @@ use crate::transport::{
 };
 
 const MAX_PENDING_BLOCKS_CLIENT: usize = 64;
+const RECENT_DELIVERED_TTL: Duration = Duration::from_secs(120);
 
 /// Handle for sending blocks through the relay client
 #[derive(Clone)]
@@ -148,6 +150,7 @@ impl RelayClient {
 
         let mut recv_buf = vec![0u8; 2048];
         let mut pending_blocks: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
+        let mut recent_delivered: HashMap<[u8; 32], Instant> = HashMap::new();
         let mut cleanup_counter: u32 = 0;
 
         loop {
@@ -171,6 +174,7 @@ impl RelayClient {
                                 self.handle_incoming_chunk(
                                     chunk,
                                     &mut pending_blocks,
+                                    &mut recent_delivered,
                                 ).await;
                             }
                         }
@@ -188,6 +192,7 @@ impl RelayClient {
                 cleanup_counter = 0;
                 let timeout = self.config.recv_timeout;
                 pending_blocks.retain(|_, (assembly, _)| !assembly.is_expired(timeout));
+                recent_delivered.retain(|_, seen_at| seen_at.elapsed() <= RECENT_DELIVERED_TTL);
             }
         }
 
@@ -262,10 +267,18 @@ impl RelayClient {
         &self,
         chunk: Chunk,
         pending: &mut HashMap<[u8; 32], (BlockAssembly, usize)>,
+        recent_delivered: &mut HashMap<[u8; 32], Instant>,
     ) {
         let block_hash = chunk.header.block_hash;
         let total_chunks = chunk.header.total_chunks as usize;
         let chunk_id = chunk.header.chunk_id as usize;
+
+        if recent_delivered
+            .get(&block_hash)
+            .is_some_and(|seen_at| seen_at.elapsed() <= RECENT_DELIVERED_TTL)
+        {
+            return;
+        }
 
         // Validate chunk header
         if chunk.header.msg_type != MessageType::Block {
@@ -342,6 +355,7 @@ impl RelayClient {
                             warn!("Failed to deliver reconstructed block (receiver dropped)");
                         }
                     }
+                    recent_delivered.insert(block_hash, Instant::now());
                     // Remove from pending
                     pending.remove(&block_hash);
                 }
@@ -391,7 +405,10 @@ mod tests {
         let header = ChunkHeader::new_block(&block_hash, 0, 3, 4);
         let chunk = Chunk::new(header, vec![1, 2, 3, 4]);
 
-        client.handle_incoming_chunk(chunk, &mut pending).await;
+        let mut recent_delivered = HashMap::new();
+        client
+            .handle_incoming_chunk(chunk, &mut pending, &mut recent_delivered)
+            .await;
 
         assert!(pending.is_empty());
         let recv = timeout(Duration::from_millis(50), rx.recv()).await;
@@ -414,7 +431,10 @@ mod tests {
         header.msg_type = MessageType::Keepalive;
         let chunk = Chunk::new(header, vec![1, 2, 3, 4]);
 
-        client.handle_incoming_chunk(chunk, &mut pending).await;
+        let mut recent_delivered = HashMap::new();
+        client
+            .handle_incoming_chunk(chunk, &mut pending, &mut recent_delivered)
+            .await;
 
         assert!(pending.is_empty());
         let recv = timeout(Duration::from_millis(50), rx.recv()).await;
@@ -441,7 +461,10 @@ mod tests {
         assembly.add_chunk(0, vec![1, 2, 3, 4]);
         pending.insert(block_hash, (assembly, 0));
 
-        client.handle_incoming_chunk(chunk, &mut pending).await;
+        let mut recent_delivered = HashMap::new();
+        client
+            .handle_incoming_chunk(chunk, &mut pending, &mut recent_delivered)
+            .await;
 
         let (assembly, _) = pending.get(&block_hash).unwrap();
         assert_eq!(assembly.received_count(), 1);

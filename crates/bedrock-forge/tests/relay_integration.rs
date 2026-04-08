@@ -33,7 +33,8 @@ fn make_test_block() -> bedrock_forge::CompactBlock {
 #[tokio::test]
 async fn relay_node_receives_chunks() {
     // Start relay node
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
     node.bind().await.unwrap();
 
@@ -92,7 +93,8 @@ async fn relay_node_receives_chunks() {
 #[tokio::test]
 async fn client_to_client_via_relay() {
     // Start relay node (no auth required for testing)
-    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 

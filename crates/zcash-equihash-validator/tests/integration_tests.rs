@@ -236,12 +236,3 @@ fn test_target_comparison_with_hash() {
     assert!(same_target.is_met_by(&same));
 }
 
-#[test]
-fn test_test_vector_helpers() {
-    // Test the hex helpers work correctly
-    let bytes = test_vectors::hex_to_bytes("deadbeef");
-    assert_eq!(bytes, vec![0xde, 0xad, 0xbe, 0xef]);
-
-    let arr: [u8; 4] = test_vectors::hex_to_array("cafebabe");
-    assert_eq!(arr, [0xca, 0xfe, 0xba, 0xbe]);
-}

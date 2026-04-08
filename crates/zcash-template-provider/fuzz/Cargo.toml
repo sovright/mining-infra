@@ -1,0 +1,37 @@
+[package]
+name = "zcash-template-provider-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zcash-template-provider = { path = ".." }
+serde_json = "1"
+hex = "0.4"
+
+[[bin]]
+name = "fuzz_hash256_from_hex"
+path = "fuzz_targets/fuzz_hash256_from_hex.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_parse_target"
+path = "fuzz_targets/fuzz_parse_target.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_assemble_header"
+path = "fuzz_targets/fuzz_assemble_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_nonce_partitioner"
+path = "fuzz_targets/fuzz_nonce_partitioner.rs"
+doc = false

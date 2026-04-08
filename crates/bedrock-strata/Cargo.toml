@@ -6,7 +6,7 @@ license.workspace = true
 description = "Strata: Monitoring and analytics layer for Bedrock mining infrastructure"
 
 [dependencies]
-prometheus = "0.13"
+prometheus = "0.14"
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 opentelemetry = { version = "0.21", features = ["trace"] }

@@ -1,0 +1,35 @@
+[package]
+name = "zcash-equihash-validator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zcash-equihash-validator = { path = ".." }
+
+[[bin]]
+name = "fuzz_compact_to_target"
+path = "fuzz_targets/fuzz_compact_to_target.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_difficulty_roundtrip"
+path = "fuzz_targets/fuzz_difficulty_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_target_ordering"
+path = "fuzz_targets/fuzz_target_ordering.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_verify_solution_rejects"
+path = "fuzz_targets/fuzz_verify_solution_rejects.rs"
+doc = false

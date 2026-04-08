@@ -137,4 +137,80 @@ mod tests {
         let result = read_compact_size(&data, &mut cursor);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_display_error() {
+        let err = CompactSizeError::OutOfBounds;
+        let msg = err.to_string();
+        assert_eq!(msg, "compact size out of bounds");
+    }
+
+    /// Kill mutant: cursor + 2 > data.len() vs cursor * 2 <= data.len()
+    /// With cursor=1 and 2-byte buffer [0xfd, 0x00]:
+    ///   cursor+2 = 3 > 2 => OutOfBounds (correct)
+    ///   cursor*2 = 2 <= 2 => would NOT error (mutant behavior)
+    #[test]
+    fn test_read_u16_cursor_plus_vs_times() {
+        // After reading 0xfd prefix, cursor=1. Buffer len=2.
+        // cursor + 2 = 3 > 2 => should fail
+        // cursor * 2 = 2 <= 2 => mutant would succeed (and likely panic on OOB)
+        let data = [0xfd, 0x00];
+        let mut cursor = 0;
+        let result = read_compact_size(&data, &mut cursor);
+        assert!(result.is_err(), "should fail: only 1 byte after 0xfd prefix, need 2");
+    }
+
+    /// Kill mutant: cursor + 2 > data.len() vs cursor + 2 < data.len()
+    /// Buffer has exactly enough bytes: [0xfd, lo, hi] => cursor+2 == 3 == data.len()
+    /// With >: 3 > 3 is false => succeeds (correct)
+    /// With <: 3 < 3 is false => also succeeds, but we verify the VALUE to catch it
+    /// The real distinguisher: [0xfd, lo] with len=2, cursor=1 after prefix
+    ///   cursor+2=3 > 2 => true => error (correct with >)
+    ///   cursor+2=3 < 2 => false => no error, then OOB panic (mutant with <)
+    /// Already covered above; also test exact boundary succeeds:
+    #[test]
+    fn test_read_u16_exact_boundary_succeeds() {
+        // Exactly enough data: prefix + 2 bytes
+        let data = [0xfd, 0x40, 0x05]; // encodes 0x0540 = 1344
+        let mut cursor = 0;
+        let result = read_compact_size(&data, &mut cursor).unwrap();
+        assert_eq!(result, 1344);
+        assert_eq!(cursor, 3);
+    }
+
+    /// Kill mutant: cursor + 4 > data.len() vs cursor * 4
+    /// After reading 0xfe prefix, cursor=1. Buffer has 0xfe + 3 bytes (4 total).
+    ///   cursor+4 = 5 > 4 => OutOfBounds (correct)
+    ///   cursor*4 = 4 <= 4 => would NOT error (mutant)
+    #[test]
+    fn test_read_u32_cursor_plus_vs_times() {
+        let data = [0xfe, 0x00, 0x00, 0x00]; // only 3 payload bytes, need 4
+        let mut cursor = 0;
+        let result = read_compact_size(&data, &mut cursor);
+        assert!(result.is_err(), "should fail: only 3 bytes after 0xfe prefix, need 4");
+    }
+
+    #[test]
+    fn test_read_u32_exact_boundary_succeeds() {
+        // Exactly enough: prefix + 4 bytes
+        let data = [0xfe, 0x00, 0x00, 0x01, 0x00]; // encodes 0x00010000 = 65536
+        let mut cursor = 0;
+        let result = read_compact_size(&data, &mut cursor).unwrap();
+        assert_eq!(result, 65536);
+        assert_eq!(cursor, 5);
+    }
+
+    /// Kill mutant: data[*cursor + 1] -> data[*cursor * 1] in u32 branch (line 47)
+    /// With distinct bytes, *cursor * 1 == *cursor, so byte[1] would be read twice
+    /// instead of reading byte[1] then byte[2], producing a wrong value.
+    #[test]
+    fn test_read_u32_distinct_bytes() {
+        // Encode 0x04030201 as [0xfe, 0x01, 0x02, 0x03, 0x04]
+        let data = [0xfe, 0x01, 0x02, 0x03, 0x04];
+        let mut cursor = 0;
+        let result = read_compact_size(&data, &mut cursor).unwrap();
+        // Correct: u32::from_le_bytes([0x01, 0x02, 0x03, 0x04]) = 0x04030201 = 67305985
+        assert_eq!(result, 0x04030201);
+        assert_eq!(cursor, 5);
+    }
 }

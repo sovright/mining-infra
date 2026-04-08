@@ -1,0 +1,21 @@
+[package]
+name = "zcash-test-miner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPU Equihash test miner for Bedrock pool testing"
+
+[[bin]]
+name = "zcash-test-miner"
+path = "src/main.rs"
+
+[dependencies]
+zcash-mining-protocol = { path = "../zcash-mining-protocol" }
+bedrock-noise = { path = "../bedrock-noise" }
+equihash = { workspace = true, features = ["solver"] }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+rand = "0.8"
+blake2b_simd = { workspace = true }

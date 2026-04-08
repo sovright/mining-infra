@@ -163,6 +163,14 @@ impl TemplateValidator {
         }
     }
 
+    /// Validate a coinbase transaction against pool payout requirements.
+    pub fn validate_coinbase(&self, coinbase: &[u8]) -> Result<(), String> {
+        if !self.pool_payout_script.is_empty() && !self.validate_pool_payout(coinbase) {
+            return Err("Missing or insufficient pool payout".into());
+        }
+        Self::parse_transaction(coinbase).map_err(|err| format!("invalid coinbase transaction: {}", err))
+    }
+
     /// Check if pool payout script appears in coinbase
     fn validate_pool_payout(&self, coinbase: &[u8]) -> bool {
         if self.pool_payout_script.is_empty() {
@@ -272,27 +280,28 @@ impl TemplateValidator {
             return ValidationResult::Invalid("too many transactions provided".into());
         }
 
+        let mut provided_txids = HashSet::with_capacity(job.tx_data.len());
         for tx_data in &job.tx_data {
             if let Err(err) = Self::parse_transaction(tx_data) {
                 return ValidationResult::Invalid(format!("invalid transaction data: {}", err));
             }
+            let txid = Self::compute_txid(tx_data);
+            if !job.tx_short_ids.contains(&txid) {
+                return ValidationResult::Invalid("transaction data not referenced".into());
+            }
+            provided_txids.insert(txid);
         }
 
         // Check if we know all referenced transactions
         let missing: Vec<[u8; 32]> = job
             .tx_short_ids
             .iter()
-            .filter(|txid| !self.known_txids.contains(*txid))
+            .filter(|txid| !self.known_txids.contains(*txid) && !provided_txids.contains(*txid))
             .copied()
             .collect();
 
-        // If there are missing txids and client didn't provide them in tx_data
         if !missing.is_empty() {
-            // Check if any of the missing were provided in tx_data
-            // For simplicity, if tx_data has same count as missing, assume they match
-            if job.tx_data.len() < missing.len() {
-                return ValidationResult::NeedTransactions(missing);
-            }
+            return ValidationResult::NeedTransactions(missing);
         }
 
         match Self::compute_merkle_root(&job.coinbase_tx, &job.tx_short_ids) {
@@ -332,7 +341,7 @@ impl TemplateValidator {
         ValidationResult::Valid
     }
 
-    fn parse_transaction(data: &[u8]) -> Result<(), String> {
+    pub(crate) fn parse_transaction(data: &[u8]) -> Result<(), String> {
         if data.len() < 4 {
             return Err("transaction too short".into());
         }
@@ -397,7 +406,7 @@ impl TemplateValidator {
             .map_err(|e| e.to_string())
     }
 
-    fn compute_txid(data: &[u8]) -> [u8; 32] {
+    pub(crate) fn compute_txid(data: &[u8]) -> [u8; 32] {
         let hash1 = Sha256::digest(data);
         let hash2 = Sha256::digest(hash1);
         let mut txid = [0u8; 32];
@@ -405,7 +414,7 @@ impl TemplateValidator {
         txid
     }
 
-    fn compute_merkle_root(coinbase: &[u8], txids: &[[u8; 32]]) -> Option<[u8; 32]> {
+    pub(crate) fn compute_merkle_root(coinbase: &[u8], txids: &[[u8; 32]]) -> Option<[u8; 32]> {
         if coinbase.is_empty() {
             return None;
         }
@@ -599,12 +608,31 @@ mod tests {
     fn test_standard_validation_with_provided_tx_data() {
         let validator = TemplateValidator::new(ValidationLevel::Standard, vec![], 0);
         let mut job = make_test_job();
-        job.tx_short_ids = vec![[0x11; 32], [0x22; 32]];
-        // Provide enough tx_data to cover the missing txids
-        job.tx_data = vec![minimal_tx(), minimal_tx()];
+        let tx1 = minimal_tx();
+        let tx2 = minimal_tx_with_script(&[0x52]);
+        job.tx_short_ids = vec![
+            TemplateValidator::compute_txid(&tx1),
+            TemplateValidator::compute_txid(&tx2),
+        ];
+        job.tx_data = vec![tx1, tx2];
         update_merkle_root(&mut job);
 
         assert_eq!(validator.validate(&job), ValidationResult::Valid);
+    }
+
+    #[test]
+    fn test_standard_validation_rejects_unreferenced_tx_data() {
+        let validator = TemplateValidator::new(ValidationLevel::Standard, vec![], 0);
+        let mut job = make_test_job();
+        let tx = minimal_tx();
+        job.tx_short_ids = vec![[0x11; 32]];
+        job.tx_data = vec![tx];
+        update_merkle_root(&mut job);
+
+        assert_eq!(
+            validator.validate(&job),
+            ValidationResult::Invalid("transaction data not referenced".into())
+        );
     }
 
     #[test]

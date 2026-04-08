@@ -1,0 +1,30 @@
+[package]
+name = "bedrock-noise-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+bedrock-noise = { path = ".." }
+snow = "0.9"
+
+[[bin]]
+name = "fuzz_key_parsing"
+path = "fuzz_targets/fuzz_key_parsing.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_private_key_roundtrip"
+path = "fuzz_targets/fuzz_private_key_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_handshake_message"
+path = "fuzz_targets/fuzz_handshake_message.rs"
+doc = false

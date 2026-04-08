@@ -154,7 +154,8 @@ fn gate_reconstruction_full_mempool() {
 /// Gate 6: Relay node starts and stops cleanly
 #[tokio::test]
 async fn gate_relay_lifecycle() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
 
     // Should bind successfully
@@ -181,7 +182,8 @@ async fn gate_relay_lifecycle() {
 /// Gate 7: Metrics tracking works
 #[tokio::test]
 async fn gate_metrics() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
     node.bind().await.unwrap();
     let addr = node.local_addr().unwrap();
@@ -263,16 +265,19 @@ fn gate_version_compatibility() {
 #[test]
 fn gate_config_validation() {
     // Valid config
-    let valid = RelayConfig::new("127.0.0.1:8333".parse().unwrap());
+    let valid = RelayConfig::new("127.0.0.1:8333".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     assert!(valid.validate().is_ok());
 
     // Invalid data_shards
-    let mut invalid = RelayConfig::new("127.0.0.1:8333".parse().unwrap());
+    let mut invalid = RelayConfig::new("127.0.0.1:8333".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     invalid.data_shards = 0;
     assert!(invalid.validate().is_err());
 
     // Invalid parity_shards
-    let mut invalid = RelayConfig::new("127.0.0.1:8333".parse().unwrap());
+    let mut invalid = RelayConfig::new("127.0.0.1:8333".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     invalid.parity_shards = 0;
     assert!(invalid.validate().is_err());
 }

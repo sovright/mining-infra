@@ -13,6 +13,10 @@ pub mod types;
 
 pub use commitments::calculate_block_commitments_hash;
 pub use error::Error;
+pub use rpc::RpcProvider;
 pub use header::{assemble_header, parse_target};
 pub use nonce::{NoncePartitioner, NonceRange};
 pub use template::{TemplateProvider, TemplateProviderConfig};
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod testutil;

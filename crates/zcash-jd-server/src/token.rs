@@ -31,10 +31,24 @@ pub struct MiningJobToken {
 pub struct DeclaredJobInfo {
     /// Pool-assigned job ID
     pub job_id: u32,
+    /// Declaring client identifier
+    pub client_id: String,
+    /// Declared mode
+    pub mode: JobDeclarationMode,
+    /// Channel ID associated with the job
+    pub channel_id: u32,
+    /// Block version
+    pub version: u32,
     /// Previous block hash
     pub prev_hash: [u8; 32],
     /// Merkle root
     pub merkle_root: [u8; 32],
+    /// Block commitments
+    pub block_commitments: [u8; 32],
+    /// Compact target bits
+    pub bits: u32,
+    /// Declared template time
+    pub time: u32,
     /// Coinbase transaction
     pub coinbase_tx: Vec<u8>,
 }
@@ -170,6 +184,19 @@ impl TokenManager {
             .ok_or(JdServerError::Protocol("Job not declared".to_string()))
     }
 
+    /// Look up a declared job by server-assigned job ID.
+    pub fn find_job_by_id(&self, job_id: u32) -> Result<DeclaredJobInfo> {
+        let tokens = self.tokens.read().unwrap_or_else(|e| e.into_inner());
+
+        tokens
+            .values()
+            .filter(|token| !token.is_expired())
+            .filter_map(|token| token.job_info.as_ref())
+            .find(|job| job.job_id == job_id)
+            .cloned()
+            .ok_or(JdServerError::Protocol(format!("unknown job id {}", job_id)))
+    }
+
     /// Remove expired tokens
     fn cleanup_expired(&self) {
         let mut tokens = self.tokens.write().unwrap_or_else(|e| e.into_inner());
@@ -269,8 +296,15 @@ mod tests {
 
         let job_info = DeclaredJobInfo {
             job_id: 42,
+            client_id: "miner-01".to_string(),
+            mode: JobDeclarationMode::CoinbaseOnly,
+            channel_id: 7,
+            version: 5,
             prev_hash: [0xaa; 32],
             merkle_root: [0xbb; 32],
+            block_commitments: [0xcc; 32],
+            bits: 0x1d00ffff,
+            time: 1_700_000_000,
             coinbase_tx: vec![0x01; 100],
         };
 

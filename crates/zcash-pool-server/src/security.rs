@@ -7,7 +7,7 @@
 //! - Timing attack mitigation via response jitter
 
 use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
@@ -242,7 +242,7 @@ impl SequenceValidator {
 #[derive(Debug)]
 pub struct ConnectionTracker {
     /// Recent connections by source address
-    connections: RwLock<HashMap<SocketAddr, ConnectionHistory>>,
+    connections: RwLock<HashMap<IpAddr, ConnectionHistory>>,
     /// Threshold for "short-lived" connections
     short_lived_threshold: Duration,
     /// Window for tracking connection patterns
@@ -266,7 +266,7 @@ struct ConnectionHistory {
 
 #[derive(Debug, Clone)]
 struct ConnectionRecord {
-    connected_at: Instant,
+    /// Timestamp of disconnect for pruning and eviction order.
     disconnected_at: Instant,
     duration: Duration,
     decryption_error: bool,
@@ -304,6 +304,7 @@ impl ConnectionTracker {
     /// Record a new connection
     pub fn on_connect(&self, addr: SocketAddr) -> Instant {
         let now = Instant::now();
+        let addr = addr.ip();
         let mut connections = self.connections.write().unwrap_or_else(|e| {
             warn!("ConnectionTracker lock poisoned in on_connect, recovering");
             e.into_inner()
@@ -353,15 +354,11 @@ impl ConnectionTracker {
     /// Record a disconnection
     ///
     /// Returns `true` if this address should be flagged as suspicious
-    pub fn on_disconnect(
-        &self,
-        addr: SocketAddr,
-        connected_at: Instant,
-        decryption_error: bool,
-    ) -> bool {
+    pub fn on_disconnect(&self, addr: SocketAddr, connected_at: Instant, decryption_error: bool) -> bool {
         let now = Instant::now();
         let duration = now.duration_since(connected_at);
         let is_short_lived = duration < self.short_lived_threshold;
+        let addr = addr.ip();
 
         let mut connections = self.connections.write().unwrap_or_else(|e| {
             warn!("ConnectionTracker lock poisoned in on_disconnect, recovering");
@@ -374,7 +371,6 @@ impl ConnectionTracker {
 
         // Record this connection
         history.recent_durations.push_back(ConnectionRecord {
-            connected_at,
             disconnected_at: now,
             duration,
             decryption_error,
@@ -435,7 +431,7 @@ impl ConnectionTracker {
                 warn!("ConnectionTracker lock poisoned in is_flagged, recovering");
                 e.into_inner()
             })
-            .get(addr)
+            .get(&addr.ip())
             .map(|h| h.is_flagged)
             .unwrap_or(false)
     }
@@ -445,7 +441,7 @@ impl ConnectionTracker {
         if let Some(history) = self.connections.write().unwrap_or_else(|e| {
             warn!("ConnectionTracker lock poisoned in clear_flag, recovering");
             e.into_inner()
-        }).get_mut(addr) {
+        }).get_mut(&addr.ip()) {
             history.is_flagged = false;
         }
     }
@@ -456,7 +452,7 @@ impl ConnectionTracker {
             warn!("ConnectionTracker lock poisoned in get_stats, recovering");
             e.into_inner()
         });
-        let history = connections.get(addr)?;
+        let history = connections.get(&addr.ip())?;
 
         let total = history.recent_durations.len();
         let short_lived = history
@@ -832,7 +828,7 @@ mod tests {
 
         let connections = tracker.connections.read().unwrap();
         assert_eq!(connections.len(), 3); // Still capped at 3
-        assert!(connections.contains_key(&new_addr)); // New entry exists
+        assert!(connections.contains_key(&new_addr.ip())); // New entry exists
     }
 
     // ========== Timing Jitter Tests ==========

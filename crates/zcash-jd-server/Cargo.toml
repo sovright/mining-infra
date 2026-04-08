@@ -19,6 +19,7 @@ rand = "0.8"
 zcash-mining-protocol = { path = "../zcash-mining-protocol" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 bedrock-noise = { path = "../bedrock-noise" }
+zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

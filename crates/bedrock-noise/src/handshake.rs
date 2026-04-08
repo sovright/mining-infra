@@ -159,4 +159,122 @@ mod tests {
         // Server should complete too
         let _server_noise = server_handle.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_wrong_server_public_key() {
+        use std::time::Duration;
+
+        let server_keypair = Keypair::generate();
+        let wrong_keypair = Keypair::generate(); // Different keypair
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            responder.accept(stream).await
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        // Client uses the WRONG public key
+        let initiator = NoiseInitiator::new(wrong_keypair.public.clone());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            initiator.connect(client_stream),
+        )
+        .await;
+
+        // Should complete within timeout (not hang)
+        let handshake_result = result.expect("handshake should not hang");
+
+        let server_result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_handle,
+        )
+        .await
+        .expect("server should not hang");
+
+        // At least one side must fail
+        let client_failed = handshake_result.is_err();
+        let server_failed = server_result.is_err() || server_result.unwrap().is_err();
+        assert!(
+            client_failed || server_failed,
+            "Handshake with wrong key should fail on at least one side"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_server_drops_mid_handshake() {
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server accepts then immediately drops the stream
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            drop(stream);
+        });
+
+        let server_keypair = Keypair::generate();
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let initiator = NoiseInitiator::new(server_keypair.public.clone());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            initiator.connect(client_stream),
+        )
+        .await;
+
+        // Should complete within timeout
+        let handshake_result = result.expect("handshake should not hang");
+        // Client should get an IO error since server dropped the connection
+        assert!(
+            handshake_result.is_err(),
+            "Client should fail when server drops connection"
+        );
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_garbage_data_instead_of_handshake() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        let server_keypair = Keypair::generate();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            responder.accept(stream).await
+        });
+
+        // Client sends garbage instead of a proper handshake
+        let mut client_stream = TcpStream::connect(addr).await.unwrap();
+        // Write a length prefix followed by random garbage
+        let garbage = vec![0xDE; 128];
+        client_stream.write_u16(garbage.len() as u16).await.unwrap();
+        client_stream.write_all(&garbage).await.unwrap();
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            server_handle,
+        )
+        .await;
+
+        let server_result = result
+            .expect("server should not hang")
+            .expect("server task should not panic");
+
+        assert!(
+            server_result.is_err(),
+            "Server should fail when receiving garbage data"
+        );
+    }
 }

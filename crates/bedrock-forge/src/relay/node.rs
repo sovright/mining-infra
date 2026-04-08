@@ -6,14 +6,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::fec::FecError;
 use crate::transport::{
-    BlockAssembly, BlockChunker, Chunk, ChunkHeader, MessageType, PowResult, PowValidator,
-    RelayConfig, RelaySession, StubPowValidator, TransportError, MAX_TOTAL_CHUNKS,
+    BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, MessageType,
+    PowResult, PowValidator, RelayConfig, RelaySession, TransportError, MAX_TOTAL_CHUNKS,
 };
 
 use super::metrics::RelayMetrics;
@@ -22,7 +23,7 @@ use super::metrics::RelayMetrics;
 ///
 /// Receives blocks from authenticated clients, validates PoW,
 /// and forwards to other connected clients.
-pub struct RelayNode<V: PowValidator = StubPowValidator> {
+pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     /// Configuration
     config: RelayConfig,
     /// UDP socket (bound in Task 4's bind() method)
@@ -39,10 +40,10 @@ pub struct RelayNode<V: PowValidator = StubPowValidator> {
     metrics: Arc<RelayMetrics>,
 }
 
-impl RelayNode<StubPowValidator> {
+impl RelayNode<EquihashPowValidator> {
     /// Create a new relay node with default PoW validator
     pub fn new(config: RelayConfig) -> Result<Self, FecError> {
-        Self::with_validator(config, StubPowValidator)
+        Self::with_validator(config, EquihashPowValidator)
     }
 }
 
@@ -98,7 +99,17 @@ impl<V: PowValidator> RelayNode<V> {
 
     /// Bind the socket and prepare for running
     pub async fn bind(&mut self) -> Result<(), TransportError> {
-        let socket = UdpSocket::bind(self.config.listen_addr).await?;
+        let domain = if self.config.listen_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_nonblocking(true)?;
+        socket.set_recv_buffer_size(4 * 1024 * 1024)?;
+        socket.bind(&self.config.listen_addr.into())?;
+
+        let socket = UdpSocket::from_std(socket.into())?;
         self.socket = Some(Arc::new(socket));
         Ok(())
     }
@@ -215,7 +226,8 @@ impl<V: PowValidator> RelayNode<V> {
         &self,
         src_addr: SocketAddr,
         block_hash: &[u8; 32],
-        chunks: &[Option<Vec<u8>>],
+        total_chunks: u16,
+        chunks: &[(u16, Vec<u8>)],
     ) -> Result<(), TransportError> {
         let socket = self.socket.as_ref()
             .ok_or_else(|| TransportError::Io(
@@ -223,7 +235,6 @@ impl<V: PowValidator> RelayNode<V> {
             ))?;
 
         let sessions = self.sessions.read().await;
-        let total_chunks = chunks.len() as u16;
         let mut outbound: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
 
         for (peer_addr, session) in sessions.iter() {
@@ -234,35 +245,32 @@ impl<V: PowValidator> RelayNode<V> {
 
             // Forward all available chunks and count them
             let mut payloads: Vec<Vec<u8>> = Vec::new();
-            for (chunk_id, payload) in chunks.iter().enumerate() {
-                if let Some(data) = payload {
-                    let header = if self.config.authorized_keys.is_empty() {
-                        ChunkHeader::new_block(
-                            block_hash,
-                            chunk_id as u16,
-                            total_chunks,
-                            data.len() as u16,
-                        )
-                    } else {
-                        let hmac = session.compute_hmac(
-                            block_hash,
-                            chunk_id as u16,
-                            total_chunks,
-                            data.len() as u16,
-                            data,
-                        );
-                        ChunkHeader::new_block_authenticated(
-                            block_hash,
-                            chunk_id as u16,
-                            total_chunks,
-                            data.len() as u16,
-                            hmac,
-                        )
-                    };
-                    let chunk = Chunk::new(header, data.clone());
-
-                    payloads.push(chunk.to_bytes());
-                }
+            for (chunk_id, data) in chunks.iter() {
+                let header = if self.config.auth_required() {
+                    let hmac = session.compute_hmac(
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        data.len() as u16,
+                        data,
+                    );
+                    ChunkHeader::new_block_authenticated(
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        data.len() as u16,
+                        hmac,
+                    )
+                } else {
+                    ChunkHeader::new_block(
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        data.len() as u16,
+                    )
+                };
+                let chunk = Chunk::new(header, data.clone());
+                payloads.push(chunk.to_bytes());
             }
             if !payloads.is_empty() {
                 outbound.push((*peer_addr, payloads));
@@ -297,24 +305,49 @@ impl<V: PowValidator> RelayNode<V> {
         block_hash: [u8; 32],
         chunk_id: usize,
         total_chunks: usize,
-    ) -> bool {
+    ) -> Option<Vec<(u16, Vec<u8>)>> {
         if !session.mark_chunk_seen(block_hash, chunk.header.chunk_id) {
-            return false;
+            return None;
         }
         let Some(assembly) = session.get_or_create_assembly(block_hash, total_chunks) else {
             self.metrics.inc_invalid_chunks();
-            return false;
+            return None;
         };
         let is_new = assembly.chunks.get(chunk_id).is_none_or(|c| c.is_none());
         assembly.add_chunk(chunk_id, chunk.payload.clone());
 
+        // PoW validation gate: we check PoW eagerly on each new chunk rather
+        // than waiting until the full block is assembled.  This is intentional --
+        // it lets the relay reject invalid streams early and avoid accumulating
+        // (and forwarding) chunks for blocks that will never pass validation.
+        // `validate_pow_from_assembly` may return `None` when there aren't enough
+        // chunks yet to extract a header; in that case we keep the current
+        // `pow_validated` state (false) and suppress forwarding until a future
+        // chunk provides enough data to decide.
         if is_new && !assembly.pow_validated {
             if let Some(valid) = self.validate_pow_from_assembly(assembly) {
                 assembly.pow_validated = valid;
             }
-            assembly.pow_validated
+        }
+
+        if !assembly.pow_validated {
+            return None;
+        }
+
+        let mut ready = Vec::new();
+        for (idx, payload) in assembly.chunks.iter().enumerate() {
+            if let Some(data) = payload {
+                if !assembly.forwarded[idx] {
+                    assembly.forwarded[idx] = true;
+                    ready.push((idx as u16, data.clone()));
+                }
+            }
+        }
+
+        if ready.is_empty() {
+            None
         } else {
-            assembly.pow_validated
+            Some(ready)
         }
     }
 
@@ -357,12 +390,12 @@ impl<V: PowValidator> RelayNode<V> {
             ));
         }
 
-        let should_forward = {
+        let chunks_to_forward = {
             let mut sessions = self.sessions.write().await;
 
             if let Some(session) = sessions.get_mut(&src_addr) {
                 // Existing session - enforce auth if configured
-                let auth_required = !self.config.authorized_keys.is_empty();
+                let auth_required = self.config.auth_required();
                 if auth_required && chunk.header.version != 2 {
                     warn!(peer = %src_addr, "Auth required but received version 1 chunk");
                     self.metrics.inc_auth_failures();
@@ -386,8 +419,13 @@ impl<V: PowValidator> RelayNode<V> {
                 session.touch();
                 self.process_chunk_for_session(session, &chunk, block_hash, chunk_id, total_chunks)
             } else {
+                if sessions.len() >= self.config.max_sessions {
+                    warn!(peer = %src_addr, max_sessions = self.config.max_sessions, "Relay session limit reached");
+                    return Err(TransportError::ConnectionRefused("relay session limit reached".into()));
+                }
+
                 // New session - authenticate
-                if self.config.authorized_keys.is_empty() {
+                if !self.config.auth_required() {
                     // No auth required
                     debug!(peer = %src_addr, "Creating unauthenticated session");
                     sessions.insert(src_addr, RelaySession::new(src_addr, [0u8; 32]));
@@ -431,15 +469,14 @@ impl<V: PowValidator> RelayNode<V> {
             }
         };
 
-        if should_forward {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(&src_addr) {
-                if let Some(assembly) = session.pending_blocks.get(&block_hash) {
-                    let chunks_to_forward: Vec<_> = assembly.chunks.clone();
-                    drop(sessions);
-                    self.forward_to_peers(src_addr, &block_hash, &chunks_to_forward).await?;
-                }
-            }
+        if let Some(chunks_to_forward) = chunks_to_forward {
+            self.forward_to_peers(
+                src_addr,
+                &block_hash,
+                chunk.header.total_chunks,
+                &chunks_to_forward,
+            )
+            .await?;
         }
 
         Ok(())
@@ -467,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn relay_node_session_count() {
-        let config = RelayConfig::default();
+        let config = RelayConfig::default().with_unauthenticated_peers_allowed(true);
         let node = RelayNode::new(config).unwrap();
 
         assert_eq!(node.session_count().await, 0);
@@ -484,7 +521,8 @@ mod tests {
 
     #[tokio::test]
     async fn relay_node_bind() {
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
         let mut node = RelayNode::new(config).unwrap();
 
         node.bind().await.unwrap();
@@ -495,7 +533,8 @@ mod tests {
 
     #[tokio::test]
     async fn relay_node_stop() {
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
         let mut node = RelayNode::new(config).unwrap();
         node.bind().await.unwrap();
 
@@ -540,9 +579,9 @@ mod tests {
         }
 
         let block_hash = [0xab; 32];
-        let chunks = vec![Some(vec![1u8; 10])];
+        let chunks = vec![(0u16, vec![1u8; 10])];
 
-        node.forward_to_peers(sender_addr, &block_hash, &chunks)
+        node.forward_to_peers(sender_addr, &block_hash, 1, &chunks)
             .await
             .unwrap();
 
@@ -568,7 +607,8 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_non_block_message() {
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
         let mut node = RelayNode::new(config).unwrap();
         node.bind().await.unwrap();
 

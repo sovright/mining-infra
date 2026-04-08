@@ -26,6 +26,7 @@ pub const MAX_TOTAL_CHUNKS: u16 = 256;
 
 /// Message types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 #[repr(u8)]
 pub enum MessageType {
     /// Block data chunk
@@ -54,6 +55,7 @@ impl TryFrom<u8> for MessageType {
 
 /// Chunk header
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct ChunkHeader {
     /// Protocol magic (CHUNK_MAGIC)
     pub magic: u32,
@@ -206,6 +208,7 @@ impl ChunkHeader {
 
 /// Complete chunk (header + payload)
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct Chunk {
     pub header: ChunkHeader,
     pub payload: Vec<u8>,

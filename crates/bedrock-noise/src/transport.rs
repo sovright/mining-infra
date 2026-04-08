@@ -167,4 +167,156 @@ mod tests {
 
         server_handle.await.unwrap();
     }
+
+    #[tokio::test]
+    async fn test_empty_message() {
+        let server_keypair = Keypair::generate();
+        let server_public = server_keypair.public.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            let mut noise = responder.accept(stream).await.unwrap();
+
+            let msg = noise.read_message().await.unwrap();
+            assert!(msg.is_empty(), "Expected empty message, got {} bytes", msg.len());
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let initiator = NoiseInitiator::new(server_public);
+        let mut client_noise = initiator.connect(client_stream).await.unwrap();
+
+        client_noise.write_message(b"").await.unwrap();
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_max_message_size_boundary() {
+        let server_keypair = Keypair::generate();
+        let server_public = server_keypair.public.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let max_msg = vec![0xBB; MAX_MESSAGE_SIZE];
+        let expected_len = MAX_MESSAGE_SIZE;
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            let mut noise = responder.accept(stream).await.unwrap();
+
+            let msg = noise.read_message().await.unwrap();
+            assert_eq!(msg.len(), expected_len);
+            assert!(msg.iter().all(|&b| b == 0xBB));
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let initiator = NoiseInitiator::new(server_public);
+        let mut client_noise = initiator.connect(client_stream).await.unwrap();
+
+        client_noise.write_message(&max_msg).await.unwrap();
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_over_max_message_size_rejected() {
+        let server_keypair = Keypair::generate();
+        let server_public = server_keypair.public.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            let _noise = responder.accept(stream).await.unwrap();
+            // Server just completes handshake; client will fail before sending
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let initiator = NoiseInitiator::new(server_public);
+        let mut client_noise = initiator.connect(client_stream).await.unwrap();
+
+        let oversized_msg = vec![0xCC; MAX_MESSAGE_SIZE + 1];
+        let result = client_noise.write_message(&oversized_msg).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_multiple_messages_sequential() {
+        let server_keypair = Keypair::generate();
+        let server_public = server_keypair.public.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            let mut noise = responder.accept(stream).await.unwrap();
+
+            for i in 0u8..10 {
+                let msg = noise.read_message().await.unwrap();
+                let expected_len = (i as usize + 1) * 100;
+                assert_eq!(msg.len(), expected_len, "Message {} wrong length", i);
+                assert!(msg.iter().all(|&b| b == i), "Message {} wrong content", i);
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let initiator = NoiseInitiator::new(server_public);
+        let mut client_noise = initiator.connect(client_stream).await.unwrap();
+
+        for i in 0u8..10 {
+            let msg = vec![i; (i as usize + 1) * 100];
+            client_noise.write_message(&msg).await.unwrap();
+        }
+
+        server_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bidirectional_communication() {
+        let server_keypair = Keypair::generate();
+        let server_public = server_keypair.public.clone();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let responder = NoiseResponder::new(server_keypair);
+            let mut noise = responder.accept(stream).await.unwrap();
+
+            // Echo back each message received
+            for _ in 0..5 {
+                let msg = noise.read_message().await.unwrap();
+                noise.write_message(&msg).await.unwrap();
+            }
+        });
+
+        let client_stream = TcpStream::connect(addr).await.unwrap();
+        let initiator = NoiseInitiator::new(server_public);
+        let mut client_noise = initiator.connect(client_stream).await.unwrap();
+
+        for round in 0u8..5 {
+            let msg = vec![round; (round as usize + 1) * 200];
+            client_noise.write_message(&msg).await.unwrap();
+
+            let echoed = client_noise.read_message().await.unwrap();
+            assert_eq!(echoed, msg, "Round {} echo mismatch", round);
+        }
+
+        server_handle.await.unwrap();
+    }
 }

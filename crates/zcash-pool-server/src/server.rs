@@ -29,10 +29,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
 use tracing::{debug, error, info, warn};
 use zcash_equihash_validator::VardiffConfig;
-use zcash_jd_server::{handle_jd_client_with_transport, JdServer, JdServerConfig, JdTransport};
+use zcash_jd_server::{
+    handle_jd_client_with_transport, CurrentTemplateContext, JdServer, JdServerConfig,
+    JdTransport,
+};
 use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
 use bedrock_noise::{Keypair, NoiseResponder};
 use bedrock_strata::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
@@ -40,6 +43,19 @@ use zcash_template_provider::types::BlockTemplate;
 use zcash_template_provider::{TemplateProvider, TemplateProviderConfig};
 use zcash_mining_protocol::messages::SubmitEquihashShare;
 use hex;
+
+#[derive(Clone)]
+struct ConnectionCtx {
+    config: PoolConfig,
+    job_distributor: Arc<RwLock<JobDistributor>>,
+    sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
+    channels: Arc<RwLock<HashMap<u32, Channel>>>,
+    session_tx: mpsc::Sender<SessionMessage>,
+    metrics: Arc<PoolMetrics>,
+    connection_tracker: Arc<ConnectionTracker>,
+    sequence_validator: Arc<SequenceValidator>,
+    connection_times: Arc<RwLock<HashMap<u32, (Instant, SocketAddr)>>>,
+}
 
 /// Main pool server
 pub struct PoolServer {
@@ -84,6 +100,10 @@ pub struct PoolServer {
     timing_jitter: Arc<TimingJitter>,
     /// Track connection start times (channel_id -> (Instant, SocketAddr))
     connection_times: Arc<RwLock<HashMap<u32, (Instant, SocketAddr)>>>,
+    /// Limits concurrent miner handshakes and sessions.
+    miner_slots: Arc<Semaphore>,
+    /// Limits concurrent JD handshakes and sessions.
+    jd_slots: Arc<Semaphore>,
 }
 
 impl PoolServer {
@@ -93,6 +113,7 @@ impl PoolServer {
         config
             .validate()
             .map_err(|e| PoolError::Config(e.to_string()))?;
+        let max_connections = config.max_connections;
 
         // Initialize logging based on config
         let log_format = if config.json_logging {
@@ -231,7 +252,23 @@ impl PoolServer {
             connection_tracker,
             timing_jitter,
             connection_times: Arc::new(RwLock::new(HashMap::new())),
+            miner_slots: Arc::new(Semaphore::new(max_connections)),
+            jd_slots: Arc::new(Semaphore::new(max_connections)),
         })
+    }
+
+    fn connection_ctx(&self) -> ConnectionCtx {
+        ConnectionCtx {
+            config: self.config.clone(),
+            job_distributor: Arc::clone(&self.job_distributor),
+            sessions: Arc::clone(&self.sessions),
+            channels: Arc::clone(&self.channels),
+            session_tx: self.session_tx.clone(),
+            metrics: Arc::clone(&self.metrics),
+            connection_tracker: Arc::clone(&self.connection_tracker),
+            sequence_validator: Arc::clone(&self.sequence_validator),
+            connection_times: Arc::clone(&self.connection_times),
+        }
     }
 
     /// Run the pool server
@@ -296,6 +333,7 @@ impl PoolServer {
 
                 // Clean up stale miner entries (idle > 30 minutes)
                 payout_tracker.cleanup_stale_miners(Duration::from_secs(1800));
+                payout_tracker.rotate_window_if_needed();
 
                 let session_count = sessions.read().await.len();
                 let active_miners = payout_tracker.active_miner_count();
@@ -335,76 +373,80 @@ impl PoolServer {
                         Ok((stream, addr)) => {
                             info!("New connection from {}", addr);
 
-                            // Check connection limit
-                            let current_connections = self.sessions.read().await.len();
-                            if current_connections >= self.config.max_connections {
+                            let Ok(permit) = self.miner_slots.clone().try_acquire_owned() else {
                                 warn!("Connection limit reached, rejecting {}", addr);
                                 continue;
-                            }
+                            };
 
                             // Track connection in metrics
                             self.metrics.record_connection();
 
-                            // Check if this address is flagged as suspicious
-                            if self.config.connection_tracking_enabled
-                                && self.connection_tracker.is_flagged(&addr)
-                            {
-                                warn!("Connection from flagged address {}, allowing but monitoring", addr);
-                            }
+                            let ctx = self.connection_ctx();
+                            let metrics = Arc::clone(&self.metrics);
+                            let connection_tracker = Arc::clone(&self.connection_tracker);
+                            let connection_tracking_enabled = self.config.connection_tracking_enabled;
+                            let noise_enabled = self.config.noise_enabled;
+                            let responder = self.noise_responder.clone();
 
-                            // Handle Noise handshake if enabled
-                            if self.config.noise_enabled {
-                                if let Some(ref responder) = self.noise_responder {
-                                    self.metrics.record_noise_handshake();
-                                    // Timeout prevents a malicious client from stalling
-                                    // the handshake indefinitely, blocking the accept loop
-                                    match tokio::time::timeout(
-                                        Duration::from_secs(10),
-                                        responder.accept(stream),
-                                    ).await {
-                                        Err(_) => {
-                                            self.metrics.record_noise_handshake_failed();
-                                            self.metrics.record_disconnection();
-                                            warn!("Noise handshake timed out for {}", addr);
-                                        }
-                                        Ok(inner) => match inner {
-                                            Ok(noise_stream) => {
-                                                info!("Noise handshake successful for {}", addr);
-                                                if let Err(e) = self.handle_new_connection(Transport::Noise(noise_stream), addr).await {
-                                                    self.metrics.record_disconnection();
-                                                    error!("Error handling new Noise connection: {}", e);
-                                                }
+                            tokio::spawn(async move {
+                                if connection_tracking_enabled && connection_tracker.is_flagged(&addr) {
+                                    warn!(
+                                        "Connection from flagged address {}, allowing but monitoring",
+                                        addr
+                                    );
+                                }
+
+                                let transport = if noise_enabled {
+                                    if let Some(responder) = responder {
+                                        metrics.record_noise_handshake();
+                                        match tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            responder.accept(stream),
+                                        )
+                                        .await
+                                        {
+                                            Err(_) => {
+                                                metrics.record_noise_handshake_failed();
+                                                metrics.record_disconnection();
+                                                warn!("Noise handshake timed out for {}", addr);
+                                                return;
                                             }
-                                            Err(e) => {
-                                                self.metrics.record_noise_handshake_failed();
-                                                self.metrics.record_disconnection();
-                                                self.metrics.record_decryption_failure();
+                                            Ok(Ok(noise_stream)) => {
+                                                info!("Noise handshake successful for {}", addr);
+                                                Transport::Noise(noise_stream)
+                                            }
+                                            Ok(Err(e)) => {
+                                                metrics.record_noise_handshake_failed();
+                                                metrics.record_disconnection();
+                                                metrics.record_decryption_failure();
                                                 warn!("Noise handshake failed for {}: {}", addr, e);
 
-                                                // Track handshake failure as decryption error
-                                                if self.config.connection_tracking_enabled {
-                                                    let connected_at = self.connection_tracker.on_connect(addr);
-                                                    if self.connection_tracker.on_disconnect(addr, connected_at, true) {
-                                                        self.metrics.inc_flagged_addresses();
+                                                if connection_tracking_enabled {
+                                                    let connected_at = connection_tracker.on_connect(addr);
+                                                    if connection_tracker.on_disconnect(addr, connected_at, true) {
+                                                        metrics.inc_flagged_addresses();
                                                     }
                                                 }
+                                                return;
                                             }
                                         }
+                                    } else {
+                                        warn!(
+                                            "Noise enabled but no responder available; falling back to plaintext"
+                                        );
+                                        Transport::Plain(stream)
                                     }
                                 } else {
-                                    warn!("Noise enabled but no responder available; falling back to plaintext");
-                                    if let Err(e) = self.handle_new_connection(Transport::Plain(stream), addr).await {
-                                        self.metrics.record_disconnection();
-                                        error!("Error handling new connection: {}", e);
-                                    }
-                                }
-                            } else {
-                                // No Noise - handle connection directly
-                                if let Err(e) = self.handle_new_connection(Transport::Plain(stream), addr).await {
-                                    self.metrics.record_disconnection();
+                                    Transport::Plain(stream)
+                                };
+
+                                if let Err(e) =
+                                    Self::handle_new_connection(ctx, transport, addr, permit).await
+                                {
+                                    metrics.record_disconnection();
                                     error!("Error handling new connection: {}", e);
                                 }
-                            }
+                            });
                         }
                         Err(e) => {
                             error!("Accept error: {}", e);
@@ -423,6 +465,10 @@ impl PoolServer {
                 } => {
                     if let Ok((stream, addr)) = jd_accept_result {
                         info!("New JD client from {}", addr);
+                        let Ok(permit) = self.jd_slots.clone().try_acquire_owned() else {
+                            warn!("JD connection limit reached, rejecting {}", addr);
+                            continue;
+                        };
                         self.metrics.record_jd_connection();
                         let jd_server = Arc::clone(&self.jd_server);
                         let metrics = Arc::clone(&self.metrics);
@@ -430,14 +476,26 @@ impl PoolServer {
                         let jd_noise_enabled = self.config.jd_noise_enabled;
                         let responder = self.noise_responder.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             let transport = if jd_noise_enabled {
                                 if let Some(responder) = responder {
                                     metrics.record_noise_handshake();
-                                    match responder.accept(stream).await {
-                                        Ok(noise_stream) => JdTransport::Noise(noise_stream),
-                                        Err(e) => {
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(10),
+                                        responder.accept(stream),
+                                    )
+                                    .await
+                                    {
+                                        Ok(Ok(noise_stream)) => JdTransport::Noise(noise_stream),
+                                        Ok(Err(e)) => {
                                             metrics.record_noise_handshake_failed();
                                             warn!("JD Noise handshake failed from {}: {}", addr, e);
+                                            metrics.record_jd_disconnection();
+                                            return;
+                                        }
+                                        Err(_) => {
+                                            metrics.record_noise_handshake_failed();
+                                            warn!("JD Noise handshake timed out from {}", addr);
                                             metrics.record_jd_disconnection();
                                             return;
                                         }
@@ -509,38 +567,39 @@ impl PoolServer {
 
     /// Handle a new miner connection
     async fn handle_new_connection(
-        &self,
+        ctx: ConnectionCtx,
         transport: Transport,
         addr: SocketAddr,
+        permit: OwnedSemaphorePermit,
     ) -> Result<()> {
         // Track connection start time
-        let connected_at = if self.config.connection_tracking_enabled {
-            self.connection_tracker.on_connect(addr)
+        let connected_at = if ctx.config.connection_tracking_enabled {
+            ctx.connection_tracker.on_connect(addr)
         } else {
             Instant::now()
         };
 
         // Generate unique nonce_1 for this channel
         let channel_id = Channel::next_id();
-        let nonce_1 = match Channel::generate_nonce_1(channel_id, self.config.nonce_1_len) {
+        let nonce_1 = match Channel::generate_nonce_1(channel_id, ctx.config.nonce_1_len) {
             Some(n) => n,
             None => {
                 error!(
                     "Invalid nonce_1_len configuration: {}",
-                    self.config.nonce_1_len
+                    ctx.config.nonce_1_len
                 );
                 return Err(PoolError::InvalidMessage(format!(
                     "Invalid nonce_1_len: {}",
-                    self.config.nonce_1_len
+                    ctx.config.nonce_1_len
                 )));
             }
         };
 
         // Create vardiff config
         let vardiff_config = VardiffConfig {
-            target_shares_per_minute: self.config.target_shares_per_minute,
-            initial_difficulty: self.config.initial_difficulty,
-            min_difficulty: self.config.initial_difficulty,
+            target_shares_per_minute: ctx.config.target_shares_per_minute,
+            initial_difficulty: ctx.config.initial_difficulty,
+            min_difficulty: ctx.config.initial_difficulty,
             max_difficulty: 1e12,
             retarget_interval: Duration::from_secs(90),
             variance_tolerance: 0.25,
@@ -562,13 +621,13 @@ impl PoolServer {
 
         // Store session sender
         {
-            let mut sessions = self.sessions.write().await;
+            let mut sessions = ctx.sessions.write().await;
             sessions.insert(channel_id, server_to_session_tx.clone());
         }
 
         // Store channel state
         {
-            let mut channels = self.channels.write().await;
+            let mut channels = ctx.channels.write().await;
             channels.insert(channel_id, channel);
         }
 
@@ -576,21 +635,21 @@ impl PoolServer {
         let session = Session::new(
             transport,
             channel_id,
-            self.session_tx.clone(),
+            ctx.session_tx.clone(),
             server_to_session_rx,
         );
 
         // Store connection time for tracking
         {
-            let mut conn_times = self.connection_times.write().await;
+            let mut conn_times = ctx.connection_times.write().await;
             conn_times.insert(channel_id, (connected_at, addr));
         }
 
         // Send initial job if available
         let initial_job = {
-            let distributor = self.job_distributor.read().await;
+            let distributor = ctx.job_distributor.read().await;
             if distributor.has_template() {
-                let mut channels = self.channels.write().await;
+                let mut channels = ctx.channels.write().await;
                 if let Some(channel) = channels.get_mut(&channel_id) {
                     if let Some(job) = distributor.create_job(channel, true) {
                         channel.add_job(job.clone(), true);
@@ -610,16 +669,17 @@ impl PoolServer {
         }
 
         // Spawn session task
-        let sessions = Arc::clone(&self.sessions);
-        let channels = Arc::clone(&self.channels);
-        let metrics = Arc::clone(&self.metrics);
-        let connection_tracker = Arc::clone(&self.connection_tracker);
-        let sequence_validator = Arc::clone(&self.sequence_validator);
-        let connection_times = Arc::clone(&self.connection_times);
-        let connection_tracking_enabled = self.config.connection_tracking_enabled;
-        let short_lived_threshold = Duration::from_secs(self.config.short_lived_threshold_secs);
+        let sessions = Arc::clone(&ctx.sessions);
+        let channels = Arc::clone(&ctx.channels);
+        let metrics = Arc::clone(&ctx.metrics);
+        let connection_tracker = Arc::clone(&ctx.connection_tracker);
+        let sequence_validator = Arc::clone(&ctx.sequence_validator);
+        let connection_times = Arc::clone(&ctx.connection_times);
+        let connection_tracking_enabled = ctx.config.connection_tracking_enabled;
+        let short_lived_threshold = Duration::from_secs(ctx.config.short_lived_threshold_secs);
 
         tokio::spawn(async move {
+            let _permit = permit;
             let decryption_error = match session.run().await {
                 Ok(()) => false,
                 Err(e) => {
@@ -685,6 +745,23 @@ impl PoolServer {
         // Update JD Server's current prev_hash (for stale detection)
         self.jd_server
             .set_current_prev_hash(template.header.prev_hash.0)
+            .await;
+        let template_txids: Vec<[u8; 32]> = template
+            .transactions
+            .iter()
+            .filter_map(|tx| zcash_template_provider::types::Hash256::from_hex(&tx.hash).ok())
+            .map(|hash| hash.0)
+            .collect();
+        self.jd_server
+            .set_current_template(CurrentTemplateContext {
+                version: template.header.version,
+                prev_hash: template.header.prev_hash.0,
+                block_commitments: template.header.hash_block_commitments.0,
+                bits: template.header.bits,
+                time: template.header.time,
+                txids: template_txids,
+                coinbase_tx_len: template.coinbase.len(),
+            })
             .await;
 
         // Announce to forge relay network (non-blocking)
@@ -762,9 +839,30 @@ impl PoolServer {
         };
 
         let mut broadcast_count = 0;
+        let mut slow_or_closed = Vec::new();
         for (sender, job) in jobs_to_send {
-            if sender.send(ServerMessage::NewJob(job)).await.is_ok() {
-                broadcast_count += 1;
+            match sender.try_send(ServerMessage::NewJob(job)) {
+                Ok(()) => {
+                    broadcast_count += 1;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(ServerMessage::NewJob(job)))
+                | Err(tokio::sync::mpsc::error::TrySendError::Closed(ServerMessage::NewJob(job))) => {
+                    slow_or_closed.push(job.channel_id);
+                }
+                Err(_) => {}
+            }
+        }
+
+        if !slow_or_closed.is_empty() {
+            let mut sessions = self.sessions.write().await;
+            let mut channels = self.channels.write().await;
+            for channel_id in slow_or_closed {
+                warn!(
+                    "Dropping slow or closed session {} during job broadcast",
+                    channel_id
+                );
+                sessions.remove(&channel_id);
+                channels.remove(&channel_id);
             }
         }
 
@@ -809,12 +907,22 @@ impl PoolServer {
             let seq_result = self.sequence_validator.validate(channel_id, share.sequence_number);
             match seq_result {
                 SequenceCheckResult::Valid => {}
-                SequenceCheckResult::ValidOutOfOrder => {
+                SequenceCheckResult::ValidOutOfOrder
+                | SequenceCheckResult::GapTooLarge
+                | SequenceCheckResult::StaleSequence => {
                     self.metrics.record_sequence_anomaly();
-                    debug!(
-                        "Out-of-order sequence {} for channel {}",
+                    warn!(
+                        "Rejecting non-monotonic sequence {} for channel {}",
                         share.sequence_number, channel_id
                     );
+                    return response_tx
+                        .send(ShareResult::Rejected(
+                            zcash_mining_protocol::messages::RejectReason::Other(
+                                "invalid sequence".to_string(),
+                            ),
+                        ))
+                        .map_err(|_| PoolError::ChannelSend)
+                        .map(|_| ());
                 }
                 SequenceCheckResult::Replay => {
                     self.metrics.record_replay_attempt();
@@ -828,22 +936,6 @@ impl PoolServer {
                         ))
                         .map_err(|_| PoolError::ChannelSend)
                         .map(|_| ());
-                }
-                SequenceCheckResult::GapTooLarge => {
-                    self.metrics.record_sequence_anomaly();
-                    warn!(
-                        "Large sequence gap: channel {} seq {} - potential attack",
-                        channel_id, share.sequence_number
-                    );
-                    // Allow but log - could be network reordering
-                }
-                SequenceCheckResult::StaleSequence => {
-                    self.metrics.record_sequence_anomaly();
-                    debug!(
-                        "Stale sequence {} for channel {}",
-                        share.sequence_number, channel_id
-                    );
-                    // Allow but log
                 }
             }
         }
@@ -919,7 +1011,13 @@ impl PoolServer {
                         };
                         // Record payout inside same lock scope
                         if let Some(diff) = difficulty {
-                            let miner_id: MinerId = format!("channel_{}", channel_id);
+                            let miner_id: MinerId = self
+                                .connection_times
+                                .read()
+                                .await
+                                .get(&channel_id)
+                                .map(|(_, addr)| addr.ip().to_string())
+                                .unwrap_or_else(|| format!("channel_{}", channel_id));
                             self.payout_tracker.record_share(&miner_id, diff);
                         }
                         (new_target, Some((difficulty, is_block)))

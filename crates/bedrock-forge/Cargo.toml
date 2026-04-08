@@ -18,6 +18,12 @@ bytes = "1.5"
 subtle = "2.5"
 tracing = { workspace = true }
 equihash = { workspace = true }
+socket2 = "0.5"
+arbitrary = { version = "1", features = ["derive"], optional = true }
+
+[features]
+arbitrary = ["dep:arbitrary"]
+generate-corpus = []
 
 [dev-dependencies]
 proptest = "1.4"

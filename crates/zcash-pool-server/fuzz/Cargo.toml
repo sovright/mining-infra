@@ -1,0 +1,25 @@
+[package]
+name = "zcash-pool-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zcash-pool-server = { path = "..", default-features = false, features = [] }
+
+[[bin]]
+name = "fuzz_sequence_validator"
+path = "fuzz_targets/fuzz_sequence_validator.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_connection_tracker"
+path = "fuzz_targets/fuzz_connection_tracker.rs"
+doc = false

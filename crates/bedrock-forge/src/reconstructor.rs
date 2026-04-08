@@ -291,4 +291,132 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn reconstruct_coinbase_only_block() {
+        let header = vec![0u8; 2189];
+        let nonce = 12345u64;
+
+        let coinbase = make_wtxid(0);
+
+        let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
+        builder.add_transaction(coinbase, vec![10]);
+
+        // No transactions in mempool (only coinbase, which is prefilled)
+        let sender_view = TestMempool::new();
+        let compact = builder.build(&sender_view);
+
+        let receiver_mempool = TestMempool::new();
+        let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
+
+        let header_hash = {
+            use sha2::{Digest, Sha256};
+            let first = Sha256::digest(&header);
+            let second = Sha256::digest(first);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&second);
+            h
+        };
+        reconstructor.prepare(&header_hash, nonce);
+
+        let result = reconstructor.reconstruct(&compact);
+
+        match result {
+            ReconstructionResult::Complete { transactions } => {
+                assert_eq!(transactions.len(), 1);
+                assert_eq!(transactions[0], vec![10]); // coinbase only
+            }
+            ReconstructionResult::Invalid { reason } => {
+                panic!("Unexpected invalid reconstruction: {}", reason);
+            }
+            ReconstructionResult::Incomplete { .. } => {
+                panic!("Expected complete reconstruction");
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_large_block() {
+        let header = vec![0u8; 2189];
+        let nonce = 12345u64;
+
+        let coinbase = make_wtxid(0);
+
+        let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
+        builder.add_transaction(coinbase, vec![0; 100]);
+
+        let mut sender_view = TestMempool::new();
+        let mut receiver_mempool = TestMempool::new();
+
+        for i in 1u8..=200 {
+            let wtxid = make_wtxid(i);
+            let tx_data = vec![i; 100];
+            builder.add_transaction(wtxid, tx_data.clone());
+            sender_view.insert(wtxid, tx_data.clone());
+            receiver_mempool.insert(wtxid, tx_data);
+        }
+
+        let compact = builder.build(&sender_view);
+
+        let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
+
+        let header_hash = {
+            use sha2::{Digest, Sha256};
+            let first = Sha256::digest(&header);
+            let second = Sha256::digest(first);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&second);
+            h
+        };
+        reconstructor.prepare(&header_hash, nonce);
+
+        let result = reconstructor.reconstruct(&compact);
+
+        match result {
+            ReconstructionResult::Complete { transactions } => {
+                assert_eq!(transactions.len(), 201); // coinbase + 200
+                assert_eq!(transactions[0], vec![0; 100]); // coinbase
+            }
+            ReconstructionResult::Invalid { reason } => {
+                panic!("Unexpected invalid reconstruction: {}", reason);
+            }
+            ReconstructionResult::Incomplete { .. } => {
+                panic!("Expected complete reconstruction");
+            }
+        }
+    }
+
+    #[test]
+    fn reconstruct_empty_block() {
+        let mempool = TestMempool::new();
+        let mut reconstructor = CompactBlockReconstructor::new(&mempool);
+
+        let header = vec![0u8; 2189];
+        let nonce = 0u64;
+
+        let header_hash = {
+            use sha2::{Digest, Sha256};
+            let first = Sha256::digest(&header);
+            let second = Sha256::digest(first);
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&second);
+            h
+        };
+        reconstructor.prepare(&header_hash, nonce);
+
+        let compact = CompactBlock::new(vec![0u8; 2189], 0, vec![], vec![]);
+
+        let result = reconstructor.reconstruct(&compact);
+        match result {
+            ReconstructionResult::Complete { transactions } => {
+                assert!(transactions.is_empty());
+            }
+            ReconstructionResult::Invalid { reason } => {
+                panic!("Unexpected invalid reconstruction: {}", reason);
+            }
+            ReconstructionResult::Incomplete { .. } => {
+                panic!("Expected complete reconstruction");
+            }
+        }
+    }
 }

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 
 use bedrock_forge::{
     fec::{FecDecoder, FecEncoder},
-    AuthDigest, BlockChunker, Chunk, ChunkHeader, CompactBlock, RelayConfig, RelayNode, ShortId,
-    WtxId,
+    AuthDigest, BlockChunker, Chunk, ChunkHeader, CompactBlock, RelayConfig, RelayNode,
+    StubPowValidator, ShortId, WtxId,
 };
 
 #[path = "../harness/mod.rs"]
@@ -88,8 +88,9 @@ async fn stress_fec_recovery_under_loss() {
 /// Test: High throughput chunk processing
 #[tokio::test]
 async fn stress_high_throughput() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
-    let mut node = RelayNode::new(config).unwrap();
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
+    let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
     node.bind().await.unwrap();
     let addr = node.local_addr().unwrap();
     let node = Arc::new(node);
@@ -138,8 +139,9 @@ async fn stress_high_throughput() {
 /// Test: Multiple concurrent senders
 #[tokio::test]
 async fn stress_concurrent_senders() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
-    let mut node = RelayNode::new(config).unwrap();
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
+    let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
     node.bind().await.unwrap();
     let addr = node.local_addr().unwrap();
     let node = Arc::new(node);

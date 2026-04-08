@@ -9,6 +9,10 @@ description = "FORGE relay sidecar for Stratum V1 mining pools (part of the Bedr
 name = "forge-sidecar"
 path = "src/main.rs"
 
+[lib]
+name = "forge_sidecar"
+path = "src/lib.rs"
+
 [dependencies]
 bedrock-forge = { path = "../bedrock-forge" }
 tokio = { workspace = true, features = ["full"] }

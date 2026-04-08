@@ -1,0 +1,32 @@
+[package]
+name = "forge-sidecar-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+forge-sidecar = { path = ".." }
+hex = "0.4"
+toml = "0.8"
+
+[[bin]]
+name = "fuzz_build_compact_block"
+path = "fuzz_targets/fuzz_build_compact_block.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_build_header"
+path = "fuzz_targets/fuzz_build_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_config_parse"
+path = "fuzz_targets/fuzz_config_parse.rs"
+doc = false

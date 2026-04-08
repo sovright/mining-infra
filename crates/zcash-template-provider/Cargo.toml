@@ -13,8 +13,13 @@ thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
 blake2b_simd.workspace = true
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", features = ["json"] }
+async-trait = "0.1"
+
+[features]
+test-support = []
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
 tracing-subscriber.workspace = true
+proptest = "1.4"

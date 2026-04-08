@@ -454,6 +454,8 @@ fn test_validation_standard_needs_transactions() {
 #[test]
 fn test_validation_standard_with_tx_data() {
     let validator = TemplateValidator::new(ValidationLevel::Standard, vec![], 0);
+    let tx1 = minimal_tx();
+    let tx2 = minimal_tx_with_script(&[0x52]);
 
     let mut job = SetFullTemplateJob {
         channel_id: 1,
@@ -466,8 +468,8 @@ fn test_validation_standard_with_tx_data() {
         coinbase_tx: minimal_tx(),
         time: 1700000000,
         bits: 0x1d00ffff,
-        tx_short_ids: vec![[0x11; 32], [0x22; 32]],
-        tx_data: vec![minimal_tx(), minimal_tx()], // tx data provided
+        tx_short_ids: vec![compute_txid(&tx1), compute_txid(&tx2)],
+        tx_data: vec![tx1, tx2],
     };
     set_merkle_root(&mut job);
 
@@ -623,8 +625,9 @@ async fn test_missing_transactions_flow_complete() {
         .expect("Token allocation should succeed");
     assert_eq!(token_response.granted_mode, JobDeclarationMode::FullTemplate);
 
-    // Submit job with unknown txid
-    let unknown_txid = [0x99; 32];
+    // Submit job with an unknown txid
+    let tx_data = minimal_tx_with_script(&[0x52]);
+    let unknown_txid = compute_txid(&tx_data);
     let job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
@@ -653,7 +656,6 @@ async fn test_missing_transactions_flow_complete() {
     }
 
     // Client provides missing transaction
-    let tx_data = vec![0x01, 0x00, 0x00, 0x00, 0x01];
     let provide = ProvideMissingTransactions {
         channel_id: 1,
         request_id: 2,
