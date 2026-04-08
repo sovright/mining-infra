@@ -70,6 +70,17 @@ init_tracing(config)?;
 | `bedrock_pool_noise_handshakes_total` | Counter | Noise handshakes initiated |
 | `bedrock_pool_noise_handshakes_failed_total` | Counter | Failed Noise handshakes |
 
+### Per-Worker Metrics
+
+These carry a `worker` label for per-miner breakdowns:
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `worker_shares_accepted_total` | Counter | Accepted shares per worker |
+| `worker_shares_rejected_total` | Counter | Rejected shares per worker |
+| `worker_blocks_found_total` | Counter | Blocks found per worker |
+| `hashrate_sol_s` | Gauge | Worker hashrate in solutions/s |
+
 ## HTTP Endpoints
 
 - `/metrics` - Prometheus metrics in text format

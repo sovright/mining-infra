@@ -147,9 +147,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (channel_id, job_id, nonce_2, time, solution)
     let (solution_tx, mut solution_rx) = mpsc::channel::<(u32, u32, Vec<u8>, u32, Vec<u8>)>(32);
 
-    // Current job for the solver thread
-    let current_job: Arc<tokio::sync::Mutex<Option<NewEquihashJob>>> =
-        Arc::new(tokio::sync::Mutex::new(None));
+    // Current job for the solver thread.
+    // Uses std::sync::Mutex (not tokio::sync::Mutex) because both the async
+    // context and the solver thread only hold the lock briefly for clone/replace
+    // operations. This avoids creating a Tokio runtime on the solver thread.
+    let current_job: Arc<std::sync::Mutex<Option<NewEquihashJob>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // Atomic job ID for fast cancellation checks
     let current_job_id = Arc::new(AtomicU32::new(0));
@@ -160,13 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let solver_tx = solution_tx.clone();
     std::thread::spawn(move || {
         loop {
-            let job = {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .unwrap();
-                rt.block_on(async { solver_job.lock().await.clone() })
-            };
+            let job = { solver_job.lock().unwrap().clone() };
 
             let Some(job) = job else {
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -235,7 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         // Update atomic job ID FIRST to cancel solver
                                         current_job_id.store(job.job_id, Ordering::Relaxed);
                                         // Then update the full job
-                                        *current_job.lock().await = Some(job);
+                                        *current_job.lock().unwrap() = Some(job);
                                     }
                                     Err(e) => {
                                         error!("Failed to decode NewEquihashJob: {}", e);

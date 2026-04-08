@@ -292,9 +292,22 @@ impl VardiffController {
                 }
             }
             VardiffPhase::SteadyState => {
-                let raw = self.current_difficulty * ratio;
-                self.config.ema_alpha * raw
-                    + (1.0 - self.config.ema_alpha) * self.current_difficulty
+                // Re-enter RampUp if the share rate has diverged wildly,
+                // e.g. after a miner reconnects with very different hashrate.
+                if ratio > self.config.ramp_threshold
+                    || ratio < 1.0 / self.config.ramp_threshold
+                {
+                    info!(
+                        "Vardiff re-entering RampUp: ratio {:.2} exceeds ramp_threshold {:.2}",
+                        ratio, self.config.ramp_threshold
+                    );
+                    self.phase = VardiffPhase::RampUp;
+                    self.current_difficulty * ratio
+                } else {
+                    let raw = self.current_difficulty * ratio;
+                    self.config.ema_alpha * raw
+                        + (1.0 - self.config.ema_alpha) * self.current_difficulty
+                }
             }
         };
 

@@ -159,20 +159,23 @@ impl PoolMetrics {
         )
         .expect("metric can be created");
 
+        // Per-worker share/block counters use a `worker_` prefix to distinguish
+        // them from the pool-level `pool_shares_*` / `pool_blocks_*` counters.
+        // Each metric carries a `worker` label for per-miner breakdowns.
         let worker_shares_accepted = IntCounterVec::new(
-            Opts::new("shares_accepted_total", "Per-worker accepted shares"),
+            Opts::new("worker_shares_accepted_total", "Per-worker accepted shares"),
             &["worker"],
         )
         .expect("metric can be created");
 
         let worker_shares_rejected = IntCounterVec::new(
-            Opts::new("shares_rejected_total", "Per-worker rejected shares"),
+            Opts::new("worker_shares_rejected_total", "Per-worker rejected shares"),
             &["worker"],
         )
         .expect("metric can be created");
 
         let worker_blocks_found = IntCounterVec::new(
-            Opts::new("blocks_found_total", "Per-worker blocks found"),
+            Opts::new("worker_blocks_found_total", "Per-worker blocks found"),
             &["worker"],
         )
         .expect("metric can be created");

@@ -5,6 +5,12 @@
 use blake2b_simd::Params as Blake2bParams;
 use sha2::{Digest, Sha256};
 
+// ZIP 244 personalization strings for BLAKE2b-256 auth digests.
+// Each must be exactly 16 bytes. These match the reference implementation:
+// - zcash/zcash: ZCASH_TRANSPARENT_SIGS_HASH_PERSONALIZATION, etc.
+// - librustzcash/orchard crate: auth digest personalizations.
+// "Sapli" and "Orcha" are the canonical truncations of "Sapling" and "Orchard"
+// used in ZIP 244 to fit the 16-byte BLAKE2b personalization field.
 const TRANSPARENT_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthTransHash";
 const SAPLING_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthSapliHash";
 const ORCHARD_AUTH_PERSONALIZATION: &[u8; 16] = b"ZTxAuthOrchaHash";

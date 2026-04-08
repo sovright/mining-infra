@@ -14,6 +14,10 @@ pub enum BuilderError {
     NoInputs,
     #[error("coinbase scriptSig too large after tag injection: {0} bytes")]
     ScriptSigTooLarge(usize),
+    #[error("coinbase scriptSig is empty (missing height push)")]
+    EmptyScriptSig,
+    #[error("coinbase scriptSig too short: need {expected} bytes for height push, got {actual}")]
+    ScriptSigTooShort { expected: usize, actual: usize },
 }
 
 #[derive(Debug, Clone)]
@@ -36,8 +40,18 @@ pub fn build_coinbase(raw_coinbase: &[u8], pool_tag: &[u8]) -> Result<BuiltCoinb
     // Extract the height push from the original scriptSig.
     // The first byte is the push length, followed by that many bytes of height data.
     let original_script = &parsed.inputs[0].script_sig;
+    if original_script.is_empty() {
+        return Err(BuilderError::EmptyScriptSig);
+    }
     let height_push_len = original_script[0] as usize;
-    let height_bytes = &original_script[..1 + height_push_len];
+    let needed = 1 + height_push_len;
+    if original_script.len() < needed {
+        return Err(BuilderError::ScriptSigTooShort {
+            expected: needed,
+            actual: original_script.len(),
+        });
+    }
+    let height_bytes = &original_script[..needed];
 
     // Build new scriptSig: height_bytes + pool_tag
     let mut new_script = Vec::with_capacity(height_bytes.len() + pool_tag.len());

@@ -285,10 +285,14 @@ impl PoolServer {
                                     header_len = block.header.len(),
                                     "Received compact block from forge relay"
                                 );
-                                // TODO: In a full implementation, we would:
-                                // 1. Reconstruct the full block using our mempool
+                                // NOTE(deferred): Compact block reconstruction is intentionally
+                                // deferred for the internal-testnet milestone. The pool currently
+                                // relies on Zebra's internal miner for block production, so relay
+                                // blocks are logged but not processed. A full implementation would:
+                                // 1. Reconstruct the full block from compact block + mempool
                                 // 2. Submit it to Zebra via submitblock RPC
                                 // 3. Update our template if it represents a new chain tip
+                                // Tracked for the mainnet-ready milestone.
                             }
                             warn!("Forge relay block receiver closed");
                         });
@@ -1087,8 +1091,12 @@ impl PoolServer {
                 warn!("Block proposal rejected for job {}: {}", share.job_id, reason);
                 return Err(PoolError::TemplateProvider(format!("block proposal rejected: {}", reason)));
             }
-            Ok(_) | Err(_) => {
+            Ok(_) => {
                 warn!("Block proposal check inconclusive for job {}, submitting anyway", share.job_id);
+            }
+            Err(e) => {
+                warn!("Block proposal RPC error for job {}: {}, not submitting", share.job_id, e);
+                return Err(PoolError::TemplateProvider(format!("block proposal RPC error: {}", e)));
             }
         }
 

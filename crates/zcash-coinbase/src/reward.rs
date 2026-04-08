@@ -5,6 +5,14 @@
 /// Post-Blossom halving interval (blocks).
 pub const POST_BLOSSOM_HALVING_INTERVAL: u64 = 1_680_000;
 
+/// Blossom activation height on mainnet.
+pub const BLOSSOM_ACTIVATION_HEIGHT: u64 = 653_600;
+
+/// Number of pre-Blossom halvings that occurred before Blossom activation.
+/// Pre-Blossom halving interval was 840,000 blocks; Blossom activated at 653,600,
+/// so zero pre-Blossom halvings occurred.
+const PRE_BLOSSOM_HALVINGS: u64 = 0;
+
 /// Post-Blossom initial block subsidy in zatoshis (3.125 ZEC).
 pub const POST_BLOSSOM_INITIAL_SUBSIDY: u64 = 312_500_000;
 
@@ -13,10 +21,18 @@ pub const DEFAULT_MINER_SHARE_PERCENT: u64 = 80;
 
 /// Compute the block subsidy at a given height using the post-Blossom halving schedule.
 ///
-/// The subsidy halves every `POST_BLOSSOM_HALVING_INTERVAL` blocks.
+/// Post-Blossom halving counts are relative to the Blossom activation height,
+/// not genesis. For heights before Blossom activation, we use the initial subsidy
+/// (no halvings occurred pre-Blossom on mainnet).
+///
 /// After 64 halvings, the subsidy is zero.
 pub fn block_subsidy(height: u64) -> u64 {
-    let halvings = height / POST_BLOSSOM_HALVING_INTERVAL;
+    let halvings = if height < BLOSSOM_ACTIVATION_HEIGHT {
+        PRE_BLOSSOM_HALVINGS
+    } else {
+        PRE_BLOSSOM_HALVINGS
+            + (height - BLOSSOM_ACTIVATION_HEIGHT) / POST_BLOSSOM_HALVING_INTERVAL
+    };
     if halvings >= 64 {
         return 0;
     }
@@ -38,34 +54,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn first_halving_era_subsidy() {
+    fn pre_blossom_subsidy() {
+        // Before Blossom activation, subsidy is the initial post-Blossom rate
         assert_eq!(block_subsidy(1), 312_500_000);
         assert_eq!(block_subsidy(100_000), 312_500_000);
+        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT - 1), 312_500_000);
+    }
+
+    #[test]
+    fn first_halving_era_subsidy() {
+        // Right at Blossom activation
+        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT), 312_500_000);
+        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 100_000), 312_500_000);
     }
 
     #[test]
     fn subsidy_halves_at_interval() {
-        // Last block of first era
+        // Last block of first post-Blossom era
         assert_eq!(
-            block_subsidy(POST_BLOSSOM_HALVING_INTERVAL - 1),
+            block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + POST_BLOSSOM_HALVING_INTERVAL - 1),
             312_500_000
         );
-        // First block of second era
+        // First block of second post-Blossom era
         assert_eq!(
-            block_subsidy(POST_BLOSSOM_HALVING_INTERVAL),
+            block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + POST_BLOSSOM_HALVING_INTERVAL),
             156_250_000
         );
         // Second halving
         assert_eq!(
-            block_subsidy(2 * POST_BLOSSOM_HALVING_INTERVAL),
+            block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 2 * POST_BLOSSOM_HALVING_INTERVAL),
             78_125_000
         );
     }
 
     #[test]
     fn subsidy_zero_after_many_halvings() {
-        assert_eq!(block_subsidy(64 * POST_BLOSSOM_HALVING_INTERVAL), 0);
-        assert_eq!(block_subsidy(100 * POST_BLOSSOM_HALVING_INTERVAL), 0);
+        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 64 * POST_BLOSSOM_HALVING_INTERVAL), 0);
+        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 100 * POST_BLOSSOM_HALVING_INTERVAL), 0);
     }
 
     #[test]
