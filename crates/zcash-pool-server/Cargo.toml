@@ -33,3 +33,13 @@ forge = ["dep:bedrock-forge"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
+zcash-template-provider = { path = "../zcash-template-provider", features = ["test-support"] }
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "share_bench"
+harness = false
+
+[[bench]]
+name = "payout_bench"
+harness = false

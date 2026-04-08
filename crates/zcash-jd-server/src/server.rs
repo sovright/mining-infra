@@ -20,15 +20,34 @@ use crate::messages::{
 };
 use crate::token::{DeclaredJobInfo, TokenManager};
 use crate::validation::{TemplateValidator, ValidationResult};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::{debug, error, info, warn};
+use zcash_equihash_validator::{compact_to_target, target_to_difficulty, EquihashValidator};
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
 use bedrock_noise::NoiseStream;
+
+#[derive(Debug, Clone)]
+pub struct CurrentTemplateContext {
+    pub version: u32,
+    pub prev_hash: [u8; 32],
+    pub block_commitments: [u8; 32],
+    pub bits: u32,
+    pub time: u32,
+    pub txids: Vec<[u8; 32]>,
+    pub coinbase_tx_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PendingMissingTransactions {
+    channel_id: u32,
+    expected_txids: Vec<[u8; 32]>,
+}
 
 /// JD Server embedded in pool
 ///
@@ -49,6 +68,10 @@ pub struct JdServer {
     payout_tracker: Arc<PayoutTracker>,
     /// Current prev_hash (for stale detection)
     current_prev_hash: Arc<TokioRwLock<Option<[u8; 32]>>>,
+    /// Current template metadata for header/coinbase validation
+    current_template: Arc<TokioRwLock<Option<CurrentTemplateContext>>>,
+    /// Outstanding missing-transaction requests keyed by (client_id, request_id)
+    pending_missing: Arc<TokioRwLock<HashMap<(String, u32), PendingMissingTransactions>>>,
 }
 
 impl JdServer {
@@ -67,6 +90,8 @@ impl JdServer {
             next_job_id: AtomicU32::new(1),
             payout_tracker,
             current_prev_hash: Arc::new(TokioRwLock::new(None)),
+            current_template: Arc::new(TokioRwLock::new(None)),
+            pending_missing: Arc::new(TokioRwLock::new(HashMap::new())),
         }
     }
 
@@ -74,9 +99,32 @@ impl JdServer {
     pub async fn set_current_prev_hash(&self, prev_hash: [u8; 32]) {
         let mut lock = self.current_prev_hash.write().await;
         *lock = Some(prev_hash);
+        drop(lock);
+
+        let mut template = self.current_template.write().await;
+        if let Some(current) = template.as_mut() {
+            current.prev_hash = prev_hash;
+        }
         debug!(
             prev_hash = ?hex::encode(prev_hash),
             "Updated current prev_hash"
+        );
+    }
+
+    /// Update the current template metadata used for job validation.
+    pub async fn set_current_template(&self, template: CurrentTemplateContext) {
+        {
+            let mut prev_hash = self.current_prev_hash.write().await;
+            *prev_hash = Some(template.prev_hash);
+        }
+        {
+            let mut current = self.current_template.write().await;
+            *current = Some(template.clone());
+        }
+        debug!(
+            prev_hash = ?hex::encode(template.prev_hash),
+            tx_count = template.txids.len(),
+            "Updated current template context"
         );
     }
 
@@ -84,6 +132,125 @@ impl JdServer {
     pub async fn get_current_prev_hash(&self) -> Option<[u8; 32]> {
         let lock = self.current_prev_hash.read().await;
         *lock
+    }
+
+    async fn validate_header_fields(
+        &self,
+        version: u32,
+        block_commitments: [u8; 32],
+        time: u32,
+        bits: u32,
+    ) -> std::result::Result<Option<CurrentTemplateContext>, String> {
+        let current = self.current_template.read().await.clone();
+
+        if let Some(ref template) = current {
+            if version != template.version {
+                return Err("block version does not match current template".into());
+            }
+            if block_commitments != template.block_commitments {
+                return Err("block commitments do not match current template".into());
+            }
+            if bits != template.bits {
+                return Err("difficulty bits do not match current template".into());
+            }
+
+            const MAX_TIME_FORWARD: u32 = 7200;
+            const MAX_TIME_BACKWARD: u32 = 60;
+            if time < template.time.saturating_sub(MAX_TIME_BACKWARD)
+                || time > template.time.saturating_add(MAX_TIME_FORWARD)
+            {
+                return Err("template time is out of range".into());
+            }
+        }
+
+        Ok(current)
+    }
+
+    async fn validate_custom_job_request(
+        &self,
+        request: &SetCustomMiningJob,
+        token_info_client_id: &str,
+    ) -> std::result::Result<(), SetCustomMiningJobError> {
+        let template = self
+            .validate_header_fields(
+                request.version,
+                request.block_commitments,
+                request.time,
+                request.bits,
+            )
+            .await
+            .map_err(|reason| {
+                SetCustomMiningJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    match reason.as_str() {
+                        "block version does not match current template" => {
+                            SetCustomMiningJobErrorCode::InvalidVersion
+                        }
+                        "block commitments do not match current template" => {
+                            SetCustomMiningJobErrorCode::Other
+                        }
+                        "difficulty bits do not match current template" => {
+                            SetCustomMiningJobErrorCode::InvalidBits
+                        }
+                        _ => SetCustomMiningJobErrorCode::Other,
+                    },
+                    reason,
+                )
+            })?;
+
+        let validator = self.validator.read().await;
+        if let Err(reason) = validator.validate_coinbase(&request.coinbase_tx) {
+            return Err(SetCustomMiningJobError::new(
+                request.channel_id,
+                request.request_id,
+                SetCustomMiningJobErrorCode::CoinbaseConstraintViolation,
+                reason,
+            ));
+        }
+        drop(validator);
+
+        if let Some(template) = template {
+            let max_coinbase_len =
+                template.coinbase_tx_len + self.config.coinbase_output_max_additional_size as usize;
+            if request.coinbase_tx.len() > max_coinbase_len {
+                return Err(SetCustomMiningJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetCustomMiningJobErrorCode::CoinbaseConstraintViolation,
+                    format!(
+                        "coinbase length {} exceeds maximum {}",
+                        request.coinbase_tx.len(),
+                        max_coinbase_len
+                    ),
+                ));
+            }
+
+            let expected_merkle_root =
+                TemplateValidator::compute_merkle_root(&request.coinbase_tx, &template.txids)
+                    .ok_or_else(|| {
+                        SetCustomMiningJobError::invalid_coinbase(
+                            request.channel_id,
+                            request.request_id,
+                            "coinbase transaction is empty",
+                        )
+                    })?;
+            if expected_merkle_root != request.merkle_root {
+                return Err(SetCustomMiningJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetCustomMiningJobErrorCode::InvalidMerkleRoot,
+                    "merkle root does not match pool transaction set",
+                ));
+            }
+        }
+
+        debug!(
+            client_id = token_info_client_id,
+            request_id = request.request_id,
+            "Validated custom job request"
+        );
+        Ok(())
     }
 
     /// Handle a token allocation request
@@ -156,8 +323,8 @@ impl JdServer {
         }
 
         // 2. Validate token
-        match self.token_manager.validate_token(&request.mining_job_token) {
-            Ok(_) => {}
+        let token_info = match self.token_manager.validate_token(&request.mining_job_token) {
+            Ok(info) => info,
             Err(JdServerError::InvalidToken) => {
                 warn!(
                     request_id = request.request_id,
@@ -191,7 +358,7 @@ impl JdServer {
                     format!("Token validation error: {}", e),
                 ));
             }
-        }
+        };
 
         // 3. Check prev_hash matches current (stale detection)
         //    Fail closed: reject if we haven't received any template yet
@@ -228,13 +395,11 @@ impl JdServer {
         }
         drop(current_prev_hash);
 
-        // 4. Validate coinbase is not empty
-        if request.coinbase_tx.is_empty() {
-            return Err(SetCustomMiningJobError::invalid_coinbase(
-                request.channel_id,
-                request.request_id,
-                "Coinbase transaction is empty",
-            ));
+        if let Err(error) = self
+            .validate_custom_job_request(&request, &token_info.client_id)
+            .await
+        {
+            return Err(error);
         }
 
         // 5. Allocate job_id
@@ -243,8 +408,15 @@ impl JdServer {
         // 6. Store job info with token
         let job_info = DeclaredJobInfo {
             job_id,
+            client_id: token_info.client_id.clone(),
+            mode: token_info.granted_mode,
+            channel_id: request.channel_id,
+            version: request.version,
             prev_hash: request.prev_hash,
             merkle_root: request.merkle_root,
+            block_commitments: request.block_commitments,
+            bits: request.bits,
+            time: request.time,
             coinbase_tx: request.coinbase_tx.clone(),
         };
 
@@ -293,34 +465,56 @@ impl JdServer {
             "Received block solution"
         );
 
-        // Validate solution length (always true for fixed-size array, but good practice)
         if !solution.validate_solution_len() {
-            warn!(
-                job_id = solution.job_id,
-                "Invalid solution length"
-            );
+            warn!(job_id = solution.job_id, "Invalid solution length");
             return Err(JdServerError::Protocol("Invalid solution length".to_string()));
         }
 
-        // TODO: In a full implementation, we would:
-        // 1. Look up the job info by job_id
-        // 2. Reconstruct the full block header
-        // 3. Verify the Equihash solution
-        // 4. Submit to the Zcash node if valid
-        // 5. Record payout credit for the miner
+        let job = self.token_manager.find_job_by_id(solution.job_id)?;
+        if job.channel_id != solution.channel_id {
+            return Err(JdServerError::Protocol(format!(
+                "solution channel {} does not match declared job channel {}",
+                solution.channel_id, job.channel_id
+            )));
+        }
+        if solution.version != job.version {
+            return Err(JdServerError::Protocol(format!(
+                "solution version {} does not match declared version {}",
+                solution.version, job.version
+            )));
+        }
 
-        // For now, just record a share for the miner
-        // In production, the miner ID would come from the session/token
-        let miner_id = format!("jd-miner-{}", solution.channel_id);
-        // SECURITY WARNING: Difficulty is not validated.
-        // In production, compute actual difficulty from solution hash vs network target.
-        tracing::warn!("Recording share with unvalidated difficulty - NOT SAFE FOR PRODUCTION");
-        self.payout_tracker.record_share(&miner_id, 1.0);
+        const MAX_TIME_FORWARD: u32 = 7200;
+        const MAX_TIME_BACKWARD: u32 = 60;
+        if solution.time < job.time.saturating_sub(MAX_TIME_BACKWARD)
+            || solution.time > job.time.saturating_add(MAX_TIME_FORWARD)
+        {
+            return Err(JdServerError::Protocol("solution time out of range".to_string()));
+        }
+
+        let mut header = [0u8; 140];
+        header[0..4].copy_from_slice(&job.version.to_le_bytes());
+        header[4..36].copy_from_slice(&job.prev_hash);
+        header[36..68].copy_from_slice(&job.merkle_root);
+        header[68..100].copy_from_slice(&job.block_commitments);
+        header[100..104].copy_from_slice(&solution.time.to_le_bytes());
+        header[104..108].copy_from_slice(&job.bits.to_le_bytes());
+        header[108..140].copy_from_slice(&solution.nonce);
+
+        let target = compact_to_target(job.bits).to_le_bytes();
+        let validator = EquihashValidator::new();
+        validator
+            .verify_share(&header, &solution.solution, &target)
+            .map_err(|e| JdServerError::Protocol(format!("invalid solution: {}", e)))?;
+
+        let difficulty = target_to_difficulty(&compact_to_target(job.bits));
+        self.payout_tracker.record_share(&job.client_id, difficulty);
 
         info!(
             channel_id = solution.channel_id,
             job_id = solution.job_id,
-            "Block solution recorded"
+            difficulty,
+            "Validated block solution"
         );
 
         Ok(())
@@ -398,6 +592,35 @@ impl JdServer {
             ));
         }
 
+        let template = match self
+            .validate_header_fields(
+                request.version,
+                request.block_commitments,
+                request.time,
+                request.bits,
+            )
+            .await
+        {
+            Ok(template) => template,
+            Err(reason) => {
+                let code = match reason.as_str() {
+                    "block version does not match current template" => {
+                        SetFullTemplateJobErrorCode::InvalidVersion
+                    }
+                    "difficulty bits do not match current template" => {
+                        SetFullTemplateJobErrorCode::InvalidBits
+                    }
+                    _ => SetFullTemplateJobErrorCode::Other,
+                };
+                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    code,
+                    reason,
+                )));
+            }
+        };
+
         // 4. Check prev_hash matches current (stale detection)
         //    Fail closed: reject if we haven't received any template yet
         let current_prev_hash = self.current_prev_hash.read().await;
@@ -435,6 +658,30 @@ impl JdServer {
 
         // 5. Validate template using the validator
         let validator = self.validator.read().await;
+        if let Err(reason) = validator.validate_coinbase(&request.coinbase_tx) {
+            return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
+                request.channel_id,
+                request.request_id,
+                SetFullTemplateJobErrorCode::CoinbaseConstraintViolation,
+                reason,
+            )));
+        }
+        if let Some(ref current) = template {
+            let max_coinbase_len =
+                current.coinbase_tx_len + self.config.coinbase_output_max_additional_size as usize;
+            if request.coinbase_tx.len() > max_coinbase_len {
+                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetFullTemplateJobErrorCode::CoinbaseConstraintViolation,
+                    format!(
+                        "coinbase length {} exceeds maximum {}",
+                        request.coinbase_tx.len(),
+                        max_coinbase_len
+                    ),
+                )));
+            }
+        }
         match validator.validate(&request) {
             ValidationResult::Valid => {
                 // Template is valid, proceed to register the job
@@ -458,6 +705,13 @@ impl JdServer {
                     missing_count = missing.len(),
                     "Full template job needs missing transactions"
                 );
+                self.pending_missing.write().await.insert(
+                    (token_info.client_id.clone(), request.request_id),
+                    PendingMissingTransactions {
+                        channel_id: request.channel_id,
+                        expected_txids: missing.clone(),
+                    },
+                );
                 return Err(FullTemplateJobResponse::NeedTransactions(
                     GetMissingTransactions::new(
                         request.channel_id,
@@ -470,7 +724,12 @@ impl JdServer {
         drop(validator);
 
         // 6. Register the job
-        let job_id = match self.register_full_template_job(&request) {
+        self.pending_missing
+            .write()
+            .await
+            .remove(&(token_info.client_id.clone(), request.request_id));
+
+        let job_id = match self.register_full_template_job(&request, &token_info) {
             Ok(id) => id,
             Err(e) => {
                 error!(
@@ -503,15 +762,26 @@ impl JdServer {
     }
 
     /// Register a full template job and return the assigned job ID
-    fn register_full_template_job(&self, job: &SetFullTemplateJob) -> Result<u32> {
+    fn register_full_template_job(
+        &self,
+        job: &SetFullTemplateJob,
+        token_info: &crate::token::MiningJobToken,
+    ) -> Result<u32> {
         // Generate job ID
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
 
         // Store job info with token
         let job_info = DeclaredJobInfo {
             job_id,
+            client_id: token_info.client_id.clone(),
+            mode: token_info.granted_mode,
+            channel_id: job.channel_id,
+            version: job.version,
             prev_hash: job.prev_hash,
             merkle_root: job.merkle_root,
+            block_commitments: job.block_commitments,
+            bits: job.bits,
+            time: job.time,
             coinbase_tx: job.coinbase_tx.clone(),
         };
 
@@ -552,35 +822,51 @@ impl JdServer {
             msg.request_id
         );
 
-        // In a full implementation, we would:
-        // 1. Parse each transaction to extract its txid
-        // 2. Verify the txid matches what was requested
-        // 3. Validate the transaction structure
-        // 4. Add the txid to the validator's known set
-        //
-        // For MVP, we trust the client provided valid data and add computed txids
-        // to the validator's known set.
+        let pending = {
+            let mut requests = self.pending_missing.write().await;
+            requests.remove(&(client_id.to_string(), msg.request_id))
+        }
+        .ok_or_else(|| {
+            JdServerError::Protocol(format!(
+                "no outstanding missing-transaction request for client {} request {}",
+                client_id, msg.request_id
+            ))
+        })?;
+
+        if pending.channel_id != msg.channel_id {
+            return Err(JdServerError::Protocol(format!(
+                "channel mismatch for missing transactions: expected {}, got {}",
+                pending.channel_id, msg.channel_id
+            )));
+        }
+        if msg.transactions.len() != pending.expected_txids.len() {
+            return Err(JdServerError::Protocol(format!(
+                "expected {} transactions, got {}",
+                pending.expected_txids.len(),
+                msg.transactions.len()
+            )));
+        }
 
         let mut validator = self.validator.write().await;
 
-        for tx_data in &msg.transactions {
-            // Compute txid as double-SHA256 of the transaction data
-            // Note: This is a simplified implementation. A real implementation
-            // would use proper Zcash transaction parsing.
-            if !tx_data.is_empty() {
-                use sha2::{Digest, Sha256};
-                let hash1 = Sha256::digest(tx_data);
-                let hash2 = Sha256::digest(hash1);
-                let mut txid = [0u8; 32];
-                txid.copy_from_slice(&hash2);
-                validator.add_known_txid(txid);
-
-                debug!(
-                    "Added txid {} from provided transaction ({} bytes)",
+        for (expected_txid, tx_data) in pending.expected_txids.iter().zip(msg.transactions.iter()) {
+            TemplateValidator::parse_transaction(tx_data)
+                .map_err(JdServerError::Protocol)?;
+            let txid = TemplateValidator::compute_txid(tx_data);
+            if &txid != expected_txid {
+                return Err(JdServerError::Protocol(format!(
+                    "provided transaction txid {} did not match requested {}",
                     hex::encode(txid),
-                    tx_data.len()
-                );
+                    hex::encode(expected_txid),
+                )));
             }
+            validator.add_known_txid(txid);
+
+            debug!(
+                "Added requested txid {} from provided transaction ({} bytes)",
+                hex::encode(txid),
+                tx_data.len()
+            );
         }
 
         Ok(())
@@ -863,7 +1149,7 @@ mod tests {
         JdServerConfig {
             token_lifetime: Duration::from_secs(300),
             coinbase_output_max_additional_size: 256,
-            pool_payout_script: vec![0x76, 0xa9, 0x14], // P2PKH prefix
+            pool_payout_script: vec![],
             async_mining_allowed: true,
             max_tokens_per_client: 10,
             noise_enabled: false,
@@ -923,7 +1209,7 @@ mod tests {
             prev_hash,
             merkle_root: [0xbb; 32],
             block_commitments: [0xcc; 32],
-            coinbase_tx: vec![0x01, 0x00, 0x00, 0x00],
+            coinbase_tx: minimal_tx(),
             time: 1700000000,
             bits: 0x1d00ffff,
         };
@@ -962,7 +1248,7 @@ mod tests {
             prev_hash: stale_prev_hash, // Stale!
             merkle_root: [0xbb; 32],
             block_commitments: [0xcc; 32],
-            coinbase_tx: vec![0x01, 0x00, 0x00, 0x00],
+            coinbase_tx: minimal_tx(),
             time: 1700000000,
             bits: 0x1d00ffff,
         };
@@ -989,7 +1275,7 @@ mod tests {
             prev_hash: [0xaa; 32],
             merkle_root: [0xbb; 32],
             block_commitments: [0xcc; 32],
-            coinbase_tx: vec![0x01, 0x00, 0x00, 0x00],
+            coinbase_tx: minimal_tx(),
             time: 1700000000,
             bits: 0x1d00ffff,
         };
@@ -1034,7 +1320,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_push_solution() {
+    async fn test_push_solution_rejects_unknown_job() {
         let config = test_config();
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker.clone());
@@ -1049,12 +1335,9 @@ mod tests {
         );
 
         let result = server.handle_push_solution(solution).await;
-        assert!(result.is_ok());
+        assert!(result.is_err());
 
-        // Check that a share was recorded
-        let stats = payout_tracker.get_stats(&"jd-miner-1".to_string());
-        assert!(stats.is_some());
-        assert_eq!(stats.unwrap().total_shares, 1);
+        assert!(payout_tracker.get_stats(&"jd-miner-1".to_string()).is_none());
     }
 
     #[test]
@@ -1094,7 +1377,7 @@ mod tests {
             prev_hash,
             merkle_root: [0xbb; 32],
             block_commitments: [0xcc; 32],
-            coinbase_tx: vec![0x01],
+            coinbase_tx: minimal_tx(),
             time: 1700000000,
             bits: 0x1d00ffff,
         };
@@ -1107,7 +1390,7 @@ mod tests {
             prev_hash,
             merkle_root: [0xdd; 32],
             block_commitments: [0xee; 32],
-            coinbase_tx: vec![0x02],
+            coinbase_tx: minimal_tx_with_script(&[0x52]),
             time: 1700000001,
             bits: 0x1d00ffff,
         };
@@ -1259,6 +1542,10 @@ mod tests {
     }
 
     fn minimal_tx() -> Vec<u8> {
+        minimal_tx_with_script(&[0x51])
+    }
+
+    fn minimal_tx_with_script(script: &[u8]) -> Vec<u8> {
         let mut tx = Vec::new();
         tx.extend_from_slice(&1u32.to_le_bytes()); // version
         tx.push(0x01); // vin count
@@ -1269,10 +1556,148 @@ mod tests {
         tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
         tx.push(0x01); // vout count
         tx.extend_from_slice(&0u64.to_le_bytes()); // value
-        tx.push(0x01); // script len
-        tx.push(0x51); // script
+        tx.push(script.len() as u8);
+        tx.extend_from_slice(script);
         tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
         tx
+    }
+
+    async fn insert_pending_request(
+        server: &JdServer,
+        client_id: &str,
+        request_id: u32,
+        channel_id: u32,
+        txids: Vec<[u8; 32]>,
+    ) {
+        server.pending_missing.write().await.insert(
+            (client_id.to_string(), request_id),
+            PendingMissingTransactions {
+                channel_id,
+                expected_txids: txids,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declare_job_rejects_missing_pool_payout() {
+        let mut config = test_config();
+        config.pool_payout_script = vec![0x51, 0xac];
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        let prev_hash = [0xaa; 32];
+        server.set_current_prev_hash(prev_hash).await;
+
+        let token_response = server
+            .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
+            .unwrap();
+
+        let result = server
+            .handle_declare_job(SetCustomMiningJob {
+                channel_id: 1,
+                request_id: 7,
+                mining_job_token: token_response.mining_job_token,
+                version: 5,
+                prev_hash,
+                merkle_root: [0xbb; 32],
+                block_commitments: [0xcc; 32],
+                coinbase_tx: minimal_tx(),
+                time: 1700000000,
+                bits: 0x1d00ffff,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            result.error_code,
+            SetCustomMiningJobErrorCode::CoinbaseConstraintViolation
+        );
+    }
+
+    #[tokio::test]
+    async fn test_declare_job_rejects_invalid_merkle_root_against_template() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        let prev_hash = [0xaa; 32];
+        let coinbase_tx = minimal_tx();
+        server
+            .set_current_template(CurrentTemplateContext {
+                version: 5,
+                prev_hash,
+                block_commitments: [0xcc; 32],
+                bits: 0x1d00ffff,
+                time: 1700000000,
+                txids: vec![],
+                coinbase_tx_len: coinbase_tx.len(),
+            })
+            .await;
+
+        let token_response = server
+            .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
+            .unwrap();
+
+        let error = server
+            .handle_declare_job(SetCustomMiningJob {
+                channel_id: 1,
+                request_id: 9,
+                mining_job_token: token_response.mining_job_token,
+                version: 5,
+                prev_hash,
+                merkle_root: [0x99; 32],
+                block_commitments: [0xcc; 32],
+                coinbase_tx,
+                time: 1700000000,
+                bits: 0x1d00ffff,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.error_code, SetCustomMiningJobErrorCode::InvalidMerkleRoot);
+    }
+
+    #[tokio::test]
+    async fn test_push_solution_rejects_invalid_solution() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker.clone());
+
+        let prev_hash = [0xaa; 32];
+        server.set_current_prev_hash(prev_hash).await;
+
+        let token_response = server
+            .handle_allocate_token(1, "jd-miner-1", JobDeclarationMode::CoinbaseOnly)
+            .unwrap();
+
+        let job_response = server
+            .handle_declare_job(SetCustomMiningJob {
+                channel_id: 1,
+                request_id: 1,
+                mining_job_token: token_response.mining_job_token,
+                version: 5,
+                prev_hash,
+                merkle_root: [0xbb; 32],
+                block_commitments: [0xcc; 32],
+                coinbase_tx: minimal_tx(),
+                time: 1700000000,
+                bits: 0x1d00ffff,
+            })
+            .await
+            .unwrap();
+
+        let solution = PushSolution::new(
+            1,
+            job_response.job_id,
+            5,
+            1700000000,
+            [0x11; 32],
+            [0x22; 1344],
+        );
+
+        let result = server.handle_push_solution(solution).await;
+        assert!(result.is_err());
+        assert!(payout_tracker.get_stats(&"jd-miner-1".to_string()).is_none());
     }
 
     fn merkle_root_for(coinbase: &[u8], txids: &[[u8; 32]]) -> [u8; 32] {
@@ -1430,11 +1855,16 @@ mod tests {
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        // Create a ProvideMissingTransactions message with some transaction data
         let tx_data = vec![
-            vec![0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03],
-            vec![0x02, 0x00, 0x00, 0x00, 0x04, 0x05, 0x06],
+            minimal_tx(),
+            minimal_tx_with_script(&[0x52]),
         ];
+        let expected_txids = tx_data
+            .iter()
+            .map(|tx| TemplateValidator::compute_txid(tx))
+            .collect();
+        insert_pending_request(&server, "test-client", 42, 1, expected_txids).await;
+
         let msg = ProvideMissingTransactions {
             channel_id: 1,
             request_id: 42,
@@ -1460,7 +1890,8 @@ mod tests {
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        // Empty transactions list
+        insert_pending_request(&server, "test-client", 42, 1, vec![]).await;
+
         let msg = ProvideMissingTransactions {
             channel_id: 1,
             request_id: 42,
@@ -1479,15 +1910,9 @@ mod tests {
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        // First, provide some transactions
-        let tx_data = vec![0x01, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03];
-
-        // Compute the expected txid (double SHA256)
-        use sha2::{Digest, Sha256};
-        let hash1 = Sha256::digest(&tx_data);
-        let hash2 = Sha256::digest(hash1);
-        let mut expected_txid = [0u8; 32];
-        expected_txid.copy_from_slice(&hash2);
+        let tx_data = minimal_tx();
+        let expected_txid = TemplateValidator::compute_txid(&tx_data);
+        insert_pending_request(&server, "test-client", 42, 1, vec![expected_txid]).await;
 
         let msg = ProvideMissingTransactions {
             channel_id: 1,
@@ -1510,25 +1935,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_provide_missing_transactions_skip_empty_tx() {
+    async fn test_provide_missing_transactions_rejects_invalid_tx_data() {
         let config = test_config_full_template();
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        // Include an empty transaction which should be skipped
+        let expected_txid = TemplateValidator::compute_txid(&minimal_tx());
+        insert_pending_request(&server, "test-client", 42, 1, vec![expected_txid]).await;
+
         let msg = ProvideMissingTransactions {
             channel_id: 1,
             request_id: 42,
-            transactions: vec![
-                vec![], // empty - should be skipped
-                vec![0x01, 0x00, 0x00, 0x00],
-            ],
+            transactions: vec![vec![]],
         };
 
         let result = server
             .handle_provide_missing_transactions(msg, "test-client")
             .await;
-        assert!(result.is_ok());
-        // Should not panic or error on empty transaction data
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_provide_missing_transactions_rejects_txid_mismatch() {
+        let config = test_config_full_template();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        let expected_txid = TemplateValidator::compute_txid(&minimal_tx());
+        insert_pending_request(&server, "test-client", 42, 1, vec![expected_txid]).await;
+
+        let msg = ProvideMissingTransactions {
+            channel_id: 1,
+            request_id: 42,
+            transactions: vec![minimal_tx_with_script(&[0x52])],
+        };
+
+        let result = server
+            .handle_provide_missing_transactions(msg, "test-client")
+            .await;
+        assert!(result.is_err());
+
+        let validator = server.validator().await;
+        assert!(!validator.is_txid_known(&expected_txid));
     }
 }

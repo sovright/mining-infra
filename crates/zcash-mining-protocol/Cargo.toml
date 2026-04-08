@@ -9,6 +9,11 @@ description = "Zcash Mining Protocol messages for Stratum V2"
 serde.workspace = true
 thiserror.workspace = true
 byteorder.workspace = true
+arbitrary = { version = "1", features = ["derive"], optional = true }
+
+[features]
+arbitrary = ["dep:arbitrary"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+proptest = "1.4"

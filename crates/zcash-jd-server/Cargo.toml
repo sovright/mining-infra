@@ -20,6 +20,7 @@ zcash-mining-protocol = { path = "../zcash-mining-protocol" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 zcash-coinbase = { path = "../zcash-coinbase" }
 bedrock-noise = { path = "../bedrock-noise" }
+zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

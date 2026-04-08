@@ -111,7 +111,8 @@ async fn e2e_chunker_roundtrip() {
 /// Test: Block flows through relay node
 #[tokio::test]
 async fn e2e_relay_node_forward() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap());
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
     node.bind().await.unwrap();
 

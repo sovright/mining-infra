@@ -1,0 +1,30 @@
+[package]
+name = "bedrock-forge-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bedrock-forge = { path = "..", features = ["arbitrary"] }
+
+[[bin]]
+name = "fuzz_chunk_header"
+path = "fuzz_targets/fuzz_chunk_header.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_chunk"
+path = "fuzz_targets/fuzz_chunk.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip_chunk"
+path = "fuzz_targets/fuzz_roundtrip_chunk.rs"
+doc = false

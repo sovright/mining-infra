@@ -20,6 +20,7 @@ impl ForgeRelay {
         bind_addr: SocketAddr,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = ClientConfig::new(relay_peers, auth_key).with_bind_addr(bind_addr);
+        let config = config.with_auth_required(true);
 
         let client = RelayClient::new(config)?;
         let sender = client.sender();
@@ -40,10 +41,13 @@ impl ForgeRelay {
 
     /// Start the relay run loop
     pub async fn start(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut client = self.client.write().await;
-        if client.take_receiver().is_none() {
-            warn!("Forge relay receiver already taken");
-        }
+        let client = Arc::clone(&self.client);
+        tokio::spawn(async move {
+            let mut client = client.write().await;
+            if let Err(e) = client.run().await {
+                warn!("Forge relay client exited with error: {}", e);
+            }
+        });
         Ok(())
     }
 
@@ -65,7 +69,7 @@ mod tests {
     #[test]
     fn relay_creation() {
         let peers = vec!["127.0.0.1:8333".parse().unwrap()];
-        let auth_key = [0u8; 32];
+        let auth_key = [0x42; 32];
         let bind_addr = "0.0.0.0:0".parse().unwrap();
 
         let relay = ForgeRelay::new(peers, auth_key, bind_addr);

@@ -35,6 +35,8 @@ pub struct BlockAssembly {
     pub original_len: Option<usize>,
     /// Whether PoW has been validated
     pub pow_validated: bool,
+    /// Tracks which chunks have already been forwarded downstream
+    pub forwarded: Vec<bool>,
 }
 
 impl BlockAssembly {
@@ -47,6 +49,7 @@ impl BlockAssembly {
             started_at: Instant::now(),
             original_len: None,
             pow_validated: false,
+            forwarded: vec![false; total_chunks],
         }
     }
 

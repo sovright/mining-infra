@@ -7,3 +7,11 @@ description = "Common types shared between pool server components"
 
 [dependencies]
 tracing = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "compact_size_bench"
+harness = false

@@ -1,0 +1,30 @@
+[package]
+name = "zcash-pool-common-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zcash-pool-common = { path = ".." }
+
+[[bin]]
+name = "fuzz_compact_size_roundtrip"
+path = "fuzz_targets/fuzz_compact_size_roundtrip.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_read_compact_size"
+path = "fuzz_targets/fuzz_read_compact_size.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_payout_difficulty"
+path = "fuzz_targets/fuzz_payout_difficulty.rs"
+doc = false

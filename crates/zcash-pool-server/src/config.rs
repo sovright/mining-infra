@@ -287,3 +287,260 @@ impl Default for PoolConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+
+    fn valid_config() -> PoolConfig {
+        PoolConfig::default()
+    }
+
+    #[test]
+    fn default_config_validates_ok() {
+        assert!(valid_config().validate().is_ok());
+    }
+
+    // 1. InvalidNonce1Len
+    #[test]
+    fn nonce1_len_zero_rejected() {
+        let mut cfg = valid_config();
+        cfg.nonce_1_len = 0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidNonce1Len(0)));
+    }
+
+    #[test]
+    fn nonce1_len_32_rejected() {
+        let mut cfg = valid_config();
+        cfg.nonce_1_len = 32;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidNonce1Len(32)));
+    }
+
+    #[test]
+    fn nonce1_len_1_accepted() {
+        let mut cfg = valid_config();
+        cfg.nonce_1_len = 1;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn nonce1_len_31_accepted() {
+        let mut cfg = valid_config();
+        cfg.nonce_1_len = 31;
+        assert!(cfg.validate().is_ok());
+    }
+
+    // 2. InvalidDifficulty
+    #[test]
+    fn difficulty_zero_rejected() {
+        let mut cfg = valid_config();
+        cfg.initial_difficulty = 0.0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidDifficulty(0.0)));
+    }
+
+    #[test]
+    fn difficulty_negative_rejected() {
+        let mut cfg = valid_config();
+        cfg.initial_difficulty = -1.0;
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidDifficulty(-1.0)));
+    }
+
+    #[test]
+    fn difficulty_nan_rejected() {
+        let mut cfg = valid_config();
+        cfg.initial_difficulty = f64::NAN;
+        // NaN != NaN, so we match the variant instead
+        assert!(matches!(
+            cfg.validate(),
+            Err(ConfigError::InvalidDifficulty(_))
+        ));
+    }
+
+    #[test]
+    fn difficulty_infinity_rejected() {
+        let mut cfg = valid_config();
+        cfg.initial_difficulty = f64::INFINITY;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidDifficulty(f64::INFINITY))
+        );
+    }
+
+    // 3. InvalidTargetSharesPerMinute
+    #[test]
+    fn target_shares_zero_rejected() {
+        let mut cfg = valid_config();
+        cfg.target_shares_per_minute = 0.0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidTargetSharesPerMinute(0.0))
+        );
+    }
+
+    // 4. InvalidValidationThreads
+    #[test]
+    fn validation_threads_zero_rejected() {
+        let mut cfg = valid_config();
+        cfg.validation_threads = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidValidationThreads(0))
+        );
+    }
+
+    // 5. InvalidTemplatePollMs
+    #[test]
+    fn template_poll_99_rejected() {
+        let mut cfg = valid_config();
+        cfg.template_poll_ms = 99;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidTemplatePollMs(99))
+        );
+    }
+
+    #[test]
+    fn template_poll_100_accepted() {
+        let mut cfg = valid_config();
+        cfg.template_poll_ms = 100;
+        assert!(cfg.validate().is_ok());
+    }
+
+    // 6. InvalidMaxConnections
+    #[test]
+    fn max_connections_zero_rejected() {
+        let mut cfg = valid_config();
+        cfg.max_connections = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidMaxConnections(0))
+        );
+    }
+
+    // 7. ForgeMissingAuthKey
+    #[test]
+    fn forge_enabled_without_auth_key_rejected() {
+        let mut cfg = valid_config();
+        cfg.forge_relay_enabled = true;
+        cfg.forge_auth_key = None;
+        assert_eq!(cfg.validate(), Err(ConfigError::ForgeMissingAuthKey));
+    }
+
+    // 8. InvalidFecConfig
+    #[test]
+    fn forge_zero_data_shards_rejected() {
+        let mut cfg = valid_config();
+        cfg.forge_relay_enabled = true;
+        cfg.forge_auth_key = Some([0u8; 32]);
+        cfg.forge_data_shards = 0;
+        cfg.forge_parity_shards = 3;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFecConfig {
+                data: 0,
+                parity: 3
+            })
+        );
+    }
+
+    #[test]
+    fn forge_zero_parity_shards_rejected() {
+        let mut cfg = valid_config();
+        cfg.forge_relay_enabled = true;
+        cfg.forge_auth_key = Some([0u8; 32]);
+        cfg.forge_data_shards = 10;
+        cfg.forge_parity_shards = 0;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFecConfig {
+                data: 10,
+                parity: 0
+            })
+        );
+    }
+
+    // 9. InvalidFecShardTotal
+    #[test]
+    fn forge_fec_total_256_rejected() {
+        let mut cfg = valid_config();
+        cfg.forge_relay_enabled = true;
+        cfg.forge_auth_key = Some([0u8; 32]);
+        cfg.forge_data_shards = 200;
+        cfg.forge_parity_shards = 56;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidFecShardTotal { total: 256 })
+        );
+    }
+
+    #[test]
+    fn forge_fec_total_255_accepted() {
+        let mut cfg = valid_config();
+        cfg.forge_relay_enabled = true;
+        cfg.forge_auth_key = Some([0u8; 32]);
+        cfg.forge_data_shards = 200;
+        cfg.forge_parity_shards = 55;
+        assert!(cfg.validate().is_ok());
+    }
+
+    // 10. JdMissingPayoutScript
+    #[test]
+    fn jd_enabled_without_payout_script_rejected() {
+        let mut cfg = valid_config();
+        cfg.jd_listen_addr = Some(SocketAddr::from(([0, 0, 0, 0], 3334)));
+        cfg.pool_payout_script = None;
+        assert_eq!(cfg.validate(), Err(ConfigError::JdMissingPayoutScript));
+    }
+
+    #[test]
+    fn jd_enabled_with_payout_script_accepted() {
+        let mut cfg = valid_config();
+        cfg.jd_listen_addr = Some(SocketAddr::from(([0, 0, 0, 0], 3334)));
+        cfg.pool_payout_script = Some(vec![0x76, 0xa9, 0x14]); // dummy script
+        assert!(cfg.validate().is_ok());
+    }
+
+    // 11. InvalidTimingJitter
+    #[test]
+    fn timing_jitter_min_greater_than_max_rejected() {
+        let mut cfg = valid_config();
+        cfg.timing_jitter_enabled = true;
+        cfg.timing_jitter_min_ms = 100;
+        cfg.timing_jitter_max_ms = 50;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::InvalidTimingJitter {
+                min_ms: 100,
+                max_ms: 50
+            })
+        );
+    }
+
+    #[test]
+    fn timing_jitter_min_equals_max_accepted() {
+        let mut cfg = valid_config();
+        cfg.timing_jitter_enabled = true;
+        cfg.timing_jitter_min_ms = 50;
+        cfg.timing_jitter_max_ms = 50;
+        assert!(cfg.validate().is_ok());
+    }
+
+    // 12. Disabled features ignore invalid sub-config
+    #[test]
+    fn forge_disabled_ignores_missing_auth_key() {
+        let mut cfg = valid_config();
+        cfg.forge_relay_enabled = false;
+        cfg.forge_auth_key = None;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn timing_jitter_disabled_ignores_invalid_range() {
+        let mut cfg = valid_config();
+        cfg.timing_jitter_enabled = false;
+        cfg.timing_jitter_min_ms = 100;
+        cfg.timing_jitter_max_ms = 50;
+        assert!(cfg.validate().is_ok());
+    }
+}

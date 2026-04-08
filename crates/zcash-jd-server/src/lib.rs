@@ -39,6 +39,9 @@ pub use codec::{
 pub use config::JdServerConfig;
 pub use error::{JdServerError, Result};
 pub use messages::*;
-pub use server::{handle_jd_client, handle_jd_client_with_transport, FullTemplateJobResponse, JdServer, JdTransport};
+pub use server::{
+    handle_jd_client, handle_jd_client_with_transport, CurrentTemplateContext,
+    FullTemplateJobResponse, JdServer, JdTransport,
+};
 pub use token::{DeclaredJobInfo, MiningJobToken, TokenManager};
 pub use validation::{TemplateValidator, ValidationLevel, ValidationResult};

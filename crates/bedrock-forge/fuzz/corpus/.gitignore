@@ -1,0 +1,8 @@
+# Ignore auto-generated binary corpus files (sha1 hashes from fuzzer)
+**/[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*
+
+# Keep named human-readable seed entries
+!**/valid_*
+!**/empty
+!**/short
+!**/bad_magic

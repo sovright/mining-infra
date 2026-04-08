@@ -19,6 +19,7 @@ pub mod message_types {
 
 /// Pool -> Miner: New mining job
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct NewEquihashJob {
     /// Channel this job belongs to
     pub channel_id: u32,
@@ -87,6 +88,7 @@ impl NewEquihashJob {
 
 /// Miner -> Pool: Submit Equihash share
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SubmitEquihashShare {
     /// Channel this share belongs to
     pub channel_id: u32,
@@ -118,6 +120,7 @@ impl SubmitEquihashShare {
 
 /// Pool -> Miner: Response to share submission
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SubmitSharesResponse {
     /// Channel ID
     pub channel_id: u32,
@@ -129,6 +132,7 @@ pub struct SubmitSharesResponse {
 
 /// Result of share validation
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum ShareResult {
     /// Share accepted
     Accepted,
@@ -138,6 +142,7 @@ pub enum ShareResult {
 
 /// Reasons for share rejection
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub enum RejectReason {
     /// Job ID not found or expired
     StaleJob,
@@ -153,6 +158,7 @@ pub enum RejectReason {
 
 /// Pool -> Miner: Update share difficulty target
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
 pub struct SetTarget {
     /// Channel ID
     pub channel_id: u32,

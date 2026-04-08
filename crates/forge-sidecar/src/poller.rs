@@ -1,6 +1,6 @@
 //! Template polling with change detection
 
-use crate::rpc::{BlockTemplate, ZebraRpc};
+use forge_sidecar::rpc::{BlockTemplate, ZebraRpc};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;

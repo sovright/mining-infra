@@ -1,5 +1,6 @@
 //! Zebra JSON-RPC client
 
+use async_trait::async_trait;
 use crate::error::{Error, Result};
 use crate::types::GetBlockTemplateResponse;
 use reqwest::Client;
@@ -37,6 +38,17 @@ pub enum SubmitBlockResult {
     Duplicate,
     /// Result was inconclusive.
     Inconclusive,
+}
+
+/// Trait abstracting RPC calls to a Zcash node, enabling mock implementations for testing.
+#[async_trait]
+pub trait RpcProvider: Send + Sync {
+    /// Get a block template from the node
+    async fn get_block_template(&self) -> Result<GetBlockTemplateResponse>;
+    /// Submit a solved block to the node
+    async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult>;
+    /// Get the best block hash
+    async fn get_best_block_hash(&self) -> Result<String>;
 }
 
 /// Zebra RPC client
@@ -104,13 +116,16 @@ impl ZebraRpc {
         serde_json::from_value(result.clone()).map_err(Error::Json)
     }
 
-    /// Get a block template from Zebra
-    pub async fn get_block_template(&self) -> Result<GetBlockTemplateResponse> {
+}
+
+#[async_trait]
+impl RpcProvider for ZebraRpc {
+    async fn get_block_template(&self) -> Result<GetBlockTemplateResponse> {
         self.request("getblocktemplate", serde_json::json!([])).await
     }
 
     /// Submit a solved block to Zebra
-    pub async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult> {
+    async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult> {
         let params = match mode {
             Some(m) if !m.as_param().is_empty() => serde_json::json!([block_hex, m.as_param()]),
             _ => serde_json::json!([block_hex]),
@@ -124,8 +139,7 @@ impl ZebraRpc {
         })
     }
 
-    /// Get the best block hash
-    pub async fn get_best_block_hash(&self) -> Result<String> {
+    async fn get_best_block_hash(&self) -> Result<String> {
         self.request("getbestblockhash", serde_json::json!([])).await
     }
 }

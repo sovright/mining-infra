@@ -1,0 +1,60 @@
+[package]
+name = "zcash-mining-protocol-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+zcash-mining-protocol = { path = "..", features = ["arbitrary"] }
+
+[[bin]]
+name = "fuzz_frame_decode"
+path = "fuzz_targets/fuzz_frame_decode.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_new_job"
+path = "fuzz_targets/fuzz_decode_new_job.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_submit_share"
+path = "fuzz_targets/fuzz_decode_submit_share.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_submit_response"
+path = "fuzz_targets/fuzz_decode_submit_response.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_target"
+path = "fuzz_targets/fuzz_decode_set_target.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip_new_job"
+path = "fuzz_targets/fuzz_roundtrip_new_job.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip_submit_share"
+path = "fuzz_targets/fuzz_roundtrip_submit_share.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip_submit_response"
+path = "fuzz_targets/fuzz_roundtrip_submit_response.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip_set_target"
+path = "fuzz_targets/fuzz_roundtrip_set_target.rs"
+doc = false

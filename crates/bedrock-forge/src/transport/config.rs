@@ -25,6 +25,10 @@ pub struct RelayConfig {
     pub assembly_timeout: Duration,
     /// Pre-shared keys for authorized clients
     pub authorized_keys: Vec<[u8; 32]>,
+    /// Explicitly allow unauthenticated peers (unsafe outside tests/dev)
+    pub allow_unauthenticated_peers: bool,
+    /// Maximum number of active peer sessions to retain
+    pub max_sessions: usize,
 }
 
 impl Default for RelayConfig {
@@ -37,6 +41,8 @@ impl Default for RelayConfig {
             session_timeout: Duration::from_secs(300),
             assembly_timeout: Duration::from_secs(30),
             authorized_keys: Vec::new(),
+            allow_unauthenticated_peers: false,
+            max_sessions: 4096,
         }
     }
 }
@@ -53,6 +59,18 @@ impl RelayConfig {
     /// Builder method: set authorized keys
     pub fn with_authorized_keys(mut self, keys: Vec<[u8; 32]>) -> Self {
         self.authorized_keys = keys;
+        self
+    }
+
+    /// Builder method: explicitly allow unauthenticated peers
+    pub fn with_unauthenticated_peers_allowed(mut self, allowed: bool) -> Self {
+        self.allow_unauthenticated_peers = allowed;
+        self
+    }
+
+    /// Builder method: set max active sessions
+    pub fn with_max_sessions(mut self, max_sessions: usize) -> Self {
+        self.max_sessions = max_sessions;
         self
     }
 
@@ -73,6 +91,17 @@ impl RelayConfig {
     /// Get total number of shards
     pub fn total_shards(&self) -> usize {
         self.data_shards + self.parity_shards
+    }
+
+    /// Whether relay authentication is required for inbound peers.
+    ///
+    /// Auth is required when `allow_unauthenticated_peers` is false.
+    /// When auth IS required, `authorized_keys` is used to validate
+    /// peer credentials -- but the presence of keys alone does not
+    /// force auth on (a relay may keep a key list for optional
+    /// verification while still allowing unauthenticated peers).
+    pub fn auth_required(&self) -> bool {
+        !self.allow_unauthenticated_peers
     }
 
     /// Validate the configuration
@@ -104,6 +133,17 @@ impl RelayConfig {
                 "chunk_size ({}) exceeds max payload size ({})",
                 self.chunk_size, MAX_PAYLOAD_SIZE
             )));
+        }
+        if self.max_sessions == 0 {
+            return Err(TransportError::InvalidChunk(
+                "max_sessions must be > 0".into(),
+            ));
+        }
+        if self.authorized_keys.is_empty() && !self.allow_unauthenticated_peers {
+            return Err(TransportError::ConnectionRefused(
+                "authorized_keys required unless unauthenticated peers are explicitly allowed"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -234,7 +274,10 @@ mod tests {
     #[test]
     fn relay_config_validation() {
         // Valid config
-        assert!(RelayConfig::default().validate().is_ok());
+        assert!(RelayConfig::default().validate().is_err());
+
+        let valid_config = RelayConfig::default().with_unauthenticated_peers_allowed(true);
+        assert!(valid_config.validate().is_ok());
 
         // Invalid data shards
         let mut config = RelayConfig::default();

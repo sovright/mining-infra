@@ -1,0 +1,69 @@
+[package]
+name = "zcash-jd-server-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+zcash-jd-server = { path = ".." }
+
+[[bin]]
+name = "fuzz_decode_allocate_token"
+path = "fuzz_targets/fuzz_decode_allocate_token.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_allocate_token_success"
+path = "fuzz_targets/fuzz_decode_allocate_token_success.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_custom_job"
+path = "fuzz_targets/fuzz_decode_set_custom_job.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_custom_job_success"
+path = "fuzz_targets/fuzz_decode_set_custom_job_success.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_custom_job_error"
+path = "fuzz_targets/fuzz_decode_set_custom_job_error.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_push_solution"
+path = "fuzz_targets/fuzz_decode_push_solution.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_full_template"
+path = "fuzz_targets/fuzz_decode_set_full_template.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_full_template_success"
+path = "fuzz_targets/fuzz_decode_set_full_template_success.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_set_full_template_error"
+path = "fuzz_targets/fuzz_decode_set_full_template_error.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_get_missing_tx"
+path = "fuzz_targets/fuzz_decode_get_missing_tx.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_decode_provide_missing_tx"
+path = "fuzz_targets/fuzz_decode_provide_missing_tx.rs"
+doc = false

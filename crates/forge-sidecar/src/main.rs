@@ -7,16 +7,14 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
-mod compact;
-mod config;
 mod poller;
 mod relay;
-mod rpc;
 
-use compact::build_compact_block;
+use forge_sidecar::compact::build_compact_block;
+use forge_sidecar::config;
+use forge_sidecar::rpc::ZebraRpc;
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::ForgeRelay;
-use rpc::ZebraRpc;
 
 #[derive(Parser, Debug)]
 #[command(name = "forge-sidecar")]
