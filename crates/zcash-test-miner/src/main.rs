@@ -1,5 +1,6 @@
 mod protocol;
 mod transport;
+mod v1_client;
 mod worker;
 
 use clap::Parser;
@@ -31,6 +32,10 @@ struct Args {
     /// Pool's Noise public key (hex). If omitted, connects without encryption.
     #[arg(long)]
     pool_public_key: Option<String>,
+
+    /// Use Stratum V1 (JSON-RPC) instead of V2 (binary)
+    #[arg(long)]
+    v1: bool,
 }
 
 #[tokio::main]
@@ -38,6 +43,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    if args.v1 {
+        let worker_name = format!("{}-1", args.worker_prefix);
+        return v1_client::run_v1(&args.pool_addr, &worker_name).await;
+    }
+
     tracing::info!(
         pool_addr = %args.pool_addr,
         workers = args.workers,

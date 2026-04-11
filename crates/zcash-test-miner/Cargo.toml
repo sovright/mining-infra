@@ -19,3 +19,6 @@ tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
 blake2b_simd = { workspace = true }
+serde_json = { workspace = true }
+serde = { workspace = true }
+hex = { workspace = true }
