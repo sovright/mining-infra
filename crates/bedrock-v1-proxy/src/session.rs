@@ -256,15 +256,34 @@ impl MinerSession {
         buf: &mut String,
     ) -> Result<Option<String>, SessionError> {
         buf.clear();
-        let read = reader.read_line(buf).await?;
-        if read == 0 {
-            return Ok(None);
-        }
-        if buf.len() > V1Codec::MAX_LINE_LENGTH {
-            return Err(SessionError::InvalidRequest(format!(
-                "downstream line exceeded {} bytes",
-                V1Codec::MAX_LINE_LENGTH
-            )));
+        // Read into a bounded buffer to prevent memory exhaustion from
+        // a malicious client sending megabytes without a newline.
+        let limit = V1Codec::MAX_LINE_LENGTH;
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                if buf.is_empty() {
+                    return Ok(None);
+                }
+                // EOF mid-line: return what we have
+                break;
+            }
+            if let Some(pos) = available.iter().position(|&b| b == b'\n') {
+                let line_bytes = &available[..pos];
+                buf.push_str(&String::from_utf8_lossy(line_bytes));
+                reader.consume(pos + 1); // consume including newline
+                break;
+            }
+            // No newline yet — append what we have
+            let chunk_len = available.len();
+            buf.push_str(&String::from_utf8_lossy(available));
+            reader.consume(chunk_len);
+            if buf.len() > limit {
+                return Err(SessionError::InvalidRequest(format!(
+                    "downstream line exceeded {} bytes",
+                    limit
+                )));
+            }
         }
         Ok(Some(buf.trim_end_matches(['\r', '\n']).to_owned()))
     }
@@ -443,11 +462,17 @@ impl MinerSession {
     ) -> Result<(), SessionError> {
         if let Some(worker_name) = &self.worker_name {
             if submit.worker_name != *worker_name {
-                debug!(
+                warn!(
                     expected = %worker_name,
                     got = %submit.worker_name,
-                    "Submit worker name differs from authorized worker"
+                    "Rejecting share: worker name mismatch"
                 );
+                self.send_json(&messages::submit_error_response(
+                    request_id,
+                    "Worker name mismatch",
+                ))
+                .await?;
+                return Ok(());
             }
         }
 
@@ -640,6 +665,7 @@ impl MinerSession {
                 self.job_map.clear();
                 self.current_job = None;
                 self.current_target = None;
+                self.fail_all_pending_shares("Upstream reconnected").await?;
                 for message in initial_messages {
                     self.handle_upstream_message(message, false).await?;
                 }
