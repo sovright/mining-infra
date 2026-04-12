@@ -275,6 +275,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bedrock-v1-proxy"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
+ "zcash-mining-protocol",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3952,7 +3967,10 @@ dependencies = [
  "blake2b_simd",
  "clap",
  "equihash",
+ "hex",
  "rand 0.8.5",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
