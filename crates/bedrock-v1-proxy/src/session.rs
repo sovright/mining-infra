@@ -256,7 +256,13 @@ impl MinerSession {
         buf: &mut String,
     ) -> Result<Option<String>, SessionError> {
         buf.clear();
-        let read = reader.read_line(buf).await?;
+        // Read at most MAX_LINE_LENGTH + 1 bytes. If we fill the budget without
+        // seeing a newline the caller will detect the oversize line and reject it,
+        // preventing unbounded memory growth from a client that never sends '\n'.
+        let read = reader
+            .take((V1Codec::MAX_LINE_LENGTH + 1) as u64)
+            .read_line(buf)
+            .await?;
         if read == 0 {
             return Ok(None);
         }
@@ -443,11 +449,17 @@ impl MinerSession {
     ) -> Result<(), SessionError> {
         if let Some(worker_name) = &self.worker_name {
             if submit.worker_name != *worker_name {
-                debug!(
+                warn!(
                     expected = %worker_name,
                     got = %submit.worker_name,
-                    "Submit worker name differs from authorized worker"
+                    "Submit worker name differs from authorized worker — rejecting"
                 );
+                self.send_json(&messages::submit_error_response(
+                    request_id,
+                    "Worker name mismatch",
+                ))
+                .await?;
+                return Ok(());
             }
         }
 
@@ -640,6 +652,9 @@ impl MinerSession {
                 self.job_map.clear();
                 self.current_job = None;
                 self.current_target = None;
+                // Fail any shares that were in-flight when the upstream dropped.
+                // Their sequence numbers are no longer valid against the new connection.
+                self.fail_all_pending_shares("Upstream reconnected").await?;
                 for message in initial_messages {
                     self.handle_upstream_message(message, false).await?;
                 }
