@@ -152,6 +152,8 @@ impl ReconnectManager {
             .last_connected_at
             .map(|t| now.duration_since(t))
             .unwrap_or(Duration::ZERO);
+        let was_stable = self.last_connected_at.is_some()
+            && connection_duration >= self.config.reset_after_stable;
 
         // Record failure for pattern analysis
         self.record_failure(ConnectionFailure {
@@ -159,6 +161,12 @@ impl ReconnectManager {
             connection_duration,
             reason,
         });
+
+        self.last_connected_at = None;
+        if was_stable {
+            debug!("Connection was stable, resetting backoff");
+            self.reset();
+        }
 
         // Check if we've exceeded max attempts
         if let Some(max) = self.config.max_attempts
@@ -437,6 +445,35 @@ mod tests {
 
         manager.reset();
         assert_eq!(manager.attempt_count(), 0);
+    }
+
+    #[test]
+    fn test_stable_disconnect_resets_next_delay() {
+        let config = ReconnectConfig {
+            jitter_factor: 0.0,
+            reset_after_stable: Duration::from_secs(50),
+            ..Default::default()
+        };
+        let mut manager = ReconnectManager::new(config);
+
+        manager.on_connected();
+        assert_eq!(
+            manager.on_disconnected(DisconnectReason::NetworkError),
+            Some(Duration::from_secs(1))
+        );
+        manager.on_connected();
+        assert_eq!(
+            manager.on_disconnected(DisconnectReason::NetworkError),
+            Some(Duration::from_secs(2))
+        );
+
+        manager.on_connected();
+        manager.last_connected_at = Some(Instant::now() - Duration::from_secs(60));
+        assert_eq!(
+            manager.on_disconnected(DisconnectReason::Normal),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(manager.attempt_count(), 1);
     }
 
     #[test]

@@ -51,6 +51,7 @@ struct ConnectionCtx {
     sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
     channels: Arc<RwLock<HashMap<u32, Channel>>>,
     session_tx: mpsc::Sender<SessionMessage>,
+    duplicate_detector: Arc<InMemoryDuplicateDetector>,
     metrics: Arc<PoolMetrics>,
     connection_tracker: Arc<ConnectionTracker>,
     sequence_validator: Arc<SequenceValidator>,
@@ -264,6 +265,7 @@ impl PoolServer {
             sessions: Arc::clone(&self.sessions),
             channels: Arc::clone(&self.channels),
             session_tx: self.session_tx.clone(),
+            duplicate_detector: Arc::clone(&self.duplicate_detector),
             metrics: Arc::clone(&self.metrics),
             connection_tracker: Arc::clone(&self.connection_tracker),
             sequence_validator: Arc::clone(&self.sequence_validator),
@@ -674,6 +676,7 @@ impl PoolServer {
                 let mut channels = ctx.channels.write().await;
                 if let Some(channel) = channels.get_mut(&channel_id) {
                     if let Some(job) = distributor.create_job(channel, true) {
+                        ctx.duplicate_detector.start_job(job.job_id);
                         channel.add_job(job.clone(), true);
                         Some(job)
                     } else {
@@ -927,8 +930,14 @@ impl PoolServer {
             let seq_result = self.sequence_validator.validate(channel_id, share.sequence_number);
             match seq_result {
                 SequenceCheckResult::Valid => {}
-                SequenceCheckResult::ValidOutOfOrder
-                | SequenceCheckResult::GapTooLarge
+                SequenceCheckResult::ValidOutOfOrder => {
+                    self.metrics.record_sequence_anomaly();
+                    debug!(
+                        "Processing out-of-order sequence {} for channel {}",
+                        share.sequence_number, channel_id
+                    );
+                }
+                SequenceCheckResult::GapTooLarge
                 | SequenceCheckResult::StaleSequence => {
                     self.metrics.record_sequence_anomaly();
                     warn!(
@@ -1009,10 +1018,10 @@ impl PoolServer {
 
         // Apply vardiff update and record payout atomically under one lock.
         // This prevents the channel from being removed between the two operations.
-        let (maybe_new_target, _accepted_info) = if let Ok(ref validation) = result {
+        let mut stale_after_validation = false;
+        let maybe_new_target = if let Ok(ref validation) = result {
             if validation.accepted {
                 let difficulty = validation.difficulty;
-                let is_block = validation.is_block;
                 let mut channels = self.channels.write().await;
                 if let Some(channel) = channels.get_mut(&channel_id) {
                     // Re-check job is still active after regaining the lock.
@@ -1023,7 +1032,8 @@ impl PoolServer {
                     // in the Quint spec.
                     if !channel.is_job_active(share.job_id) {
                         debug!("Job {} became stale during validation for channel {}", share.job_id, channel_id);
-                        (None, None)
+                        stale_after_validation = true;
+                        None
                     } else {
                         let new_target = if channel.record_share().is_some() {
                             Some(channel.current_target())
@@ -1041,22 +1051,34 @@ impl PoolServer {
                                 .unwrap_or_else(|| format!("channel_{}", channel_id));
                             self.payout_tracker.record_share(&miner_id, diff);
                         }
-                        (new_target, Some((difficulty, is_block)))
+                        new_target
                     }
                 } else {
                     warn!("Channel {} removed during share validation", channel_id);
-                    (None, None)
+                    stale_after_validation = true;
+                    None
                 }
             } else {
-                (None, Some((None, false)))
+                None
             }
         } else {
-            (None, None)
+            None
         };
 
         let share_result = match result {
             Ok(validation) => {
-                if validation.accepted {
+                if validation.accepted && stale_after_validation {
+                    let worker_label = format!("channel_{}", channel_id);
+                    self.metrics.record_share_rejected("StaleJob");
+                    self.metrics.record_worker_share_rejected(&worker_label);
+                    debug!(
+                        "Rejecting share from channel {} because job {} became stale during validation",
+                        channel_id, share.job_id
+                    );
+                    zcash_mining_protocol::messages::ShareResult::Rejected(
+                        zcash_mining_protocol::messages::RejectReason::StaleJob,
+                    )
+                } else if validation.accepted {
                     // Check for block find
                     if validation.is_block {
                         info!(
@@ -1119,6 +1141,7 @@ impl PoolServer {
                         "Share accepted from channel {} (diff: {:?})",
                         channel_id, validation.difficulty
                     );
+                    validation.result
                 } else {
                     let worker_label = format!("channel_{}", channel_id);
                     let reason = match &validation.result {
@@ -1127,9 +1150,8 @@ impl PoolServer {
                     };
                     self.metrics.record_share_rejected(&reason);
                     self.metrics.record_worker_share_rejected(&worker_label);
+                    validation.result
                 }
-
-                validation.result
             }
             Err(e) => {
                 self.metrics.record_share_rejected("validation_error");

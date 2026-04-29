@@ -157,12 +157,8 @@ impl SequenceValidator {
                 state.anomaly_count += 1;
                 return SequenceCheckResult::ValidOutOfOrder;
             } else {
-                // Update highest_seen even on large gap to prevent permanently
-                // breaking the validator. Without this, all future sequences
-                // would also be seen as GapTooLarge since they'd be compared
-                // against the old, stale highest_seen value.
-                state.highest_seen = sequence;
-                Self::add_to_window(&mut state.seen_window, sequence, self.window_size);
+                // Do not advance state for a rejected sequence. A malicious
+                // large jump must not poison later legitimate messages.
                 state.anomaly_count += 1;
                 warn!(
                     "Large gap detected: channel {} seq {} (expected ~{}), gap={}",
@@ -700,11 +696,26 @@ mod tests {
     }
 
     #[test]
+    fn test_sequence_large_gap_does_not_advance_state() {
+        let validator = SequenceValidator::new(10, 64);
+        validator.validate(1, 1);
+
+        assert_eq!(
+            validator.validate(1, 100),
+            SequenceCheckResult::GapTooLarge
+        );
+
+        assert_eq!(validator.validate(1, 2), SequenceCheckResult::Valid);
+        assert_eq!(
+            validator.validate(1, 100),
+            SequenceCheckResult::GapTooLarge
+        );
+    }
+
+    #[test]
     fn test_sequence_large_gap_recovers() {
-        // After a GapTooLarge, the validator must recover: subsequent
-        // in-order sequences from the new position should be Valid.
-        // Previously, highest_seen was not updated on GapTooLarge,
-        // permanently breaking the validator for that channel.
+        // After a GapTooLarge, the validator must recover by continuing from
+        // the last accepted high-water mark, not the rejected jump.
         let validator = SequenceValidator::new(10, 64);
         validator.validate(1, 1);
 
@@ -714,29 +725,22 @@ mod tests {
             SequenceCheckResult::GapTooLarge
         );
 
-        // Next in-order sequence after the gap should be Valid
-        assert_eq!(
-            validator.validate(1, 101),
-            SequenceCheckResult::Valid
-        );
-        assert_eq!(
-            validator.validate(1, 102),
-            SequenceCheckResult::Valid
-        );
+        assert_eq!(validator.validate(1, 2), SequenceCheckResult::Valid);
+        assert_eq!(validator.validate(1, 3), SequenceCheckResult::Valid);
     }
 
     #[test]
-    fn test_sequence_large_gap_prevents_replay_after_recovery() {
-        // After recovering from GapTooLarge, the jumped-to sequence
-        // should be in the window and rejected as Replay
+    fn test_sequence_large_gap_is_not_recorded_as_replay() {
         let validator = SequenceValidator::new(10, 64);
         validator.validate(1, 1);
-        validator.validate(1, 100); // GapTooLarge but updates state
-
-        // Replaying 100 should be caught
         assert_eq!(
             validator.validate(1, 100),
-            SequenceCheckResult::Replay
+            SequenceCheckResult::GapTooLarge
+        );
+
+        assert_eq!(
+            validator.validate(1, 100),
+            SequenceCheckResult::GapTooLarge
         );
     }
 
