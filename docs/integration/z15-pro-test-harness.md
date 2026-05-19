@@ -24,7 +24,11 @@ parity against a native V2 test miner.
 | Stratum protocol | V1 / JSON-RPC over TCP (ZIP 301 dialect) |
 | Firmware | Stock Bitmain. No V2 firmware exists. Record exact firmware date from *System → Overview*. |
 
-### Site requirements
+### Site requirements (full harness)
+
+These apply to the full §6 test pass — especially the 24 h soak (T13). For a
+short integration smoke test see [§1.1 Bench smoke profile](#11-bench-smoke-profile-relaxed-requirements)
+below; most of these can be relaxed.
 
 - **Circuit**: dedicated 230 V / 30 A (NEMA L6-30 or IEC equivalent) with at
   least 3.5 kW headroom on the breaker. Don't share the circuit with other
@@ -38,6 +42,86 @@ parity against a native V2 test miner.
 - **Acoustic isolation**: 75 dB sustained — do not co-locate with humans.
 - **Network**: dedicated VLAN/subnet for the test harness. We want to mirror
   traffic without polluting prod and we want a clean firewall boundary.
+
+---
+
+## 1.1 Bench smoke profile (relaxed requirements)
+
+For a **short integration check** (≤30 min powered, just enough to prove the
+software stack talks to a real ASIC), you do **not** need the full site setup.
+Use this profile to get a yes/no answer on integration before committing to
+rack space and a dedicated circuit.
+
+### What the smoke test is for
+
+- Confirm `bedrock-v1-proxy` correctly handshakes with a real Z15 Pro, not
+  just `zcash-test-miner --v1`.
+- Confirm field encoding (ZIP 301) survives real firmware (Bitmain's JSON
+  parser is fussier than ours).
+- Confirm at least one real share round-trips: ASIC → proxy → pool → accept.
+
+### What the smoke test is **not** for
+
+- 24 h stability (T13) — needs the full thermal/electrical setup.
+- Vardiff convergence at steady state (T6) — needs the unit at full hashrate
+  long enough to settle; partial OK in 30 min but don't draw conclusions.
+- Block-found path (§5.6, §8) — use regtest instead, not bench hardware.
+- Anything you'd cite as "the proxy is production-ready."
+
+### Relaxed requirements
+
+| Full harness | Smoke profile | Notes |
+|---|---|---|
+| Dedicated 230 V / 30 A circuit with 3.5 kW headroom | Any 230 V outlet on a 15 A+ circuit (~12 A draw) | Don't share with other heavy loads. |
+| 110 V SKU unsupported | Still unsupported | If your lab is 110 V only, **skip the ASIC** and run §1.2 software-only profile. |
+| Two C13 outlets on a metered/switched PDU | One 230 V outlet + a passive C13 splitter is acceptable | The dual inlets are for current sharing, not redundancy — a splitter on one circuit is electrically fine. **Both inlets must still be energised.** |
+| Remote-switchable PDU (kill switch) | A reachable power strip with a physical switch | Someone must be present for the entire smoke run. |
+| Front-to-back airflow, ≤30 °C intake, 1 m exhaust clearance | Open room, table-top, exhaust pointed at an open window or doorway | The chassis thermal protection will throttle before damage on a 30 min run. |
+| 9000 BTU/h cooling budget | None — let the room absorb it | Don't smoke-test in a closed closet. |
+| 75 dB acoustic isolation | Foam earplugs for anyone in the room | Don't stand next to it for >10 min unprotected. |
+| Dedicated VLAN with traffic mirroring | Any switch on the same subnet as your dev box | Skip the span port; rely on proxy/pool logs + a single-side `tcpdump` if needed. |
+| DHCP reservation | Note the IP it grabs, hard-code it for the run | No need to touch the router config. |
+
+### Smoke profile test selection
+
+Run only these from §6:
+
+| # | Why |
+|---|---|
+| T1 | Cold start handshake — does the ASIC reach the proxy at all. |
+| T2 | First share accepted — proves end-to-end happy path on real hardware. |
+| T4 | Field encoding (one captured `mining.notify` decoded by hand) — catches ZIP 301 regressions cheaply. |
+| T5 | Solution prefix tolerance — the Z15 Pro's actual byte layout. |
+| T10 | ASIC link flap — fast, doesn't need the full thermal envelope. |
+
+Skip T3, T6, T7, T8, T9, T11, T12, T13, T14 in smoke mode; defer to the full
+harness.
+
+### Smoke profile exit criteria
+
+- T1, T2, T4, T5, T10 all PASS.
+- Proxy did not panic.
+- ASIC dashboard shows at least one accepted share (§4.11).
+- Save the proxy log and one `mining.notify` hex dump in
+  `runs/<date>-z15pro-smoke/` — that's it, no formal artifact bundle required.
+
+A green smoke result authorizes scheduling the full harness. It does **not**
+authorize shipping anything.
+
+---
+
+## 1.2 Software-only profile (no ASIC at all)
+
+If you don't have hardware available, want to iterate quickly on the proxy,
+or your lab is 110 V only:
+
+- Run §4.1–§4.5 (build + Zebra + pool + proxy + `zcash-test-miner --v1`).
+- That single command exercises the full V1↔V2 translation path with
+  CPU-generated Equihash solutions.
+- Covers T1, T3, T4, T7, T8, T9, T11, T12 end-to-end. It does **not** cover
+  T2/T5/T6/T10 (those need real ASIC firmware behaviour) or T13/T14.
+- Useful as the inner-loop CI check; not a substitute for the bench smoke
+  before any hardware-dependent claim.
 
 ---
 
