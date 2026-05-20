@@ -175,6 +175,25 @@ Record all SHAs in `runs/<date>-z15pro/manifest.txt` at the start of every run.
 
 ## 4. Bring-up Sequence
 
+> **Role split (May 2026).** Bring-up is now divided across two role-specific
+> runbooks; this section is kept as the technical reference behind them.
+>
+> - **Site operator** (Singapore on-site): follow
+>   [`bedrock-z15-bench/docs/site-operator-runbook.md`](https://github.com/sovright/bedrock-z15-bench/blob/main/docs/site-operator-runbook.md).
+>   That doc supersedes §4.6 (physical bring-up), §4.7 (find IP), §4.8 (first
+>   login), and §4.9 (network hardening) below. It hands off when the jump
+>   host is reachable on Tailscale and the ASIC sits on an isolated subnet
+>   with stock firmware and a hardened web UI.
+> - **Harness engineer** (remote, post-handoff): follow
+>   [`z15-pro-harness-engineer-runbook.md`](z15-pro-harness-engineer-runbook.md).
+>   That doc supersedes §4.10 (configure pools) and §4.11 (verify on
+>   dashboard) below, and incorporates §4.1–§4.5 via the
+>   `sovright/bedrock-z15-bench` provision script.
+>
+> Read on if you want the underlying detail (manual build commands, exact
+> JSON for the proxy/pool configs, fallback procedures). For day-to-day
+> operation use the two role runbooks.
+
 ### 4.1 Build
 
 ```bash
