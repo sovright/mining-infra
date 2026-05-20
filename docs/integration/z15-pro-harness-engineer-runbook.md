@@ -20,9 +20,14 @@ The site operator does **not** do anything in this runbook — it's all you.
 
 ## 1. Reach the jump host
 
+The bench tailnet is `tail7e789b.ts.net` under the "bootstrap" Tailscale
+account. You should be tagged `tag:bench-engineer` or `tag:bench-admin`.
+
 ```bash
 tailscale status                                # confirm you see bedrock-bench-01
-ssh zaki@bedrock-bench-01                       # uses Tailscale SSH
+ssh zaki@bedrock-bench-01                       # MagicDNS short name
+# or, fully qualified:
+ssh zaki@bedrock-bench-01.tail7e789b.ts.net
 ```
 
 If `ssh` fails:
