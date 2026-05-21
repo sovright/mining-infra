@@ -259,6 +259,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bedrock-p2p-ingress"
+version = "0.1.0"
+dependencies = [
+ "bedrock-forge",
+ "blake2b_simd",
+ "hex",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "bedrock-strata"
 version = "0.1.0"
 dependencies = [

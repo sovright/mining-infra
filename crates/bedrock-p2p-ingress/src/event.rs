@@ -1,0 +1,130 @@
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde_json::json;
+
+use crate::error::{IngressError, Result};
+
+#[derive(Clone)]
+pub struct EventSink {
+    target: EventTarget,
+}
+
+#[derive(Clone)]
+enum EventTarget {
+    Stdout,
+    File(Arc<Mutex<File>>),
+}
+
+impl EventSink {
+    pub fn new(path: Option<PathBuf>) -> Result<Self> {
+        match path {
+            Some(path) => {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let file = OpenOptions::new().create(true).append(true).open(path)?;
+                Ok(Self {
+                    target: EventTarget::File(Arc::new(Mutex::new(file))),
+                })
+            }
+            None => Ok(Self {
+                target: EventTarget::Stdout,
+            }),
+        }
+    }
+
+    pub fn p2p_peer_connected(&self, peer: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_peer_connected",
+            "peer": peer,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_peer_version(&self, peer: &str, remote_version: i32) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_peer_version",
+            "peer": peer,
+            "remote_version": remote_version,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_handshake_complete(&self, peer: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_handshake_complete",
+            "peer": peer,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_reject(&self, peer: &str, bytes: usize) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_reject",
+            "peer": peer,
+            "bytes": bytes,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_block_inv(&self, peer: &str, hash: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_block_inv",
+            "peer": peer,
+            "hash": hash,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_block_received(&self, peer: &str, hash: &str, bytes: usize) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_block_received",
+            "peer": peer,
+            "hash": hash,
+            "bytes": bytes,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_peer_error(&self, peer: &str, error: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_peer_error",
+            "peer": peer,
+            "error": error,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    fn write(&self, value: serde_json::Value) -> Result<()> {
+        let line = serde_json::to_string(&value)
+            .map_err(|e| IngressError::Wire(format!("event serialization failed: {e}")))?;
+        match &self.target {
+            EventTarget::Stdout => {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(line.as_bytes())?;
+                stdout.write_all(b"\n")?;
+                stdout.flush()?;
+            }
+            EventTarget::File(file) => {
+                let mut file = file
+                    .lock()
+                    .map_err(|_| IngressError::Wire("event log mutex poisoned".to_string()))?;
+                file.write_all(line.as_bytes())?;
+                file.write_all(b"\n")?;
+                file.flush()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn now_unix_ms() -> u128 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis()
+}
