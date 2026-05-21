@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -41,6 +41,7 @@ pub async fn run_peer(
     let mut sent_verack = false;
     let mut seen_inv = HashSet::new();
     let mut requested = HashSet::new();
+    let mut pending_block_responses = VecDeque::new();
 
     loop {
         let msg = timeout(Duration::from_secs(90), read_message(&mut reader))
@@ -82,6 +83,7 @@ pub async fn run_peer(
                     let display = inventory_hash_to_display(&inv.hash);
                     events.p2p_block_inv(&peer, &display)?;
                     if requested.insert(inv.hash) {
+                        pending_block_responses.push_back(inv.hash);
                         block_requests.push(inv);
                     }
                 }
@@ -94,7 +96,8 @@ pub async fn run_peer(
                 if !saw_verack {
                     continue;
                 }
-                let display = display_hash_from_header(&msg.payload)?;
+                let display =
+                    received_block_display_hash(&mut pending_block_responses, &msg.payload)?;
                 events.p2p_block_received(&peer, &display, msg.payload.len())?;
                 if let Some(forge) = &forge {
                     if let Err(error) = forge.forward_header_only(&msg.payload).await {
@@ -110,6 +113,17 @@ pub async fn run_peer(
 fn remote_version(payload: &[u8]) -> Result<i32> {
     let mut cursor = 0;
     read_i32_le(payload, &mut cursor)
+}
+
+fn received_block_display_hash(
+    pending_block_responses: &mut VecDeque<[u8; 32]>,
+    block_payload: &[u8],
+) -> Result<String> {
+    if let Some(hash) = pending_block_responses.pop_front() {
+        return Ok(inventory_hash_to_display(&hash));
+    }
+
+    display_hash_from_header(block_payload)
 }
 
 fn version_payload(peer_addr: SocketAddr) -> Vec<u8> {
@@ -180,5 +194,20 @@ mod tests {
         assert_eq!(&out[8..20], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff]);
         assert_eq!(&out[20..24], &[1, 2, 3, 4]);
         assert_eq!(&out[24..26], &8233u16.to_be_bytes());
+    }
+
+    #[test]
+    fn received_block_display_uses_requested_inventory_hash() {
+        let mut pending = std::collections::VecDeque::new();
+        let mut hash = [0u8; 32];
+        hash[0] = 0x5c;
+        hash[31] = 0x01;
+        pending.push_back(hash);
+
+        let display = received_block_display_hash(&mut pending, &[0u8; 4]).unwrap();
+
+        assert!(display.starts_with("01"));
+        assert!(display.ends_with("5c"));
+        assert!(pending.is_empty());
     }
 }
