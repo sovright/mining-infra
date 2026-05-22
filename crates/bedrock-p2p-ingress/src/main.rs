@@ -1,3 +1,4 @@
+mod block;
 mod config;
 mod crawler;
 mod error;
@@ -58,10 +59,8 @@ async fn main() -> Result<()> {
             ));
         }
 
-        if handles.is_empty() {
-            if !config.crawler_enabled || crawler.queue_len() == 0 {
-                break;
-            }
+        if handles.is_empty() && (!config.crawler_enabled || crawler.queue_len() == 0) {
+            break;
         }
 
         if !config.crawler_enabled && crawler.queue_len() == 0 {

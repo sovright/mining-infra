@@ -174,6 +174,23 @@ impl EventSink {
         }))
     }
 
+    pub fn p2p_forge_block_forwarded(
+        &self,
+        peer: &str,
+        hash: &str,
+        bytes: usize,
+        tx_count: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_forge_block_forwarded",
+            "peer": peer,
+            "hash": hash,
+            "bytes": bytes,
+            "tx_count": tx_count,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     pub fn p2p_peer_error(&self, peer: &str, error: &str) -> Result<()> {
         self.write(json!({
             "event": "p2p_peer_error",
@@ -241,6 +258,9 @@ mod tests {
         events
             .p2p_peer_rotation("127.0.0.1:8233", "rotated", 78, 9)
             .unwrap();
+        events
+            .p2p_forge_block_forwarded("127.0.0.1:8233", "abcd", 1234, 2)
+            .unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         let rows: Vec<serde_json::Value> = contents
@@ -262,6 +282,10 @@ mod tests {
         assert_eq!(rows[4]["outcome"], "rotated");
         assert_eq!(rows[4]["cooldown_ms"], 78);
         assert_eq!(rows[4]["queue_len"], 9);
+        assert_eq!(rows[5]["event"], "p2p_forge_block_forwarded");
+        assert_eq!(rows[5]["hash"], "abcd");
+        assert_eq!(rows[5]["bytes"], 1234);
+        assert_eq!(rows[5]["tx_count"], 2);
 
         let _ = fs::remove_file(path);
     }

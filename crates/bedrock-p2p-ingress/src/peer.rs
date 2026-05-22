@@ -89,13 +89,13 @@ pub async fn run_peer(
                 events.p2p_addr_received(&peer, count, accepted)?;
             }
             "pong" => {
-                if let Some(nonce) = pong_nonce(&msg.payload) {
-                    if Some(nonce) == ping_nonce {
-                        if let Some(started) = ping_started.take() {
-                            events.p2p_ping_rtt(&peer, nonce, started.elapsed().as_millis())?;
-                        }
-                        ping_nonce = None;
+                if let Some(nonce) = pong_nonce(&msg.payload)
+                    && Some(nonce) == ping_nonce
+                {
+                    if let Some(started) = ping_started.take() {
+                        events.p2p_ping_rtt(&peer, nonce, started.elapsed().as_millis())?;
                     }
+                    ping_nonce = None;
                 }
             }
             "ping" => {
@@ -138,8 +138,19 @@ pub async fn run_peer(
                     received_block_display_hash(&mut pending_block_responses, &msg.payload)?;
                 events.p2p_block_received(&peer, &display, msg.payload.len())?;
                 if let Some(forge) = &forge {
-                    if let Err(error) = forge.forward_header_only(&msg.payload).await {
-                        events.p2p_peer_error(&peer, &format!("forge forward failed: {error}"))?;
+                    match forge.forward_block(&msg.payload).await {
+                        Ok(forwarded) => {
+                            events.p2p_forge_block_forwarded(
+                                &peer,
+                                &display,
+                                forwarded.bytes,
+                                forwarded.tx_count,
+                            )?;
+                        }
+                        Err(error) => {
+                            events
+                                .p2p_peer_error(&peer, &format!("forge forward failed: {error}"))?;
+                        }
                     }
                 }
             }
