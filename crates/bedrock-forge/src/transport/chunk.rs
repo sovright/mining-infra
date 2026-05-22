@@ -115,6 +115,20 @@ impl ChunkHeader {
         }
     }
 
+    /// Create a new authenticated keepalive header.
+    pub fn new_keepalive_authenticated(hmac: [u8; 32]) -> Self {
+        Self {
+            magic: CHUNK_MAGIC,
+            version: 2,
+            msg_type: MessageType::Keepalive,
+            block_hash: [0u8; 32],
+            chunk_id: 0,
+            total_chunks: 0,
+            payload_len: 0,
+            hmac,
+        }
+    }
+
     /// Serialize header to bytes
     pub fn to_bytes(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
@@ -142,7 +156,10 @@ impl ChunkHeader {
         if magic != CHUNK_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid magic: expected {:08x}, got {:08x}", CHUNK_MAGIC, magic),
+                format!(
+                    "invalid magic: expected {:08x}, got {:08x}",
+                    CHUNK_MAGIC, magic
+                ),
             ));
         }
 
@@ -164,7 +181,10 @@ impl ChunkHeader {
         if total_chunks > MAX_TOTAL_CHUNKS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("total_chunks {} exceeds max {}", total_chunks, MAX_TOTAL_CHUNKS),
+                format!(
+                    "total_chunks {} exceeds max {}",
+                    total_chunks, MAX_TOTAL_CHUNKS
+                ),
             ));
         }
         let payload_len = u16::from_be_bytes([buf[42], buf[43]]);
@@ -352,12 +372,7 @@ mod tests {
     #[test]
     fn rejects_total_chunks_over_max() {
         let block_hash = [0xab; 32];
-        let header = ChunkHeader::new_block(
-            &block_hash,
-            0,
-            MAX_TOTAL_CHUNKS.saturating_add(1),
-            10,
-        );
+        let header = ChunkHeader::new_block(&block_hash, 0, MAX_TOTAL_CHUNKS.saturating_add(1), 10);
         let bytes = header.to_bytes();
 
         let result = ChunkHeader::from_bytes(&bytes);

@@ -2,8 +2,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use socket2::{Domain, Protocol, Socket, Type};
@@ -13,8 +13,8 @@ use tracing::{debug, info, warn};
 
 use crate::fec::FecError;
 use crate::transport::{
-    BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, MessageType,
-    PowResult, PowValidator, RelayConfig, RelaySession, TransportError, MAX_TOTAL_CHUNKS,
+    BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, MAX_TOTAL_CHUNKS,
+    MessageType, PowResult, PowValidator, RelayConfig, RelaySession, TransportError,
 };
 
 use super::metrics::RelayMetrics;
@@ -52,7 +52,10 @@ impl<V: PowValidator> RelayNode<V> {
     pub fn with_validator(config: RelayConfig, validator: V) -> Result<Self, FecError> {
         // Validate config first
         if let Err(e) = config.validate() {
-            return Err(FecError::InvalidConfiguration(format!("config error: {}", e)));
+            return Err(FecError::InvalidConfiguration(format!(
+                "config error: {}",
+                e
+            )));
         }
 
         let chunker = BlockChunker::new_with_max_payload(
@@ -123,10 +126,12 @@ impl<V: PowValidator> RelayNode<V> {
     ///
     /// This method runs until `stop()` is called or an error occurs.
     pub async fn run(&self) -> Result<(), TransportError> {
-        let socket = self.socket.as_ref()
-            .ok_or_else(|| TransportError::Io(
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "socket not bound")
-            ))?;
+        let socket = self.socket.as_ref().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "socket not bound",
+            ))
+        })?;
 
         self.running.store(true, Ordering::SeqCst);
 
@@ -138,10 +143,8 @@ impl<V: PowValidator> RelayNode<V> {
                 break;
             }
 
-            let recv_result = tokio::time::timeout(
-                Duration::from_millis(100),
-                socket.recv_from(&mut buf)
-            ).await;
+            let recv_result =
+                tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await;
 
             match recv_result {
                 Ok(Ok((len, src_addr))) => {
@@ -229,10 +232,12 @@ impl<V: PowValidator> RelayNode<V> {
         total_chunks: u16,
         chunks: &[(u16, Vec<u8>)],
     ) -> Result<(), TransportError> {
-        let socket = self.socket.as_ref()
-            .ok_or_else(|| TransportError::Io(
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "socket not bound")
-            ))?;
+        let socket = self.socket.as_ref().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "socket not bound",
+            ))
+        })?;
 
         let sessions = self.sessions.read().await;
         let mut outbound: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
@@ -262,12 +267,7 @@ impl<V: PowValidator> RelayNode<V> {
                         hmac,
                     )
                 } else {
-                    ChunkHeader::new_block(
-                        block_hash,
-                        *chunk_id,
-                        total_chunks,
-                        data.len() as u16,
-                    )
+                    ChunkHeader::new_block(block_hash, *chunk_id, total_chunks, data.len() as u16)
                 };
                 let chunk = Chunk::new(header, data.clone());
                 payloads.push(chunk.to_bytes());
@@ -344,11 +344,7 @@ impl<V: PowValidator> RelayNode<V> {
             }
         }
 
-        if ready.is_empty() {
-            None
-        } else {
-            Some(ready)
-        }
+        if ready.is_empty() { None } else { Some(ready) }
     }
 
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
@@ -356,18 +352,24 @@ impl<V: PowValidator> RelayNode<V> {
 
         let chunk = Chunk::from_bytes(data)?;
 
+        if chunk.header.msg_type == MessageType::Keepalive {
+            return self.handle_keepalive(src_addr, &chunk).await;
+        }
+
         // Validate chunk type and counts
         if chunk.header.msg_type != MessageType::Block {
             self.metrics.inc_invalid_chunks();
-            return Err(TransportError::InvalidChunk(
-                format!("unsupported message type: {:?}", chunk.header.msg_type),
-            ));
+            return Err(TransportError::InvalidChunk(format!(
+                "unsupported message type: {:?}",
+                chunk.header.msg_type
+            )));
         }
         if chunk.header.total_chunks == 0 || chunk.header.total_chunks > MAX_TOTAL_CHUNKS {
             self.metrics.inc_invalid_chunks();
-            return Err(TransportError::InvalidChunk(
-                format!("invalid total_chunks: {}", chunk.header.total_chunks),
-            ));
+            return Err(TransportError::InvalidChunk(format!(
+                "invalid total_chunks: {}",
+                chunk.header.total_chunks
+            )));
         }
 
         let expected_total = (self.config.data_shards + self.config.parity_shards) as u16;
@@ -385,9 +387,10 @@ impl<V: PowValidator> RelayNode<V> {
 
         if chunk_id >= total_chunks {
             self.metrics.inc_invalid_chunks();
-            return Err(TransportError::InvalidChunk(
-                format!("chunk_id {} >= total_chunks {}", chunk_id, total_chunks),
-            ));
+            return Err(TransportError::InvalidChunk(format!(
+                "chunk_id {} >= total_chunks {}",
+                chunk_id, total_chunks
+            )));
         }
 
         let chunks_to_forward = {
@@ -401,27 +404,29 @@ impl<V: PowValidator> RelayNode<V> {
                     self.metrics.inc_auth_failures();
                     return Err(TransportError::AuthenticationFailed);
                 }
-        if auth_required
-            && chunk.header.version == 2
-            && !session.verify_hmac(
-                &block_hash,
-                chunk.header.chunk_id,
-                chunk.header.total_chunks,
-                chunk.header.payload_len,
-                &chunk.payload,
-                &chunk.header.hmac,
-            )
-        {
-            warn!(peer = %src_addr, "HMAC verification failed for existing session");
-            self.metrics.inc_auth_failures();
-            return Err(TransportError::AuthenticationFailed);
-        }
+                if auth_required
+                    && chunk.header.version == 2
+                    && !session.verify_hmac(
+                        &block_hash,
+                        chunk.header.chunk_id,
+                        chunk.header.total_chunks,
+                        chunk.header.payload_len,
+                        &chunk.payload,
+                        &chunk.header.hmac,
+                    )
+                {
+                    warn!(peer = %src_addr, "HMAC verification failed for existing session");
+                    self.metrics.inc_auth_failures();
+                    return Err(TransportError::AuthenticationFailed);
+                }
                 session.touch();
                 self.process_chunk_for_session(session, &chunk, block_hash, chunk_id, total_chunks)
             } else {
                 if sessions.len() >= self.config.max_sessions {
                     warn!(peer = %src_addr, max_sessions = self.config.max_sessions, "Relay session limit reached");
-                    return Err(TransportError::ConnectionRefused("relay session limit reached".into()));
+                    return Err(TransportError::ConnectionRefused(
+                        "relay session limit reached".into(),
+                    ));
                 }
 
                 // New session - authenticate
@@ -431,7 +436,13 @@ impl<V: PowValidator> RelayNode<V> {
                     sessions.insert(src_addr, RelaySession::new(src_addr, [0u8; 32]));
                     self.metrics.inc_sessions_created();
                     let session = sessions.get_mut(&src_addr).unwrap();
-                    self.process_chunk_for_session(session, &chunk, block_hash, chunk_id, total_chunks)
+                    self.process_chunk_for_session(
+                        session,
+                        &chunk,
+                        block_hash,
+                        chunk_id,
+                        total_chunks,
+                    )
                 } else if chunk.header.version == 2 {
                     // Try each authorized key
                     let mut authenticated_key: Option<[u8; 32]> = None;
@@ -455,7 +466,13 @@ impl<V: PowValidator> RelayNode<V> {
                         sessions.insert(src_addr, RelaySession::new(src_addr, key));
                         self.metrics.inc_sessions_created();
                         let session = sessions.get_mut(&src_addr).unwrap();
-                        self.process_chunk_for_session(session, &chunk, block_hash, chunk_id, total_chunks)
+                        self.process_chunk_for_session(
+                            session,
+                            &chunk,
+                            block_hash,
+                            chunk_id,
+                            total_chunks,
+                        )
                     } else {
                         warn!(peer = %src_addr, "Authentication failed - no matching key");
                         self.metrics.inc_auth_failures();
@@ -480,6 +497,98 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         Ok(())
+    }
+
+    async fn handle_keepalive(
+        &self,
+        src_addr: SocketAddr,
+        chunk: &Chunk,
+    ) -> Result<(), TransportError> {
+        if chunk.header.block_hash != [0u8; 32]
+            || chunk.header.chunk_id != 0
+            || chunk.header.total_chunks != 0
+            || chunk.header.payload_len != 0
+            || !chunk.payload.is_empty()
+        {
+            self.metrics.inc_invalid_chunks();
+            return Err(TransportError::InvalidChunk(
+                "invalid keepalive framing".into(),
+            ));
+        }
+
+        let mut sessions = self.sessions.write().await;
+
+        if let Some(session) = sessions.get_mut(&src_addr) {
+            let auth_required = self.config.auth_required();
+            if auth_required && chunk.header.version != 2 {
+                warn!(peer = %src_addr, "Auth required but received version 1 keepalive");
+                self.metrics.inc_auth_failures();
+                return Err(TransportError::AuthenticationFailed);
+            }
+            if auth_required
+                && !session.verify_hmac(
+                    &chunk.header.block_hash,
+                    chunk.header.chunk_id,
+                    chunk.header.total_chunks,
+                    chunk.header.payload_len,
+                    &chunk.payload,
+                    &chunk.header.hmac,
+                )
+            {
+                warn!(peer = %src_addr, "HMAC verification failed for existing keepalive session");
+                self.metrics.inc_auth_failures();
+                return Err(TransportError::AuthenticationFailed);
+            }
+            session.touch();
+            return Ok(());
+        }
+
+        if sessions.len() >= self.config.max_sessions {
+            warn!(peer = %src_addr, max_sessions = self.config.max_sessions, "Relay session limit reached");
+            return Err(TransportError::ConnectionRefused(
+                "relay session limit reached".into(),
+            ));
+        }
+
+        if !self.config.auth_required() {
+            debug!(peer = %src_addr, "Creating unauthenticated keepalive session");
+            sessions.insert(src_addr, RelaySession::new(src_addr, [0u8; 32]));
+            self.metrics.inc_sessions_created();
+            return Ok(());
+        }
+
+        if chunk.header.version != 2 {
+            warn!(peer = %src_addr, "Auth required but received version 1 keepalive");
+            self.metrics.inc_auth_failures();
+            return Err(TransportError::AuthenticationFailed);
+        }
+
+        let mut authenticated_key: Option<[u8; 32]> = None;
+        for key in &self.config.authorized_keys {
+            let temp_session = RelaySession::new(src_addr, *key);
+            if temp_session.verify_hmac(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                &chunk.payload,
+                &chunk.header.hmac,
+            ) {
+                authenticated_key = Some(*key);
+                break;
+            }
+        }
+
+        if let Some(key) = authenticated_key {
+            info!(peer = %src_addr, "Authenticated new keepalive session");
+            sessions.insert(src_addr, RelaySession::new(src_addr, key));
+            self.metrics.inc_sessions_created();
+            Ok(())
+        } else {
+            warn!(peer = %src_addr, "Keepalive authentication failed - no matching key");
+            self.metrics.inc_auth_failures();
+            Err(TransportError::AuthenticationFailed)
+        }
     }
 }
 
@@ -542,9 +651,7 @@ mod tests {
         let node = Arc::new(node);
         let node_clone = Arc::clone(&node);
 
-        let handle = tokio::spawn(async move {
-            node_clone.run().await
-        });
+        let handle = tokio::spawn(async move { node_clone.run().await });
 
         // Give it time to start
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -562,8 +669,8 @@ mod tests {
     #[tokio::test]
     async fn forward_uses_authenticated_chunks_when_required() {
         let auth_key = [0x42; 32];
-        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-            .with_authorized_keys(vec![auth_key]);
+        let config =
+            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
         let mut node = RelayNode::new(config).unwrap();
         node.bind().await.unwrap();
 

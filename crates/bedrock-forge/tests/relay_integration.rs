@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bedrock_forge::{
-    AuthDigest, CompactBlockBuilder, ClientConfig, RelayClient, RelayConfig,
-    RelayNode, TestMempool, TxId, WtxId,
+    AuthDigest, ClientConfig, CompactBlockBuilder, RelayClient, RelayConfig, RelayNode,
+    TestMempool, TxId, WtxId,
 };
 
 fn make_test_block() -> bedrock_forge::CompactBlock {
@@ -33,8 +33,8 @@ fn make_test_block() -> bedrock_forge::CompactBlock {
 #[tokio::test]
 async fn relay_node_receives_chunks() {
     // Start relay node
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
     node.bind().await.unwrap();
 
@@ -70,7 +70,11 @@ async fn relay_node_receives_chunks() {
     // Verify node has received the session from the client
     let session_count = node.session_count().await;
     // Session should be created when packets are received
-    assert!(session_count > 0, "Expected at least 1 session, got {}", session_count);
+    assert!(
+        session_count > 0,
+        "Expected at least 1 session, got {}",
+        session_count
+    );
 
     // Cleanup - stop both node and client properly
     node.stop();
@@ -93,8 +97,8 @@ async fn relay_node_receives_chunks() {
 #[tokio::test]
 async fn client_to_client_via_relay() {
     // Start relay node (no auth required for testing)
-    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let node_config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 
@@ -158,8 +162,8 @@ async fn authenticated_relay() {
     let auth_key = [0x42; 32];
 
     // Start relay node with auth required
-    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_authorized_keys(vec![auth_key]);
+    let node_config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 
@@ -167,9 +171,7 @@ async fn authenticated_relay() {
     let node = Arc::new(node);
     let node_clone = Arc::clone(&node);
 
-    let node_handle = tokio::spawn(async move {
-        node_clone.run().await
-    });
+    let node_handle = tokio::spawn(async move { node_clone.run().await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -179,9 +181,7 @@ async fn authenticated_relay() {
     client.bind().await.unwrap();
     let sender = client.sender();
 
-    let _client_handle = tokio::spawn(async move {
-        client.run().await
-    });
+    let _client_handle = tokio::spawn(async move { client.run().await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -193,12 +193,63 @@ async fn authenticated_relay() {
 
     // Verify metrics
     let metrics = node.metrics().snapshot();
-    assert!(metrics.packets_received > 0, "Expected packets to be received");
+    assert!(
+        metrics.packets_received > 0,
+        "Expected packets to be received"
+    );
     assert_eq!(metrics.auth_failures, 0, "Expected no auth failures");
-    assert!(metrics.sessions_created > 0, "Expected session to be created");
+    assert!(
+        metrics.sessions_created > 0,
+        "Expected session to be created"
+    );
 
     // Cleanup
     node.stop();
+    let _ = node_handle.await;
+}
+
+/// Test that a receive-only client registers with the relay before sending
+/// block announcements, so relays can forward future blocks to it.
+#[tokio::test]
+async fn receive_only_client_registers_session_with_keepalive() {
+    let auth_key = [0x42; 32];
+
+    let node_config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+    let mut node = RelayNode::new(node_config).unwrap();
+    node.bind().await.unwrap();
+
+    let node_addr = node.local_addr().unwrap();
+    let node = Arc::new(node);
+    let node_clone = Arc::clone(&node);
+
+    let node_handle = tokio::spawn(async move { node_clone.run().await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client_config = ClientConfig::new(vec![node_addr], auth_key).with_auth_required(true);
+    let mut receiver_client = RelayClient::new(client_config).unwrap();
+    receiver_client.bind().await.unwrap();
+    let (_receiver, outgoing) = receiver_client.take_receiver().unwrap();
+
+    let client_handle =
+        tokio::spawn(async move { receiver_client.run_with_outgoing(outgoing).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let metrics = node.metrics().snapshot();
+    assert_eq!(metrics.auth_failures, 0, "Expected no auth failures");
+    assert!(
+        metrics.sessions_created > 0,
+        "Expected keepalive to create a relay session"
+    );
+    assert!(
+        node.session_count().await > 0,
+        "Expected receive-only client to be registered as a relay session"
+    );
+
+    node.stop();
+    client_handle.abort();
     let _ = node_handle.await;
 }
 
@@ -209,8 +260,8 @@ async fn unauthenticated_client_rejected() {
     let wrong_key = [0x00; 32]; // Different key
 
     // Start relay node with auth required
-    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_authorized_keys(vec![auth_key]);
+    let node_config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 
@@ -218,9 +269,7 @@ async fn unauthenticated_client_rejected() {
     let node = Arc::new(node);
     let node_clone = Arc::clone(&node);
 
-    let node_handle = tokio::spawn(async move {
-        node_clone.run().await
-    });
+    let node_handle = tokio::spawn(async move { node_clone.run().await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -230,9 +279,7 @@ async fn unauthenticated_client_rejected() {
     client.bind().await.unwrap();
     let sender = client.sender();
 
-    let _client_handle = tokio::spawn(async move {
-        client.run().await
-    });
+    let _client_handle = tokio::spawn(async move { client.run().await });
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -244,7 +291,10 @@ async fn unauthenticated_client_rejected() {
 
     // Verify auth failures were recorded
     let metrics = node.metrics().snapshot();
-    assert!(metrics.packets_received > 0, "Expected packets to be received");
+    assert!(
+        metrics.packets_received > 0,
+        "Expected packets to be received"
+    );
     assert!(metrics.auth_failures > 0, "Expected auth failures");
     assert_eq!(metrics.sessions_created, 0, "Expected no sessions created");
 

@@ -19,6 +19,8 @@ use crate::transport::{
 
 const MAX_PENDING_BLOCKS_CLIENT: usize = 64;
 const RECENT_DELIVERED_TTL: Duration = Duration::from_secs(120);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
+const KEEPALIVE_BLOCK_HASH: [u8; 32] = [0u8; 32];
 
 /// Handle for sending blocks through the relay client
 #[derive(Clone)]
@@ -172,6 +174,8 @@ impl RelayClient {
         let mut pending_blocks: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
         let mut recent_delivered: HashMap<[u8; 32], Instant> = HashMap::new();
         let mut cleanup_counter: u32 = 0;
+        let mut keepalive_interval = tokio::time::interval(KEEPALIVE_INTERVAL);
+        keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             if !self.running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -179,6 +183,14 @@ impl RelayClient {
             }
 
             tokio::select! {
+                // Register/refresh this client as a relay session, including
+                // receive-only clients that have no block announcements to send.
+                _ = keepalive_interval.tick() => {
+                    if let Err(e) = self.send_keepalive_internal(&socket).await {
+                        warn!(error = ?e, "Error sending relay keepalive");
+                    }
+                }
+
                 // Handle outgoing blocks
                 Some(block) = outgoing_rx.recv() => {
                     if let Err(e) = self.send_block_internal(&socket, &block).await {
@@ -216,6 +228,24 @@ impl RelayClient {
             }
         }
 
+        Ok(())
+    }
+
+    /// Send an authenticated keepalive to all relay nodes.
+    async fn send_keepalive_internal(&self, socket: &UdpSocket) -> Result<(), TransportError> {
+        use crate::transport::RelaySession;
+
+        let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
+        let payload: [u8; 0] = [];
+        let hmac = session.compute_hmac(&KEEPALIVE_BLOCK_HASH, 0, 0, 0, &payload);
+        let chunk = Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new());
+        let data = chunk.to_bytes();
+
+        for relay_addr in &self.config.relay_addrs {
+            socket.send_to(&data, relay_addr).await?;
+        }
+
+        debug!("Sent relay keepalive");
         Ok(())
     }
 
