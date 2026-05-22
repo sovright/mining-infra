@@ -1,4 +1,5 @@
 mod config;
+mod crawler;
 mod error;
 mod event;
 mod forge;
@@ -15,6 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use config::{Config, seed_socket};
+use crawler::Crawler;
 use error::Result;
 use event::EventSink;
 use forge::ForgeBridge;
@@ -29,44 +31,92 @@ async fn main() -> Result<()> {
     let events = EventSink::new(config.event_log.clone())?;
     let forge = ForgeBridge::from_config(&config).await?;
     let peers = discover_peers(&config).await;
+    let crawler = Crawler::new(&config, peers);
 
     info!(
-        peers = peers.len(),
+        peers = crawler.known_len(),
         max_peers = config.max_peers,
+        crawler_enabled = config.crawler_enabled,
         "starting P2P ingress"
     );
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
-    for peer in peers.into_iter().take(config.max_peers) {
-        let cfg = config.clone();
-        let sink = events.clone();
-        let bridge = forge.clone();
-        handles.push(tokio::spawn(async move {
-            let peer_text = peer.to_string();
-            let result = if cfg.peer_runtime.is_zero() {
-                peer::run_peer(peer, cfg, sink.clone(), bridge).await
-            } else {
-                match tokio::time::timeout(
-                    cfg.peer_runtime,
-                    peer::run_peer(peer, cfg, sink.clone(), bridge),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Ok(()),
-                }
+
+    loop {
+        reap_finished(&mut handles).await;
+
+        while handles.len() < config.max_peers {
+            let Some(peer) = crawler.next_peer() else {
+                break;
             };
-            if let Err(error) = result {
-                let _ = sink.p2p_peer_error(&peer_text, &error.to_string());
-                warn!(peer = %peer_text, %error, "peer task exited");
+            handles.push(spawn_peer(
+                peer,
+                config.clone(),
+                events.clone(),
+                forge.clone(),
+                crawler.clone(),
+            ));
+        }
+
+        if handles.is_empty() {
+            if !config.crawler_enabled || crawler.queue_len() == 0 {
+                break;
             }
-        }));
+        }
+
+        if !config.crawler_enabled && crawler.queue_len() == 0 {
+            for handle in handles {
+                let _ = handle.await;
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            return Ok(());
+        }
+
+        tokio::time::sleep(config.crawler_drain_interval).await;
     }
 
-    for handle in handles {
-        let _ = handle.await;
-    }
     tokio::time::sleep(Duration::from_secs(5)).await;
     Ok(())
+}
+
+fn spawn_peer(
+    peer: SocketAddr,
+    config: Config,
+    events: EventSink,
+    forge: Option<ForgeBridge>,
+    crawler: Crawler,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let peer_text = peer.to_string();
+        let result = if config.peer_runtime.is_zero() {
+            peer::run_peer(peer, config, events.clone(), forge, crawler).await
+        } else {
+            match tokio::time::timeout(
+                config.peer_runtime,
+                peer::run_peer(peer, config, events.clone(), forge, crawler),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Ok(()),
+            }
+        };
+        if let Err(error) = result {
+            let _ = events.p2p_peer_error(&peer_text, &error.to_string());
+            warn!(peer = %peer_text, %error, "peer task exited");
+        }
+    })
+}
+
+async fn reap_finished(handles: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < handles.len() {
+        if handles[index].is_finished() {
+            let handle = handles.swap_remove(index);
+            let _ = handle.await;
+        } else {
+            index += 1;
+        }
+    }
 }
 
 async fn discover_peers(config: &Config) -> Vec<SocketAddr> {

@@ -13,6 +13,10 @@ pub struct Config {
     pub max_peers: usize,
     pub connect_timeout: Duration,
     pub peer_runtime: Duration,
+    pub crawler_enabled: bool,
+    pub crawler_max_known_peers: usize,
+    pub crawler_max_addr_per_message: usize,
+    pub crawler_drain_interval: Duration,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
@@ -26,6 +30,12 @@ impl Config {
         let max_peers = env_usize("BEDROCK_P2P_MAX_PEERS", 8)?;
         let connect_timeout = Duration::from_secs(env_u64("BEDROCK_P2P_CONNECT_TIMEOUT_SECS", 5)?);
         let peer_runtime = Duration::from_secs(env_u64("BEDROCK_P2P_PEER_RUNTIME_SECS", 0)?);
+        let crawler_enabled = env_bool("BEDROCK_P2P_CRAWLER_ENABLED", false)?;
+        let crawler_max_known_peers = env_usize("BEDROCK_P2P_CRAWLER_MAX_KNOWN_PEERS", 5_000)?;
+        let crawler_max_addr_per_message =
+            env_usize("BEDROCK_P2P_CRAWLER_MAX_ADDR_PER_MESSAGE", 1_000)?;
+        let crawler_drain_interval =
+            Duration::from_secs(env_u64("BEDROCK_P2P_CRAWLER_DRAIN_INTERVAL_SECS", 5)?);
         let event_log = env::var("BEDROCK_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("BEDROCK_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("BEDROCK_P2P_RELAY_BIND_ADDR")
@@ -51,6 +61,10 @@ impl Config {
             max_peers,
             connect_timeout,
             peer_runtime,
+            crawler_enabled,
+            crawler_max_known_peers,
+            crawler_max_addr_per_message,
+            crawler_drain_interval,
             event_log,
             relay_peers,
             relay_bind_addr,
@@ -107,6 +121,17 @@ fn env_u64(name: &str, default: u64) -> Result<u64> {
         Ok(value) => value
             .parse()
             .map_err(|e| IngressError::Config(format!("invalid {name}: {e}"))),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_bool(name: &str, default: bool) -> Result<bool> {
+    match env::var(name) {
+        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            _ => Err(IngressError::Config(format!("invalid {name}: {value}"))),
+        },
         Err(_) => Ok(default),
     }
 }

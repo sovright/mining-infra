@@ -62,6 +62,25 @@ impl EventSink {
         }))
     }
 
+    pub fn p2p_addr_received(&self, peer: &str, count: usize, accepted: usize) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_addr_received",
+            "peer": peer,
+            "count": count,
+            "accepted": accepted,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_peer_discovered(&self, source_peer: &str, peer: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_peer_discovered",
+            "source_peer": source_peer,
+            "peer": peer,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     pub fn p2p_reject(&self, peer: &str, bytes: usize) -> Result<()> {
         self.write(json!({
             "event": "p2p_reject",
@@ -74,6 +93,15 @@ impl EventSink {
     pub fn p2p_block_inv(&self, peer: &str, hash: &str) -> Result<()> {
         self.write(json!({
             "event": "p2p_block_inv",
+            "peer": peer,
+            "hash": hash,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_getdata_sent(&self, peer: &str, hash: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_getdata_sent",
             "peer": peer,
             "hash": hash,
             "observed_at_unix_ms": now_unix_ms(),

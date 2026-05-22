@@ -1,4 +1,5 @@
 use sha2::{Digest, Sha256};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{IngressError, Result};
@@ -170,6 +171,61 @@ pub fn parse_inventory(payload: &[u8]) -> Result<Vec<Inventory>> {
     Ok(items)
 }
 
+pub fn parse_addr(payload: &[u8], max_count: usize) -> Result<Vec<SocketAddr>> {
+    let mut cursor = 0;
+    let count = decode_compact_size(payload, &mut cursor)?;
+    if count as usize > max_count {
+        return Err(IngressError::Wire(format!(
+            "too many addr entries: {count}"
+        )));
+    }
+
+    let mut peers = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let _timestamp = read_u32_le(payload, &mut cursor)?;
+        let _services = read_u64_le(payload, &mut cursor)?;
+        let mut ip_bytes = [0u8; 16];
+        read_exact(payload, &mut cursor, &mut ip_bytes)?;
+        let port = read_u16_be(payload, &mut cursor)?;
+        if port == 0 {
+            continue;
+        }
+        let ip = network_ip(ip_bytes);
+        if skip_ip(ip) {
+            continue;
+        }
+        peers.push(SocketAddr::new(ip, port));
+    }
+    Ok(peers)
+}
+
+fn network_ip(bytes: [u8; 16]) -> IpAddr {
+    if bytes[..10] == [0u8; 10] && bytes[10..12] == [0xff, 0xff] {
+        IpAddr::V4(Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]))
+    } else {
+        IpAddr::V6(Ipv6Addr::from(bytes))
+    }
+}
+
+fn skip_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_private()
+                || ip.is_link_local()
+        }
+        IpAddr::V6(ip) => {
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_multicast()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+        }
+    }
+}
+
 pub fn read_u8(payload: &[u8], cursor: &mut usize) -> Result<u8> {
     let value = *payload
         .get(*cursor)
@@ -181,6 +237,11 @@ pub fn read_u8(payload: &[u8], cursor: &mut usize) -> Result<u8> {
 pub fn read_u16_le(payload: &[u8], cursor: &mut usize) -> Result<u16> {
     let bytes = read_array::<2>(payload, cursor)?;
     Ok(u16::from_le_bytes(bytes))
+}
+
+pub fn read_u16_be(payload: &[u8], cursor: &mut usize) -> Result<u16> {
+    let bytes = read_array::<2>(payload, cursor)?;
+    Ok(u16::from_be_bytes(bytes))
 }
 
 pub fn read_u32_le(payload: &[u8], cursor: &mut usize) -> Result<u32> {
@@ -279,5 +340,28 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].inv_type, MSG_WTX);
         assert_eq!(parsed[1].inv_type, MSG_BLOCK);
+    }
+
+    #[test]
+    fn parses_addr_payload() {
+        let mut payload = Vec::new();
+        encode_compact_size(2, &mut payload);
+
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&[0; 10]);
+        payload.extend_from_slice(&[0xff, 0xff]);
+        payload.extend_from_slice(&[8, 8, 8, 8]);
+        payload.extend_from_slice(&8233u16.to_be_bytes());
+
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        payload.extend_from_slice(&[0; 10]);
+        payload.extend_from_slice(&[0xff, 0xff]);
+        payload.extend_from_slice(&[10, 0, 0, 1]);
+        payload.extend_from_slice(&8233u16.to_be_bytes());
+
+        let parsed = parse_addr(&payload, 10).unwrap();
+        assert_eq!(parsed, vec!["8.8.8.8:8233".parse().unwrap()]);
     }
 }

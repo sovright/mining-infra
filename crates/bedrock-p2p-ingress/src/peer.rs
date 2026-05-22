@@ -7,13 +7,14 @@ use tokio::time::timeout;
 use tracing::{debug, info};
 
 use crate::config::Config;
+use crate::crawler::Crawler;
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
 use crate::forge::ForgeBridge;
 use crate::hash::{display_hash_from_header, inventory_hash_to_display};
 use crate::wire::{
-    Inventory, encode_compact_size, encode_inventory, parse_inventory, read_i32_le, read_message,
-    write_message,
+    Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
+    read_message, write_message,
 };
 
 const PROTOCOL_VERSION: i32 = 170_140;
@@ -24,6 +25,7 @@ pub async fn run_peer(
     config: Config,
     events: EventSink,
     forge: Option<ForgeBridge>,
+    crawler: Crawler,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
     let stream = timeout(config.connect_timeout, TcpStream::connect(peer_addr))
@@ -67,6 +69,15 @@ pub async fn run_peer(
             "reject" => {
                 events.p2p_reject(&peer, msg.payload.len())?;
             }
+            "addr" => {
+                if !saw_verack {
+                    continue;
+                }
+                let addrs = parse_addr(&msg.payload, config.crawler_max_addr_per_message)?;
+                let count = addrs.len();
+                let accepted = crawler.add_discovered(&peer, addrs, &events)?;
+                events.p2p_addr_received(&peer, count, accepted)?;
+            }
             "ping" => {
                 write_message(&mut writer, "pong", &msg.payload).await?;
             }
@@ -88,8 +99,15 @@ pub async fn run_peer(
                     }
                 }
                 if !block_requests.is_empty() {
+                    let requested_hashes: Vec<String> = block_requests
+                        .iter()
+                        .map(|inv| inventory_hash_to_display(&inv.hash))
+                        .collect();
                     let request = encode_inventory(&block_requests);
                     write_message(&mut writer, "getdata", &request).await?;
+                    for hash in requested_hashes {
+                        events.p2p_getdata_sent(&peer, &hash)?;
+                    }
                 }
             }
             "block" => {
