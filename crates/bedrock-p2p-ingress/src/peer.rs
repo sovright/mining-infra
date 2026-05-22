@@ -1,6 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -28,9 +28,11 @@ pub async fn run_peer(
     crawler: Crawler,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
+    let connect_started = Instant::now();
     let stream = timeout(config.connect_timeout, TcpStream::connect(peer_addr))
         .await
         .map_err(|_| IngressError::Timeout(format!("connect to {peer}")))??;
+    events.p2p_connect_timing(&peer, connect_started.elapsed().as_millis())?;
     stream.set_nodelay(true)?;
     events.p2p_peer_connected(&peer)?;
     info!(%peer, "connected to Zcash P2P peer");
@@ -41,6 +43,9 @@ pub async fn run_peer(
 
     let mut saw_verack = false;
     let mut sent_verack = false;
+    let handshake_started = Instant::now();
+    let mut ping_nonce = None;
+    let mut ping_started = None;
     let mut seen_inv = HashSet::new();
     let mut requested = HashSet::new();
     let mut pending_block_responses = VecDeque::new();
@@ -64,6 +69,11 @@ pub async fn run_peer(
             "verack" => {
                 saw_verack = true;
                 events.p2p_handshake_complete(&peer)?;
+                events.p2p_handshake_timing(&peer, handshake_started.elapsed().as_millis())?;
+                let nonce = nonce();
+                write_message(&mut writer, "ping", &nonce.to_le_bytes()).await?;
+                ping_nonce = Some(nonce);
+                ping_started = Some(Instant::now());
                 write_message(&mut writer, "getaddr", &[]).await?;
             }
             "reject" => {
@@ -77,6 +87,16 @@ pub async fn run_peer(
                 let count = addrs.len();
                 let accepted = crawler.add_discovered(&peer, addrs, &events)?;
                 events.p2p_addr_received(&peer, count, accepted)?;
+            }
+            "pong" => {
+                if let Some(nonce) = pong_nonce(&msg.payload) {
+                    if Some(nonce) == ping_nonce {
+                        if let Some(started) = ping_started.take() {
+                            events.p2p_ping_rtt(&peer, nonce, started.elapsed().as_millis())?;
+                        }
+                        ping_nonce = None;
+                    }
+                }
             }
             "ping" => {
                 write_message(&mut writer, "pong", &msg.payload).await?;
@@ -131,6 +151,14 @@ pub async fn run_peer(
 fn remote_version(payload: &[u8]) -> Result<i32> {
     let mut cursor = 0;
     read_i32_le(payload, &mut cursor)
+}
+
+fn pong_nonce(payload: &[u8]) -> Option<u64> {
+    if payload.len() == 8 {
+        Some(u64::from_le_bytes(payload.try_into().ok()?))
+    } else {
+        None
+    }
 }
 
 fn received_block_display_hash(
@@ -227,5 +255,12 @@ mod tests {
         assert!(display.starts_with("01"));
         assert!(display.ends_with("5c"));
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn parses_pong_nonce() {
+        let nonce = 42u64;
+        assert_eq!(pong_nonce(&nonce.to_le_bytes()), Some(42));
+        assert_eq!(pong_nonce(&[1, 2, 3]), None);
     }
 }

@@ -35,5 +35,10 @@ When crawler mode is enabled, the daemon still only makes outbound Zcash P2P
 connections. It does not open an inbound listener, submit blocks, or forward to
 FORGE unless the separate FORGE bridge settings are configured.
 
+Measurement events include `p2p_connect_timing`, `p2p_handshake_timing`,
+`p2p_ping_rtt`, `p2p_block_inv`, `p2p_getdata_sent`, and
+`p2p_block_received`. These events are advisory telemetry only; crawler mode
+does not rotate connections by score yet.
+
 The FORGE bridge is disabled unless both `BEDROCK_P2P_RELAY_PEERS` and
 `BEDROCK_P2P_RELAY_AUTH_KEY_HEX` are configured.
