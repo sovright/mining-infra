@@ -17,6 +17,9 @@ pub struct Config {
     pub crawler_max_known_peers: usize,
     pub crawler_max_addr_per_message: usize,
     pub crawler_drain_interval: Duration,
+    pub rotation_enabled: bool,
+    pub rotation_cooldown: Duration,
+    pub rotation_failure_cooldown: Duration,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
@@ -36,6 +39,11 @@ impl Config {
             env_usize("BEDROCK_P2P_CRAWLER_MAX_ADDR_PER_MESSAGE", 1_000)?;
         let crawler_drain_interval =
             Duration::from_secs(env_u64("BEDROCK_P2P_CRAWLER_DRAIN_INTERVAL_SECS", 5)?);
+        let rotation_enabled = env_bool("BEDROCK_P2P_ROTATION_ENABLED", false)?;
+        let rotation_cooldown =
+            Duration::from_secs(env_u64("BEDROCK_P2P_ROTATION_COOLDOWN_SECS", 30)?);
+        let rotation_failure_cooldown =
+            Duration::from_secs(env_u64("BEDROCK_P2P_ROTATION_FAILURE_COOLDOWN_SECS", 120)?);
         let event_log = env::var("BEDROCK_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("BEDROCK_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("BEDROCK_P2P_RELAY_BIND_ADDR")
@@ -65,6 +73,9 @@ impl Config {
             crawler_max_known_peers,
             crawler_max_addr_per_message,
             crawler_drain_interval,
+            rotation_enabled,
+            rotation_cooldown,
+            rotation_failure_cooldown,
             event_log,
             relay_peers,
             relay_bind_addr,

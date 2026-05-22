@@ -120,6 +120,23 @@ impl EventSink {
         }))
     }
 
+    pub fn p2p_peer_rotation(
+        &self,
+        peer: &str,
+        outcome: &str,
+        cooldown_ms: u128,
+        queue_len: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_peer_rotation",
+            "peer": peer,
+            "outcome": outcome,
+            "cooldown_ms": cooldown_ms,
+            "queue_len": queue_len,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     pub fn p2p_reject(&self, peer: &str, bytes: usize) -> Result<()> {
         self.write(json!({
             "event": "p2p_reject",
@@ -221,6 +238,9 @@ mod tests {
         events
             .p2p_peer_score("127.0.0.1:8233", 100, "first_block")
             .unwrap();
+        events
+            .p2p_peer_rotation("127.0.0.1:8233", "rotated", 78, 9)
+            .unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         let rows: Vec<serde_json::Value> = contents
@@ -238,6 +258,10 @@ mod tests {
         assert_eq!(rows[3]["event"], "p2p_peer_score");
         assert_eq!(rows[3]["score"], 100);
         assert_eq!(rows[3]["reason"], "first_block");
+        assert_eq!(rows[4]["event"], "p2p_peer_rotation");
+        assert_eq!(rows[4]["outcome"], "rotated");
+        assert_eq!(rows[4]["cooldown_ms"], 78);
+        assert_eq!(rows[4]["queue_len"], 9);
 
         let _ = fs::remove_file(path);
     }

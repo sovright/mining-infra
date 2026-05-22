@@ -16,7 +16,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use config::{Config, seed_socket};
-use crawler::Crawler;
+use crawler::{Crawler, PeerOutcome};
 use error::Result;
 use event::EventSink;
 use forge::ForgeBridge;
@@ -37,6 +37,7 @@ async fn main() -> Result<()> {
         peers = crawler.known_len(),
         max_peers = config.max_peers,
         crawler_enabled = config.crawler_enabled,
+        rotation_enabled = config.rotation_enabled,
         "starting P2P ingress"
     );
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -88,21 +89,33 @@ fn spawn_peer(
     tokio::spawn(async move {
         let peer_text = peer.to_string();
         let result = if config.peer_runtime.is_zero() {
-            peer::run_peer(peer, config, events.clone(), forge, crawler).await
+            peer::run_peer(peer, config, events.clone(), forge, crawler.clone()).await
         } else {
             match tokio::time::timeout(
                 config.peer_runtime,
-                peer::run_peer(peer, config, events.clone(), forge, crawler),
+                peer::run_peer(peer, config, events.clone(), forge, crawler.clone()),
             )
             .await
             {
                 Ok(result) => result,
-                Err(_) => Ok(()),
+                Err(_) => {
+                    if let Err(error) = crawler.release_peer(peer, PeerOutcome::Rotated, &events) {
+                        warn!(peer = %peer_text, %error, "failed to requeue rotated peer");
+                    }
+                    return;
+                }
             }
         };
-        if let Err(error) = result {
-            let _ = events.p2p_peer_error(&peer_text, &error.to_string());
-            warn!(peer = %peer_text, %error, "peer task exited");
+        let outcome = match result {
+            Ok(()) => PeerOutcome::Rotated,
+            Err(error) => {
+                let _ = events.p2p_peer_error(&peer_text, &error.to_string());
+                warn!(peer = %peer_text, %error, "peer task exited");
+                PeerOutcome::Errored
+            }
+        };
+        if let Err(error) = crawler.release_peer(peer, outcome, &events) {
+            warn!(peer = %peer_text, %error, "failed to release peer");
         }
     })
 }
