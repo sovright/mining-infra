@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -13,8 +13,8 @@ use tracing::{debug, warn};
 use crate::compact_block::CompactBlock;
 use crate::fec::FecError;
 use crate::transport::{
-    BlockAssembly, BlockChunker, Chunk, ChunkHeader, ClientConfig, MessageType, TransportError,
-    MAX_TOTAL_CHUNKS,
+    BlockAssembly, BlockChunker, Chunk, ChunkHeader, ClientConfig, MAX_TOTAL_CHUNKS, MessageType,
+    TransportError,
 };
 
 const MAX_PENDING_BLOCKS_CLIENT: usize = 64;
@@ -72,7 +72,10 @@ impl RelayClient {
     pub fn new(config: ClientConfig) -> Result<Self, FecError> {
         // Validate config first
         if let Err(e) = config.validate() {
-            return Err(FecError::InvalidConfiguration(format!("config error: {}", e)));
+            return Err(FecError::InvalidConfiguration(format!(
+                "config error: {}",
+                e
+            )));
         }
 
         let chunker = BlockChunker::new(config.data_shards, config.parity_shards)?;
@@ -135,18 +138,35 @@ impl RelayClient {
     ///
     /// Handles both sending outgoing blocks and receiving incoming blocks.
     pub async fn run(&mut self) -> Result<(), TransportError> {
-        let socket = self.socket.as_ref()
-            .ok_or_else(|| TransportError::Io(
-                std::io::Error::new(std::io::ErrorKind::NotConnected, "socket not bound")
-            ))?
+        let outgoing_rx = self
+            .outgoing_rx
+            .take()
+            .ok_or_else(|| TransportError::Io(std::io::Error::other("receiver already taken")))?;
+
+        self.run_with_outgoing(outgoing_rx).await
+    }
+
+    /// Run the client using an outgoing queue returned by `take_receiver`.
+    ///
+    /// This lets callers receive relay-delivered blocks while the same client
+    /// continues to process outgoing announcements.
+    pub async fn run_with_outgoing(
+        &mut self,
+        mut outgoing_rx: mpsc::Receiver<CompactBlock>,
+    ) -> Result<(), TransportError> {
+        let socket = self
+            .socket
+            .as_ref()
+            .ok_or_else(|| {
+                TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "socket not bound",
+                ))
+            })?
             .clone();
 
-        let mut outgoing_rx = self.outgoing_rx.take()
-            .ok_or_else(|| TransportError::Io(
-                std::io::Error::other("receiver already taken")
-            ))?;
-
-        self.running.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.running
+            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let mut recv_buf = vec![0u8; 2048];
         let mut pending_blocks: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
@@ -212,10 +232,7 @@ impl RelayClient {
 
         // Create temporary session for HMAC computation
         use crate::transport::RelaySession;
-        let session = RelaySession::new(
-            "0.0.0.0:0".parse().unwrap(),
-            self.config.auth_key,
-        );
+        let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
 
         // Send to all relay nodes
         for relay_addr in &self.config.relay_addrs {
@@ -367,12 +384,12 @@ impl RelayClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::time::{timeout, Duration};
+    use tokio::time::{Duration, timeout};
 
     #[test]
     fn client_creation() {
-        let config = ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32])
-            .with_fec(2, 1);
+        let config =
+            ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32]).with_fec(2, 1);
 
         let client = RelayClient::new(config).unwrap();
         assert!(!client.is_running());
@@ -387,6 +404,27 @@ mod tests {
 
         let addr = client.local_addr().unwrap();
         assert!(addr.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn client_runs_with_taken_block_receiver() {
+        let config = ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32]);
+        let mut client = RelayClient::new(config).unwrap();
+        client.bind().await.unwrap();
+
+        let (_receiver, outgoing) = client
+            .take_receiver()
+            .expect("receiver should be available before run");
+
+        let result = timeout(
+            Duration::from_millis(50),
+            client.run_with_outgoing(outgoing),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "client.run_with_outgoing() returned after take_receiver(): {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -443,8 +481,8 @@ mod tests {
 
     #[tokio::test]
     async fn client_drops_duplicate_chunks() {
-        let config = ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32])
-            .with_fec(2, 1);
+        let config =
+            ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32]).with_fec(2, 1);
         let client = RelayClient::new(config).unwrap();
 
         let (tx, _rx) = mpsc::channel(1);

@@ -3,3 +3,4 @@
 pub mod compact;
 pub mod config;
 pub mod rpc;
+pub mod submit;

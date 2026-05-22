@@ -27,6 +27,18 @@ pub struct Config {
     /// Poll interval in milliseconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
+
+    /// Announce local Zebra templates into FORGE.
+    #[serde(default = "default_announce_templates")]
+    pub announce_templates: bool,
+
+    /// Receive relay-reconstructed compact blocks from FORGE.
+    #[serde(default)]
+    pub receive_relay_blocks: bool,
+
+    /// Submit eligible relay-received blocks to Zebra.
+    #[serde(default)]
+    pub enable_submitblock: bool,
 }
 
 fn default_zebra_url() -> String {
@@ -39,6 +51,10 @@ fn default_bind_addr() -> String {
 
 fn default_poll_interval() -> u64 {
     100
+}
+
+fn default_announce_templates() -> bool {
+    true
 }
 
 impl Config {
@@ -112,5 +128,24 @@ mod tests {
         assert_eq!(config.zebra_url, "http://127.0.0.1:8232");
         assert_eq!(config.bind_addr, "0.0.0.0:0");
         assert_eq!(config.poll_interval_ms, 100);
+        assert!(config.announce_templates);
+        assert!(!config.receive_relay_blocks);
+        assert!(!config.enable_submitblock);
+    }
+
+    #[test]
+    fn config_parses_submit_safety_flags() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            announce_templates = false
+            receive_relay_blocks = true
+            enable_submitblock = true
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(!config.announce_templates);
+        assert!(config.receive_relay_blocks);
+        assert!(config.enable_submitblock);
     }
 }

@@ -20,3 +20,15 @@ bind_addr = "0.0.0.0:0"
 # Template poll interval in milliseconds
 # Lower = faster detection, higher CPU usage
 poll_interval_ms = 100
+
+# Announce local Zebra templates into FORGE.
+# Keep true for a tip-synced pool sidecar; set false for receive-only dry runs.
+announce_templates = true
+
+# Receive reconstructed compact blocks from the FORGE relay client.
+# Dry-run receive is safe for observability; it does not call submitblock.
+receive_relay_blocks = false
+
+# Submit eligible relay-received blocks to Zebra.
+# Requires receive_relay_blocks = true. Keep false until mainnet cutover signoff.
+enable_submitblock = false

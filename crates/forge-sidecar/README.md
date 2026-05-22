@@ -14,6 +14,8 @@ The FORGE sidecar:
 - Polls Zebra for new block templates
 - Builds compact blocks when templates change
 - Announces compact blocks to the FORGE relay network
+- Optionally receives relay-reconstructed compact blocks in dry-run mode
+- Submits eligible relay-received blocks to Zebra only when explicitly enabled
 
 This allows any V1 pool (NOMP, etc.) to benefit from compact block relay without modification.
 
@@ -37,6 +39,28 @@ forge-sidecar --config config.toml
 
 See `config.example.toml` for all options.
 
+### Relay Receive Safety
+
+Relay receive is disabled by default. To observe relay-received blocks without
+submitting them, enable dry-run receive:
+
+```bash
+forge-sidecar \
+    --zebra-url http://127.0.0.1:8232 \
+    --relay-peer forge-relay.example.com:8333 \
+    --auth-key 0123456789abcdef... \
+    --receive-relay-blocks \
+    --disable-template-announcements
+```
+
+`--enable-submitblock` requires `--receive-relay-blocks` and should remain off
+until mainnet cutover signoff. The sidecar only submits compact blocks that
+contain all transactions as contiguous prefilled transactions; header-only or
+short-ID-only compact blocks are rejected as non-submit candidates.
+`--disable-template-announcements` is useful while the local Zebra node is not
+at tip because it prevents stale template broadcasts while keeping relay receive
+telemetry alive.
+
 ## Architecture
 
 ```
@@ -45,7 +69,7 @@ STRATUM V1 POOL (unmodified)
         ▼ getblocktemplate/submitblock
     ZEBRA NODE ◄──────────────────────┐
         │                             │
-        │ poll templates              │ (future: submitblock)
+        │ poll templates              │ guarded submitblock, disabled by default
         ▼                             │
    FORGE SIDECAR ─────────────────────┘
         │

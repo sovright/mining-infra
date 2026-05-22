@@ -1,11 +1,12 @@
 //! Forge sidecar for Stratum V1 mining pools
 
+use bedrock_forge::BlockReceiver;
 use clap::Parser;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod poller;
 mod relay;
@@ -13,6 +14,7 @@ mod relay;
 use forge_sidecar::compact::build_compact_block;
 use forge_sidecar::config;
 use forge_sidecar::rpc::ZebraRpc;
+use forge_sidecar::submit::{SubmissionOutcome, SubmitBlockMode, handle_relay_compact_block};
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::ForgeRelay;
 
@@ -43,6 +45,18 @@ struct Args {
     /// Poll interval in milliseconds
     #[arg(long, default_value = "100")]
     poll_interval_ms: u64,
+
+    /// Disable local Zebra template announcements into FORGE
+    #[arg(long)]
+    disable_template_announcements: bool,
+
+    /// Receive reconstructed compact blocks from the FORGE relay client
+    #[arg(long)]
+    receive_relay_blocks: bool,
+
+    /// Submit eligible relay-received blocks to Zebra
+    #[arg(long)]
+    enable_submitblock: bool,
 }
 
 #[tokio::main]
@@ -57,50 +71,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args = Args::parse();
 
     // Load config file if specified, CLI args override config
-    let (zebra_url, relay_peers, auth_key, bind_addr, poll_interval_ms) =
-        if let Some(config_path) = &args.config {
-            let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
-            (
-                cfg.zebra_url.clone(),
-                cfg.parsed_relay_peers()?,
-                cfg.parsed_auth_key()?,
-                cfg.parsed_bind_addr()?,
-                cfg.poll_interval_ms,
-            )
-        } else {
-            // Use CLI args
-            if args.relay_peer.is_empty() {
-                return Err("relay_peer is required (use --relay-peer or --config)".into());
+    let (
+        zebra_url,
+        relay_peers,
+        auth_key,
+        bind_addr,
+        poll_interval_ms,
+        announce_templates,
+        receive_relay_blocks,
+        enable_submitblock,
+    ) = if let Some(config_path) = &args.config {
+        let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
+        (
+            cfg.zebra_url.clone(),
+            cfg.parsed_relay_peers()?,
+            cfg.parsed_auth_key()?,
+            cfg.parsed_bind_addr()?,
+            cfg.poll_interval_ms,
+            cfg.announce_templates,
+            cfg.receive_relay_blocks,
+            cfg.enable_submitblock,
+        )
+    } else {
+        // Use CLI args
+        if args.relay_peer.is_empty() {
+            return Err("relay_peer is required (use --relay-peer or --config)".into());
+        }
+
+        let relay_peers: Vec<SocketAddr> = args
+            .relay_peer
+            .iter()
+            .map(|s| s.parse())
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let auth_key: [u8; 32] = if let Some(key_hex) = &args.auth_key {
+            let bytes = hex::decode(key_hex)?;
+            if bytes.len() != 32 {
+                return Err("auth_key must be 32 bytes (64 hex characters)".into());
             }
-
-            let relay_peers: Vec<SocketAddr> = args
-                .relay_peer
-                .iter()
-                .map(|s| s.parse())
-                .collect::<Result<Vec<_>, _>>()?;
-
-            let auth_key: [u8; 32] = if let Some(key_hex) = &args.auth_key {
-                let bytes = hex::decode(key_hex)?;
-                if bytes.len() != 32 {
-                    return Err("auth_key must be 32 bytes (64 hex characters)".into());
-                }
-                let mut arr = [0u8; 32];
-                arr.copy_from_slice(&bytes);
-                arr
-            } else {
-                [0u8; 32]
-            };
-
-            let bind_addr: SocketAddr = args.bind_addr.parse()?;
-
-            (
-                args.zebra_url.clone(),
-                relay_peers,
-                auth_key,
-                bind_addr,
-                args.poll_interval_ms,
-            )
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            arr
+        } else {
+            [0u8; 32]
         };
+
+        let bind_addr: SocketAddr = args.bind_addr.parse()?;
+
+        (
+            args.zebra_url.clone(),
+            relay_peers,
+            auth_key,
+            bind_addr,
+            args.poll_interval_ms,
+            !args.disable_template_announcements,
+            args.receive_relay_blocks,
+            args.enable_submitblock,
+        )
+    };
+
+    if enable_submitblock && !receive_relay_blocks {
+        return Err("enable_submitblock requires receive_relay_blocks".into());
+    }
+    if !announce_templates && !receive_relay_blocks {
+        return Err(
+            "disable_template_announcements requires receive_relay_blocks so the sidecar has work"
+                .into(),
+        );
+    }
 
     info!(zebra_url = %zebra_url, "Starting forge sidecar");
 
@@ -111,8 +149,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize forge relay
     let relay = ForgeRelay::new(relay_peers.clone(), auth_key, bind_addr)?;
     relay.init().await?;
-    relay.start().await?;
+    if receive_relay_blocks {
+        let receiver = relay.start_with_receiver().await?;
+        let mode = if enable_submitblock {
+            SubmitBlockMode::Live
+        } else {
+            SubmitBlockMode::DryRun
+        };
+        spawn_relay_block_handler(receiver, Arc::clone(&rpc), mode);
+    } else {
+        relay.start().await?;
+    }
     let relay = Arc::new(relay);
+
+    if !announce_templates {
+        info!("Template announcements disabled; sidecar running relay receive only");
+        std::future::pending::<()>().await;
+        return Ok(());
+    }
 
     // Create template channel
     let (tx, mut rx) = mpsc::channel::<TemplateUpdate>(16);
@@ -151,4 +205,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+fn spawn_relay_block_handler(
+    mut receiver: BlockReceiver,
+    rpc: Arc<ZebraRpc>,
+    mode: SubmitBlockMode,
+) {
+    tokio::spawn(async move {
+        while let Some(compact) = receiver.recv().await {
+            match handle_relay_compact_block(rpc.as_ref(), &compact, mode).await {
+                Ok(SubmissionOutcome::DryRun(candidate)) => {
+                    info!(
+                        block_hash = %candidate.block_hash,
+                        tx_count = candidate.tx_count,
+                        block_bytes = candidate.block_bytes,
+                        "Relay block submit dry-run candidate"
+                    );
+                }
+                Ok(SubmissionOutcome::Submitted { candidate, result }) => {
+                    info!(
+                        block_hash = %candidate.block_hash,
+                        tx_count = candidate.tx_count,
+                        block_bytes = candidate.block_bytes,
+                        result = ?result,
+                        "Relay block submitted to Zebra"
+                    );
+                }
+                Err(error) => {
+                    warn!(%error, "Relay block is not a submit candidate");
+                }
+            }
+        }
+        warn!("Relay block receiver closed");
+    });
 }
