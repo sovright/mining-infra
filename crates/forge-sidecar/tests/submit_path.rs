@@ -1,12 +1,11 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bedrock_forge::{CompactBlock, PrefilledTx, ShortId};
+use bedrock_forge::{CompactBlock, PrefilledTx, ShortId, zcash_block_hash};
 use forge_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitFuture,
     build_raw_block_submission_candidate, build_submission_candidate, handle_relay_compact_block,
     handle_relay_raw_block,
 };
-use sha2::{Digest, Sha256};
 
 struct CountingSubmitter {
     calls: AtomicUsize,
@@ -32,11 +31,7 @@ fn header() -> Vec<u8> {
 }
 
 fn raw_block_hash(raw_block: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(&raw_block[..1487]);
-    let second = Sha256::digest(first);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&second);
-    hash
+    zcash_block_hash(&raw_block[..1487])
 }
 
 fn raw_block() -> Vec<u8> {

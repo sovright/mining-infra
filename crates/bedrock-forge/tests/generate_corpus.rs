@@ -2,7 +2,7 @@
 //! Run: cargo test -p bedrock-forge --features generate-corpus --test generate_corpus
 #![cfg(feature = "generate-corpus")]
 
-use bedrock_forge::{ChunkHeader, Chunk, CHUNK_MAGIC};
+use bedrock_forge::{CHUNK_MAGIC, Chunk, ChunkHeader};
 use std::fs;
 
 #[test]

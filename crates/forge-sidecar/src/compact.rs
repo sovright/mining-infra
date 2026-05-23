@@ -1,8 +1,9 @@
 //! Build CompactBlock from Zebra block templates
 
 use crate::rpc::BlockTemplate;
-use bedrock_forge::{AuthDigest, CompactBlock, PrefilledTx, ShortId, TxId, WtxId};
-use sha2::{Digest, Sha256};
+use bedrock_forge::{
+    AuthDigest, CompactBlock, PrefilledTx, ShortId, TxId, WtxId, zcash_block_hash,
+};
 use tracing::warn;
 
 /// Equihash solution size for Zcash (n=200, k=9)
@@ -132,13 +133,9 @@ fn build_header(template: &BlockTemplate) -> Result<Vec<u8>, CompactBlockError> 
     Ok(header)
 }
 
-/// Compute double-SHA256 header hash
+/// Compute the Zcash header hash.
 fn compute_header_hash(header: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&second);
-    hash
+    zcash_block_hash(header)
 }
 
 #[derive(Debug)]

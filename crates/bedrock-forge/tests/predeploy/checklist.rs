@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bedrock_forge::{
-    fec::{FecDecoder, FecEncoder},
     AuthDigest, BlockChunker, BlockHash, ChunkHeader, CompactBlock, CompactBlockReconstructor,
-    ReconstructionResult, RelayConfig, RelayNode, ShortId, TestMempool, TxId, WtxId, EQUIHASH_K,
-    EQUIHASH_N, ZCASH_FULL_HEADER_SIZE,
+    EQUIHASH_K, EQUIHASH_N, ReconstructionResult, RelayConfig, RelayNode, ShortId, TestMempool,
+    TxId, WtxId, ZCASH_FULL_HEADER_SIZE,
+    fec::{FecDecoder, FecEncoder},
 };
 
 /// Gate 1: Core types are correctly sized
@@ -87,9 +87,13 @@ fn gate_compact_block_roundtrip() {
 
     // Chunker roundtrip
     let chunker = BlockChunker::new(10, 3).unwrap();
-    let chunks = chunker.compact_block_to_chunks(&compact, hash.as_bytes()).unwrap();
+    let chunks = chunker
+        .compact_block_to_chunks(&compact, hash.as_bytes())
+        .unwrap();
     let shard_opts: Vec<Option<Vec<u8>>> = chunks.into_iter().map(|c| Some(c.payload)).collect();
-    let recovered = chunker.chunks_to_compact_block(shard_opts, serialized.len()).unwrap();
+    let recovered = chunker
+        .chunks_to_compact_block(shard_opts, serialized.len())
+        .unwrap();
 
     assert_eq!(recovered.header, compact.header);
     assert_eq!(recovered.nonce, compact.nonce);
@@ -125,15 +129,7 @@ fn gate_reconstruction_full_mempool() {
     let compact = CompactBlock::new(header.clone(), nonce, short_ids, vec![]);
 
     let mut reconstructor = CompactBlockReconstructor::new(&mempool);
-    // Use first 32 bytes of header as hash for prepare
-    let header_hash = {
-        use sha2::{Digest, Sha256};
-        let first = Sha256::digest(&header);
-        let second = Sha256::digest(first);
-        let mut h = [0u8; 32];
-        h.copy_from_slice(&second);
-        h
-    };
+    let header_hash = bedrock_forge::zcash_block_hash(&header);
     reconstructor.prepare(&header_hash, nonce);
 
     let result = reconstructor.reconstruct(&compact);
@@ -154,8 +150,8 @@ fn gate_reconstruction_full_mempool() {
 /// Gate 6: Relay node starts and stops cleanly
 #[tokio::test]
 async fn gate_relay_lifecycle() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
 
     // Should bind successfully
@@ -182,8 +178,8 @@ async fn gate_relay_lifecycle() {
 /// Gate 7: Metrics tracking works
 #[tokio::test]
 async fn gate_metrics() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
     node.bind().await.unwrap();
     let addr = node.local_addr().unwrap();

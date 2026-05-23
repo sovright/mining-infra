@@ -26,7 +26,12 @@ impl TestBlock {
 
     /// Get total serialized size
     pub fn total_size(&self) -> usize {
-        self.header.len() + self.transactions.iter().map(|(_, tx)| tx.len()).sum::<usize>()
+        self.header.len()
+            + self
+                .transactions
+                .iter()
+                .map(|(_, tx)| tx.len())
+                .sum::<usize>()
     }
 
     /// Get transaction count
@@ -45,19 +50,8 @@ pub fn create_synthetic_block(tx_count: usize, tx_size: usize) -> TestBlock {
     header[4] = 0xAB;
     header[5] = 0xCD;
 
-    // Create block hash from header
-    let hash = BlockHash::from_bytes({
-        use sha2::{Digest, Sha256};
-        let mut hasher = Sha256::new();
-        hasher.update(&header[..140]);
-        let first = hasher.finalize();
-        let mut hasher = Sha256::new();
-        hasher.update(&first);
-        let result = hasher.finalize();
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&result);
-        arr
-    });
+    // Create Zcash block hash from the full header.
+    let hash = BlockHash::from_bytes(bedrock_forge::zcash_block_hash(&header));
 
     // Create synthetic transactions
     let mut transactions = Vec::with_capacity(tx_count);

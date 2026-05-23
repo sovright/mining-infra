@@ -3,20 +3,15 @@
 //! Verifies compact block construction, short ID computation, and reconstruction
 //! match expected behavior from the BIP 152 specification (adapted for Zcash).
 
+use bedrock_forge::types::{AuthDigest, TxId, WtxId};
 use bedrock_forge::{
     CompactBlock, CompactBlockBuilder, CompactBlockReconstructor, PrefilledTx,
-    ReconstructionResult, ShortId, TestMempool,
+    ReconstructionResult, ShortId, TestMempool, zcash_block_hash,
 };
-use bedrock_forge::types::{AuthDigest, TxId, WtxId};
-use sha2::{Digest, Sha256};
 
-/// Helper: compute double-SHA256 header hash (same as CompactBlock::header_hash)
+/// Helper: compute Zcash header hash (same as CompactBlock::header_hash)
 fn header_hash(header: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut h = [0u8; 32];
-    h.copy_from_slice(&second);
-    h
+    zcash_block_hash(header)
 }
 
 /// Helper: create a deterministic WtxId from a seed byte
@@ -181,16 +176,12 @@ fn test_short_id_key_derivation() {
 
     // Verify expected key derivation manually
     let expected_k0 = u64::from_le_bytes(known_header_hash[0..8].try_into().unwrap());
-    let expected_k1 =
-        u64::from_le_bytes(known_header_hash[8..16].try_into().unwrap()) ^ nonce;
+    let expected_k1 = u64::from_le_bytes(known_header_hash[8..16].try_into().unwrap()) ^ nonce;
 
     // k0 from bytes [0,1,2,3,4,5,6,7] LE = 0x0706050403020100
     assert_eq!(expected_k0, 0x0706050403020100_u64);
     // k1 from bytes [8,9,10,11,12,13,14,15] LE = 0x0f0e0d0c0b0a0908, XOR nonce
-    assert_eq!(
-        expected_k1,
-        0x0f0e0d0c0b0a0908_u64 ^ 0xfedcba9876543210_u64
-    );
+    assert_eq!(expected_k1, 0x0f0e0d0c0b0a0908_u64 ^ 0xfedcba9876543210_u64);
 
     let wtxid = WtxId::new(
         TxId::from_bytes([0xaa; 32]),
@@ -206,7 +197,10 @@ fn test_short_id_key_derivation() {
 
     // Different nonce produces different short ID
     let sid3 = ShortId::compute(&wtxid, &known_header_hash, nonce.wrapping_add(1));
-    assert_ne!(sid1, sid3, "different nonce should produce different short ID");
+    assert_ne!(
+        sid1, sid3,
+        "different nonce should produce different short ID"
+    );
 
     // Different wtxid produces different short ID
     let other_wtxid = WtxId::new(
@@ -214,7 +208,10 @@ fn test_short_id_key_derivation() {
         AuthDigest::from_bytes([0xdd; 32]),
     );
     let sid4 = ShortId::compute(&other_wtxid, &known_header_hash, nonce);
-    assert_ne!(sid1, sid4, "different wtxid should produce different short ID");
+    assert_ne!(
+        sid1, sid4,
+        "different wtxid should produce different short ID"
+    );
 }
 
 /// Test 5: Prefilled index out of bounds -> Invalid reconstruction.

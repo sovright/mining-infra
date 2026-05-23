@@ -1,14 +1,17 @@
 //! Performance benchmarks for bedrock-forge
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use bedrock_forge::{
-    fec::{FecDecoder, FecEncoder},
     AuthDigest, BlockChunker, BlockHash, CompactBlock, CompactBlockReconstructor, ShortId,
     TestMempool, TxId, WtxId,
+    fec::{FecDecoder, FecEncoder},
 };
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 /// Create a synthetic block for benchmarking
-fn create_bench_block(tx_count: usize, tx_size: usize) -> (BlockHash, Vec<u8>, Vec<(WtxId, Vec<u8>)>) {
+fn create_bench_block(
+    tx_count: usize,
+    tx_size: usize,
+) -> (BlockHash, Vec<u8>, Vec<(WtxId, Vec<u8>)>) {
     let mut header = vec![0u8; 1487];
     header[0..4].copy_from_slice(&4u32.to_le_bytes());
 
@@ -112,7 +115,9 @@ fn bench_fec_decode(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("kb", size_kb),
             &(shard_opts.clone(), data.len()),
-            |b, (shards, orig_len)| b.iter(|| black_box(decoder.decode(shards.clone(), *orig_len).unwrap())),
+            |b, (shards, orig_len)| {
+                b.iter(|| black_box(decoder.decode(shards.clone(), *orig_len).unwrap()))
+            },
         );
     }
 
@@ -139,7 +144,9 @@ fn bench_fec_decode_with_loss(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::new("kb", size_kb),
             &(shard_opts.clone(), data.len()),
-            |b, (shards, orig_len)| b.iter(|| black_box(decoder.decode(shards.clone(), *orig_len).unwrap())),
+            |b, (shards, orig_len)| {
+                b.iter(|| black_box(decoder.decode(shards.clone(), *orig_len).unwrap()))
+            },
         );
     }
 
@@ -206,10 +213,16 @@ fn bench_chunker_roundtrip(c: &mut Criterion) {
             &(compact.clone(), *hash.as_bytes(), data.len()),
             |b, (compact, block_hash, orig_len)| {
                 b.iter(|| {
-                    let chunks = chunker.compact_block_to_chunks(compact, block_hash).unwrap();
+                    let chunks = chunker
+                        .compact_block_to_chunks(compact, block_hash)
+                        .unwrap();
                     let shard_opts: Vec<Option<Vec<u8>>> =
                         chunks.into_iter().map(|c| Some(c.payload)).collect();
-                    black_box(chunker.chunks_to_compact_block(shard_opts, *orig_len).unwrap())
+                    black_box(
+                        chunker
+                            .chunks_to_compact_block(shard_opts, *orig_len)
+                            .unwrap(),
+                    )
                 });
             },
         );

@@ -3,12 +3,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use sha2::{Digest, Sha256};
-
 use bedrock_forge::{
     AuthDigest, ClientConfig, CompactBlockBuilder, RelayClient, RelayConfig, RelayNode,
     StubPowValidator, TestMempool, TxId, WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
-    split_raw_block,
+    split_raw_block, zcash_block_hash,
 };
 
 fn make_test_block() -> bedrock_forge::CompactBlock {
@@ -28,11 +26,7 @@ fn make_test_block() -> bedrock_forge::CompactBlock {
 }
 
 fn raw_block_hash(raw_block: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
-    let second = Sha256::digest(first);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&second);
-    hash
+    zcash_block_hash(&raw_block[..ZCASH_FULL_HEADER_SIZE])
 }
 
 /// Test that a RelayNode can receive chunks from a connected client.

@@ -6,7 +6,6 @@ use std::time::Duration;
 use bedrock_forge::{
     BlockChunker, Chunk, ChunkHeader, RelaySession, ZCASH_FULL_HEADER_SIZE, split_raw_block,
 };
-use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::time::sleep;
 
@@ -153,11 +152,7 @@ fn authenticate_raw_segment_chunk(session: &RelaySession, chunk: &bedrock_forge:
 }
 
 fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&second);
-    hash
+    bedrock_forge::zcash_block_hash(header)
 }
 
 #[cfg(test)]

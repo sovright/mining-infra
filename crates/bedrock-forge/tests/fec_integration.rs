@@ -3,8 +3,7 @@
 //! Tests FEC round-trip scenarios for compact block encoding/decoding.
 
 use bedrock_forge::{
-    AuthDigest, BlockChunker, CompactBlock, CompactBlockBuilder,
-    FecError, TestMempool, TxId, WtxId,
+    AuthDigest, BlockChunker, CompactBlock, CompactBlockBuilder, FecError, TestMempool, TxId, WtxId,
 };
 
 fn make_wtxid(seed: u8) -> WtxId {
@@ -42,7 +41,9 @@ fn fec_roundtrip_no_loss() {
     let block_hash = [0xcd; 32];
 
     // Encode
-    let chunks = chunker.compact_block_to_chunks(&compact, &block_hash).unwrap();
+    let chunks = chunker
+        .compact_block_to_chunks(&compact, &block_hash)
+        .unwrap();
     println!("Encoded into {} chunks", chunks.len());
 
     // Get original length for decoding
@@ -51,12 +52,11 @@ fn fec_roundtrip_no_loss() {
     println!("Original data size: {} bytes", original_len);
 
     // Decode with all chunks
-    let shard_opts: Vec<Option<Vec<u8>>> = chunks
-        .into_iter()
-        .map(|c| Some(c.payload))
-        .collect();
+    let shard_opts: Vec<Option<Vec<u8>>> = chunks.into_iter().map(|c| Some(c.payload)).collect();
 
-    let recovered = chunker.chunks_to_compact_block(shard_opts, original_len).unwrap();
+    let recovered = chunker
+        .chunks_to_compact_block(shard_opts, original_len)
+        .unwrap();
 
     // Verify full content equality
     assert_eq!(recovered.header, compact.header);
@@ -71,23 +71,25 @@ fn fec_roundtrip_with_packet_loss() {
     let compact = make_realistic_compact_block();
     let block_hash = [0xcd; 32];
 
-    let chunks = chunker.compact_block_to_chunks(&compact, &block_hash).unwrap();
+    let chunks = chunker
+        .compact_block_to_chunks(&compact, &block_hash)
+        .unwrap();
 
     let original_data = BlockChunker::serialize_compact_block(&compact);
     let original_len = original_data.len();
 
     // Simulate 3 lost packets (max recoverable with 3 parity shards)
-    let mut shard_opts: Vec<Option<Vec<u8>>> = chunks
-        .into_iter()
-        .map(|c| Some(c.payload))
-        .collect();
+    let mut shard_opts: Vec<Option<Vec<u8>>> =
+        chunks.into_iter().map(|c| Some(c.payload)).collect();
 
     // Lose chunks 2, 7, 11
     shard_opts[2] = None;
     shard_opts[7] = None;
     shard_opts[11] = None;
 
-    let recovered = chunker.chunks_to_compact_block(shard_opts, original_len).unwrap();
+    let recovered = chunker
+        .chunks_to_compact_block(shard_opts, original_len)
+        .unwrap();
 
     // Verify full content equality
     assert_eq!(recovered.header, compact.header);
@@ -102,16 +104,16 @@ fn fec_fails_with_too_much_loss() {
     let compact = make_realistic_compact_block();
     let block_hash = [0xcd; 32];
 
-    let chunks = chunker.compact_block_to_chunks(&compact, &block_hash).unwrap();
+    let chunks = chunker
+        .compact_block_to_chunks(&compact, &block_hash)
+        .unwrap();
 
     let original_data = BlockChunker::serialize_compact_block(&compact);
     let original_len = original_data.len();
 
     // Simulate 4 lost packets (more than 3 parity shards can recover)
-    let mut shard_opts: Vec<Option<Vec<u8>>> = chunks
-        .into_iter()
-        .map(|c| Some(c.payload))
-        .collect();
+    let mut shard_opts: Vec<Option<Vec<u8>>> =
+        chunks.into_iter().map(|c| Some(c.payload)).collect();
 
     shard_opts[0] = None;
     shard_opts[1] = None;

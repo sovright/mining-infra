@@ -12,6 +12,8 @@ use crate::block::compact_block_from_raw_block;
 use crate::config::Config;
 use crate::error::{IngressError, Result};
 
+const FORGE_LEN_PREFIX_BYTES: usize = 4;
+
 #[derive(Clone)]
 pub struct ForgeBridge {
     sender: BlockSender,
@@ -163,7 +165,7 @@ impl ForgeBridge {
         block_hash: [u8; 32],
         block_payload: &[u8],
     ) -> Result<RawBlockSegmentPlan> {
-        let max_segment_frame_bytes = self.data_shards.saturating_mul(MAX_PAYLOAD_SIZE);
+        let max_segment_frame_bytes = self.raw_segment_frame_budget();
         let segments = split_raw_block(block_hash, block_payload, max_segment_frame_bytes)
             .map_err(|e| IngressError::Forge(e.to_string()))?;
         Ok(RawBlockSegmentPlan {
@@ -178,9 +180,15 @@ impl ForgeBridge {
         block_hash: [u8; 32],
         block_payload: &[u8],
     ) -> Result<Vec<bedrock_forge::RawBlockSegment>> {
-        let max_segment_frame_bytes = self.data_shards.saturating_mul(MAX_PAYLOAD_SIZE);
+        let max_segment_frame_bytes = self.raw_segment_frame_budget();
         split_raw_block(block_hash, block_payload, max_segment_frame_bytes)
             .map_err(|e| IngressError::Forge(e.to_string()))
+    }
+
+    fn raw_segment_frame_budget(&self) -> usize {
+        self.data_shards
+            .saturating_mul(MAX_PAYLOAD_SIZE)
+            .saturating_sub(FORGE_LEN_PREFIX_BYTES)
     }
 }
 
@@ -294,6 +302,10 @@ mod tests {
                 .all(|segment: &RawBlockSegment| segment.encoded_len()
                     <= plan.max_segment_frame_bytes)
         );
+        let chunker = BlockChunker::new(bridge.data_shards, bridge.parity_shards).unwrap();
+        for segment in &segments {
+            chunker.raw_block_segment_to_chunks(segment).unwrap();
+        }
         assert_eq!(reassembled, raw_block);
     }
 

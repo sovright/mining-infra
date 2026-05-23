@@ -1,7 +1,5 @@
-use bedrock_forge::ZCASH_FULL_HEADER_SIZE;
-use blake2b_simd::Params;
-
 use crate::error::{IngressError, Result};
+use bedrock_forge::ZCASH_FULL_HEADER_SIZE;
 
 pub fn display_hash_from_header(block_payload: &[u8]) -> Result<String> {
     let raw = raw_hash_from_header(block_payload)?;
@@ -14,13 +12,7 @@ pub fn raw_hash_from_header(block_payload: &[u8]) -> Result<[u8; 32]> {
     let header = block_payload
         .get(..ZCASH_FULL_HEADER_SIZE)
         .ok_or_else(|| IngressError::Wire("block payload shorter than Zcash header".to_string()))?;
-    let hash = Params::new()
-        .hash_length(32)
-        .personal(b"ZcashBlockHash\0\0")
-        .hash(header);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(hash.as_bytes());
-    Ok(out)
+    Ok(bedrock_forge::zcash_block_hash(header))
 }
 
 pub fn inventory_hash_to_display(hash: &[u8; 32]) -> String {

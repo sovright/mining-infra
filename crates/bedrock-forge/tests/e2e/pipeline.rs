@@ -4,15 +4,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bedrock_forge::{
-    fec::{FecDecoder, FecEncoder},
     AuthDigest, BlockChunker, CompactBlock, CompactBlockReconstructor, ReconstructionResult,
     RelayConfig, RelayNode, ShortId, TestMempool, WtxId,
+    fec::{FecDecoder, FecEncoder},
 };
 
 // Import test fixtures
 #[path = "../fixtures/mod.rs"]
 mod fixtures;
-use fixtures::blocks::{create_synthetic_block, create_testnet_block, TestBlock};
+use fixtures::blocks::{TestBlock, create_synthetic_block, create_testnet_block};
 
 /// Helper to build a compact block from test block
 fn build_compact_block(block: &TestBlock) -> CompactBlock {
@@ -111,8 +111,8 @@ async fn e2e_chunker_roundtrip() {
 /// Test: Block flows through relay node
 #[tokio::test]
 async fn e2e_relay_node_forward() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::new(config).unwrap();
     node.bind().await.unwrap();
 

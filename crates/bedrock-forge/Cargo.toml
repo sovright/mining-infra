@@ -9,6 +9,7 @@ repository = "https://github.com/zcash/stratum-v2-zcash"
 [dependencies]
 thiserror = { workspace = true }
 hex = { workspace = true }
+blake2b_simd = { workspace = true }
 siphasher = "1.0"
 reed-solomon-erasure = "6.0"
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "macros", "time", "sync"] }

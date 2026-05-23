@@ -384,6 +384,7 @@ impl<V: PowValidator> RelayNode<V> {
             };
             if should_forward && let Some(assembly) = session.pending_blocks.get_mut(&object_hash) {
                 assembly.pow_validated = true;
+                self.metrics.inc_raw_segment_cached_promotions();
             }
         }
     }
@@ -496,6 +497,15 @@ impl<V: PowValidator> RelayNode<V> {
             }
             if chunks_sent > 0 {
                 self.metrics.inc_packets_forwarded(chunks_sent);
+                match msg_type {
+                    MessageType::Block => {
+                        self.metrics.inc_compact_block_chunks_forwarded(chunks_sent)
+                    }
+                    MessageType::RawBlockSegment => {
+                        self.metrics.inc_raw_segment_chunks_forwarded(chunks_sent)
+                    }
+                    MessageType::Keepalive | MessageType::Auth => {}
+                }
             }
         }
 
@@ -517,6 +527,9 @@ impl<V: PowValidator> RelayNode<V> {
         total_chunks: usize,
     ) -> Vec<ReadyChunks> {
         if !session.mark_chunk_seen(block_hash, chunk.header.chunk_id) {
+            if chunk.header.msg_type == MessageType::RawBlockSegment {
+                self.metrics.inc_raw_segment_duplicate_chunks();
+            }
             return Vec::new();
         }
         {
@@ -543,12 +556,24 @@ impl<V: PowValidator> RelayNode<V> {
             // chunks yet to extract a header; in that case we keep the current
             // `pow_validated` state (false) and suppress forwarding until a future
             // chunk provides enough data to decide.
-            if is_new
-                && !assembly.pow_validated
-                && let Some(valid) =
-                    self.validate_pow_from_assembly(assembly, chunk.header.msg_type)
-            {
-                assembly.pow_validated = valid;
+            if is_new && !assembly.pow_validated {
+                match self.validate_pow_from_assembly(assembly, chunk.header.msg_type) {
+                    Some(valid) => {
+                        if chunk.header.msg_type == MessageType::RawBlockSegment {
+                            if valid {
+                                self.metrics.inc_raw_segment_validation_successes();
+                            } else {
+                                self.metrics.inc_raw_segment_validation_failures();
+                            }
+                        }
+                        assembly.pow_validated = valid;
+                    }
+                    None => {
+                        if chunk.header.msg_type == MessageType::RawBlockSegment {
+                            self.metrics.inc_raw_segment_validation_deferred();
+                        }
+                    }
+                }
             }
         }
 
@@ -627,6 +652,12 @@ impl<V: PowValidator> RelayNode<V> {
                 "unsupported message type: {:?}",
                 chunk.header.msg_type
             )));
+        }
+
+        match chunk.header.msg_type {
+            MessageType::Block => self.metrics.inc_compact_block_chunks_received(),
+            MessageType::RawBlockSegment => self.metrics.inc_raw_segment_chunks_received(),
+            MessageType::Keepalive | MessageType::Auth => {}
         }
         if chunk.header.total_chunks == 0 || chunk.header.total_chunks > MAX_TOTAL_CHUNKS {
             self.metrics.inc_invalid_chunks();
@@ -913,19 +944,13 @@ fn authenticated_data_header(
 }
 
 fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&second);
-    hash
+    crate::zcash_block_hash(header)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompactBlock, StubPowValidator, split_raw_block};
+    use crate::{CompactBlock, MAX_PAYLOAD_SIZE, StubPowValidator, split_raw_block};
     use std::time::Duration;
     use tokio::time::timeout;
 
@@ -1055,6 +1080,95 @@ mod tests {
     }
 
     #[test]
+    fn raw_segment_validation_rejects_legacy_double_sha_block_hash() {
+        use sha2::{Digest, Sha256};
+
+        let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE + 4096];
+        raw_block[0] = 0x04;
+        let header = &raw_block[..ZCASH_FULL_HEADER_SIZE];
+        let zcash_hash = raw_block_header_hash(header);
+        let legacy_hash = {
+            let first = Sha256::digest(header);
+            let second = Sha256::digest(first);
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&second);
+            hash
+        };
+        assert_ne!(zcash_hash, legacy_hash);
+
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
+        let node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+
+        let valid_segment = split_raw_block(zcash_hash, &raw_block, 2_000)
+            .unwrap()
+            .remove(0);
+        let valid_assembly = raw_segment_assembly(&node, &valid_segment);
+        assert_eq!(
+            node.validate_pow_from_assembly(&valid_assembly, MessageType::RawBlockSegment),
+            Some(true)
+        );
+
+        let legacy_segment = split_raw_block(legacy_hash, &raw_block, 2_000)
+            .unwrap()
+            .remove(0);
+        let legacy_assembly = raw_segment_assembly(&node, &legacy_segment);
+        assert_eq!(
+            node.validate_pow_from_assembly(&legacy_assembly, MessageType::RawBlockSegment),
+            Some(false),
+            "raw segment metadata must use the canonical Zcash block hash"
+        );
+    }
+
+    #[test]
+    fn live_sized_raw_segments_validate_with_production_fec_budget() {
+        let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        raw_block.resize(335_940, 0xcd);
+        raw_block[0] = 0x04;
+        let block_hash = raw_block_header_hash(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
+        let segment_frame_bytes = 224 * MAX_PAYLOAD_SIZE - 4;
+        let segments = split_raw_block(block_hash, &raw_block, segment_frame_bytes).unwrap();
+        assert_eq!(segments.len(), 2);
+
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true)
+            .with_fec(224, 32);
+        let node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), [0u8; 32]);
+        let mut ready_objects = Vec::new();
+
+        for segment in &segments {
+            let chunks = node.chunker.raw_block_segment_to_chunks(segment).unwrap();
+            assert_eq!(chunks.len(), 256);
+            for chunk in &chunks {
+                ready_objects.extend(node.process_chunk_for_session(
+                    &mut session,
+                    chunk,
+                    chunk.header.block_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                ));
+            }
+        }
+
+        for segment in &segments {
+            let object_hash = segment_object_hash(segment.block_hash, segment.segment_index);
+            assert!(
+                ready_objects
+                    .iter()
+                    .any(|ready| ready.block_hash == object_hash),
+                "validated live-sized segment object should become forwardable"
+            );
+        }
+        let metrics = node.metrics().snapshot();
+        assert_eq!(
+            metrics.raw_segment_validation_successes,
+            segments.len() as u64
+        );
+        assert_eq!(metrics.raw_segment_validation_failures, 0);
+    }
+
+    #[test]
     fn raw_segment_zero_promotes_previously_buffered_nonzero_segments() {
         let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE + 4096];
         raw_block[0] = 0x04;
@@ -1116,6 +1230,8 @@ mod tests {
                 .any(|ready| ready.block_hash == segment_one_object_hash),
             "previously buffered nonzero segment chunks should forward after segment zero validates"
         );
+        let metrics = node.metrics().snapshot();
+        assert_eq!(metrics.raw_segment_cached_promotions, 1);
     }
 
     #[tokio::test]

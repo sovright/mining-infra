@@ -225,6 +225,7 @@ name = "bedrock-forge"
 version = "0.1.0"
 dependencies = [
  "arbitrary",
+ "blake2b_simd",
  "bytes",
  "criterion",
  "equihash",

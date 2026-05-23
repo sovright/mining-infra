@@ -9,8 +9,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use bedrock_forge::{CompactBlock, ZCASH_FULL_HEADER_SIZE};
-use sha2::{Digest, Sha256};
+use bedrock_forge::{CompactBlock, ZCASH_FULL_HEADER_SIZE, zcash_block_hash};
 
 use crate::rpc::ZebraRpc;
 
@@ -295,11 +294,7 @@ fn decode_compact_size(input: &[u8], cursor: &mut usize) -> Result<u64, RelayBlo
 }
 
 fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&second);
-    hash
+    zcash_block_hash(header)
 }
 
 #[cfg(test)]

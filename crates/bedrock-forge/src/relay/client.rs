@@ -5,7 +5,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -400,14 +399,10 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Compute block hash from header using double-SHA256, matching
+    /// Compute the Zcash block hash from the header, matching
     /// `CompactBlock::header_hash()` and `CompactBlockBuilder::compute_header_hash()`.
     fn compute_block_hash(&self, block: &CompactBlock) -> [u8; 32] {
-        let first = Sha256::digest(&block.header);
-        let second = Sha256::digest(first);
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&second);
-        hash
+        crate::zcash_block_hash(&block.header)
     }
 
     /// Handle an incoming chunk
