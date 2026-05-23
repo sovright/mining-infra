@@ -212,6 +212,32 @@ impl EventSink {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_tx_cache_snapshot(
+        &self,
+        entries: usize,
+        bytes: usize,
+        max_entries: usize,
+        max_bytes: usize,
+        max_tx_bytes: usize,
+        evicted_entries_total: usize,
+        evicted_bytes_total: usize,
+        dropped_too_large_total: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_tx_cache_snapshot",
+            "entries": entries,
+            "bytes": bytes,
+            "max_entries": max_entries,
+            "max_bytes": max_bytes,
+            "max_tx_bytes": max_tx_bytes,
+            "evicted_entries_total": evicted_entries_total,
+            "evicted_bytes_total": evicted_bytes_total,
+            "dropped_too_large_total": dropped_too_large_total,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     pub fn p2p_block_received(&self, peer: &str, hash: &str, bytes: usize) -> Result<()> {
         self.write(json!({
             "event": "p2p_block_received",
@@ -313,6 +339,9 @@ mod tests {
         events
             .p2p_forge_block_forwarded("127.0.0.1:8233", "abcd", 1234, 2, "compact_block", 1)
             .unwrap();
+        events
+            .p2p_tx_cache_snapshot(7, 700, 10, 1_000, 100, 2, 200, 1)
+            .unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         let rows: Vec<serde_json::Value> = contents
@@ -340,6 +369,15 @@ mod tests {
         assert_eq!(rows[5]["tx_count"], 2);
         assert_eq!(rows[5]["mode"], "compact_block");
         assert_eq!(rows[5]["relay_objects"], 1);
+        assert_eq!(rows[6]["event"], "p2p_tx_cache_snapshot");
+        assert_eq!(rows[6]["entries"], 7);
+        assert_eq!(rows[6]["bytes"], 700);
+        assert_eq!(rows[6]["max_entries"], 10);
+        assert_eq!(rows[6]["max_bytes"], 1_000);
+        assert_eq!(rows[6]["max_tx_bytes"], 100);
+        assert_eq!(rows[6]["evicted_entries_total"], 2);
+        assert_eq!(rows[6]["evicted_bytes_total"], 200);
+        assert_eq!(rows[6]["dropped_too_large_total"], 1);
 
         let _ = fs::remove_file(path);
     }

@@ -228,6 +228,7 @@ pub async fn run_peer(
                         outcome.evicted_bytes,
                         outcome.dropped_too_large,
                     )?;
+                    emit_tx_cache_snapshot(&events, cache)?;
                 } else if tx_cache.is_some() {
                     events
                         .p2p_peer_error(&peer, "received tx without pending transaction request")?;
@@ -236,6 +237,20 @@ pub async fn run_peer(
             _ => {}
         }
     }
+}
+
+fn emit_tx_cache_snapshot(events: &EventSink, cache: &TxCache) -> Result<()> {
+    let snapshot = cache.snapshot();
+    events.p2p_tx_cache_snapshot(
+        snapshot.entries,
+        snapshot.bytes,
+        snapshot.max_entries,
+        snapshot.max_bytes,
+        snapshot.max_tx_bytes,
+        snapshot.evicted_entries_total,
+        snapshot.evicted_bytes_total,
+        snapshot.dropped_too_large_total,
+    )
 }
 
 fn queue_tx_request(
@@ -350,6 +365,16 @@ mod tests {
     use super::*;
     use crate::tx_cache::TxInventoryKey;
     use crate::wire::{MSG_TX, MSG_WTX};
+    use std::fs;
+
+    fn temp_log_path(name: &str) -> std::path::PathBuf {
+        let unique = format!(
+            "bedrock-p2p-peer-{name}-{}-{}.jsonl",
+            std::process::id(),
+            unix_time_secs()
+        );
+        std::env::temp_dir().join(unique)
+    }
 
     #[test]
     fn version_payload_contains_user_agent() {
@@ -468,5 +493,31 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn emits_tx_cache_snapshot_event_from_cache_state() {
+        let path = temp_log_path("tx-cache-snapshot");
+        let events = EventSink::new(Some(path.clone())).unwrap();
+        let cache = TxCache::new(crate::tx_cache::TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 1_024,
+            max_tx_bytes: 512,
+        });
+        cache.insert(TxInventoryKey::tx([0x91; 32]), vec![1, 2, 3]);
+
+        emit_tx_cache_snapshot(&events, &cache).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        let row: serde_json::Value =
+            serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+        assert_eq!(row["event"], "p2p_tx_cache_snapshot");
+        assert_eq!(row["entries"], 1);
+        assert_eq!(row["bytes"], 3);
+        assert_eq!(row["max_entries"], 8);
+        assert_eq!(row["max_bytes"], 1_024);
+        assert_eq!(row["max_tx_bytes"], 512);
+
+        let _ = fs::remove_file(path);
     }
 }

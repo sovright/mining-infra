@@ -84,6 +84,18 @@ pub struct TxCacheInsertOutcome {
     pub dropped_too_large: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TxCacheSnapshot {
+    pub entries: usize,
+    pub bytes: usize,
+    pub max_entries: usize,
+    pub max_bytes: usize,
+    pub max_tx_bytes: usize,
+    pub evicted_entries_total: usize,
+    pub evicted_bytes_total: usize,
+    pub dropped_too_large_total: usize,
+}
+
 #[derive(Clone)]
 pub struct TxCache {
     config: TxCacheConfig,
@@ -96,6 +108,9 @@ struct TxCacheInner {
     order: VecDeque<WtxId>,
     payload_index: HashMap<[u8; 32], Vec<WtxId>>,
     bytes: usize,
+    evicted_entries_total: usize,
+    evicted_bytes_total: usize,
+    dropped_too_large_total: usize,
 }
 
 struct CachedTx {
@@ -114,6 +129,7 @@ impl TxCache {
     pub fn insert(&self, key: TxInventoryKey, tx_bytes: Vec<u8>) -> TxCacheInsertOutcome {
         let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
         if tx_bytes.len() > self.config.max_tx_bytes || self.config.max_entries == 0 {
+            inner.dropped_too_large_total += 1;
             return TxCacheInsertOutcome {
                 inserted: false,
                 entries: inner.entries.len(),
@@ -153,6 +169,8 @@ impl TxCache {
                 evicted_bytes += entry.bytes.len();
             }
         }
+        inner.evicted_entries_total += evicted_entries;
+        inner.evicted_bytes_total += evicted_bytes;
 
         TxCacheInsertOutcome {
             inserted: inner.entries.contains_key(&wtxid),
@@ -183,6 +201,20 @@ impl TxCache {
             None
         } else {
             Some(first)
+        }
+    }
+
+    pub fn snapshot(&self) -> TxCacheSnapshot {
+        let inner = self.inner.lock().expect("tx cache mutex poisoned");
+        TxCacheSnapshot {
+            entries: inner.entries.len(),
+            bytes: inner.bytes,
+            max_entries: self.config.max_entries,
+            max_bytes: self.config.max_bytes,
+            max_tx_bytes: self.config.max_tx_bytes,
+            evicted_entries_total: inner.evicted_entries_total,
+            evicted_bytes_total: inner.evicted_bytes_total,
+            dropped_too_large_total: inner.dropped_too_large_total,
         }
     }
 }
@@ -342,5 +374,35 @@ mod tests {
         cache.insert(TxInventoryKey::tx([0x82; 32]), payload.clone());
 
         assert_eq!(cache.wtxid_for_payload(&payload), None);
+    }
+
+    #[test]
+    fn snapshot_reports_bounds_and_cumulative_evictions_and_drops() {
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 2,
+            max_bytes: 5,
+            max_tx_bytes: 4,
+        });
+
+        cache.insert(TxInventoryKey::tx([0x01; 32]), vec![1, 1]);
+        cache.insert(TxInventoryKey::tx([0x02; 32]), vec![2, 2]);
+        cache.insert(TxInventoryKey::tx([0x03; 32]), vec![3, 3]);
+        cache.insert(TxInventoryKey::tx([0x04; 32]), vec![4, 4, 4, 4, 4]);
+
+        let snapshot = cache.snapshot();
+
+        assert_eq!(
+            snapshot,
+            TxCacheSnapshot {
+                entries: 2,
+                bytes: 4,
+                max_entries: 2,
+                max_bytes: 5,
+                max_tx_bytes: 4,
+                evicted_entries_total: 1,
+                evicted_bytes_total: 2,
+                dropped_too_large_total: 1,
+            }
+        );
     }
 }
