@@ -12,6 +12,7 @@ use tracing::{debug, warn};
 
 use crate::compact_block::CompactBlock;
 use crate::fec::FecError;
+use crate::segmented_block::RawBlockSegment;
 use crate::transport::{
     BlockAssembly, BlockChunker, Chunk, ChunkHeader, ClientConfig, MAX_TOTAL_CHUNKS, MessageType,
     TransportError,
@@ -22,17 +23,37 @@ const RECENT_DELIVERED_TTL: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const KEEPALIVE_BLOCK_HASH: [u8; 32] = [0u8; 32];
 
+/// Payload delivered through the relay client.
+#[derive(Clone, Debug)]
+pub enum RelayPayload {
+    /// Compact block relay object.
+    CompactBlock(CompactBlock),
+    /// One segment of a raw serialized block.
+    RawBlockSegment(RawBlockSegment),
+}
+
 /// Handle for sending blocks through the relay client
 #[derive(Clone)]
 pub struct BlockSender {
-    tx: mpsc::Sender<CompactBlock>,
+    tx: mpsc::Sender<RelayPayload>,
 }
 
 impl BlockSender {
     /// Send a block to be relayed
     pub async fn send(&self, block: CompactBlock) -> Result<(), TransportError> {
         self.tx
-            .send(block)
+            .send(RelayPayload::CompactBlock(block))
+            .await
+            .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
+    }
+
+    /// Send one raw block segment to be relayed.
+    pub async fn send_raw_block_segment(
+        &self,
+        segment: RawBlockSegment,
+    ) -> Result<(), TransportError> {
+        self.tx
+            .send(RelayPayload::RawBlockSegment(segment))
             .await
             .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
     }
@@ -40,12 +61,32 @@ impl BlockSender {
 
 /// Handle for receiving blocks from the relay
 pub struct BlockReceiver {
-    rx: mpsc::Receiver<CompactBlock>,
+    rx: mpsc::Receiver<RelayPayload>,
 }
 
 impl BlockReceiver {
     /// Receive the next block
     pub async fn recv(&mut self) -> Option<CompactBlock> {
+        while let Some(payload) = self.rx.recv().await {
+            if let RelayPayload::CompactBlock(block) = payload {
+                return Some(block);
+            }
+        }
+        None
+    }
+
+    /// Receive the next raw block segment.
+    pub async fn recv_raw_block_segment(&mut self) -> Option<RawBlockSegment> {
+        while let Some(payload) = self.rx.recv().await {
+            if let RelayPayload::RawBlockSegment(segment) = payload {
+                return Some(segment);
+            }
+        }
+        None
+    }
+
+    /// Receive the next relay payload of any supported type.
+    pub async fn recv_payload(&mut self) -> Option<RelayPayload> {
         self.rx.recv().await
     }
 }
@@ -61,10 +102,10 @@ pub struct RelayClient {
     #[allow(dead_code)]
     chunker: BlockChunker,
     /// Channel for outgoing blocks
-    outgoing_tx: mpsc::Sender<CompactBlock>,
-    outgoing_rx: Option<mpsc::Receiver<CompactBlock>>,
+    outgoing_tx: mpsc::Sender<RelayPayload>,
+    outgoing_rx: Option<mpsc::Receiver<RelayPayload>>,
     /// Channel for delivering received blocks to user
-    incoming_tx: Option<mpsc::Sender<CompactBlock>>,
+    incoming_tx: Option<mpsc::Sender<RelayPayload>>,
     /// Running flag
     running: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -117,7 +158,7 @@ impl RelayClient {
     ///
     /// Returns a BlockReceiver for receiving blocks from the relay.
     /// Also returns the outgoing channel receiver for the run loop to consume.
-    pub fn take_receiver(&mut self) -> Option<(BlockReceiver, mpsc::Receiver<CompactBlock>)> {
+    pub fn take_receiver(&mut self) -> Option<(BlockReceiver, mpsc::Receiver<RelayPayload>)> {
         self.outgoing_rx.take().map(|outgoing| {
             let (incoming_tx, incoming_rx) = mpsc::channel(16);
             self.incoming_tx = Some(incoming_tx);
@@ -154,7 +195,7 @@ impl RelayClient {
     /// continues to process outgoing announcements.
     pub async fn run_with_outgoing(
         &mut self,
-        mut outgoing_rx: mpsc::Receiver<CompactBlock>,
+        mut outgoing_rx: mpsc::Receiver<RelayPayload>,
     ) -> Result<(), TransportError> {
         let socket = self
             .socket
@@ -192,9 +233,9 @@ impl RelayClient {
                 }
 
                 // Handle outgoing blocks
-                Some(block) = outgoing_rx.recv() => {
-                    if let Err(e) = self.send_block_internal(&socket, &block).await {
-                        warn!(error = ?e, "Error sending block");
+                Some(payload) = outgoing_rx.recv() => {
+                    if let Err(e) = self.send_payload_internal(&socket, &payload).await {
+                        warn!(error = ?e, "Error sending relay payload");
                     }
                 }
 
@@ -249,6 +290,20 @@ impl RelayClient {
         Ok(())
     }
 
+    /// Send a payload to all relay nodes
+    async fn send_payload_internal(
+        &self,
+        socket: &UdpSocket,
+        payload: &RelayPayload,
+    ) -> Result<(), TransportError> {
+        match payload {
+            RelayPayload::CompactBlock(block) => self.send_block_internal(socket, block).await,
+            RelayPayload::RawBlockSegment(segment) => {
+                self.send_raw_block_segment_internal(socket, segment).await
+            }
+        }
+    }
+
     /// Send a block to all relay nodes
     async fn send_block_internal(
         &self,
@@ -257,9 +312,31 @@ impl RelayClient {
     ) -> Result<(), TransportError> {
         let block_hash = self.compute_block_hash(block);
 
-        // Convert to chunks (unauthenticated)
         let chunks = self.chunker.compact_block_to_chunks(block, &block_hash)?;
+        self.send_chunks_internal(socket, &block_hash, chunks, "compact block")
+            .await
+    }
 
+    /// Send one raw block segment to all relay nodes.
+    async fn send_raw_block_segment_internal(
+        &self,
+        socket: &UdpSocket,
+        segment: &RawBlockSegment,
+    ) -> Result<(), TransportError> {
+        let object_hash =
+            crate::segmented_block::segment_object_hash(segment.block_hash, segment.segment_index);
+        let chunks = self.chunker.raw_block_segment_to_chunks(segment)?;
+        self.send_chunks_internal(socket, &object_hash, chunks, "raw block segment")
+            .await
+    }
+
+    async fn send_chunks_internal(
+        &self,
+        socket: &UdpSocket,
+        object_hash: &[u8; 32],
+        chunks: Vec<Chunk>,
+        label: &str,
+    ) -> Result<(), TransportError> {
         // Create temporary session for HMAC computation
         use crate::transport::RelaySession;
         let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
@@ -277,13 +354,29 @@ impl RelayClient {
                 );
 
                 // Create authenticated version 2 chunk
-                let auth_header = ChunkHeader::new_block_authenticated(
-                    &block_hash,
-                    chunk.header.chunk_id,
-                    chunk.header.total_chunks,
-                    chunk.header.payload_len,
-                    hmac,
-                );
+                let auth_header = match chunk.header.msg_type {
+                    MessageType::Block => ChunkHeader::new_block_authenticated(
+                        &chunk.header.block_hash,
+                        chunk.header.chunk_id,
+                        chunk.header.total_chunks,
+                        chunk.header.payload_len,
+                        hmac,
+                    ),
+                    MessageType::RawBlockSegment => {
+                        ChunkHeader::new_raw_block_segment_authenticated(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            hmac,
+                        )
+                    }
+                    MessageType::Keepalive | MessageType::Auth => {
+                        return Err(TransportError::InvalidChunk(
+                            "unsupported outgoing chunk message type".into(),
+                        ));
+                    }
+                };
                 let auth_chunk = Chunk::new(auth_header, chunk.payload.clone());
 
                 let data = auth_chunk.to_bytes();
@@ -292,9 +385,10 @@ impl RelayClient {
         }
 
         debug!(
-            block_hash = ?hex::encode(&block_hash[..8]),
+            object_hash = ?hex::encode(&object_hash[..8]),
             chunks = chunks.len(),
-            "Sent authenticated block"
+            label,
+            "Sent authenticated relay payload"
         );
         Ok(())
     }
@@ -328,7 +422,10 @@ impl RelayClient {
         }
 
         // Validate chunk header
-        if chunk.header.msg_type != MessageType::Block {
+        if !matches!(
+            chunk.header.msg_type,
+            MessageType::Block | MessageType::RawBlockSegment
+        ) {
             return;
         }
         if total_chunks == 0 || chunk_id >= total_chunks {
@@ -395,18 +492,38 @@ impl RelayClient {
             let est_len = *original_len;
 
             if est_len > 0
-                && let Ok(block) = self.chunker.chunks_to_compact_block(shard_opts, est_len)
+                && let Some(payload) =
+                    self.decode_payload(chunk.header.msg_type, shard_opts, est_len)
             {
-                // Send to receiver
                 if let Some(tx) = &self.incoming_tx
-                    && tx.send(block).await.is_err()
+                    && tx.send(payload).await.is_err()
                 {
-                    warn!("Failed to deliver reconstructed block (receiver dropped)");
+                    warn!("Failed to deliver reconstructed relay payload (receiver dropped)");
                 }
                 recent_delivered.insert(block_hash, Instant::now());
-                // Remove from pending
                 pending.remove(&block_hash);
             }
+        }
+    }
+
+    fn decode_payload(
+        &self,
+        msg_type: MessageType,
+        chunks: Vec<Option<Vec<u8>>>,
+        original_len: usize,
+    ) -> Option<RelayPayload> {
+        match msg_type {
+            MessageType::Block => self
+                .chunker
+                .chunks_to_compact_block(chunks, original_len)
+                .ok()
+                .map(RelayPayload::CompactBlock),
+            MessageType::RawBlockSegment => self
+                .chunker
+                .chunks_to_raw_block_segment(chunks, original_len)
+                .ok()
+                .map(RelayPayload::RawBlockSegment),
+            MessageType::Keepalive | MessageType::Auth => None,
         }
     }
 }

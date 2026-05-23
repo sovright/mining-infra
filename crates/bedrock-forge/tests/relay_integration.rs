@@ -3,9 +3,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
+
 use bedrock_forge::{
     AuthDigest, ClientConfig, CompactBlockBuilder, RelayClient, RelayConfig, RelayNode,
-    TestMempool, TxId, WtxId,
+    StubPowValidator, TestMempool, TxId, WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
+    split_raw_block,
 };
 
 fn make_test_block() -> bedrock_forge::CompactBlock {
@@ -22,6 +25,14 @@ fn make_test_block() -> bedrock_forge::CompactBlock {
 
     let mempool = TestMempool::new();
     builder.build(&mempool)
+}
+
+fn raw_block_hash(raw_block: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
+    let second = Sha256::digest(first);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&second);
+    hash
 }
 
 /// Test that a RelayNode can receive chunks from a connected client.
@@ -250,6 +261,69 @@ async fn receive_only_client_registers_session_with_keepalive() {
 
     node.stop();
     client_handle.abort();
+    let _ = node_handle.await;
+}
+
+#[tokio::test]
+async fn raw_block_segments_flow_client_to_client_via_relay() {
+    let auth_key = [0x42; 32];
+
+    let node_config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+    let mut node = RelayNode::with_validator(node_config, StubPowValidator).unwrap();
+    node.bind().await.unwrap();
+
+    let node_addr = node.local_addr().unwrap();
+    let node = Arc::new(node);
+    let node_clone = Arc::clone(&node);
+    let node_handle = tokio::spawn(async move { node_clone.run().await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let receiver_config = ClientConfig::new(vec![node_addr], auth_key).with_auth_required(true);
+    let mut receiver_client = RelayClient::new(receiver_config).unwrap();
+    receiver_client.bind().await.unwrap();
+    let (mut receiver, outgoing) = receiver_client.take_receiver().unwrap();
+    let receiver_handle =
+        tokio::spawn(async move { receiver_client.run_with_outgoing(outgoing).await });
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let sender_config = ClientConfig::new(vec![node_addr], auth_key).with_auth_required(true);
+    let mut sender_client = RelayClient::new(sender_config).unwrap();
+    sender_client.bind().await.unwrap();
+    let sender = sender_client.sender();
+    let sender_handle = tokio::spawn(async move { sender_client.run().await });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+    raw_block.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+    raw_block.resize(ZCASH_FULL_HEADER_SIZE + 4096, 0xcd);
+    let block_hash = raw_block_hash(&raw_block);
+    let segments = split_raw_block(block_hash, &raw_block, 2_000).unwrap();
+    assert!(segments.len() > 1);
+
+    for segment in segments.iter().cloned() {
+        sender.send_raw_block_segment(segment).await.unwrap();
+    }
+
+    let mut received = Vec::new();
+    while received.len() < segments.len() {
+        let segment =
+            tokio::time::timeout(Duration::from_secs(2), receiver.recv_raw_block_segment())
+                .await
+                .expect("timed out waiting for raw block segment")
+                .expect("raw block segment receiver closed");
+        received.push(segment);
+    }
+
+    let reassembled = reassemble_raw_block(&received).unwrap();
+    assert_eq!(reassembled, raw_block);
+
+    node.stop();
+    receiver_handle.abort();
+    sender_handle.abort();
     let _ = node_handle.await;
 }
 

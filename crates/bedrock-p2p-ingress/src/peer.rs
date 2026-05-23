@@ -151,6 +151,8 @@ pub async fn run_peer(
                                 &display,
                                 forwarded.bytes,
                                 forwarded.tx_count,
+                                forwarded.mode.as_str(),
+                                forwarded.relay_objects,
                             )?;
                         }
                         Err(error) => {

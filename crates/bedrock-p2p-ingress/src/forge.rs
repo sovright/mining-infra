@@ -79,6 +79,24 @@ impl ForgeBridge {
         let compact = compact_block_from_raw_block(block_payload)?;
         let tx_count = compact.prefilled_txs.len();
         if let Err(error) = self.preflight_chunks(&compact) {
+            let text = error.to_string();
+            if text.contains("all-prefilled compact block too large") {
+                let segments =
+                    self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
+                let segment_count = segments.len();
+                for segment in segments {
+                    self.sender
+                        .send_raw_block_segment(segment)
+                        .await
+                        .map_err(map_transport_error)?;
+                }
+                return Ok(ForwardedBlock {
+                    tx_count,
+                    bytes: block_payload.len(),
+                    relay_objects: segment_count,
+                    mode: ForwardMode::RawBlockSegments,
+                });
+            }
             return Err(self.with_segment_plan(error, &compact, block_payload));
         }
         self.sender
@@ -88,6 +106,8 @@ impl ForgeBridge {
         Ok(ForwardedBlock {
             tx_count,
             bytes: block_payload.len(),
+            relay_objects: 1,
+            mode: ForwardMode::CompactBlock,
         })
     }
 
@@ -147,11 +167,38 @@ impl ForgeBridge {
             max_segment_frame_bytes,
         })
     }
+
+    fn raw_block_segments(
+        &self,
+        block_hash: [u8; 32],
+        block_payload: &[u8],
+    ) -> Result<Vec<bedrock_forge::RawBlockSegment>> {
+        let max_segment_frame_bytes = self.data_shards.saturating_mul(MAX_PAYLOAD_SIZE);
+        split_raw_block(block_hash, block_payload, max_segment_frame_bytes)
+            .map_err(|e| IngressError::Forge(e.to_string()))
+    }
 }
 
 pub struct ForwardedBlock {
     pub tx_count: usize,
     pub bytes: usize,
+    pub relay_objects: usize,
+    pub mode: ForwardMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForwardMode {
+    CompactBlock,
+    RawBlockSegments,
+}
+
+impl ForwardMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForwardMode::CompactBlock => "compact_block",
+            ForwardMode::RawBlockSegments => "raw_block_segments",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +216,7 @@ fn map_transport_error(error: TransportError) -> IngressError {
 mod tests {
     use super::*;
     use bedrock_forge::{
-        PrefilledTx, RawBlockSegment, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
+        PrefilledTx, RawBlockSegment, RelayPayload, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
     };
     use std::path::PathBuf;
     use std::time::Duration;
@@ -183,6 +230,18 @@ mod tests {
             data_shards: 10,
             parity_shards: 3,
         }
+    }
+
+    fn large_raw_block() -> Vec<u8> {
+        let mut block = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        crate::wire::encode_compact_size(2_000, &mut block);
+        for _ in 0..2_000 {
+            block.extend_from_slice(&1u32.to_le_bytes());
+            crate::wire::encode_compact_size(0, &mut block);
+            crate::wire::encode_compact_size(0, &mut block);
+            block.extend_from_slice(&0u32.to_le_bytes());
+        }
+        block
     }
 
     #[test]
@@ -230,6 +289,40 @@ mod tests {
                 .all(|segment: &RawBlockSegment| segment.encoded_len()
                     <= plan.max_segment_frame_bytes)
         );
+        assert_eq!(reassembled, raw_block);
+    }
+
+    #[tokio::test]
+    async fn forwards_raw_block_segments_when_compact_exceeds_current_fec_budget() {
+        let mut client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let sender = client.sender();
+        let (_receiver, mut outgoing) = client.take_receiver().unwrap();
+        let bridge = ForgeBridge {
+            sender,
+            data_shards: 10,
+            parity_shards: 3,
+        };
+        let raw_block = large_raw_block();
+
+        let forwarded = bridge.forward_block(&raw_block).await.unwrap();
+
+        assert_eq!(forwarded.mode, ForwardMode::RawBlockSegments);
+        assert!(forwarded.relay_objects > 1);
+
+        let mut segments = Vec::new();
+        for _ in 0..forwarded.relay_objects {
+            let payload = outgoing.recv().await.expect("segment queued");
+            match payload {
+                RelayPayload::RawBlockSegment(segment) => segments.push(segment),
+                RelayPayload::CompactBlock(_) => panic!("expected raw block segment"),
+            }
+        }
+
+        let reassembled = reassemble_raw_block(&segments).unwrap();
         assert_eq!(reassembled, raw_block);
     }
 

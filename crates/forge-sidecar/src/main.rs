@@ -1,7 +1,8 @@
 //! Forge sidecar for Stratum V1 mining pools
 
-use bedrock_forge::BlockReceiver;
+use bedrock_forge::{BlockReceiver, RawBlockSegment, RelayPayload, reassemble_raw_block};
 use clap::Parser;
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +15,9 @@ mod relay;
 use forge_sidecar::compact::build_compact_block;
 use forge_sidecar::config;
 use forge_sidecar::rpc::ZebraRpc;
-use forge_sidecar::submit::{SubmissionOutcome, SubmitBlockMode, handle_relay_compact_block};
+use forge_sidecar::submit::{
+    SubmissionOutcome, SubmitBlockMode, handle_relay_compact_block, handle_relay_raw_block,
+};
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::ForgeRelay;
 
@@ -233,30 +236,90 @@ fn spawn_relay_block_handler(
     mode: SubmitBlockMode,
 ) {
     tokio::spawn(async move {
-        while let Some(compact) = receiver.recv().await {
-            match handle_relay_compact_block(rpc.as_ref(), &compact, mode).await {
-                Ok(SubmissionOutcome::DryRun(candidate)) => {
-                    info!(
-                        block_hash = %candidate.block_hash,
-                        tx_count = candidate.tx_count,
-                        block_bytes = candidate.block_bytes,
-                        "Relay block submit dry-run candidate"
+        let mut raw_segments: HashMap<[u8; 32], Vec<Option<RawBlockSegment>>> = HashMap::new();
+        while let Some(payload) = receiver.recv_payload().await {
+            match payload {
+                RelayPayload::CompactBlock(compact) => {
+                    log_submission_outcome(
+                        handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
                     );
                 }
-                Ok(SubmissionOutcome::Submitted { candidate, result }) => {
-                    info!(
-                        block_hash = %candidate.block_hash,
-                        tx_count = candidate.tx_count,
-                        block_bytes = candidate.block_bytes,
-                        result = ?result,
-                        "Relay block submitted to Zebra"
-                    );
-                }
-                Err(error) => {
-                    warn!(%error, "Relay block is not a submit candidate");
+                RelayPayload::RawBlockSegment(segment) => {
+                    let block_hash = segment.block_hash;
+                    let segment_count = segment.segment_count as usize;
+                    let entry = raw_segments
+                        .entry(block_hash)
+                        .or_insert_with(|| vec![None; segment_count]);
+                    if entry.len() != segment_count {
+                        warn!(
+                            block_hash = %hex::encode(block_hash),
+                            "Relay raw block segment has inconsistent segment count"
+                        );
+                        raw_segments.remove(&block_hash);
+                        continue;
+                    }
+                    let index = segment.segment_index as usize;
+                    if index >= entry.len() {
+                        warn!(
+                            block_hash = %hex::encode(block_hash),
+                            segment_index = segment.segment_index,
+                            segment_count = segment.segment_count,
+                            "Relay raw block segment index out of bounds"
+                        );
+                        continue;
+                    }
+                    entry[index] = Some(segment);
+                    if entry.iter().all(Option::is_some) {
+                        let complete: Vec<RawBlockSegment> =
+                            entry.iter().filter_map(Clone::clone).collect();
+                        raw_segments.remove(&block_hash);
+                        match reassemble_raw_block(&complete) {
+                            Ok(raw_block) => {
+                                log_submission_outcome(
+                                    handle_relay_raw_block(
+                                        rpc.as_ref(),
+                                        &raw_block,
+                                        Some(block_hash),
+                                        mode,
+                                    )
+                                    .await,
+                                );
+                            }
+                            Err(error) => {
+                                warn!(%error, "Relay raw block segments did not reassemble");
+                            }
+                        }
+                    }
                 }
             }
         }
         warn!("Relay block receiver closed");
     });
+}
+
+fn log_submission_outcome(
+    outcome: Result<SubmissionOutcome, forge_sidecar::submit::RelayBlockError>,
+) {
+    match outcome {
+        Ok(SubmissionOutcome::DryRun(candidate)) => {
+            info!(
+                block_hash = %candidate.block_hash,
+                tx_count = candidate.tx_count,
+                block_bytes = candidate.block_bytes,
+                "Relay block submit dry-run candidate"
+            );
+        }
+        Ok(SubmissionOutcome::Submitted { candidate, result }) => {
+            info!(
+                block_hash = %candidate.block_hash,
+                tx_count = candidate.tx_count,
+                block_bytes = candidate.block_bytes,
+                result = ?result,
+                "Relay block submitted to Zebra"
+            );
+        }
+        Err(error) => {
+            warn!(%error, "Relay block is not a submit candidate");
+        }
+    }
 }

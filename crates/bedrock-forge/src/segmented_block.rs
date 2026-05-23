@@ -268,6 +268,22 @@ pub fn reassemble_raw_block(segments: &[RawBlockSegment]) -> Result<Vec<u8>, Seg
     Ok(raw_block)
 }
 
+/// Derive the relay object identifier for one raw block segment.
+///
+/// Relay chunk headers have one 32-byte object key. Segmented raw blocks need a
+/// distinct key per segment while preserving the parent block hash inside the
+/// segment frame.
+pub fn segment_object_hash(block_hash: [u8; 32], segment_index: u16) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"FORGE raw block segment v1");
+    hasher.update(block_hash);
+    hasher.update(segment_index.to_be_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];

@@ -3,8 +3,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use bedrock_forge::{CompactBlock, PrefilledTx, ShortId};
 use forge_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitFuture,
-    build_submission_candidate, handle_relay_compact_block,
+    build_raw_block_submission_candidate, build_submission_candidate, handle_relay_compact_block,
+    handle_relay_raw_block,
 };
+use sha2::{Digest, Sha256};
 
 struct CountingSubmitter {
     calls: AtomicUsize,
@@ -27,6 +29,21 @@ impl SubmitBlock for CountingSubmitter {
 
 fn header() -> Vec<u8> {
     vec![0xab; 1487]
+}
+
+fn raw_block_hash(raw_block: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(&raw_block[..1487]);
+    let second = Sha256::digest(first);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&second);
+    hash
+}
+
+fn raw_block() -> Vec<u8> {
+    let mut block = header();
+    block.push(1);
+    block.extend_from_slice(&[0x01, 0x02, 0x03]);
+    block
 }
 
 #[test]
@@ -120,4 +137,45 @@ async fn live_mode_submits_candidate_to_zebra() {
 
     assert!(matches!(outcome, SubmissionOutcome::Submitted { .. }));
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn raw_block_candidate_uses_complete_raw_bytes() {
+    let raw_block = raw_block();
+    let expected_hash = raw_block_hash(&raw_block);
+
+    let candidate = build_raw_block_submission_candidate(&raw_block, Some(expected_hash)).unwrap();
+
+    assert_eq!(candidate.tx_count, 1);
+    assert_eq!(candidate.block_bytes, raw_block.len());
+    assert_eq!(candidate.block_hex, hex::encode(&raw_block));
+    assert_eq!(candidate.block_hash, hex::encode(expected_hash));
+}
+
+#[test]
+fn raw_block_candidate_rejects_hash_mismatch() {
+    let raw_block = raw_block();
+
+    let err = build_raw_block_submission_candidate(&raw_block, Some([0x55; 32])).unwrap_err();
+
+    assert_eq!(err, RelayBlockError::RawBlockHashMismatch);
+}
+
+#[tokio::test]
+async fn dry_run_raw_block_does_not_submit_to_zebra() {
+    let submitter = CountingSubmitter::new();
+    let raw_block = raw_block();
+    let expected_hash = raw_block_hash(&raw_block);
+
+    let outcome = handle_relay_raw_block(
+        &submitter,
+        &raw_block,
+        Some(expected_hash),
+        SubmitBlockMode::DryRun,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(outcome, SubmissionOutcome::DryRun(_)));
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
 }

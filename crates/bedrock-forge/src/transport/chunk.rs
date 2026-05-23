@@ -35,6 +35,8 @@ pub enum MessageType {
     Keepalive = 1,
     /// Authentication handshake
     Auth = 2,
+    /// Segmented raw block object chunk
+    RawBlockSegment = 3,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -45,6 +47,7 @@ impl TryFrom<u8> for MessageType {
             0 => Ok(MessageType::Block),
             1 => Ok(MessageType::Keepalive),
             2 => Ok(MessageType::Auth),
+            3 => Ok(MessageType::RawBlockSegment),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid message type: {}", value),
@@ -83,10 +86,42 @@ impl ChunkHeader {
         total_chunks: u16,
         payload_len: u16,
     ) -> Self {
+        Self::new(
+            MessageType::Block,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )
+    }
+
+    /// Create a new chunk header for raw block segment data
+    pub fn new_raw_block_segment(
+        object_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+    ) -> Self {
+        Self::new(
+            MessageType::RawBlockSegment,
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )
+    }
+
+    fn new(
+        msg_type: MessageType,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+    ) -> Self {
         Self {
             magic: CHUNK_MAGIC,
             version: 1,
-            msg_type: MessageType::Block,
+            msg_type,
             block_hash: *block_hash,
             chunk_id,
             total_chunks,
@@ -103,10 +138,46 @@ impl ChunkHeader {
         payload_len: u16,
         hmac: [u8; 32],
     ) -> Self {
+        Self::new_authenticated(
+            MessageType::Block,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )
+    }
+
+    /// Create a new authenticated raw block segment chunk header
+    pub fn new_raw_block_segment_authenticated(
+        object_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        hmac: [u8; 32],
+    ) -> Self {
+        Self::new_authenticated(
+            MessageType::RawBlockSegment,
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )
+    }
+
+    fn new_authenticated(
+        msg_type: MessageType,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        hmac: [u8; 32],
+    ) -> Self {
         Self {
             magic: CHUNK_MAGIC,
             version: 2,
-            msg_type: MessageType::Block,
+            msg_type,
             block_hash: *block_hash,
             chunk_id,
             total_chunks,
@@ -197,10 +268,11 @@ impl ChunkHeader {
                 ),
             ));
         }
-        if msg_type == MessageType::Block && payload_len == 0 {
+        if matches!(msg_type, MessageType::Block | MessageType::RawBlockSegment) && payload_len == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "payload_len must be > 0 for block messages",
+                "payload_len must be > 0 for data messages",
             ));
         }
 

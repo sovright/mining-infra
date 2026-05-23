@@ -12,9 +12,11 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use crate::fec::FecError;
+use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{
     BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, MAX_TOTAL_CHUNKS,
     MessageType, PowResult, PowValidator, RelayConfig, RelaySession, TransportError,
+    ZCASH_FULL_HEADER_SIZE,
 };
 
 use super::metrics::RelayMetrics;
@@ -201,7 +203,19 @@ impl<V: PowValidator> RelayNode<V> {
     }
 
     /// Validate PoW once we can reconstruct serialized data
-    fn validate_pow_from_assembly(&self, assembly: &BlockAssembly) -> Option<bool> {
+    fn validate_pow_from_assembly(
+        &self,
+        assembly: &BlockAssembly,
+        msg_type: MessageType,
+    ) -> Option<bool> {
+        match msg_type {
+            MessageType::Block => self.validate_compact_block_pow(assembly),
+            MessageType::RawBlockSegment => self.validate_raw_block_segment(assembly),
+            MessageType::Keepalive | MessageType::Auth => None,
+        }
+    }
+
+    fn validate_compact_block_pow(&self, assembly: &BlockAssembly) -> Option<bool> {
         let est_len = self.estimate_original_len(assembly)?;
         let data = match self.chunker.decode_data(assembly.chunks.clone(), est_len) {
             Ok(data) => data,
@@ -231,10 +245,47 @@ impl<V: PowValidator> RelayNode<V> {
         }
     }
 
+    fn validate_raw_block_segment(&self, assembly: &BlockAssembly) -> Option<bool> {
+        let segment = self.decode_raw_segment_from_assembly(assembly)?;
+        let expected_object_hash = segment_object_hash(segment.block_hash, segment.segment_index);
+        if expected_object_hash != assembly.block_hash {
+            return Some(false);
+        }
+
+        if segment.segment_index != 0 {
+            return Some(true);
+        }
+
+        if segment.payload.len() < ZCASH_FULL_HEADER_SIZE {
+            return None;
+        }
+        let header = &segment.payload[..ZCASH_FULL_HEADER_SIZE];
+        if raw_block_header_hash(header) != segment.block_hash {
+            return Some(false);
+        }
+
+        match self.validator.validate(header) {
+            PowResult::Valid => Some(true),
+            PowResult::Invalid => Some(false),
+            PowResult::Indeterminate => None,
+        }
+    }
+
+    fn decode_raw_segment_from_assembly(
+        &self,
+        assembly: &BlockAssembly,
+    ) -> Option<RawBlockSegment> {
+        let est_len = self.estimate_original_len(assembly)?;
+        self.chunker
+            .chunks_to_raw_block_segment(assembly.chunks.clone(), est_len)
+            .ok()
+    }
+
     /// Forward chunks to all other sessions
     async fn forward_to_peers(
         &self,
         src_addr: SocketAddr,
+        msg_type: MessageType,
         block_hash: &[u8; 32],
         total_chunks: u16,
         chunks: &[(u16, Vec<u8>)],
@@ -266,15 +317,22 @@ impl<V: PowValidator> RelayNode<V> {
                         data.len() as u16,
                         data,
                     );
-                    ChunkHeader::new_block_authenticated(
+                    authenticated_data_header(
+                        msg_type,
                         block_hash,
                         *chunk_id,
                         total_chunks,
                         data.len() as u16,
                         hmac,
-                    )
+                    )?
                 } else {
-                    ChunkHeader::new_block(block_hash, *chunk_id, total_chunks, data.len() as u16)
+                    data_header(
+                        msg_type,
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        data.len() as u16,
+                    )?
                 };
                 let chunk = Chunk::new(header, data.clone());
                 payloads.push(chunk.to_bytes());
@@ -333,7 +391,7 @@ impl<V: PowValidator> RelayNode<V> {
         // chunk provides enough data to decide.
         if is_new
             && !assembly.pow_validated
-            && let Some(valid) = self.validate_pow_from_assembly(assembly)
+            && let Some(valid) = self.validate_pow_from_assembly(assembly, chunk.header.msg_type)
         {
             assembly.pow_validated = valid;
         }
@@ -365,7 +423,10 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         // Validate chunk type and counts
-        if chunk.header.msg_type != MessageType::Block {
+        if !matches!(
+            chunk.header.msg_type,
+            MessageType::Block | MessageType::RawBlockSegment
+        ) {
             self.metrics.inc_invalid_chunks();
             return Err(TransportError::InvalidChunk(format!(
                 "unsupported message type: {:?}",
@@ -497,6 +558,7 @@ impl<V: PowValidator> RelayNode<V> {
         if let Some(chunks_to_forward) = chunks_to_forward {
             self.forward_to_peers(
                 src_addr,
+                chunk.header.msg_type,
                 &block_hash,
                 chunk.header.total_chunks,
                 &chunks_to_forward,
@@ -600,6 +662,71 @@ impl<V: PowValidator> RelayNode<V> {
     }
 }
 
+fn data_header(
+    msg_type: MessageType,
+    object_hash: &[u8; 32],
+    chunk_id: u16,
+    total_chunks: u16,
+    payload_len: u16,
+) -> Result<ChunkHeader, TransportError> {
+    match msg_type {
+        MessageType::Block => Ok(ChunkHeader::new_block(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )),
+        MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )),
+        MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
+            "unsupported forwarded chunk message type".into(),
+        )),
+    }
+}
+
+fn authenticated_data_header(
+    msg_type: MessageType,
+    object_hash: &[u8; 32],
+    chunk_id: u16,
+    total_chunks: u16,
+    payload_len: u16,
+    hmac: [u8; 32],
+) -> Result<ChunkHeader, TransportError> {
+    match msg_type {
+        MessageType::Block => Ok(ChunkHeader::new_block_authenticated(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )),
+        MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment_authenticated(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )),
+        MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
+            "unsupported forwarded chunk message type".into(),
+        )),
+    }
+}
+
+fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+
+    let first = Sha256::digest(header);
+    let second = Sha256::digest(first);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&second);
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -671,7 +798,10 @@ mod tests {
             .with_unauthenticated_peers_allowed(true);
         let node = RelayNode::with_validator(config, HeaderPrefixValidator(marker)).unwrap();
 
-        assert_eq!(node.validate_pow_from_assembly(&assembly), Some(true));
+        assert_eq!(
+            node.validate_pow_from_assembly(&assembly, MessageType::Block),
+            Some(true)
+        );
     }
 
     #[tokio::test]
@@ -734,7 +864,7 @@ mod tests {
         let block_hash = [0xab; 32];
         let chunks = vec![(0u16, vec![1u8; 10])];
 
-        node.forward_to_peers(sender_addr, &block_hash, 1, &chunks)
+        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 1, &chunks)
             .await
             .unwrap();
 

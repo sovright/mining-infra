@@ -24,10 +24,11 @@ pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
     BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
-    render_prometheus_text,
+    RelayPayload, render_prometheus_text,
 };
 pub use segmented_block::{
-    RawBlockSegment, SegmentedBlockError, reassemble_raw_block, split_raw_block,
+    RawBlockSegment, SegmentedBlockError, reassemble_raw_block, segment_object_hash,
+    split_raw_block,
 };
 pub use transport::{
     BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,

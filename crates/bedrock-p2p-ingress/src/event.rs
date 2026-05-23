@@ -180,6 +180,8 @@ impl EventSink {
         hash: &str,
         bytes: usize,
         tx_count: usize,
+        mode: &str,
+        relay_objects: usize,
     ) -> Result<()> {
         self.write(json!({
             "event": "p2p_forge_block_forwarded",
@@ -187,6 +189,8 @@ impl EventSink {
             "hash": hash,
             "bytes": bytes,
             "tx_count": tx_count,
+            "mode": mode,
+            "relay_objects": relay_objects,
             "observed_at_unix_ms": now_unix_ms(),
         }))
     }
@@ -259,7 +263,7 @@ mod tests {
             .p2p_peer_rotation("127.0.0.1:8233", "rotated", 78, 9)
             .unwrap();
         events
-            .p2p_forge_block_forwarded("127.0.0.1:8233", "abcd", 1234, 2)
+            .p2p_forge_block_forwarded("127.0.0.1:8233", "abcd", 1234, 2, "compact_block", 1)
             .unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
@@ -286,6 +290,8 @@ mod tests {
         assert_eq!(rows[5]["hash"], "abcd");
         assert_eq!(rows[5]["bytes"], 1234);
         assert_eq!(rows[5]["tx_count"], 2);
+        assert_eq!(rows[5]["mode"], "compact_block");
+        assert_eq!(rows[5]["relay_objects"], 1);
 
         let _ = fs::remove_file(path);
     }

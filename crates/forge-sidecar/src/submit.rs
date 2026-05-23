@@ -9,7 +9,8 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use bedrock_forge::CompactBlock;
+use bedrock_forge::{CompactBlock, ZCASH_FULL_HEADER_SIZE};
+use sha2::{Digest, Sha256};
 
 use crate::rpc::ZebraRpc;
 
@@ -63,6 +64,9 @@ pub enum RelayBlockError {
     MissingTransactions { short_ids: usize },
     NonContiguousPrefilledTx { expected: u16, actual: u16 },
     TooManyTransactions { count: usize },
+    RawBlockTooShort { bytes: usize },
+    RawBlockHashMismatch,
+    InvalidCompactSize,
     SubmitFailed(String),
 }
 
@@ -84,6 +88,15 @@ impl fmt::Display for RelayBlockError {
             ),
             RelayBlockError::TooManyTransactions { count } => {
                 write!(f, "transaction count {count} exceeds compactSize u64")
+            }
+            RelayBlockError::RawBlockTooShort { bytes } => {
+                write!(f, "raw block too short for Zcash header: {bytes} bytes")
+            }
+            RelayBlockError::RawBlockHashMismatch => {
+                write!(f, "raw block header hash does not match relay metadata")
+            }
+            RelayBlockError::InvalidCompactSize => {
+                write!(f, "invalid transaction count compactSize")
             }
             RelayBlockError::SubmitFailed(error) => write!(f, "submitblock failed: {error}"),
         }
@@ -147,6 +160,40 @@ pub fn build_submission_candidate(
     })
 }
 
+/// Build a submit candidate from a complete raw serialized block.
+pub fn build_raw_block_submission_candidate(
+    raw_block: &[u8],
+    expected_block_hash: Option<[u8; 32]>,
+) -> Result<SubmissionCandidate, RelayBlockError> {
+    let header =
+        raw_block
+            .get(..ZCASH_FULL_HEADER_SIZE)
+            .ok_or(RelayBlockError::RawBlockTooShort {
+                bytes: raw_block.len(),
+            })?;
+    let block_hash = raw_block_header_hash(header);
+    if let Some(expected) = expected_block_hash
+        && expected != block_hash
+    {
+        return Err(RelayBlockError::RawBlockHashMismatch);
+    }
+
+    let mut cursor = ZCASH_FULL_HEADER_SIZE;
+    let tx_count = decode_compact_size(raw_block, &mut cursor)?;
+    if tx_count == 0 {
+        return Err(RelayBlockError::EmptyTransactions);
+    }
+    let tx_count = usize::try_from(tx_count)
+        .map_err(|_| RelayBlockError::TooManyTransactions { count: usize::MAX })?;
+
+    Ok(SubmissionCandidate {
+        block_hash: hex::encode(block_hash),
+        block_hex: hex::encode(raw_block),
+        tx_count,
+        block_bytes: raw_block.len(),
+    })
+}
+
 /// Handle one relay compact block under the configured submit mode.
 pub async fn handle_relay_compact_block<S: SubmitBlock + Sync>(
     submitter: &S,
@@ -154,6 +201,26 @@ pub async fn handle_relay_compact_block<S: SubmitBlock + Sync>(
     mode: SubmitBlockMode,
 ) -> Result<SubmissionOutcome, RelayBlockError> {
     let candidate = build_submission_candidate(compact)?;
+    match mode {
+        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+        SubmitBlockMode::Live => {
+            let result = submitter
+                .submit_block(&candidate.block_hex)
+                .await
+                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+            Ok(SubmissionOutcome::Submitted { candidate, result })
+        }
+    }
+}
+
+/// Handle one relay raw block under the configured submit mode.
+pub async fn handle_relay_raw_block<S: SubmitBlock + Sync>(
+    submitter: &S,
+    raw_block: &[u8],
+    expected_block_hash: Option<[u8; 32]>,
+    mode: SubmitBlockMode,
+) -> Result<SubmissionOutcome, RelayBlockError> {
+    let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
     match mode {
         SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
         SubmitBlockMode::Live => {
@@ -194,6 +261,45 @@ fn encode_compact_size(count: usize, out: &mut Vec<u8>) -> Result<(), RelayBlock
         return Err(RelayBlockError::TooManyTransactions { count });
     }
     Ok(())
+}
+
+fn decode_compact_size(input: &[u8], cursor: &mut usize) -> Result<u64, RelayBlockError> {
+    let Some(tag) = input.get(*cursor).copied() else {
+        return Err(RelayBlockError::InvalidCompactSize);
+    };
+    *cursor += 1;
+    match tag {
+        0x00..=0xfc => Ok(tag as u64),
+        0xfd => {
+            let bytes = input
+                .get(*cursor..*cursor + 2)
+                .ok_or(RelayBlockError::InvalidCompactSize)?;
+            *cursor += 2;
+            Ok(u16::from_le_bytes(bytes.try_into().unwrap()) as u64)
+        }
+        0xfe => {
+            let bytes = input
+                .get(*cursor..*cursor + 4)
+                .ok_or(RelayBlockError::InvalidCompactSize)?;
+            *cursor += 4;
+            Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
+        }
+        0xff => {
+            let bytes = input
+                .get(*cursor..*cursor + 8)
+                .ok_or(RelayBlockError::InvalidCompactSize)?;
+            *cursor += 8;
+            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
+        }
+    }
+}
+
+fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
+    let first = Sha256::digest(header);
+    let second = Sha256::digest(first);
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&second);
+    hash
 }
 
 #[cfg(test)]
