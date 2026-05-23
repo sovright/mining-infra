@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::{Config, is_denied_peer_addr};
+use crate::config::{Config, is_accepted_peer_addr};
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
 
@@ -15,6 +15,7 @@ pub struct Crawler {
     rotation_cooldown: Duration,
     rotation_failure_cooldown: Duration,
     max_known_peers: usize,
+    accept_nonstandard_ports: bool,
 }
 
 struct CrawlerInner {
@@ -50,7 +51,7 @@ impl Crawler {
         let mut queue = VecDeque::new();
         let now = Instant::now();
         for peer in initial_peers {
-            if is_denied_peer_addr(&peer) {
+            if !is_accepted_peer_addr(&peer, config.accept_nonstandard_ports) {
                 continue;
             }
             if peers
@@ -75,6 +76,7 @@ impl Crawler {
             rotation_cooldown: config.rotation_cooldown,
             rotation_failure_cooldown: config.rotation_failure_cooldown,
             max_known_peers: config.crawler_max_known_peers,
+            accept_nonstandard_ports: config.accept_nonstandard_ports,
         }
     }
 
@@ -171,7 +173,7 @@ impl Crawler {
                 .lock()
                 .map_err(|_| IngressError::Wire("crawler mutex poisoned".to_string()))?;
             for peer in peers {
-                if is_denied_peer_addr(&peer) {
+                if !is_accepted_peer_addr(&peer, self.accept_nonstandard_ports) {
                     continue;
                 }
                 if inner.peers.len() >= self.max_known_peers {
@@ -217,6 +219,7 @@ mod tests {
             rotation_enabled,
             rotation_cooldown: Duration::from_secs(0),
             rotation_failure_cooldown: Duration::from_secs(30),
+            accept_nonstandard_ports: false,
             event_log: None::<PathBuf>,
             relay_peers: Vec::new(),
             relay_bind_addr: "0.0.0.0:0".parse().unwrap(),
@@ -306,6 +309,23 @@ mod tests {
 
         let accepted = crawler
             .add_discovered("127.0.0.9:8233", [flux_peer, flux_alt_peer], &events())
+            .unwrap();
+
+        assert_eq!(accepted, 0);
+        assert_eq!(crawler.known_len(), 1);
+    }
+
+    #[test]
+    fn crawler_rejects_nonstandard_ports_by_default() {
+        let zcash_peer: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let nonstandard_peer: SocketAddr = "127.0.0.2:34567".parse().unwrap();
+        let crawler = Crawler::new(&config(true), [zcash_peer, nonstandard_peer]);
+
+        assert_eq!(crawler.known_len(), 1);
+        assert_eq!(crawler.next_peer(), Some(zcash_peer));
+
+        let accepted = crawler
+            .add_discovered("127.0.0.9:8233", [nonstandard_peer], &events())
             .unwrap();
 
         assert_eq!(accepted, 0);

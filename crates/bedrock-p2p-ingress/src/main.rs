@@ -16,7 +16,7 @@ use tokio::net::lookup_host;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use config::{Config, is_denied_peer_addr, seed_socket};
+use config::{Config, is_accepted_peer_addr, seed_socket};
 use crawler::{Crawler, PeerOutcome};
 use error::Result;
 use event::EventSink;
@@ -138,14 +138,14 @@ async fn discover_peers(config: &Config) -> Vec<SocketAddr> {
             .peers
             .iter()
             .copied()
-            .filter(|peer| !is_denied_peer_addr(peer)),
+            .filter(|peer| is_accepted_peer_addr(peer, config.accept_nonstandard_ports)),
     );
 
     for seed in &config.seeds {
         match lookup_host(seed_socket(seed)).await {
             Ok(addrs) => {
                 for addr in addrs {
-                    if !is_denied_peer_addr(&addr) {
+                    if is_accepted_peer_addr(&addr, config.accept_nonstandard_ports) {
                         peers.insert(addr);
                     }
                 }

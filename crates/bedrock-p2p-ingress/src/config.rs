@@ -24,6 +24,7 @@ pub struct Config {
     pub rotation_enabled: bool,
     pub rotation_cooldown: Duration,
     pub rotation_failure_cooldown: Duration,
+    pub accept_nonstandard_ports: bool,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
@@ -48,6 +49,7 @@ impl Config {
             Duration::from_secs(env_u64("BEDROCK_P2P_ROTATION_COOLDOWN_SECS", 30)?);
         let rotation_failure_cooldown =
             Duration::from_secs(env_u64("BEDROCK_P2P_ROTATION_FAILURE_COOLDOWN_SECS", 120)?);
+        let accept_nonstandard_ports = env_bool("BEDROCK_P2P_ACCEPT_NONSTANDARD_PORTS", false)?;
         let event_log = env::var("BEDROCK_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("BEDROCK_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("BEDROCK_P2P_RELAY_BIND_ADDR")
@@ -80,6 +82,7 @@ impl Config {
             rotation_enabled,
             rotation_cooldown,
             rotation_failure_cooldown,
+            accept_nonstandard_ports,
             event_log,
             relay_peers,
             relay_bind_addr,
@@ -170,6 +173,10 @@ pub fn is_denied_peer_addr(peer: &SocketAddr) -> bool {
     DENIED_PEER_PORTS.contains(&peer.port())
 }
 
+pub fn is_accepted_peer_addr(peer: &SocketAddr, accept_nonstandard_ports: bool) -> bool {
+    !is_denied_peer_addr(peer) && (accept_nonstandard_ports || peer.port() == DEFAULT_PORT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,5 +198,25 @@ mod tests {
         assert!(is_denied_peer_addr(&"127.0.0.1:16125".parse().unwrap()));
         assert!(is_denied_peer_addr(&"127.0.0.1:26125".parse().unwrap()));
         assert!(!is_denied_peer_addr(&"127.0.0.1:8233".parse().unwrap()));
+    }
+
+    #[test]
+    fn accepts_standard_port_by_default() {
+        assert!(is_accepted_peer_addr(
+            &"127.0.0.1:8233".parse().unwrap(),
+            false
+        ));
+        assert!(!is_accepted_peer_addr(
+            &"127.0.0.1:34567".parse().unwrap(),
+            false
+        ));
+        assert!(is_accepted_peer_addr(
+            &"127.0.0.1:34567".parse().unwrap(),
+            true
+        ));
+        assert!(!is_accepted_peer_addr(
+            &"127.0.0.1:16125".parse().unwrap(),
+            true
+        ));
     }
 }
