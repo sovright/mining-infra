@@ -47,3 +47,6 @@ raw_segment_ttl_secs = 120
 # Zero disables pacing. Useful for large raw-block fallback drills.
 send_burst_packets = 0
 send_burst_delay_micros = 0
+
+# Optional Prometheus textfile for receive/reassembly/submit metrics.
+# metrics_textfile = "/var/lib/forge-sidecar/metrics.prom"

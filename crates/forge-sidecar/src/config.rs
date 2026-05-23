@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Error type alias for config operations
 type ConfigError = Box<dyn std::error::Error + Send + Sync>;
@@ -68,6 +68,10 @@ pub struct Config {
     /// Optional client-side delay after each outbound relay packet burst.
     #[serde(default)]
     pub send_burst_delay_micros: u64,
+
+    /// Optional Prometheus textfile path for sidecar receive metrics.
+    #[serde(default)]
+    pub metrics_textfile: Option<PathBuf>,
 }
 
 fn default_zebra_url() -> String {
@@ -187,6 +191,7 @@ mod tests {
         assert_eq!(config.raw_segment_ttl_secs, 120);
         assert_eq!(config.send_burst_packets, 0);
         assert_eq!(config.send_burst_delay_micros, 0);
+        assert_eq!(config.metrics_textfile, None);
     }
 
     #[test]
@@ -247,5 +252,20 @@ mod tests {
 
         assert_eq!(config.send_burst_packets, 32);
         assert_eq!(config.send_burst_delay_micros, 1000);
+    }
+
+    #[test]
+    fn config_parses_metrics_textfile() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            metrics_textfile = "/var/lib/forge-sidecar/metrics.prom"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            config.metrics_textfile,
+            Some(PathBuf::from("/var/lib/forge-sidecar/metrics.prom"))
+        );
     }
 }

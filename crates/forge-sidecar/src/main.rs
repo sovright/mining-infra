@@ -3,8 +3,11 @@
 use bedrock_forge::{BlockReceiver, RawBlockSegment, RelayPayload, reassemble_raw_block};
 use clap::Parser;
 use std::collections::HashMap;
+use std::fs;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -88,6 +91,10 @@ struct Args {
     /// Optional client-side delay after each outbound relay packet burst
     #[arg(long, default_value = "0")]
     send_burst_delay_micros: u64,
+
+    /// Optional Prometheus textfile path for sidecar receive metrics
+    #[arg(long)]
+    metrics_textfile: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -118,6 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         raw_segment_ttl_secs,
         send_burst_packets,
         send_burst_delay_micros,
+        metrics_textfile,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -136,6 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.raw_segment_ttl_secs,
             cfg.send_burst_packets,
             cfg.send_burst_delay_micros,
+            cfg.metrics_textfile.clone(),
         )
     } else {
         // Use CLI args
@@ -179,6 +188,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.raw_segment_ttl_secs,
             args.send_burst_packets,
             args.send_burst_delay_micros,
+            args.metrics_textfile.clone(),
         )
     };
 
@@ -198,6 +208,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
 
     info!(zebra_url = %zebra_url, "Starting forge sidecar");
+    let metrics = Arc::new(SidecarMetrics::default());
+    if let Some(path) = metrics_textfile {
+        spawn_metrics_textfile_writer(Arc::clone(&metrics), path);
+    }
 
     // Initialize Zebra RPC client
     let rpc = Arc::new(ZebraRpc::new(&zebra_url).await?);
@@ -221,7 +235,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             SubmitBlockMode::DryRun
         };
-        spawn_relay_block_handler(receiver, Arc::clone(&rpc), mode, raw_segment_buffer_config);
+        spawn_relay_block_handler(
+            receiver,
+            Arc::clone(&rpc),
+            mode,
+            raw_segment_buffer_config,
+            Arc::clone(&metrics),
+        );
     } else {
         relay.start().await?;
     }
@@ -277,17 +297,21 @@ fn spawn_relay_block_handler(
     rpc: Arc<ZebraRpc>,
     mode: SubmitBlockMode,
     raw_segment_buffer_config: RawSegmentBufferConfig,
+    metrics: Arc<SidecarMetrics>,
 ) {
     tokio::spawn(async move {
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
         while let Some(payload) = receiver.recv_payload().await {
             match payload {
                 RelayPayload::CompactBlock(compact) => {
+                    metrics.inc_compact_blocks_received();
                     log_submission_outcome(
                         handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
+                        metrics.as_ref(),
                     );
                 }
                 RelayPayload::RawBlockSegment(segment) => {
+                    metrics.inc_raw_segments_received();
                     let block_hash = segment.block_hash;
                     let segment_index = segment.segment_index;
                     let segment_count = segment.segment_count;
@@ -301,6 +325,7 @@ fn spawn_relay_block_handler(
                     );
                     match raw_segments.insert(segment, Instant::now()) {
                         RawSegmentInsert::Pending => {
+                            raw_segments.update_metrics(metrics.as_ref());
                             info!(
                                 block_hash = %hex::encode(block_hash),
                                 segment_index,
@@ -309,6 +334,8 @@ fn spawn_relay_block_handler(
                             );
                         }
                         RawSegmentInsert::Complete(segments) => {
+                            metrics.inc_raw_segment_sets_completed();
+                            raw_segments.update_metrics(metrics.as_ref());
                             let completed_segments = segments.len();
                             match reassemble_raw_block(&segments) {
                                 Ok(raw_block) => {
@@ -326,20 +353,26 @@ fn spawn_relay_block_handler(
                                             mode,
                                         )
                                         .await,
+                                        metrics.as_ref(),
                                     );
                                 }
                                 Err(error) => {
+                                    metrics.inc_raw_segment_reassembly_failures();
                                     warn!(%error, "Relay raw block segments did not reassemble");
                                 }
                             }
                         }
-                        RawSegmentInsert::Dropped { reason } => warn!(
-                            block_hash = %hex::encode(block_hash),
-                            segment_index,
-                            segment_count,
-                            reason,
-                            "Dropping relay raw block segment"
-                        ),
+                        RawSegmentInsert::Dropped { reason } => {
+                            metrics.inc_raw_segment_drops();
+                            raw_segments.update_metrics(metrics.as_ref());
+                            warn!(
+                                block_hash = %hex::encode(block_hash),
+                                segment_index,
+                                segment_count,
+                                reason,
+                                "Dropping relay raw block segment"
+                            );
+                        }
                     }
                 }
             }
@@ -519,13 +552,19 @@ impl RawSegmentBuffer {
         self.total_payload_bytes = self.total_payload_bytes.saturating_sub(entry.bytes);
         Some(entry)
     }
+
+    fn update_metrics(&self, metrics: &SidecarMetrics) {
+        metrics.set_raw_segment_buffer_state(self.entries.len(), self.total_payload_bytes);
+    }
 }
 
 fn log_submission_outcome(
     outcome: Result<SubmissionOutcome, forge_sidecar::submit::RelayBlockError>,
+    metrics: &SidecarMetrics,
 ) {
     match outcome {
         Ok(SubmissionOutcome::DryRun(candidate)) => {
+            metrics.inc_submit_dry_run_candidates();
             info!(
                 block_hash = %candidate.block_hash,
                 tx_count = candidate.tx_count,
@@ -534,6 +573,7 @@ fn log_submission_outcome(
             );
         }
         Ok(SubmissionOutcome::Submitted { candidate, result }) => {
+            metrics.inc_submit_successes();
             info!(
                 block_hash = %candidate.block_hash,
                 tx_count = candidate.tx_count,
@@ -543,15 +583,151 @@ fn log_submission_outcome(
             );
         }
         Err(error) => {
+            metrics.inc_submit_rejections();
             warn!(%error, "Relay block is not a submit candidate");
         }
     }
+}
+
+#[derive(Default)]
+struct SidecarMetrics {
+    compact_blocks_received: AtomicU64,
+    raw_segments_received: AtomicU64,
+    raw_segment_sets_completed: AtomicU64,
+    raw_segment_drops: AtomicU64,
+    raw_segment_reassembly_failures: AtomicU64,
+    submit_dry_run_candidates: AtomicU64,
+    submit_successes: AtomicU64,
+    submit_rejections: AtomicU64,
+    raw_segment_incomplete_blocks: AtomicUsize,
+    raw_segment_payload_bytes: AtomicUsize,
+}
+
+impl SidecarMetrics {
+    fn inc_compact_blocks_received(&self) {
+        self.compact_blocks_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_raw_segments_received(&self) {
+        self.raw_segments_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_raw_segment_sets_completed(&self) {
+        self.raw_segment_sets_completed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_raw_segment_drops(&self) {
+        self.raw_segment_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_raw_segment_reassembly_failures(&self) {
+        self.raw_segment_reassembly_failures
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_submit_dry_run_candidates(&self) {
+        self.submit_dry_run_candidates
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_submit_successes(&self) {
+        self.submit_successes.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_submit_rejections(&self) {
+        self.submit_rejections.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn set_raw_segment_buffer_state(&self, incomplete_blocks: usize, payload_bytes: usize) {
+        self.raw_segment_incomplete_blocks
+            .store(incomplete_blocks, Ordering::Relaxed);
+        self.raw_segment_payload_bytes
+            .store(payload_bytes, Ordering::Relaxed);
+    }
+
+    fn render_prometheus_text(&self) -> String {
+        let compact_blocks_received = self.compact_blocks_received.load(Ordering::Relaxed);
+        let raw_segments_received = self.raw_segments_received.load(Ordering::Relaxed);
+        let raw_segment_sets_completed = self.raw_segment_sets_completed.load(Ordering::Relaxed);
+        let raw_segment_drops = self.raw_segment_drops.load(Ordering::Relaxed);
+        let raw_segment_reassembly_failures =
+            self.raw_segment_reassembly_failures.load(Ordering::Relaxed);
+        let submit_dry_run_candidates = self.submit_dry_run_candidates.load(Ordering::Relaxed);
+        let submit_successes = self.submit_successes.load(Ordering::Relaxed);
+        let submit_rejections = self.submit_rejections.load(Ordering::Relaxed);
+        let raw_segment_incomplete_blocks =
+            self.raw_segment_incomplete_blocks.load(Ordering::Relaxed);
+        let raw_segment_payload_bytes = self.raw_segment_payload_bytes.load(Ordering::Relaxed);
+
+        format!(
+            concat!(
+                "# TYPE forge_sidecar_relay_compact_blocks_received_total counter\n",
+                "forge_sidecar_relay_compact_blocks_received_total {compact_blocks_received}\n",
+                "# TYPE forge_sidecar_relay_raw_segments_received_total counter\n",
+                "forge_sidecar_relay_raw_segments_received_total {raw_segments_received}\n",
+                "# TYPE forge_sidecar_relay_raw_segment_sets_completed_total counter\n",
+                "forge_sidecar_relay_raw_segment_sets_completed_total {raw_segment_sets_completed}\n",
+                "# TYPE forge_sidecar_relay_raw_segment_drops_total counter\n",
+                "forge_sidecar_relay_raw_segment_drops_total {raw_segment_drops}\n",
+                "# TYPE forge_sidecar_relay_raw_segment_reassembly_failures_total counter\n",
+                "forge_sidecar_relay_raw_segment_reassembly_failures_total {raw_segment_reassembly_failures}\n",
+                "# TYPE forge_sidecar_relay_submit_dry_run_candidates_total counter\n",
+                "forge_sidecar_relay_submit_dry_run_candidates_total {submit_dry_run_candidates}\n",
+                "# TYPE forge_sidecar_relay_submit_successes_total counter\n",
+                "forge_sidecar_relay_submit_successes_total {submit_successes}\n",
+                "# TYPE forge_sidecar_relay_submit_rejections_total counter\n",
+                "forge_sidecar_relay_submit_rejections_total {submit_rejections}\n",
+                "# TYPE forge_sidecar_raw_segment_incomplete_blocks gauge\n",
+                "forge_sidecar_raw_segment_incomplete_blocks {raw_segment_incomplete_blocks}\n",
+                "# TYPE forge_sidecar_raw_segment_payload_bytes gauge\n",
+                "forge_sidecar_raw_segment_payload_bytes {raw_segment_payload_bytes}\n",
+            ),
+            compact_blocks_received = compact_blocks_received,
+            raw_segments_received = raw_segments_received,
+            raw_segment_sets_completed = raw_segment_sets_completed,
+            raw_segment_drops = raw_segment_drops,
+            raw_segment_reassembly_failures = raw_segment_reassembly_failures,
+            submit_dry_run_candidates = submit_dry_run_candidates,
+            submit_successes = submit_successes,
+            submit_rejections = submit_rejections,
+            raw_segment_incomplete_blocks = raw_segment_incomplete_blocks,
+            raw_segment_payload_bytes = raw_segment_payload_bytes,
+        )
+    }
+}
+
+fn spawn_metrics_textfile_writer(metrics: Arc<SidecarMetrics>, path: PathBuf) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        loop {
+            interval.tick().await;
+            let text = metrics.render_prometheus_text();
+            if let Err(error) = write_metrics_textfile(&path, &text) {
+                warn!(%error, path = %path.display(), "Failed to write forge sidecar metrics textfile");
+            }
+        }
+    });
+}
+
+fn write_metrics_textfile(
+    path: &Path,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, text)?;
+    fs::rename(tmp, path)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use bedrock_forge::split_raw_block;
+    use std::sync::atomic::Ordering;
 
     fn buffer_config(
         max_incomplete_blocks: usize,
@@ -588,6 +764,60 @@ mod tests {
         }
         assert!(buffer.entries.is_empty());
         assert_eq!(buffer.total_payload_bytes, 0);
+    }
+
+    #[test]
+    fn raw_segment_buffer_updates_metrics() {
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+        let metrics = SidecarMetrics::default();
+        let raw_block = vec![0xab; 25];
+        let segments =
+            split_raw_block([0x06; 32], &raw_block, RawBlockSegment::HEADER_LEN + 5).unwrap();
+        let now = Instant::now();
+
+        assert!(matches!(
+            buffer.insert(segments[0].clone(), now),
+            RawSegmentInsert::Pending
+        ));
+        buffer.update_metrics(&metrics);
+
+        assert_eq!(
+            metrics
+                .raw_segment_incomplete_blocks
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics.raw_segment_payload_bytes.load(Ordering::Relaxed),
+            segments[0].payload.len()
+        );
+    }
+
+    #[test]
+    fn sidecar_metrics_render_prometheus_text() {
+        let metrics = SidecarMetrics::default();
+        metrics.inc_compact_blocks_received();
+        metrics.inc_raw_segments_received();
+        metrics.inc_raw_segment_sets_completed();
+        metrics.inc_raw_segment_drops();
+        metrics.inc_raw_segment_reassembly_failures();
+        metrics.inc_submit_dry_run_candidates();
+        metrics.inc_submit_successes();
+        metrics.inc_submit_rejections();
+        metrics.set_raw_segment_buffer_state(2, 4096);
+
+        let text = metrics.render_prometheus_text();
+
+        assert!(text.contains("forge_sidecar_relay_compact_blocks_received_total 1"));
+        assert!(text.contains("forge_sidecar_relay_raw_segments_received_total 1"));
+        assert!(text.contains("forge_sidecar_relay_raw_segment_sets_completed_total 1"));
+        assert!(text.contains("forge_sidecar_relay_raw_segment_drops_total 1"));
+        assert!(text.contains("forge_sidecar_relay_raw_segment_reassembly_failures_total 1"));
+        assert!(text.contains("forge_sidecar_relay_submit_dry_run_candidates_total 1"));
+        assert!(text.contains("forge_sidecar_relay_submit_successes_total 1"));
+        assert!(text.contains("forge_sidecar_relay_submit_rejections_total 1"));
+        assert!(text.contains("forge_sidecar_raw_segment_incomplete_blocks 2"));
+        assert!(text.contains("forge_sidecar_raw_segment_payload_bytes 4096"));
     }
 
     #[test]
