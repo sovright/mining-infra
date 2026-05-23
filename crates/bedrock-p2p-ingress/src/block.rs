@@ -481,7 +481,7 @@ mod tests {
             max_tx_bytes: 2_048,
         });
         let cached_key = TxInventoryKey::wtx([0x41; 32], [0x42; 32]);
-        cache.insert(cached_key, tx1.clone());
+        cache.insert(cached_key.to_wtxid(), tx1.clone());
 
         let compact = compact_block_from_raw_block_with_tx_cache(&block, &cache).unwrap();
 

@@ -21,7 +21,10 @@ pub use compact_block::{CompactBlock, PrefilledTx};
 pub use error::CompactBlockError;
 pub use fec::FecError;
 pub use hash::zcash_block_hash;
-pub use mempool::{MempoolError, MempoolProvider, TestMempool};
+pub use mempool::{
+    MempoolError, MempoolProvider, TestMempool, TxCache, TxCacheConfig, TxCacheInsertOutcome,
+    TxCacheSnapshot,
+};
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{

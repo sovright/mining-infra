@@ -216,7 +216,7 @@ pub async fn run_peer(
                     continue;
                 }
                 if let (Some(cache), Some(key)) = (&tx_cache, pending_tx_responses.pop_front()) {
-                    let outcome = cache.insert(key, msg.payload.clone());
+                    let outcome = cache.insert(key.to_wtxid(), msg.payload.clone());
                     events.p2p_tx_received(
                         &peer,
                         key.kind(),
@@ -504,7 +504,7 @@ mod tests {
             max_bytes: 1_024,
             max_tx_bytes: 512,
         });
-        cache.insert(TxInventoryKey::tx([0x91; 32]), vec![1, 2, 3]);
+        cache.insert(TxInventoryKey::tx([0x91; 32]).to_wtxid(), vec![1, 2, 3]);
 
         emit_tx_cache_snapshot(&events, &cache).unwrap();
 

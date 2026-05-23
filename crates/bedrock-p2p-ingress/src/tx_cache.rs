@@ -1,17 +1,7 @@
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
-
-use bedrock_forge::{AuthDigest, MempoolProvider, TxId, WtxId};
-use sha2::{Digest, Sha256};
+use bedrock_forge::{AuthDigest, TxId, WtxId};
+pub use bedrock_forge::{TxCache, TxCacheConfig};
 
 use crate::wire::{Inventory, MSG_TX, MSG_WTX};
-
-#[derive(Debug, Clone, Copy)]
-pub struct TxCacheConfig {
-    pub max_entries: usize,
-    pub max_bytes: usize,
-    pub max_tx_bytes: usize,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TxInventoryKey {
@@ -74,194 +64,10 @@ impl TxInventoryKey {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct TxCacheInsertOutcome {
-    pub inserted: bool,
-    pub entries: usize,
-    pub bytes: usize,
-    pub evicted_entries: usize,
-    pub evicted_bytes: usize,
-    pub dropped_too_large: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TxCacheSnapshot {
-    pub entries: usize,
-    pub bytes: usize,
-    pub max_entries: usize,
-    pub max_bytes: usize,
-    pub max_tx_bytes: usize,
-    pub evicted_entries_total: usize,
-    pub evicted_bytes_total: usize,
-    pub dropped_too_large_total: usize,
-}
-
-#[derive(Clone)]
-pub struct TxCache {
-    config: TxCacheConfig,
-    inner: Arc<Mutex<TxCacheInner>>,
-}
-
-#[derive(Default)]
-struct TxCacheInner {
-    entries: HashMap<WtxId, CachedTx>,
-    order: VecDeque<WtxId>,
-    payload_index: HashMap<[u8; 32], Vec<WtxId>>,
-    bytes: usize,
-    evicted_entries_total: usize,
-    evicted_bytes_total: usize,
-    dropped_too_large_total: usize,
-}
-
-struct CachedTx {
-    bytes: Vec<u8>,
-    payload_digest: [u8; 32],
-}
-
-impl TxCache {
-    pub fn new(config: TxCacheConfig) -> Self {
-        Self {
-            config,
-            inner: Arc::new(Mutex::new(TxCacheInner::default())),
-        }
-    }
-
-    pub fn insert(&self, key: TxInventoryKey, tx_bytes: Vec<u8>) -> TxCacheInsertOutcome {
-        let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
-        if tx_bytes.len() > self.config.max_tx_bytes || self.config.max_entries == 0 {
-            inner.dropped_too_large_total += 1;
-            return TxCacheInsertOutcome {
-                inserted: false,
-                entries: inner.entries.len(),
-                bytes: inner.bytes,
-                dropped_too_large: 1,
-                ..TxCacheInsertOutcome::default()
-            };
-        }
-
-        let wtxid = key.to_wtxid();
-        remove_entry(&mut inner, &wtxid);
-
-        let payload_digest = payload_digest(&tx_bytes);
-        inner.bytes += tx_bytes.len();
-        inner.entries.insert(
-            wtxid,
-            CachedTx {
-                bytes: tx_bytes,
-                payload_digest,
-            },
-        );
-        inner.order.push_back(wtxid);
-        inner
-            .payload_index
-            .entry(payload_digest)
-            .or_default()
-            .push(wtxid);
-
-        let mut evicted_entries = 0;
-        let mut evicted_bytes = 0;
-        while inner.entries.len() > self.config.max_entries || inner.bytes > self.config.max_bytes {
-            let Some(oldest) = inner.order.pop_front() else {
-                break;
-            };
-            if let Some(entry) = remove_entry(&mut inner, &oldest) {
-                evicted_entries += 1;
-                evicted_bytes += entry.bytes.len();
-            }
-        }
-        inner.evicted_entries_total += evicted_entries;
-        inner.evicted_bytes_total += evicted_bytes;
-
-        TxCacheInsertOutcome {
-            inserted: inner.entries.contains_key(&wtxid),
-            entries: inner.entries.len(),
-            bytes: inner.bytes,
-            evicted_entries,
-            evicted_bytes,
-            dropped_too_large: 0,
-        }
-    }
-
-    pub fn wtxid_for_payload(&self, tx_payload: &[u8]) -> Option<WtxId> {
-        let digest = payload_digest(tx_payload);
-        let inner = self.inner.lock().expect("tx cache mutex poisoned");
-        let mut matches = inner
-            .payload_index
-            .get(&digest)?
-            .iter()
-            .copied()
-            .filter(|wtxid| {
-                inner
-                    .entries
-                    .get(wtxid)
-                    .is_some_and(|entry| entry.bytes == tx_payload)
-            });
-        let first = matches.next()?;
-        if matches.next().is_some() {
-            None
-        } else {
-            Some(first)
-        }
-    }
-
-    pub fn snapshot(&self) -> TxCacheSnapshot {
-        let inner = self.inner.lock().expect("tx cache mutex poisoned");
-        TxCacheSnapshot {
-            entries: inner.entries.len(),
-            bytes: inner.bytes,
-            max_entries: self.config.max_entries,
-            max_bytes: self.config.max_bytes,
-            max_tx_bytes: self.config.max_tx_bytes,
-            evicted_entries_total: inner.evicted_entries_total,
-            evicted_bytes_total: inner.evicted_bytes_total,
-            dropped_too_large_total: inner.dropped_too_large_total,
-        }
-    }
-}
-
-fn payload_digest(tx_payload: &[u8]) -> [u8; 32] {
-    Sha256::digest(tx_payload).into()
-}
-
-fn remove_entry(inner: &mut TxCacheInner, wtxid: &WtxId) -> Option<CachedTx> {
-    let entry = inner.entries.remove(wtxid)?;
-    inner.bytes = inner.bytes.saturating_sub(entry.bytes.len());
-    inner.order.retain(|candidate| candidate != wtxid);
-    remove_payload_index_entry(&mut inner.payload_index, entry.payload_digest, wtxid);
-    Some(entry)
-}
-
-fn remove_payload_index_entry(
-    payload_index: &mut HashMap<[u8; 32], Vec<WtxId>>,
-    digest: [u8; 32],
-    wtxid: &WtxId,
-) {
-    let should_remove = if let Some(candidates) = payload_index.get_mut(&digest) {
-        candidates.retain(|candidate| candidate != wtxid);
-        candidates.is_empty()
-    } else {
-        false
-    };
-    if should_remove {
-        payload_index.remove(&digest);
-    }
-}
-
-impl MempoolProvider for TxCache {
-    fn get_wtxids(&self) -> Vec<WtxId> {
-        let inner = self.inner.lock().expect("tx cache mutex poisoned");
-        inner.entries.keys().copied().collect()
-    }
-
-    fn get_tx_data(&self, wtxid: &WtxId) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().expect("tx cache mutex poisoned");
-        inner.entries.get(wtxid).map(|entry| entry.bytes.clone())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bedrock_forge::{MempoolProvider, TxCacheSnapshot};
 
     #[test]
     fn stores_wtx_inventory_as_mempool_provider() {
@@ -273,7 +79,7 @@ mod tests {
         let key = TxInventoryKey::wtx([0x11; 32], [0x22; 32]);
         let tx_bytes = vec![0xaa, 0xbb, 0xcc];
 
-        let outcome = cache.insert(key, tx_bytes.clone());
+        let outcome = cache.insert(key.to_wtxid(), tx_bytes.clone());
 
         assert!(outcome.inserted);
         assert_eq!(outcome.entries, 1);
@@ -294,9 +100,9 @@ mod tests {
         let second = TxInventoryKey::tx([0x02; 32]);
         let third = TxInventoryKey::tx([0x03; 32]);
 
-        cache.insert(first, vec![1, 1]);
-        cache.insert(second, vec![2, 2]);
-        let outcome = cache.insert(third, vec![3, 3]);
+        cache.insert(first.to_wtxid(), vec![1, 1]);
+        cache.insert(second.to_wtxid(), vec![2, 2]);
+        let outcome = cache.insert(third.to_wtxid(), vec![3, 3]);
 
         assert!(outcome.inserted);
         assert_eq!(outcome.evicted_entries, 1);
@@ -315,7 +121,7 @@ mod tests {
             max_tx_bytes: 2,
         });
 
-        let outcome = cache.insert(TxInventoryKey::tx([0x44; 32]), vec![1, 2, 3]);
+        let outcome = cache.insert(TxInventoryKey::tx([0x44; 32]).to_wtxid(), vec![1, 2, 3]);
 
         assert!(!outcome.inserted);
         assert_eq!(outcome.dropped_too_large, 1);
@@ -333,7 +139,7 @@ mod tests {
         let key = TxInventoryKey::wtx([0x55; 32], [0x66; 32]);
         let tx_bytes = vec![0xde, 0xad, 0xbe, 0xef];
 
-        cache.insert(key, tx_bytes.clone());
+        cache.insert(key.to_wtxid(), tx_bytes.clone());
 
         assert_eq!(cache.wtxid_for_payload(&tx_bytes), Some(key.to_wtxid()));
         assert_eq!(cache.wtxid_for_payload(&[0xde, 0xad, 0xbe, 0x00]), None);
@@ -351,8 +157,8 @@ mod tests {
         let first_payload = vec![1, 2, 3];
         let second_payload = vec![4, 5, 6];
 
-        cache.insert(first, first_payload.clone());
-        cache.insert(second, second_payload.clone());
+        cache.insert(first.to_wtxid(), first_payload.clone());
+        cache.insert(second.to_wtxid(), second_payload.clone());
 
         assert_eq!(cache.wtxid_for_payload(&first_payload), None);
         assert_eq!(
@@ -370,8 +176,8 @@ mod tests {
         });
         let payload = vec![0xaa, 0xbb, 0xcc];
 
-        cache.insert(TxInventoryKey::tx([0x81; 32]), payload.clone());
-        cache.insert(TxInventoryKey::tx([0x82; 32]), payload.clone());
+        cache.insert(TxInventoryKey::tx([0x81; 32]).to_wtxid(), payload.clone());
+        cache.insert(TxInventoryKey::tx([0x82; 32]).to_wtxid(), payload.clone());
 
         assert_eq!(cache.wtxid_for_payload(&payload), None);
     }
@@ -384,10 +190,13 @@ mod tests {
             max_tx_bytes: 4,
         });
 
-        cache.insert(TxInventoryKey::tx([0x01; 32]), vec![1, 1]);
-        cache.insert(TxInventoryKey::tx([0x02; 32]), vec![2, 2]);
-        cache.insert(TxInventoryKey::tx([0x03; 32]), vec![3, 3]);
-        cache.insert(TxInventoryKey::tx([0x04; 32]), vec![4, 4, 4, 4, 4]);
+        cache.insert(TxInventoryKey::tx([0x01; 32]).to_wtxid(), vec![1, 1]);
+        cache.insert(TxInventoryKey::tx([0x02; 32]).to_wtxid(), vec![2, 2]);
+        cache.insert(TxInventoryKey::tx([0x03; 32]).to_wtxid(), vec![3, 3]);
+        cache.insert(
+            TxInventoryKey::tx([0x04; 32]).to_wtxid(),
+            vec![4, 4, 4, 4, 4],
+        );
 
         let snapshot = cache.snapshot();
 
