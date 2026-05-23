@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use bedrock_forge::{
-    BlockChunker, BlockSender, ClientConfig, CompactBlock, RelayClient, TransportError,
+    BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_PAYLOAD_SIZE, RelayClient,
+    TransportError,
 };
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -71,6 +72,17 @@ impl ForgeBridge {
         let block_hash = compact.header_hash();
         let chunker = BlockChunker::new(self.data_shards, self.parity_shards)
             .map_err(|e| IngressError::Forge(e.to_string()))?;
+        let serialized_len = BlockChunker::serialize_compact_block(compact).len();
+        let max_data_bytes = self.data_shards.saturating_mul(MAX_PAYLOAD_SIZE);
+        if serialized_len > max_data_bytes {
+            return Err(IngressError::Forge(format!(
+                "all-prefilled compact block too large for current FORGE frame budget: \
+                 serialized_bytes={serialized_len} max_data_bytes={max_data_bytes} \
+                 data_shards={} parity_shards={} max_payload={MAX_PAYLOAD_SIZE}; \
+                 production full-block relay needs compact reconstruction or segmented object framing",
+                self.data_shards, self.parity_shards
+            )));
+        }
         chunker
             .compact_block_to_chunks(compact, block_hash.as_bytes())
             .map(|_| ())
@@ -85,4 +97,45 @@ pub struct ForwardedBlock {
 
 fn map_transport_error(error: TransportError) -> IngressError {
     IngressError::Forge(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bedrock_forge::{PrefilledTx, ZCASH_FULL_HEADER_SIZE};
+
+    fn bridge_with_default_fec() -> ForgeBridge {
+        let config = ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+            .with_auth_required(true);
+        let client = RelayClient::new(config).unwrap();
+        ForgeBridge {
+            sender: client.sender(),
+            data_shards: 10,
+            parity_shards: 3,
+        }
+    }
+
+    #[test]
+    fn preflight_reports_all_prefilled_frame_budget_for_large_blocks() {
+        let compact = CompactBlock::new(
+            vec![0xab; ZCASH_FULL_HEADER_SIZE],
+            0,
+            Vec::new(),
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: vec![0xcd; 20_000],
+            }],
+        );
+
+        let err = bridge_with_default_fec()
+            .preflight_chunks(&compact)
+            .unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("all-prefilled compact block too large"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("data_shards=10"), "{err}");
+    }
 }
