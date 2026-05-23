@@ -21,6 +21,14 @@ pub use fec::FecError;
 pub use mempool::{MempoolError, MempoolProvider, TestMempool};
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
-pub use transport::{BlockAssembly, BlockChunker, Chunk, ChunkHeader, ClientConfig, EquihashPowValidator, MessageType, PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession, StubPowValidator, TransportError, CHUNK_MAGIC, EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, MAX_PAYLOAD_SIZE, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE};
-pub use relay::{BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode};
+pub use relay::{
+    BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
+    render_prometheus_text,
+};
+pub use transport::{
+    BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,
+    EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, MAX_PAYLOAD_SIZE, MessageType,
+    PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession, StubPowValidator,
+    TransportError, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+};
 pub use types::{AuthDigest, BlockHash, ShortId, TxId, WtxId};

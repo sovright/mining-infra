@@ -7,5 +7,5 @@ mod metrics;
 mod node;
 
 pub use client::{BlockReceiver, BlockSender, RelayClient};
-pub use metrics::{MetricsSnapshot, RelayMetrics};
+pub use metrics::{MetricsSnapshot, RelayMetrics, render_prometheus_text};
 pub use node::RelayNode;

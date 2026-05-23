@@ -79,6 +79,78 @@ pub struct MetricsSnapshot {
     pub sessions_expired: u64,
 }
 
+/// Render relay metrics in Prometheus text exposition format.
+pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> String {
+    let mut text = String::new();
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_sessions",
+        "Current relay sessions.",
+        "gauge",
+        sessions as u64,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_packets_received_total",
+        "Total relay packets received.",
+        "counter",
+        snapshot.packets_received,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_packets_forwarded_total",
+        "Total relay packets forwarded.",
+        "counter",
+        snapshot.packets_forwarded,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_auth_failures_total",
+        "Total relay authentication failures.",
+        "counter",
+        snapshot.auth_failures,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_invalid_chunks_total",
+        "Total invalid chunks rejected by the relay.",
+        "counter",
+        snapshot.invalid_chunks,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_sessions_created_total",
+        "Total relay sessions created.",
+        "counter",
+        snapshot.sessions_created,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_sessions_expired_total",
+        "Total relay sessions expired.",
+        "counter",
+        snapshot.sessions_expired,
+    );
+    text
+}
+
+fn push_metric(text: &mut String, name: &str, help: &str, metric_type: &str, value: u64) {
+    text.push_str("# HELP ");
+    text.push_str(name);
+    text.push(' ');
+    text.push_str(help);
+    text.push('\n');
+    text.push_str("# TYPE ");
+    text.push_str(name);
+    text.push(' ');
+    text.push_str(metric_type);
+    text.push('\n');
+    text.push_str(name);
+    text.push(' ');
+    text.push_str(&value.to_string());
+    text.push('\n');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,5 +167,29 @@ mod tests {
         assert_eq!(snapshot.packets_received, 2);
         assert_eq!(snapshot.auth_failures, 1);
         assert_eq!(snapshot.packets_forwarded, 0);
+    }
+
+    #[test]
+    fn prometheus_text_includes_relay_counters_and_sessions() {
+        let snapshot = MetricsSnapshot {
+            packets_received: 12,
+            packets_forwarded: 7,
+            auth_failures: 1,
+            invalid_chunks: 2,
+            sessions_created: 3,
+            sessions_expired: 4,
+        };
+
+        let text = render_prometheus_text(&snapshot, 5);
+
+        assert!(text.contains("# HELP bedrock_forge_relay_sessions Current relay sessions."));
+        assert!(text.contains("# TYPE bedrock_forge_relay_sessions gauge"));
+        assert!(text.contains("bedrock_forge_relay_sessions 5\n"));
+        assert!(text.contains("bedrock_forge_relay_packets_received_total 12\n"));
+        assert!(text.contains("bedrock_forge_relay_packets_forwarded_total 7\n"));
+        assert!(text.contains("bedrock_forge_relay_auth_failures_total 1\n"));
+        assert!(text.contains("bedrock_forge_relay_invalid_chunks_total 2\n"));
+        assert!(text.contains("bedrock_forge_relay_sessions_created_total 3\n"));
+        assert!(text.contains("bedrock_forge_relay_sessions_expired_total 4\n"));
     }
 }
