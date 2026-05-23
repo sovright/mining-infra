@@ -11,6 +11,7 @@ pub mod mempool;
 pub mod messages;
 pub mod reconstructor;
 pub mod relay;
+pub mod segmented_block;
 pub mod transport;
 pub mod types;
 
@@ -24,6 +25,9 @@ pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
     BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
     render_prometheus_text,
+};
+pub use segmented_block::{
+    RawBlockSegment, SegmentedBlockError, reassemble_raw_block, split_raw_block,
 };
 pub use transport::{
     BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,

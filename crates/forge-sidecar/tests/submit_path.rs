@@ -67,7 +67,7 @@ fn candidate_serializes_contiguous_prefilled_transactions() {
                 tx_data: vec![0x01, 0x02],
             },
             PrefilledTx {
-                index: 1,
+                index: 0,
                 tx_data: vec![0x03],
             },
         ],

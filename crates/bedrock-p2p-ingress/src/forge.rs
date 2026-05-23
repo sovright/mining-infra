@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use bedrock_forge::{
     BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_PAYLOAD_SIZE, RelayClient,
-    TransportError,
+    TransportError, split_raw_block,
 };
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -78,7 +78,9 @@ impl ForgeBridge {
     pub async fn forward_block(&self, block_payload: &[u8]) -> Result<ForwardedBlock> {
         let compact = compact_block_from_raw_block(block_payload)?;
         let tx_count = compact.prefilled_txs.len();
-        self.preflight_chunks(&compact)?;
+        if let Err(error) = self.preflight_chunks(&compact) {
+            return Err(self.with_segment_plan(error, &compact, block_payload));
+        }
         self.sender
             .send(compact)
             .await
@@ -87,6 +89,27 @@ impl ForgeBridge {
             tx_count,
             bytes: block_payload.len(),
         })
+    }
+
+    fn with_segment_plan(
+        &self,
+        error: IngressError,
+        compact: &CompactBlock,
+        block_payload: &[u8],
+    ) -> IngressError {
+        let text = error.to_string();
+        if !text.contains("all-prefilled compact block too large") {
+            return error;
+        }
+        match self.plan_raw_block_segments(*compact.header_hash().as_bytes(), block_payload) {
+            Ok(plan) => IngressError::Forge(format!(
+                "{text}; segmented raw block plan: segments={} object_bytes={} max_segment_frame_bytes={}",
+                plan.segment_count, plan.object_bytes, plan.max_segment_frame_bytes
+            )),
+            Err(plan_error) => IngressError::Forge(format!(
+                "{text}; segmented raw block plan unavailable: {plan_error}"
+            )),
+        }
     }
 
     fn preflight_chunks(&self, compact: &CompactBlock) -> Result<()> {
@@ -109,11 +132,33 @@ impl ForgeBridge {
             .map(|_| ())
             .map_err(|e| IngressError::Forge(e.to_string()))
     }
+
+    fn plan_raw_block_segments(
+        &self,
+        block_hash: [u8; 32],
+        block_payload: &[u8],
+    ) -> Result<RawBlockSegmentPlan> {
+        let max_segment_frame_bytes = self.data_shards.saturating_mul(MAX_PAYLOAD_SIZE);
+        let segments = split_raw_block(block_hash, block_payload, max_segment_frame_bytes)
+            .map_err(|e| IngressError::Forge(e.to_string()))?;
+        Ok(RawBlockSegmentPlan {
+            segment_count: segments.len(),
+            object_bytes: block_payload.len(),
+            max_segment_frame_bytes,
+        })
+    }
 }
 
 pub struct ForwardedBlock {
     pub tx_count: usize,
     pub bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RawBlockSegmentPlan {
+    segment_count: usize,
+    object_bytes: usize,
+    max_segment_frame_bytes: usize,
 }
 
 fn map_transport_error(error: TransportError) -> IngressError {
@@ -123,7 +168,9 @@ fn map_transport_error(error: TransportError) -> IngressError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bedrock_forge::{PrefilledTx, ZCASH_FULL_HEADER_SIZE};
+    use bedrock_forge::{
+        PrefilledTx, RawBlockSegment, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
+    };
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -160,6 +207,30 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("data_shards=10"), "{err}");
+    }
+
+    #[test]
+    fn raw_block_segment_plan_uses_current_fec_budget() {
+        let bridge = bridge_with_default_fec();
+        let raw_block = vec![0xab; 25_000];
+        let block_hash = [0x42; 32];
+
+        let plan = bridge
+            .plan_raw_block_segments(block_hash, &raw_block)
+            .unwrap();
+        let segments =
+            split_raw_block(block_hash, &raw_block, plan.max_segment_frame_bytes).unwrap();
+        let reassembled = reassemble_raw_block(&segments).unwrap();
+
+        assert_eq!(plan.object_bytes, raw_block.len());
+        assert!(plan.segment_count > 1);
+        assert!(
+            segments
+                .iter()
+                .all(|segment: &RawBlockSegment| segment.encoded_len()
+                    <= plan.max_segment_frame_bytes)
+        );
+        assert_eq!(reassembled, raw_block);
     }
 
     fn test_config() -> Config {

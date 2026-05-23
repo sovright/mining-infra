@@ -105,19 +105,27 @@ pub fn build_submission_candidate(
         return Err(RelayBlockError::EmptyTransactions);
     }
 
-    let mut txs = compact.prefilled_txs.clone();
-    txs.sort_by_key(|tx| tx.index);
+    let txs = &compact.prefilled_txs;
+    let mut next_position = 0usize;
     for (expected, tx) in txs.iter().enumerate() {
         if expected > u16::MAX as usize {
             return Err(RelayBlockError::TooManyTransactions { count: txs.len() });
         }
         let expected = expected as u16;
-        if tx.index != expected {
+        let position = next_position
+            .checked_add(tx.index as usize)
+            .ok_or(RelayBlockError::TooManyTransactions { count: txs.len() })?;
+        if position > u16::MAX as usize {
+            return Err(RelayBlockError::TooManyTransactions { count: txs.len() });
+        }
+        let position = position as u16;
+        if position != expected {
             return Err(RelayBlockError::NonContiguousPrefilledTx {
                 expected,
-                actual: tx.index,
+                actual: position,
             });
         }
+        next_position = position as usize + 1;
     }
 
     let mut block = Vec::with_capacity(
@@ -127,7 +135,7 @@ pub fn build_submission_candidate(
     );
     block.extend_from_slice(&compact.header);
     encode_compact_size(txs.len(), &mut block)?;
-    for tx in &txs {
+    for tx in txs {
         block.extend_from_slice(&tx.tx_data);
     }
 
@@ -186,4 +194,74 @@ fn encode_compact_size(count: usize, out: &mut Vec<u8>) -> Result<(), RelayBlock
         return Err(RelayBlockError::TooManyTransactions { count });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bedrock_forge::{CompactBlock, PrefilledTx};
+
+    #[test]
+    fn submission_candidate_decodes_differential_prefilled_indices() {
+        let header = vec![0xab; 2189];
+        let compact = CompactBlock::new(
+            header.clone(),
+            0,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: vec![0x01],
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: vec![0x02, 0x03],
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: vec![0x04],
+                },
+            ],
+        );
+
+        let candidate = build_submission_candidate(&compact).unwrap();
+        let block = hex::decode(&candidate.block_hex).unwrap();
+
+        let mut expected = header;
+        expected.push(3);
+        expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+
+        assert_eq!(candidate.tx_count, 3);
+        assert_eq!(candidate.block_bytes, expected.len());
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn submission_candidate_rejects_legacy_absolute_prefilled_indices() {
+        let compact = CompactBlock::new(
+            vec![0xab; 2189],
+            0,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: vec![0x01],
+                },
+                PrefilledTx {
+                    index: 1,
+                    tx_data: vec![0x02],
+                },
+            ],
+        );
+
+        let err = build_submission_candidate(&compact).unwrap_err();
+
+        assert_eq!(
+            err,
+            RelayBlockError::NonContiguousPrefilledTx {
+                expected: 1,
+                actual: 2,
+            }
+        );
+    }
 }

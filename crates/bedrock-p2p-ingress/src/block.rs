@@ -38,6 +38,7 @@ pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<Compa
     }
 
     let mut prefilled_txs = Vec::with_capacity(tx_count as usize);
+    let mut last_prefilled_index: i64 = -1;
     for index in 0..tx_count {
         let start = cursor;
         skip_transaction(block_payload, &mut cursor)?;
@@ -45,10 +46,12 @@ pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<Compa
             .get(start..cursor)
             .ok_or_else(|| IngressError::Wire("transaction cursor escaped block".to_string()))?
             .to_vec();
+        let diff = index as i64 - last_prefilled_index - 1;
         prefilled_txs.push(PrefilledTx {
-            index: index as u16,
+            index: diff as u16,
             tx_data,
         });
+        last_prefilled_index = index as i64;
     }
 
     if cursor != block_payload.len() {
@@ -418,7 +421,7 @@ mod tests {
         assert_eq!(compact.prefilled_txs.len(), 2);
         assert_eq!(compact.prefilled_txs[0].index, 0);
         assert_eq!(compact.prefilled_txs[0].tx_data, tx0);
-        assert_eq!(compact.prefilled_txs[1].index, 1);
+        assert_eq!(compact.prefilled_txs[1].index, 0);
         assert_eq!(compact.prefilled_txs[1].tx_data, tx1);
 
         let mut reconstructed = compact.header.clone();
