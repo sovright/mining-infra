@@ -56,6 +56,10 @@ pub struct Config {
     #[serde(default)]
     pub tx_cache_enabled: bool,
 
+    /// Optional local TCP bind address for transaction-feed ingestion.
+    #[serde(default)]
+    pub tx_feed_bind_addr: Option<String>,
+
     /// Maximum transactions to keep in the sidecar transaction cache.
     #[serde(default = "default_tx_cache_max_entries")]
     pub tx_cache_max_entries: usize,
@@ -226,6 +230,7 @@ mod tests {
         assert_eq!(config.send_burst_delay_micros, 0);
         assert_eq!(config.metrics_textfile, None);
         assert!(!config.tx_cache_enabled);
+        assert_eq!(config.tx_feed_bind_addr, None);
         assert_eq!(config.tx_cache_max_entries, 50_000);
         assert_eq!(config.tx_cache_max_bytes, 128 * 1024 * 1024);
         assert_eq!(config.tx_cache_max_tx_bytes, 2 * 1024 * 1024);
@@ -324,5 +329,20 @@ mod tests {
         assert_eq!(config.tx_cache_max_entries, 123);
         assert_eq!(config.tx_cache_max_bytes, 456);
         assert_eq!(config.tx_cache_max_tx_bytes, 789);
+    }
+
+    #[test]
+    fn config_parses_tx_feed_bind_addr() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            tx_feed_bind_addr = "127.0.0.1:19091"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            config.tx_feed_bind_addr,
+            Some("127.0.0.1:19091".to_string())
+        );
     }
 }

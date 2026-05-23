@@ -385,6 +385,7 @@ mod tests {
             tx_cache_max_entries: 200_000,
             tx_cache_max_bytes: 536_870_912,
             tx_cache_max_tx_bytes: 2_097_152,
+            tx_feed_addr: None,
             tx_request_limit_per_inv: 256,
             event_log: Some(PathBuf::from("/tmp/test.jsonl")),
             relay_peers: vec!["127.0.0.1:1".parse().unwrap()],

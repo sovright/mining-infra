@@ -13,6 +13,7 @@ use crate::event::EventSink;
 use crate::forge::ForgeBridge;
 use crate::hash::{display_hash_from_header, inventory_hash_to_display};
 use crate::tx_cache::{TxCache, TxInventoryKey};
+use crate::tx_feed::TxFeedClient;
 use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
@@ -28,6 +29,7 @@ pub async fn run_peer(
     events: EventSink,
     forge: Option<ForgeBridge>,
     tx_cache: Option<TxCache>,
+    tx_feed: Option<TxFeedClient>,
     crawler: Crawler,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
@@ -139,7 +141,7 @@ pub async fn run_peer(
                     } else if inv.is_transaction()
                         && let Some(key) = queue_tx_request(
                             inv,
-                            tx_cache.is_some(),
+                            tx_cache.is_some() || tx_feed.is_some(),
                             config.tx_request_limit_per_inv,
                             &mut seen_tx_inv,
                             &mut requested_tx,
@@ -215,21 +217,38 @@ pub async fn run_peer(
                 if !saw_verack {
                     continue;
                 }
-                if let (Some(cache), Some(key)) = (&tx_cache, pending_tx_responses.pop_front()) {
-                    let outcome = cache.insert(key.to_wtxid(), msg.payload.clone());
-                    events.p2p_tx_received(
-                        &peer,
-                        key.kind(),
-                        &key.display_hash(),
-                        msg.payload.len(),
-                        outcome.entries,
-                        outcome.bytes,
-                        outcome.evicted_entries,
-                        outcome.evicted_bytes,
-                        outcome.dropped_too_large,
-                    )?;
-                    emit_tx_cache_snapshot(&events, cache)?;
-                } else if tx_cache.is_some() {
+                if let Some(key) = pending_tx_responses.pop_front() {
+                    let wtxid = key.to_wtxid();
+                    if let Some(cache) = &tx_cache {
+                        let outcome = cache.insert(wtxid, msg.payload.clone());
+                        events.p2p_tx_received(
+                            &peer,
+                            key.kind(),
+                            &key.display_hash(),
+                            msg.payload.len(),
+                            outcome.entries,
+                            outcome.bytes,
+                            outcome.evicted_entries,
+                            outcome.evicted_bytes,
+                            outcome.dropped_too_large,
+                        )?;
+                        emit_tx_cache_snapshot(&events, cache)?;
+                    }
+                    if let Some(feed) = &tx_feed {
+                        match feed.send(wtxid, &msg.payload).await {
+                            Ok(()) => events.p2p_tx_feed_forwarded(
+                                &peer,
+                                key.kind(),
+                                &key.display_hash(),
+                                msg.payload.len(),
+                            )?,
+                            Err(error) => events.p2p_peer_error(
+                                &peer,
+                                &format!("tx feed forward failed: {error}"),
+                            )?,
+                        }
+                    }
+                } else if tx_cache.is_some() || tx_feed.is_some() {
                     events
                         .p2p_peer_error(&peer, "received tx without pending transaction request")?;
                 }

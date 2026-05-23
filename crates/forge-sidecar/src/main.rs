@@ -1,8 +1,9 @@
 //! Forge sidecar for Stratum V1 mining pools
 
 use bedrock_forge::{
-    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, TxCache,
-    TxCacheConfig, TxCacheSnapshot, WtxId, reassemble_raw_block,
+    AuthDigest, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
+    TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxId, WtxId,
+    reassemble_raw_block,
 };
 use clap::Parser;
 use std::collections::HashMap;
@@ -12,8 +13,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod poller;
 mod relay;
@@ -84,6 +87,10 @@ struct Args {
     #[arg(long)]
     tx_cache_enabled: bool,
 
+    /// Optional local TCP bind address for transaction-feed ingestion
+    #[arg(long)]
+    tx_feed_bind_addr: Option<String>,
+
     /// Maximum transactions to keep in the sidecar transaction cache
     #[arg(long, default_value = "50000")]
     tx_cache_max_entries: usize,
@@ -146,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         enable_submitblock,
         compact_reconstruction_enabled,
         tx_cache_enabled,
+        tx_feed_bind_addr,
         tx_cache_max_entries,
         tx_cache_max_bytes,
         tx_cache_max_tx_bytes,
@@ -170,6 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.enable_submitblock,
             cfg.compact_reconstruction_enabled,
             cfg.tx_cache_enabled,
+            cfg.tx_feed_bind_addr.clone(),
             cfg.tx_cache_max_entries,
             cfg.tx_cache_max_bytes,
             cfg.tx_cache_max_tx_bytes,
@@ -219,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.enable_submitblock,
             args.compact_reconstruction_enabled,
             args.tx_cache_enabled,
+            args.tx_feed_bind_addr.clone(),
             args.tx_cache_max_entries,
             args.tx_cache_max_bytes,
             args.tx_cache_max_tx_bytes,
@@ -240,6 +250,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .into(),
         );
     }
+    if tx_feed_bind_addr.is_some() && !tx_cache_enabled {
+        return Err("tx_feed_bind_addr requires tx_cache_enabled".into());
+    }
     let raw_segment_buffer_config = RawSegmentBufferConfig::new(
         raw_segment_max_incomplete_blocks,
         raw_segment_max_payload_bytes,
@@ -256,6 +269,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }));
     if let Some(snapshot) = mempool.tx_cache_snapshot() {
         metrics.set_tx_cache_snapshot(&snapshot);
+    }
+    if let Some(bind_addr) = tx_feed_bind_addr {
+        let bind_addr: SocketAddr = bind_addr.parse()?;
+        let local_addr =
+            start_tx_feed_listener(bind_addr, Arc::clone(&mempool), Arc::clone(&metrics)).await?;
+        info!(%local_addr, "Sidecar transaction feed listener started");
     }
     if let Some(path) = metrics_textfile {
         spawn_metrics_textfile_writer(Arc::clone(&metrics), mempool.tx_cache(), path);
@@ -547,6 +566,125 @@ impl MempoolProvider for SidecarMempool {
             Self::TxCache(cache) => cache.get_tx_data(wtxid),
         }
     }
+}
+
+fn ingest_sidecar_tx_payload(
+    mempool: &SidecarMempool,
+    metrics: &SidecarMetrics,
+    wtxid: WtxId,
+    tx_bytes: Vec<u8>,
+) -> Option<TxCacheInsertOutcome> {
+    let cache = mempool.tx_cache()?;
+    let outcome = cache.insert(wtxid, tx_bytes);
+    metrics.set_tx_cache_snapshot(&cache.snapshot());
+    Some(outcome)
+}
+
+async fn start_tx_feed_listener(
+    bind_addr: SocketAddr,
+    mempool: Arc<SidecarMempool>,
+    metrics: Arc<SidecarMetrics>,
+) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind(bind_addr).await?;
+    let local_addr = listener.local_addr()?;
+    tokio::spawn(run_tx_feed_listener(listener, mempool, metrics));
+    Ok(local_addr)
+}
+
+async fn run_tx_feed_listener(
+    listener: TcpListener,
+    mempool: Arc<SidecarMempool>,
+    metrics: Arc<SidecarMetrics>,
+) {
+    loop {
+        match listener.accept().await {
+            Ok((stream, peer)) => {
+                tokio::spawn(handle_tx_feed_connection(
+                    stream,
+                    peer,
+                    Arc::clone(&mempool),
+                    Arc::clone(&metrics),
+                ));
+            }
+            Err(error) => {
+                warn!(%error, "Sidecar transaction feed listener failed to accept connection");
+                break;
+            }
+        }
+    }
+}
+
+async fn handle_tx_feed_connection(
+    stream: TcpStream,
+    peer: SocketAddr,
+    mempool: Arc<SidecarMempool>,
+    metrics: Arc<SidecarMetrics>,
+) {
+    let mut lines = BufReader::new(stream).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => match parse_tx_feed_line(&line) {
+                Ok((wtxid, tx_bytes)) => {
+                    let tx_bytes_len = tx_bytes.len();
+                    match ingest_sidecar_tx_payload(&mempool, &metrics, wtxid, tx_bytes) {
+                        Some(outcome) => {
+                            debug!(
+                                %peer,
+                                tx_bytes = tx_bytes_len,
+                                cache_entries = outcome.entries,
+                                cache_bytes = outcome.bytes,
+                                inserted = outcome.inserted,
+                                "Sidecar transaction feed payload processed"
+                            );
+                        }
+                        None => {
+                            warn!(%peer, "Sidecar transaction feed received payload while tx cache is disabled")
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(%peer, %error, "Dropping invalid sidecar transaction feed line")
+                }
+            },
+            Ok(None) => break,
+            Err(error) => {
+                warn!(%peer, %error, "Sidecar transaction feed connection failed");
+                break;
+            }
+        }
+    }
+}
+
+fn parse_tx_feed_line(line: &str) -> Result<(WtxId, Vec<u8>), String> {
+    let mut parts = line.split_whitespace();
+    let wtxid_hex = parts
+        .next()
+        .ok_or_else(|| "missing wtxid hex field".to_string())?;
+    let tx_hex = parts
+        .next()
+        .ok_or_else(|| "missing transaction hex field".to_string())?;
+    if parts.next().is_some() {
+        return Err("unexpected extra transaction feed field".to_string());
+    }
+
+    let mut wtxid_bytes = [0u8; 64];
+    hex::decode_to_slice(wtxid_hex, &mut wtxid_bytes)
+        .map_err(|error| format!("invalid wtxid hex: {error}"))?;
+    let mut txid = [0u8; 32];
+    txid.copy_from_slice(&wtxid_bytes[..32]);
+    let mut auth_digest = [0u8; 32];
+    auth_digest.copy_from_slice(&wtxid_bytes[32..]);
+
+    let tx_bytes =
+        hex::decode(tx_hex).map_err(|error| format!("invalid transaction hex: {error}"))?;
+    if tx_bytes.is_empty() {
+        return Err("empty transaction payload".to_string());
+    }
+
+    Ok((
+        WtxId::new(TxId::from_bytes(txid), AuthDigest::from_bytes(auth_digest)),
+        tx_bytes,
+    ))
 }
 
 fn raw_segment_cleanup_interval(ttl: Duration) -> Duration {
@@ -1221,6 +1359,82 @@ mod tests {
 
         assert_eq!(mempool.get_tx_data(&wtxid), Some(tx));
         assert_eq!(mempool.tx_cache_snapshot().unwrap().max_entries, 8);
+    }
+
+    #[test]
+    fn sidecar_tx_feed_inserts_into_enabled_cache_and_updates_metrics() {
+        let mempool = SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
+            enabled: true,
+            max_entries: 8,
+            max_bytes: 1024,
+            max_tx_bytes: 512,
+        });
+        let metrics = SidecarMetrics::default();
+        let wtxid = make_wtxid(0x77);
+        let tx = vec![0xde, 0xad, 0xbe, 0xef];
+
+        let outcome = ingest_sidecar_tx_payload(&mempool, &metrics, wtxid, tx.clone())
+            .expect("enabled tx cache should ingest feed payload");
+
+        assert!(outcome.inserted);
+        assert_eq!(outcome.entries, 1);
+        assert_eq!(outcome.bytes, tx.len());
+        assert_eq!(mempool.get_tx_data(&wtxid), Some(tx));
+
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("forge_sidecar_tx_cache_entries 1"));
+        assert!(text.contains("forge_sidecar_tx_cache_bytes 4"));
+        assert!(text.contains("forge_sidecar_tx_cache_max_entries 8"));
+        assert!(text.contains("forge_sidecar_tx_cache_max_bytes 1024"));
+        assert!(text.contains("forge_sidecar_tx_cache_max_tx_bytes 512"));
+    }
+
+    #[tokio::test]
+    async fn sidecar_tx_feed_listener_accepts_line_payloads() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let mempool = Arc::new(SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
+            enabled: true,
+            max_entries: 8,
+            max_bytes: 1024,
+            max_tx_bytes: 512,
+        }));
+        let metrics = Arc::new(SidecarMetrics::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_tx_feed_listener(
+            listener,
+            Arc::clone(&mempool),
+            Arc::clone(&metrics),
+        ));
+        let wtxid = make_wtxid(0x78);
+        let tx = vec![0xca, 0xfe, 0xba, 0xbe];
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(
+                format!("{} {}\n", hex::encode(wtxid.to_bytes()), hex::encode(&tx)).as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if mempool.get_tx_data(&wtxid).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tx feed listener should insert payload");
+
+        handle.abort();
+        assert_eq!(mempool.get_tx_data(&wtxid), Some(tx));
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("forge_sidecar_tx_cache_entries 1"));
+        assert!(text.contains("forge_sidecar_tx_cache_bytes 4"));
     }
 
     #[tokio::test]

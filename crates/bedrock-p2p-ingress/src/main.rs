@@ -7,6 +7,7 @@ mod forge;
 mod hash;
 mod peer;
 mod tx_cache;
+mod tx_feed;
 mod wire;
 
 use std::collections::HashSet;
@@ -23,6 +24,7 @@ use error::Result;
 use event::EventSink;
 use forge::ForgeBridge;
 use tx_cache::{TxCache, TxCacheConfig};
+use tx_feed::TxFeedClient;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -40,6 +42,7 @@ async fn main() -> Result<()> {
             max_tx_bytes: config.tx_cache_max_tx_bytes,
         })
     });
+    let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
     let peers = discover_peers(&config).await;
     let crawler = Crawler::new(&config, peers);
 
@@ -49,6 +52,7 @@ async fn main() -> Result<()> {
         crawler_enabled = config.crawler_enabled,
         rotation_enabled = config.rotation_enabled,
         tx_cache_enabled = tx_cache.is_some(),
+        tx_feed_enabled = tx_feed.is_some(),
         "starting P2P ingress"
     );
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -66,6 +70,7 @@ async fn main() -> Result<()> {
                 events.clone(),
                 forge.clone(),
                 tx_cache.clone(),
+                tx_feed.clone(),
                 crawler.clone(),
             ));
         }
@@ -95,6 +100,7 @@ fn spawn_peer(
     events: EventSink,
     forge: Option<ForgeBridge>,
     tx_cache: Option<TxCache>,
+    tx_feed: Option<TxFeedClient>,
     crawler: Crawler,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -108,6 +114,7 @@ fn spawn_peer(
                 events.clone(),
                 forge,
                 tx_cache,
+                tx_feed,
                 crawler.clone(),
             )
             .await
@@ -120,6 +127,7 @@ fn spawn_peer(
                     events.clone(),
                     forge,
                     tx_cache,
+                    tx_feed,
                     crawler.clone(),
                 ),
             )

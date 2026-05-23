@@ -34,6 +34,7 @@ pub struct Config {
     pub tx_cache_max_entries: usize,
     pub tx_cache_max_bytes: usize,
     pub tx_cache_max_tx_bytes: usize,
+    pub tx_feed_addr: Option<SocketAddr>,
     pub tx_request_limit_per_inv: usize,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
@@ -74,6 +75,7 @@ impl Config {
         let tx_cache_max_entries = env_usize("BEDROCK_P2P_TX_CACHE_MAX_ENTRIES", 200_000)?;
         let tx_cache_max_bytes = env_usize("BEDROCK_P2P_TX_CACHE_MAX_BYTES", 536_870_912)?;
         let tx_cache_max_tx_bytes = env_usize("BEDROCK_P2P_TX_CACHE_MAX_TX_BYTES", 2_097_152)?;
+        let tx_feed_addr = env_optional_socket("BEDROCK_P2P_TX_FEED_ADDR")?;
         let tx_request_limit_per_inv = env_usize("BEDROCK_P2P_TX_REQUEST_LIMIT_PER_INV", 256)?;
         let event_log = env::var("BEDROCK_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("BEDROCK_P2P_RELAY_PEERS")?;
@@ -124,6 +126,7 @@ impl Config {
             tx_cache_max_entries,
             tx_cache_max_bytes,
             tx_cache_max_tx_bytes,
+            tx_feed_addr,
             tx_request_limit_per_inv,
             event_log,
             relay_peers,
@@ -170,6 +173,19 @@ fn env_socket_csv(name: &str) -> Result<Vec<SocketAddr>> {
             })
         })
         .collect()
+}
+
+fn env_optional_socket(name: &str) -> Result<Option<SocketAddr>> {
+    let Ok(value) = env::var(name) else {
+        return Ok(None);
+    };
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed.parse().map(Some).map_err(|e| {
+        IngressError::Config(format!("invalid socket address in {name}: {trimmed}: {e}"))
+    })
 }
 
 fn env_usize(name: &str, default: usize) -> Result<usize> {
@@ -274,5 +290,26 @@ mod tests {
             &"127.0.0.1:16125".parse().unwrap(),
             true
         ));
+    }
+
+    #[test]
+    fn parses_optional_socket_env() {
+        let key = format!(
+            "BEDROCK_P2P_TEST_TX_FEED_ADDR_{}_{}",
+            std::process::id(),
+            19091
+        );
+        unsafe {
+            std::env::set_var(&key, "127.0.0.1:19091");
+        }
+
+        assert_eq!(
+            env_optional_socket(&key).unwrap(),
+            Some("127.0.0.1:19091".parse().unwrap())
+        );
+
+        unsafe {
+            std::env::remove_var(&key);
+        }
     }
 }

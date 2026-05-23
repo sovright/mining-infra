@@ -184,6 +184,23 @@ impl EventSink {
         }))
     }
 
+    pub fn p2p_tx_feed_forwarded(
+        &self,
+        peer: &str,
+        kind: &str,
+        hash: &str,
+        bytes: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_tx_feed_forwarded",
+            "peer": peer,
+            "kind": kind,
+            "hash": hash,
+            "bytes": bytes,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn p2p_tx_received(
         &self,
@@ -342,6 +359,9 @@ mod tests {
         events
             .p2p_tx_cache_snapshot(7, 700, 10, 1_000, 100, 2, 200, 1)
             .unwrap();
+        events
+            .p2p_tx_feed_forwarded("127.0.0.1:8233", "wtx", "feedhash", 321)
+            .unwrap();
 
         let contents = fs::read_to_string(&path).unwrap();
         let rows: Vec<serde_json::Value> = contents
@@ -378,6 +398,10 @@ mod tests {
         assert_eq!(rows[6]["evicted_entries_total"], 2);
         assert_eq!(rows[6]["evicted_bytes_total"], 200);
         assert_eq!(rows[6]["dropped_too_large_total"], 1);
+        assert_eq!(rows[7]["event"], "p2p_tx_feed_forwarded");
+        assert_eq!(rows[7]["kind"], "wtx");
+        assert_eq!(rows[7]["hash"], "feedhash");
+        assert_eq!(rows[7]["bytes"], 321);
 
         let _ = fs::remove_file(path);
     }
