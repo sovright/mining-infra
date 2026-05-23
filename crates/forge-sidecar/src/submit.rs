@@ -9,7 +9,10 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
-use bedrock_forge::{CompactBlock, ZCASH_FULL_HEADER_SIZE, zcash_block_hash};
+use bedrock_forge::{
+    CompactBlock, CompactBlockReconstructor, MempoolProvider, ReconstructionResult,
+    ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
+};
 
 use crate::rpc::ZebraRpc;
 
@@ -76,10 +79,26 @@ impl SubmitBlockStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RelayBlockError {
     EmptyTransactions,
-    MissingTransactions { short_ids: usize },
-    NonContiguousPrefilledTx { expected: u16, actual: u16 },
-    TooManyTransactions { count: usize },
-    RawBlockTooShort { bytes: usize },
+    MissingTransactions {
+        short_ids: usize,
+    },
+    ReconstructionIncomplete {
+        missing_wtxids: usize,
+        unresolved_short_ids: usize,
+    },
+    ReconstructionInvalid {
+        reason: String,
+    },
+    NonContiguousPrefilledTx {
+        expected: u16,
+        actual: u16,
+    },
+    TooManyTransactions {
+        count: usize,
+    },
+    RawBlockTooShort {
+        bytes: usize,
+    },
     RawBlockHashMismatch,
     InvalidCompactSize,
     SubmitFailed(String),
@@ -97,6 +116,16 @@ impl fmt::Display for RelayBlockError {
                     f,
                     "compact block is missing {short_ids} short-id transactions"
                 )
+            }
+            RelayBlockError::ReconstructionIncomplete {
+                missing_wtxids,
+                unresolved_short_ids,
+            } => write!(
+                f,
+                "compact block reconstruction incomplete: missing_wtxids={missing_wtxids} unresolved_short_ids={unresolved_short_ids}"
+            ),
+            RelayBlockError::ReconstructionInvalid { reason } => {
+                write!(f, "compact block reconstruction invalid: {reason}")
             }
             RelayBlockError::NonContiguousPrefilledTx { expected, actual } => write!(
                 f,
@@ -177,6 +206,64 @@ pub fn build_submission_candidate(
     })
 }
 
+/// Build a full serialized block from a compact block using a mempool provider
+/// for short-id transactions.
+pub fn build_submission_candidate_with_mempool<M: MempoolProvider>(
+    compact: &CompactBlock,
+    mempool: &M,
+) -> Result<SubmissionCandidate, RelayBlockError> {
+    if compact.short_ids.is_empty() {
+        return build_submission_candidate(compact);
+    }
+
+    let mut reconstructor = CompactBlockReconstructor::new(mempool);
+    let header_hash = zcash_block_hash(&compact.header);
+    reconstructor.prepare(&header_hash, compact.nonce);
+
+    match reconstructor.reconstruct(compact) {
+        ReconstructionResult::Complete { transactions } => {
+            build_submission_candidate_from_transactions(&compact.header, &transactions)
+        }
+        ReconstructionResult::Incomplete {
+            missing_wtxids,
+            unresolved_short_ids,
+            ..
+        } => Err(RelayBlockError::ReconstructionIncomplete {
+            missing_wtxids: missing_wtxids.len(),
+            unresolved_short_ids: unresolved_short_ids.len(),
+        }),
+        ReconstructionResult::Invalid { reason } => {
+            Err(RelayBlockError::ReconstructionInvalid { reason })
+        }
+    }
+}
+
+fn build_submission_candidate_from_transactions(
+    header: &[u8],
+    transactions: &[Vec<u8>],
+) -> Result<SubmissionCandidate, RelayBlockError> {
+    if transactions.is_empty() {
+        return Err(RelayBlockError::EmptyTransactions);
+    }
+    let mut block = Vec::with_capacity(
+        header.len()
+            + compact_size_len(transactions.len())
+            + transactions.iter().map(Vec::len).sum::<usize>(),
+    );
+    block.extend_from_slice(header);
+    encode_compact_size(transactions.len(), &mut block)?;
+    for tx in transactions {
+        block.extend_from_slice(tx);
+    }
+
+    Ok(SubmissionCandidate {
+        block_hash: hex::encode(zcash_block_hash(header)),
+        block_hex: hex::encode(&block),
+        tx_count: transactions.len(),
+        block_bytes: block.len(),
+    })
+}
+
 /// Build a submit candidate from a complete raw serialized block.
 pub fn build_raw_block_submission_candidate(
     raw_block: &[u8],
@@ -218,6 +305,32 @@ pub async fn handle_relay_compact_block<S: SubmitBlock + Sync>(
     mode: SubmitBlockMode,
 ) -> Result<SubmissionOutcome, RelayBlockError> {
     let candidate = build_submission_candidate(compact)?;
+    match mode {
+        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+        SubmitBlockMode::Live => {
+            let result = submitter
+                .submit_block(&candidate.block_hex)
+                .await
+                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+            let status = classify_submitblock_result(result)?;
+            Ok(SubmissionOutcome::Submitted { candidate, status })
+        }
+    }
+}
+
+/// Handle one relay compact block, allowing short-id reconstruction from a
+/// provided mempool before applying the submit mode.
+pub async fn handle_relay_compact_block_with_mempool<S, M>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    mempool: &M,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    M: MempoolProvider,
+{
+    let candidate = build_submission_candidate_with_mempool(compact, mempool)?;
     match mode {
         SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
         SubmitBlockMode::Live => {
@@ -330,7 +443,14 @@ fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bedrock_forge::{CompactBlock, PrefilledTx};
+    use bedrock_forge::{AuthDigest, CompactBlock, PrefilledTx, ShortId, TestMempool, TxId, WtxId};
+
+    fn make_wtxid(seed: u8) -> WtxId {
+        WtxId::new(
+            TxId::from_bytes([seed; 32]),
+            AuthDigest::from_bytes([seed; 32]),
+        )
+    }
 
     #[test]
     fn submission_candidate_decodes_differential_prefilled_indices() {
@@ -392,6 +512,68 @@ mod tests {
             RelayBlockError::NonContiguousPrefilledTx {
                 expected: 1,
                 actual: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn submission_candidate_reconstructs_short_ids_from_mempool() {
+        let header = vec![0xcd; 2189];
+        let nonce = 42;
+        let coinbase = vec![0x01, 0x02];
+        let tx1 = vec![0x03, 0x04, 0x05];
+        let tx1_wtxid = make_wtxid(0x11);
+        let header_hash = zcash_block_hash(&header);
+        let short_id = ShortId::compute(&tx1_wtxid, &header_hash, nonce);
+        let compact = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase.clone(),
+            }],
+        );
+        let mut mempool = TestMempool::new();
+        mempool.insert(tx1_wtxid, tx1.clone());
+
+        let candidate = build_submission_candidate_with_mempool(&compact, &mempool).unwrap();
+        let block = hex::decode(&candidate.block_hex).unwrap();
+
+        let mut expected = header;
+        expected.push(2);
+        expected.extend_from_slice(&coinbase);
+        expected.extend_from_slice(&tx1);
+        assert_eq!(candidate.tx_count, 2);
+        assert_eq!(candidate.block_bytes, expected.len());
+        assert_eq!(block, expected);
+    }
+
+    #[test]
+    fn submission_candidate_reports_incomplete_reconstruction() {
+        let header = vec![0xef; 2189];
+        let nonce = 7;
+        let missing_wtxid = make_wtxid(0x21);
+        let header_hash = zcash_block_hash(&header);
+        let short_id = ShortId::compute(&missing_wtxid, &header_hash, nonce);
+        let compact = CompactBlock::new(
+            header,
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: vec![0x01],
+            }],
+        );
+        let mempool = TestMempool::new();
+
+        let err = build_submission_candidate_with_mempool(&compact, &mempool).unwrap_err();
+
+        assert_eq!(
+            err,
+            RelayBlockError::ReconstructionIncomplete {
+                missing_wtxids: 0,
+                unresolved_short_ids: 1,
             }
         );
     }

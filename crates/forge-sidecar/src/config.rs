@@ -48,6 +48,10 @@ pub struct Config {
     #[serde(default)]
     pub enable_submitblock: bool,
 
+    /// Reconstruct short-id compact blocks using the sidecar mempool.
+    #[serde(default)]
+    pub compact_reconstruction_enabled: bool,
+
     /// Maximum incomplete raw blocks to buffer while waiting for segments.
     #[serde(default = "default_raw_segment_max_incomplete_blocks")]
     pub raw_segment_max_incomplete_blocks: usize,
@@ -186,6 +190,7 @@ mod tests {
         assert!(config.announce_templates);
         assert!(!config.receive_relay_blocks);
         assert!(!config.enable_submitblock);
+        assert!(!config.compact_reconstruction_enabled);
         assert_eq!(config.raw_segment_max_incomplete_blocks, 128);
         assert_eq!(config.raw_segment_max_payload_bytes, 64 * 1024 * 1024);
         assert_eq!(config.raw_segment_ttl_secs, 120);
@@ -201,6 +206,7 @@ mod tests {
             announce_templates = false
             receive_relay_blocks = true
             enable_submitblock = true
+            compact_reconstruction_enabled = true
         "#;
 
         let config: Config = toml::from_str(toml).unwrap();
@@ -208,6 +214,7 @@ mod tests {
         assert!(!config.announce_templates);
         assert!(config.receive_relay_blocks);
         assert!(config.enable_submitblock);
+        assert!(config.compact_reconstruction_enabled);
     }
 
     #[test]

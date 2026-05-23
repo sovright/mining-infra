@@ -1,6 +1,8 @@
 //! Forge sidecar for Stratum V1 mining pools
 
-use bedrock_forge::{BlockReceiver, RawBlockSegment, RelayPayload, reassemble_raw_block};
+use bedrock_forge::{
+    BlockReceiver, MempoolProvider, RawBlockSegment, RelayPayload, WtxId, reassemble_raw_block,
+};
 use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
@@ -19,8 +21,8 @@ use forge_sidecar::compact::build_compact_block;
 use forge_sidecar::config;
 use forge_sidecar::rpc::ZebraRpc;
 use forge_sidecar::submit::{
-    SubmissionOutcome, SubmitBlockMode, SubmitBlockStatus, handle_relay_compact_block,
-    handle_relay_raw_block,
+    RelayBlockError, SubmissionOutcome, SubmitBlockMode, SubmitBlockStatus,
+    handle_relay_compact_block, handle_relay_compact_block_with_mempool, handle_relay_raw_block,
 };
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::ForgeRelay;
@@ -73,6 +75,10 @@ struct Args {
     #[arg(long)]
     enable_submitblock: bool,
 
+    /// Reconstruct relay compact blocks with short IDs from the sidecar mempool
+    #[arg(long)]
+    compact_reconstruction_enabled: bool,
+
     /// Maximum incomplete raw blocks to buffer while waiting for segments
     #[arg(long, default_value = "128")]
     raw_segment_max_incomplete_blocks: usize,
@@ -121,6 +127,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         announce_templates,
         receive_relay_blocks,
         enable_submitblock,
+        compact_reconstruction_enabled,
         raw_segment_max_incomplete_blocks,
         raw_segment_max_payload_bytes,
         raw_segment_ttl_secs,
@@ -140,6 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.announce_templates,
             cfg.receive_relay_blocks,
             cfg.enable_submitblock,
+            cfg.compact_reconstruction_enabled,
             cfg.raw_segment_max_incomplete_blocks,
             cfg.raw_segment_max_payload_bytes,
             cfg.raw_segment_ttl_secs,
@@ -184,6 +192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             !args.disable_template_announcements,
             args.receive_relay_blocks,
             args.enable_submitblock,
+            args.compact_reconstruction_enabled,
             args.raw_segment_max_incomplete_blocks,
             args.raw_segment_max_payload_bytes,
             args.raw_segment_ttl_secs,
@@ -240,6 +249,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             receiver,
             Arc::clone(&rpc),
             mode,
+            compact_reconstruction_enabled,
             raw_segment_buffer_config,
             Arc::clone(&metrics),
         );
@@ -297,6 +307,7 @@ fn spawn_relay_block_handler(
     mut receiver: BlockReceiver,
     rpc: Arc<ZebraRpc>,
     mode: SubmitBlockMode,
+    compact_reconstruction_enabled: bool,
     raw_segment_buffer_config: RawSegmentBufferConfig,
     metrics: Arc<SidecarMetrics>,
 ) {
@@ -315,10 +326,24 @@ fn spawn_relay_block_handler(
                     match payload {
                         RelayPayload::CompactBlock(compact) => {
                             metrics.inc_compact_blocks_received();
-                            log_submission_outcome(
-                                handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
-                                metrics.as_ref(),
-                            );
+                            if compact_reconstruction_enabled && !compact.short_ids.is_empty() {
+                                metrics.inc_compact_reconstruction_attempts();
+                                let mempool = EmptyMempool;
+                                let outcome = handle_relay_compact_block_with_mempool(
+                                    rpc.as_ref(),
+                                    &compact,
+                                    mode,
+                                    &mempool,
+                                )
+                                .await;
+                                record_compact_reconstruction_outcome(&outcome, metrics.as_ref());
+                                log_submission_outcome(outcome, metrics.as_ref());
+                            } else {
+                                log_submission_outcome(
+                                    handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
+                                    metrics.as_ref(),
+                                );
+                            }
                         }
                         RelayPayload::RawBlockSegment(segment) => {
                             metrics.inc_raw_segments_received();
@@ -397,6 +422,18 @@ fn spawn_relay_block_handler(
             }
         }
     });
+}
+
+struct EmptyMempool;
+
+impl MempoolProvider for EmptyMempool {
+    fn get_wtxids(&self) -> Vec<WtxId> {
+        Vec::new()
+    }
+
+    fn get_tx_data(&self, _wtxid: &WtxId) -> Option<Vec<u8>> {
+        None
+    }
 }
 
 fn raw_segment_cleanup_interval(ttl: Duration) -> Duration {
@@ -641,9 +678,29 @@ fn log_submission_outcome(
     }
 }
 
+fn record_compact_reconstruction_outcome(
+    outcome: &Result<SubmissionOutcome, RelayBlockError>,
+    metrics: &SidecarMetrics,
+) {
+    match outcome {
+        Ok(_) => metrics.inc_compact_reconstruction_completes(),
+        Err(RelayBlockError::ReconstructionIncomplete { .. }) => {
+            metrics.inc_compact_reconstruction_incompletes();
+        }
+        Err(RelayBlockError::ReconstructionInvalid { .. }) => {
+            metrics.inc_compact_reconstruction_invalids();
+        }
+        Err(_) => metrics.inc_compact_reconstruction_invalids(),
+    }
+}
+
 #[derive(Default)]
 struct SidecarMetrics {
     compact_blocks_received: AtomicU64,
+    compact_reconstruction_attempts: AtomicU64,
+    compact_reconstruction_completes: AtomicU64,
+    compact_reconstruction_incompletes: AtomicU64,
+    compact_reconstruction_invalids: AtomicU64,
     raw_segments_received: AtomicU64,
     raw_segment_sets_completed: AtomicU64,
     raw_segment_drops: AtomicU64,
@@ -659,6 +716,26 @@ struct SidecarMetrics {
 impl SidecarMetrics {
     fn inc_compact_blocks_received(&self) {
         self.compact_blocks_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_compact_reconstruction_attempts(&self) {
+        self.compact_reconstruction_attempts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_compact_reconstruction_completes(&self) {
+        self.compact_reconstruction_completes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_compact_reconstruction_incompletes(&self) {
+        self.compact_reconstruction_incompletes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_compact_reconstruction_invalids(&self) {
+        self.compact_reconstruction_invalids
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_raw_segments_received(&self) {
@@ -705,6 +782,16 @@ impl SidecarMetrics {
 
     fn render_prometheus_text(&self) -> String {
         let compact_blocks_received = self.compact_blocks_received.load(Ordering::Relaxed);
+        let compact_reconstruction_attempts =
+            self.compact_reconstruction_attempts.load(Ordering::Relaxed);
+        let compact_reconstruction_completes = self
+            .compact_reconstruction_completes
+            .load(Ordering::Relaxed);
+        let compact_reconstruction_incompletes = self
+            .compact_reconstruction_incompletes
+            .load(Ordering::Relaxed);
+        let compact_reconstruction_invalids =
+            self.compact_reconstruction_invalids.load(Ordering::Relaxed);
         let raw_segments_received = self.raw_segments_received.load(Ordering::Relaxed);
         let raw_segment_sets_completed = self.raw_segment_sets_completed.load(Ordering::Relaxed);
         let raw_segment_drops = self.raw_segment_drops.load(Ordering::Relaxed);
@@ -722,6 +809,14 @@ impl SidecarMetrics {
             concat!(
                 "# TYPE forge_sidecar_relay_compact_blocks_received_total counter\n",
                 "forge_sidecar_relay_compact_blocks_received_total {compact_blocks_received}\n",
+                "# TYPE forge_sidecar_relay_compact_reconstruction_attempts_total counter\n",
+                "forge_sidecar_relay_compact_reconstruction_attempts_total {compact_reconstruction_attempts}\n",
+                "# TYPE forge_sidecar_relay_compact_reconstruction_completes_total counter\n",
+                "forge_sidecar_relay_compact_reconstruction_completes_total {compact_reconstruction_completes}\n",
+                "# TYPE forge_sidecar_relay_compact_reconstruction_incompletes_total counter\n",
+                "forge_sidecar_relay_compact_reconstruction_incompletes_total {compact_reconstruction_incompletes}\n",
+                "# TYPE forge_sidecar_relay_compact_reconstruction_invalids_total counter\n",
+                "forge_sidecar_relay_compact_reconstruction_invalids_total {compact_reconstruction_invalids}\n",
                 "# TYPE forge_sidecar_relay_raw_segments_received_total counter\n",
                 "forge_sidecar_relay_raw_segments_received_total {raw_segments_received}\n",
                 "# TYPE forge_sidecar_relay_raw_segment_sets_completed_total counter\n",
@@ -744,6 +839,10 @@ impl SidecarMetrics {
                 "forge_sidecar_raw_segment_payload_bytes {raw_segment_payload_bytes}\n",
             ),
             compact_blocks_received = compact_blocks_received,
+            compact_reconstruction_attempts = compact_reconstruction_attempts,
+            compact_reconstruction_completes = compact_reconstruction_completes,
+            compact_reconstruction_incompletes = compact_reconstruction_incompletes,
+            compact_reconstruction_invalids = compact_reconstruction_invalids,
             raw_segments_received = raw_segments_received,
             raw_segment_sets_completed = raw_segment_sets_completed,
             raw_segment_drops = raw_segment_drops,
@@ -905,6 +1004,10 @@ mod tests {
     fn sidecar_metrics_render_prometheus_text() {
         let metrics = SidecarMetrics::default();
         metrics.inc_compact_blocks_received();
+        metrics.inc_compact_reconstruction_attempts();
+        metrics.inc_compact_reconstruction_completes();
+        metrics.inc_compact_reconstruction_incompletes();
+        metrics.inc_compact_reconstruction_invalids();
         metrics.inc_raw_segments_received();
         metrics.inc_raw_segment_sets_completed();
         metrics.inc_raw_segment_drops();
@@ -918,6 +1021,10 @@ mod tests {
         let text = metrics.render_prometheus_text();
 
         assert!(text.contains("forge_sidecar_relay_compact_blocks_received_total 1"));
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_attempts_total 1"));
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_completes_total 1"));
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_incompletes_total 1"));
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_invalids_total 1"));
         assert!(text.contains("forge_sidecar_relay_raw_segments_received_total 1"));
         assert!(text.contains("forge_sidecar_relay_raw_segment_sets_completed_total 1"));
         assert!(text.contains("forge_sidecar_relay_raw_segment_drops_total 1"));
