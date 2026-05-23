@@ -27,13 +27,7 @@ impl ForgeBridge {
             return Ok(None);
         }
 
-        let client_config = ClientConfig::new(config.relay_peers.clone(), auth_key)
-            .with_bind_addr(config.relay_bind_addr)
-            .with_auth_required(true);
-        let data_shards = client_config.data_shards;
-        let parity_shards = client_config.parity_shards;
-        let mut client =
-            RelayClient::new(client_config).map_err(|e| IngressError::Forge(e.to_string()))?;
+        let mut client = Self::new_client_for_config(config, auth_key)?;
         client
             .bind()
             .await
@@ -46,12 +40,39 @@ impl ForgeBridge {
                 warn!(%error, "FORGE relay client exited");
             }
         });
-        info!(peers = config.relay_peers.len(), "FORGE bridge enabled");
+        info!(
+            peers = config.relay_peers.len(),
+            data_shards = config.relay_data_shards,
+            parity_shards = config.relay_parity_shards,
+            "FORGE bridge enabled"
+        );
         Ok(Some(Self {
             sender,
-            data_shards,
-            parity_shards,
+            data_shards: config.relay_data_shards,
+            parity_shards: config.relay_parity_shards,
         }))
+    }
+
+    #[cfg(test)]
+    fn new_for_config(config: &Config) -> Result<Self> {
+        let auth_key = config
+            .relay_auth_key
+            .ok_or_else(|| IngressError::Forge("missing relay auth key".to_string()))?;
+        let client = Self::new_client_for_config(config, auth_key)?;
+        let sender = client.sender();
+        Ok(Self {
+            sender,
+            data_shards: config.relay_data_shards,
+            parity_shards: config.relay_parity_shards,
+        })
+    }
+
+    fn new_client_for_config(config: &Config, auth_key: [u8; 32]) -> Result<RelayClient> {
+        let client_config = ClientConfig::new(config.relay_peers.clone(), auth_key)
+            .with_bind_addr(config.relay_bind_addr)
+            .with_fec(config.relay_data_shards, config.relay_parity_shards)
+            .with_auth_required(true);
+        RelayClient::new(client_config).map_err(|e| IngressError::Forge(e.to_string()))
     }
 
     pub async fn forward_block(&self, block_payload: &[u8]) -> Result<ForwardedBlock> {
@@ -103,6 +124,8 @@ fn map_transport_error(error: TransportError) -> IngressError {
 mod tests {
     use super::*;
     use bedrock_forge::{PrefilledTx, ZCASH_FULL_HEADER_SIZE};
+    use std::path::PathBuf;
+    use std::time::Duration;
 
     fn bridge_with_default_fec() -> ForgeBridge {
         let config = ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
@@ -137,5 +160,37 @@ mod tests {
             "{err}"
         );
         assert!(err.to_string().contains("data_shards=10"), "{err}");
+    }
+
+    fn test_config() -> Config {
+        Config {
+            seeds: Vec::new(),
+            peers: vec!["127.0.0.1:8233".parse().unwrap()],
+            max_peers: 1,
+            connect_timeout: Duration::from_secs(1),
+            peer_runtime: Duration::from_secs(0),
+            crawler_enabled: false,
+            crawler_max_known_peers: 1,
+            crawler_max_addr_per_message: 1,
+            crawler_drain_interval: Duration::from_secs(1),
+            rotation_enabled: false,
+            rotation_cooldown: Duration::from_secs(1),
+            rotation_failure_cooldown: Duration::from_secs(1),
+            accept_nonstandard_ports: false,
+            event_log: Some(PathBuf::from("/tmp/test.jsonl")),
+            relay_peers: vec!["127.0.0.1:1".parse().unwrap()],
+            relay_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            relay_auth_key: Some([0x42; 32]),
+            relay_data_shards: 96,
+            relay_parity_shards: 32,
+        }
+    }
+
+    #[test]
+    fn bridge_uses_configured_relay_fec_profile() {
+        let bridge = ForgeBridge::new_for_config(&test_config()).unwrap();
+
+        assert_eq!(bridge.data_shards, 96);
+        assert_eq!(bridge.parity_shards, 32);
     }
 }

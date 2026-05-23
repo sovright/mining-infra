@@ -13,13 +13,17 @@ pub struct ForgeRelay {
 }
 
 impl ForgeRelay {
-    /// Create a new forge relay
-    pub fn new(
+    /// Create a new forge relay with explicit FEC profile.
+    pub fn new_with_fec(
         relay_peers: Vec<SocketAddr>,
         auth_key: [u8; 32],
         bind_addr: SocketAddr,
+        data_shards: usize,
+        parity_shards: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let config = ClientConfig::new(relay_peers, auth_key).with_bind_addr(bind_addr);
+        let config = ClientConfig::new(relay_peers, auth_key)
+            .with_bind_addr(bind_addr)
+            .with_fec(data_shards, parity_shards);
         let config = config.with_auth_required(true);
 
         let client = RelayClient::new(config)?;
@@ -94,7 +98,7 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "0.0.0.0:0".parse().unwrap();
 
-        let relay = ForgeRelay::new(peers, auth_key, bind_addr);
+        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 10, 3);
         assert!(relay.is_ok());
     }
 
@@ -103,7 +107,7 @@ mod tests {
         let peers = vec!["127.0.0.1:8333".parse().unwrap()];
         let auth_key = [0x42; 32];
         let bind_addr = "127.0.0.1:0".parse().unwrap();
-        let relay = ForgeRelay::new(peers, auth_key, bind_addr).unwrap();
+        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 10, 3).unwrap();
         relay.init().await.unwrap();
 
         let mut receiver = relay.start_with_receiver().await.unwrap();
@@ -113,5 +117,16 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[test]
+    fn relay_rejects_invalid_fec_profile() {
+        let peers = vec!["127.0.0.1:8333".parse().unwrap()];
+        let auth_key = [0x42; 32];
+        let bind_addr = "127.0.0.1:0".parse().unwrap();
+
+        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 255, 2);
+
+        assert!(relay.is_err());
     }
 }

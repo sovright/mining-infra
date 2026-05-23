@@ -17,6 +17,11 @@ relay_peers = [
 # Local bind address for UDP socket
 bind_addr = "0.0.0.0:0"
 
+# FEC profile for relay traffic. These values must match the relay nodes and
+# any P2P ingress bridge sending into the same canary path.
+data_shards = 10
+parity_shards = 3
+
 # Template poll interval in milliseconds
 # Lower = faster detection, higher CPU usage
 poll_interval_ms = 100

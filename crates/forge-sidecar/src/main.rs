@@ -42,6 +42,14 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:0")]
     bind_addr: String,
 
+    /// Number of FEC data shards for relay traffic
+    #[arg(long, default_value = "10")]
+    data_shards: usize,
+
+    /// Number of FEC parity shards for relay traffic
+    #[arg(long, default_value = "3")]
+    parity_shards: usize,
+
     /// Poll interval in milliseconds
     #[arg(long, default_value = "100")]
     poll_interval_ms: u64,
@@ -76,6 +84,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         relay_peers,
         auth_key,
         bind_addr,
+        data_shards,
+        parity_shards,
         poll_interval_ms,
         announce_templates,
         receive_relay_blocks,
@@ -87,6 +97,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.parsed_relay_peers()?,
             cfg.parsed_auth_key()?,
             cfg.parsed_bind_addr()?,
+            cfg.data_shards,
+            cfg.parity_shards,
             cfg.poll_interval_ms,
             cfg.announce_templates,
             cfg.receive_relay_blocks,
@@ -123,6 +135,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             relay_peers,
             auth_key,
             bind_addr,
+            args.data_shards,
+            args.parity_shards,
             args.poll_interval_ms,
             !args.disable_template_announcements,
             args.receive_relay_blocks,
@@ -147,7 +161,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("Connected to Zebra RPC");
 
     // Initialize forge relay
-    let relay = ForgeRelay::new(relay_peers.clone(), auth_key, bind_addr)?;
+    let relay = ForgeRelay::new_with_fec(
+        relay_peers.clone(),
+        auth_key,
+        bind_addr,
+        data_shards,
+        parity_shards,
+    )?;
     relay.init().await?;
     if receive_relay_blocks {
         let receiver = relay.start_with_receiver().await?;

@@ -61,6 +61,11 @@ short-ID-only compact blocks are rejected as non-submit candidates.
 at tip because it prevents stale template broadcasts while keeping relay receive
 telemetry alive.
 
+Relay FEC settings must match the relay nodes and any P2P ingress bridge in the
+same canary path. The defaults are `data_shards = 10` and `parity_shards = 3`;
+larger canary profiles can be set in `config.example.toml` or with
+`--data-shards` and `--parity-shards`.
+
 ## Architecture
 
 ```

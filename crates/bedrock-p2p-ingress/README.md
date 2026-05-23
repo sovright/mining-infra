@@ -42,3 +42,6 @@ does not rotate connections by score yet.
 
 The FORGE bridge is disabled unless both `BEDROCK_P2P_RELAY_PEERS` and
 `BEDROCK_P2P_RELAY_AUTH_KEY_HEX` are configured.
+`BEDROCK_P2P_RELAY_DATA_SHARDS` and `BEDROCK_P2P_RELAY_PARITY_SHARDS`
+override the default `10+3` FEC profile for relay traffic; they must match the
+relay daemon and receiving sidecar.

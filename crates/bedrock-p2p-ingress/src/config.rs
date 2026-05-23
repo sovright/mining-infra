@@ -29,6 +29,8 @@ pub struct Config {
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
     pub relay_auth_key: Option<[u8; 32]>,
+    pub relay_data_shards: usize,
+    pub relay_parity_shards: usize,
 }
 
 impl Config {
@@ -62,6 +64,8 @@ impl Config {
             Ok(value) => Some(parse_auth_key(&value)?),
             Err(_) => None,
         };
+        let relay_data_shards = env_usize("BEDROCK_P2P_RELAY_DATA_SHARDS", 10)?;
+        let relay_parity_shards = env_usize("BEDROCK_P2P_RELAY_PARITY_SHARDS", 3)?;
 
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -87,6 +91,8 @@ impl Config {
             relay_peers,
             relay_bind_addr,
             relay_auth_key,
+            relay_data_shards,
+            relay_parity_shards,
         })
     }
 }

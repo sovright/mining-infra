@@ -24,6 +24,14 @@ pub struct Config {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
 
+    /// Number of FEC data shards for relay traffic.
+    #[serde(default = "default_data_shards")]
+    pub data_shards: usize,
+
+    /// Number of FEC parity shards for relay traffic.
+    #[serde(default = "default_parity_shards")]
+    pub parity_shards: usize,
+
     /// Poll interval in milliseconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
@@ -51,6 +59,14 @@ fn default_bind_addr() -> String {
 
 fn default_poll_interval() -> u64 {
     100
+}
+
+fn default_data_shards() -> usize {
+    10
+}
+
+fn default_parity_shards() -> usize {
+    3
 }
 
 fn default_announce_templates() -> bool {
@@ -127,6 +143,8 @@ mod tests {
 
         assert_eq!(config.zebra_url, "http://127.0.0.1:8232");
         assert_eq!(config.bind_addr, "0.0.0.0:0");
+        assert_eq!(config.data_shards, 10);
+        assert_eq!(config.parity_shards, 3);
         assert_eq!(config.poll_interval_ms, 100);
         assert!(config.announce_templates);
         assert!(!config.receive_relay_blocks);
@@ -147,5 +165,19 @@ mod tests {
         assert!(!config.announce_templates);
         assert!(config.receive_relay_blocks);
         assert!(config.enable_submitblock);
+    }
+
+    #[test]
+    fn config_parses_relay_fec_profile() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            data_shards = 96
+            parity_shards = 32
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.data_shards, 96);
+        assert_eq!(config.parity_shards, 32);
     }
 }

@@ -224,6 +224,8 @@ mod tests {
             relay_peers: Vec::new(),
             relay_bind_addr: "0.0.0.0:0".parse().unwrap(),
             relay_auth_key: None,
+            relay_data_shards: 10,
+            relay_parity_shards: 3,
         }
     }
 
