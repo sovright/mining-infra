@@ -14,6 +14,7 @@ pub mod reconstructor;
 pub mod relay;
 pub mod segmented_block;
 pub mod transport;
+pub mod tx_feed;
 pub mod types;
 
 pub use builder::CompactBlockBuilder;
@@ -41,4 +42,5 @@ pub use transport::{
     PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession, StubPowValidator,
     TransportError, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
 };
+pub use tx_feed::{TxFeedError, TxFeedRecord};
 pub use types::{AuthDigest, BlockHash, ShortId, TxId, WtxId};

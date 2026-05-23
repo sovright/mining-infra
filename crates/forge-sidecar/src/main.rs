@@ -1,8 +1,8 @@
 //! Forge sidecar for Stratum V1 mining pools
 
 use bedrock_forge::{
-    AuthDigest, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
-    TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxId, WtxId,
+    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, TxCache,
+    TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
     reassemble_raw_block,
 };
 use clap::Parser;
@@ -623,10 +623,15 @@ async fn handle_tx_feed_connection(
     let mut lines = BufReader::new(stream).lines();
     loop {
         match lines.next_line().await {
-            Ok(Some(line)) => match parse_tx_feed_line(&line) {
-                Ok((wtxid, tx_bytes)) => {
-                    let tx_bytes_len = tx_bytes.len();
-                    match ingest_sidecar_tx_payload(&mempool, &metrics, wtxid, tx_bytes) {
+            Ok(Some(line)) => match TxFeedRecord::parse_line(&line) {
+                Ok(record) => {
+                    let tx_bytes_len = record.tx_bytes.len();
+                    match ingest_sidecar_tx_payload(
+                        &mempool,
+                        &metrics,
+                        record.wtxid,
+                        record.tx_bytes,
+                    ) {
                         Some(outcome) => {
                             debug!(
                                 %peer,
@@ -653,38 +658,6 @@ async fn handle_tx_feed_connection(
             }
         }
     }
-}
-
-fn parse_tx_feed_line(line: &str) -> Result<(WtxId, Vec<u8>), String> {
-    let mut parts = line.split_whitespace();
-    let wtxid_hex = parts
-        .next()
-        .ok_or_else(|| "missing wtxid hex field".to_string())?;
-    let tx_hex = parts
-        .next()
-        .ok_or_else(|| "missing transaction hex field".to_string())?;
-    if parts.next().is_some() {
-        return Err("unexpected extra transaction feed field".to_string());
-    }
-
-    let mut wtxid_bytes = [0u8; 64];
-    hex::decode_to_slice(wtxid_hex, &mut wtxid_bytes)
-        .map_err(|error| format!("invalid wtxid hex: {error}"))?;
-    let mut txid = [0u8; 32];
-    txid.copy_from_slice(&wtxid_bytes[..32]);
-    let mut auth_digest = [0u8; 32];
-    auth_digest.copy_from_slice(&wtxid_bytes[32..]);
-
-    let tx_bytes =
-        hex::decode(tx_hex).map_err(|error| format!("invalid transaction hex: {error}"))?;
-    if tx_bytes.is_empty() {
-        return Err("empty transaction payload".to_string());
-    }
-
-    Ok((
-        WtxId::new(TxId::from_bytes(txid), AuthDigest::from_bytes(auth_digest)),
-        tx_bytes,
-    ))
 }
 
 fn raw_segment_cleanup_interval(ttl: Duration) -> Duration {
@@ -1413,9 +1386,7 @@ mod tests {
 
         let mut stream = TcpStream::connect(addr).await.unwrap();
         stream
-            .write_all(
-                format!("{} {}\n", hex::encode(wtxid.to_bytes()), hex::encode(&tx)).as_bytes(),
-            )
+            .write_all(TxFeedRecord::encode_line(wtxid, &tx).as_bytes())
             .await
             .unwrap();
 

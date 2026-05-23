@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use bedrock_forge::WtxId;
+use bedrock_forge::{TxFeedRecord, WtxId};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
@@ -19,14 +19,7 @@ impl TxFeedClient {
     pub async fn send(&self, wtxid: WtxId, tx_bytes: &[u8]) -> Result<()> {
         let mut stream = TcpStream::connect(self.addr).await?;
         stream
-            .write_all(
-                format!(
-                    "{} {}\n",
-                    hex::encode(wtxid.to_bytes()),
-                    hex::encode(tx_bytes)
-                )
-                .as_bytes(),
-            )
+            .write_all(TxFeedRecord::encode_line(wtxid, tx_bytes).as_bytes())
             .await?;
         Ok(())
     }
@@ -62,9 +55,6 @@ mod tests {
 
         client.send(wtxid, &tx).await.unwrap();
 
-        assert_eq!(
-            server.await.unwrap(),
-            format!("{} {}\n", hex::encode(wtxid.to_bytes()), hex::encode(&tx))
-        );
+        assert_eq!(server.await.unwrap(), TxFeedRecord::encode_line(wtxid, &tx));
     }
 }
