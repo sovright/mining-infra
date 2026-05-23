@@ -915,6 +915,7 @@ fn record_compact_reconstruction_outcome(
     match outcome {
         Ok(_) => metrics.inc_compact_reconstruction_completes(),
         Err(RelayBlockError::ReconstructionIncomplete {
+            block_hash: _,
             missing_indexes: _,
             missing_wtxids,
             unresolved_short_ids,
@@ -1607,6 +1608,7 @@ mod tests {
     fn compact_reconstruction_incomplete_records_missing_detail_metrics() {
         let metrics = SidecarMetrics::default();
         let outcome = Err(RelayBlockError::ReconstructionIncomplete {
+            block_hash: bedrock_forge::BlockHash::from_bytes([0x30; 32]),
             missing_indexes: vec![1, 2, 3, 4, 5],
             missing_wtxids: vec![make_wtxid(0x31), make_wtxid(0x32)],
             unresolved_short_ids: vec![

@@ -10,8 +10,8 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bedrock_forge::{
-    CompactBlock, CompactBlockReconstructor, MempoolProvider, ReconstructionResult, ShortId, WtxId,
-    ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
+    BlockHash, CompactBlock, CompactBlockReconstructor, GetBlockTxn, MempoolProvider,
+    ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
 };
 
 use crate::rpc::ZebraRpc;
@@ -83,6 +83,7 @@ pub enum RelayBlockError {
         short_ids: usize,
     },
     ReconstructionIncomplete {
+        block_hash: BlockHash,
         missing_indexes: Vec<usize>,
         missing_wtxids: Vec<WtxId>,
         unresolved_short_ids: Vec<ShortId>,
@@ -119,6 +120,7 @@ impl fmt::Display for RelayBlockError {
                 )
             }
             RelayBlockError::ReconstructionIncomplete {
+                block_hash: _,
                 missing_indexes,
                 missing_wtxids,
                 unresolved_short_ids,
@@ -155,6 +157,20 @@ impl fmt::Display for RelayBlockError {
 }
 
 impl Error for RelayBlockError {}
+
+impl RelayBlockError {
+    /// Build a `getblocktxn` request for compact reconstruction misses.
+    pub fn missing_transaction_request(&self) -> Option<GetBlockTxn> {
+        match self {
+            RelayBlockError::ReconstructionIncomplete {
+                block_hash,
+                missing_indexes,
+                ..
+            } => GetBlockTxn::from_missing_indexes(*block_hash, missing_indexes).ok(),
+            _ => None,
+        }
+    }
+}
 
 /// Build a full serialized block from a compact block when all transactions are prefilled.
 pub fn build_submission_candidate(
@@ -234,6 +250,7 @@ pub fn build_submission_candidate_with_mempool<M: MempoolProvider>(
             missing_wtxids,
             unresolved_short_ids,
         } => Err(RelayBlockError::ReconstructionIncomplete {
+            block_hash: compact.header_hash(),
             missing_indexes: partial
                 .iter()
                 .enumerate()
@@ -582,10 +599,38 @@ mod tests {
         assert_eq!(
             err,
             RelayBlockError::ReconstructionIncomplete {
+                block_hash: compact.header_hash(),
                 missing_indexes: vec![1],
                 missing_wtxids: Vec::new(),
                 unresolved_short_ids: vec![short_id],
             }
         );
+    }
+
+    #[test]
+    fn incomplete_reconstruction_builds_getblocktxn_request() {
+        let header = vec![0xef; 2189];
+        let nonce = 7;
+        let missing_wtxid = make_wtxid(0x21);
+        let header_hash = zcash_block_hash(&header);
+        let short_id = ShortId::compute(&missing_wtxid, &header_hash, nonce);
+        let compact = CompactBlock::new(
+            header,
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: vec![0x01],
+            }],
+        );
+        let mempool = TestMempool::new();
+
+        let err = build_submission_candidate_with_mempool(&compact, &mempool).unwrap_err();
+
+        let request = err
+            .missing_transaction_request()
+            .expect("incomplete reconstruction should produce getblocktxn");
+        assert_eq!(request.block_hash, compact.header_hash());
+        assert_eq!(request.indexes, vec![1]);
     }
 }
