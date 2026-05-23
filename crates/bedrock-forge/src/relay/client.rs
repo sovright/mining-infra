@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::compact_block::CompactBlock;
 use crate::fec::FecError;
@@ -425,6 +425,7 @@ impl RelayClient {
             .get(&block_hash)
             .is_some_and(|seen_at| seen_at.elapsed() <= RECENT_DELIVERED_TTL)
         {
+            log_raw_segment_chunk_drop(&chunk, "recently delivered");
             return;
         }
 
@@ -433,22 +434,27 @@ impl RelayClient {
             chunk.header.msg_type,
             MessageType::Block | MessageType::RawBlockSegment
         ) {
+            log_raw_segment_chunk_drop(&chunk, "unsupported message type");
             return;
         }
         if total_chunks == 0 || chunk_id >= total_chunks {
+            log_raw_segment_chunk_drop(&chunk, "invalid chunk id or total chunks");
             return; // Drop invalid chunk
         }
         if chunk.header.total_chunks > MAX_TOTAL_CHUNKS {
+            log_raw_segment_chunk_drop(&chunk, "too many chunks");
             return; // Drop invalid chunk
         }
         let expected_total = self.config.data_shards + self.config.parity_shards;
         if total_chunks != expected_total {
+            log_raw_segment_chunk_drop(&chunk, "mismatched FEC profile");
             return; // Drop mismatched FEC config chunks
         }
 
         // Enforce authentication if configured
         let auth_required = self.config.auth_required;
         if auth_required && chunk.header.version != 2 {
+            log_raw_segment_chunk_drop(&chunk, "authentication required");
             return; // Drop unauthenticated chunk
         }
         if chunk.header.version == 2 {
@@ -462,12 +468,14 @@ impl RelayClient {
                 &chunk.payload,
                 &chunk.header.hmac,
             ) {
+                log_raw_segment_chunk_drop(&chunk, "authentication failed");
                 return; // Drop failed auth
             }
         }
 
         // Get or create assembly
         if !pending.contains_key(&block_hash) && pending.len() >= MAX_PENDING_BLOCKS_CLIENT {
+            log_raw_segment_chunk_drop(&chunk, "pending assembly limit reached");
             return;
         }
         let (assembly, original_len) = pending.entry(block_hash).or_insert_with(|| {
@@ -477,6 +485,7 @@ impl RelayClient {
             )
         });
         if assembly.total_chunks != total_chunks || assembly.msg_type != chunk.header.msg_type {
+            log_raw_segment_chunk_drop(&chunk, "assembly metadata mismatch");
             return;
         }
 
@@ -484,10 +493,27 @@ impl RelayClient {
         if let Some(existing) = assembly.chunks.get(chunk_id)
             && existing.is_some()
         {
+            log_raw_segment_chunk_drop(&chunk, "duplicate chunk");
             return;
         }
         // Add chunk
+        let msg_type = chunk.header.msg_type;
         assembly.add_chunk(chunk_id, chunk.payload);
+        if msg_type == MessageType::RawBlockSegment {
+            let received_count = assembly.received_count();
+            if received_count == 1
+                || received_count == self.config.data_shards
+                || received_count % 64 == 0
+            {
+                info!(
+                    object_hash = %hex::encode(block_hash),
+                    received_count,
+                    total_chunks,
+                    data_shards = self.config.data_shards,
+                    "Relay raw segment object chunks buffered"
+                );
+            }
+        }
 
         // Set original length estimate once we know shard size
         if *original_len == 0
@@ -504,17 +530,34 @@ impl RelayClient {
             // Estimate original length from first chunk if available
             let est_len = *original_len;
 
-            if est_len > 0
-                && let Some(payload) =
-                    self.decode_payload(chunk.header.msg_type, shard_opts, est_len)
-            {
-                if let Some(tx) = &self.incoming_tx
-                    && tx.send(payload).await.is_err()
-                {
-                    warn!("Failed to deliver reconstructed relay payload (receiver dropped)");
+            if est_len > 0 {
+                match self.decode_payload(msg_type, shard_opts, est_len) {
+                    Some(payload) => {
+                        if msg_type == MessageType::RawBlockSegment {
+                            info!(
+                                object_hash = %hex::encode(block_hash),
+                                "Relay raw segment object reconstructed"
+                            );
+                        }
+                        if let Some(tx) = &self.incoming_tx
+                            && tx.send(payload).await.is_err()
+                        {
+                            warn!(
+                                "Failed to deliver reconstructed relay payload (receiver dropped)"
+                            );
+                        }
+                        recent_delivered.insert(block_hash, Instant::now());
+                        pending.remove(&block_hash);
+                    }
+                    None if msg_type == MessageType::RawBlockSegment => {
+                        warn!(
+                            object_hash = %hex::encode(block_hash),
+                            est_len,
+                            "Relay raw segment object decode failed"
+                        );
+                    }
+                    None => {}
                 }
-                recent_delivered.insert(block_hash, Instant::now());
-                pending.remove(&block_hash);
             }
         }
     }
@@ -570,6 +613,18 @@ impl SendPacing {
         }
         *sent_since_delay = 0;
         true
+    }
+}
+
+fn log_raw_segment_chunk_drop(chunk: &Chunk, reason: &'static str) {
+    if chunk.header.msg_type == MessageType::RawBlockSegment {
+        warn!(
+            object_hash = %hex::encode(chunk.header.block_hash),
+            chunk_id = chunk.header.chunk_id,
+            total_chunks = chunk.header.total_chunks,
+            reason,
+            "Dropping relay raw segment chunk"
+        );
     }
 }
 
