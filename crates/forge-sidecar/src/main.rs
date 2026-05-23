@@ -574,8 +574,12 @@ fn ingest_sidecar_tx_payload(
     wtxid: WtxId,
     tx_bytes: Vec<u8>,
 ) -> Option<TxCacheInsertOutcome> {
+    metrics.inc_tx_feed_payload(tx_bytes.len());
     let cache = mempool.tx_cache()?;
     let outcome = cache.insert(wtxid, tx_bytes);
+    if outcome.dropped_too_large > 0 {
+        metrics.add_tx_feed_dropped_too_large(outcome.dropped_too_large);
+    }
     metrics.set_tx_cache_snapshot(&cache.snapshot());
     Some(outcome)
 }
@@ -643,11 +647,13 @@ async fn handle_tx_feed_connection(
                             );
                         }
                         None => {
+                            metrics.inc_tx_feed_cache_disabled();
                             warn!(%peer, "Sidecar transaction feed received payload while tx cache is disabled")
                         }
                     }
                 }
                 Err(error) => {
+                    metrics.inc_tx_feed_invalid_lines();
                     warn!(%peer, %error, "Dropping invalid sidecar transaction feed line")
                 }
             },
@@ -943,6 +949,11 @@ struct SidecarMetrics {
     tx_cache_evicted_entries_total: AtomicUsize,
     tx_cache_evicted_bytes_total: AtomicUsize,
     tx_cache_dropped_too_large_total: AtomicUsize,
+    tx_feed_payloads: AtomicU64,
+    tx_feed_bytes: AtomicU64,
+    tx_feed_invalid_lines: AtomicU64,
+    tx_feed_cache_disabled: AtomicU64,
+    tx_feed_dropped_too_large: AtomicU64,
 }
 
 impl SidecarMetrics {
@@ -1030,6 +1041,25 @@ impl SidecarMetrics {
             .store(snapshot.dropped_too_large_total, Ordering::Relaxed);
     }
 
+    fn inc_tx_feed_payload(&self, bytes: usize) {
+        self.tx_feed_payloads.fetch_add(1, Ordering::Relaxed);
+        self.tx_feed_bytes
+            .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    fn inc_tx_feed_invalid_lines(&self) {
+        self.tx_feed_invalid_lines.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_tx_feed_cache_disabled(&self) {
+        self.tx_feed_cache_disabled.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_tx_feed_dropped_too_large(&self, count: usize) {
+        self.tx_feed_dropped_too_large
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
     fn render_prometheus_text(&self) -> String {
         let compact_blocks_received = self.compact_blocks_received.load(Ordering::Relaxed);
         let compact_reconstruction_attempts =
@@ -1066,6 +1096,11 @@ impl SidecarMetrics {
         let tx_cache_dropped_too_large_total = self
             .tx_cache_dropped_too_large_total
             .load(Ordering::Relaxed);
+        let tx_feed_payloads = self.tx_feed_payloads.load(Ordering::Relaxed);
+        let tx_feed_bytes = self.tx_feed_bytes.load(Ordering::Relaxed);
+        let tx_feed_invalid_lines = self.tx_feed_invalid_lines.load(Ordering::Relaxed);
+        let tx_feed_cache_disabled = self.tx_feed_cache_disabled.load(Ordering::Relaxed);
+        let tx_feed_dropped_too_large = self.tx_feed_dropped_too_large.load(Ordering::Relaxed);
 
         format!(
             concat!(
@@ -1115,6 +1150,16 @@ impl SidecarMetrics {
                 "forge_sidecar_tx_cache_evicted_bytes_total {tx_cache_evicted_bytes_total}\n",
                 "# TYPE forge_sidecar_tx_cache_dropped_too_large_total counter\n",
                 "forge_sidecar_tx_cache_dropped_too_large_total {tx_cache_dropped_too_large_total}\n",
+                "# TYPE forge_sidecar_tx_feed_payloads_total counter\n",
+                "forge_sidecar_tx_feed_payloads_total {tx_feed_payloads}\n",
+                "# TYPE forge_sidecar_tx_feed_bytes_total counter\n",
+                "forge_sidecar_tx_feed_bytes_total {tx_feed_bytes}\n",
+                "# TYPE forge_sidecar_tx_feed_invalid_lines_total counter\n",
+                "forge_sidecar_tx_feed_invalid_lines_total {tx_feed_invalid_lines}\n",
+                "# TYPE forge_sidecar_tx_feed_cache_disabled_total counter\n",
+                "forge_sidecar_tx_feed_cache_disabled_total {tx_feed_cache_disabled}\n",
+                "# TYPE forge_sidecar_tx_feed_dropped_too_large_total counter\n",
+                "forge_sidecar_tx_feed_dropped_too_large_total {tx_feed_dropped_too_large}\n",
             ),
             compact_blocks_received = compact_blocks_received,
             compact_reconstruction_attempts = compact_reconstruction_attempts,
@@ -1139,6 +1184,11 @@ impl SidecarMetrics {
             tx_cache_evicted_entries_total = tx_cache_evicted_entries_total,
             tx_cache_evicted_bytes_total = tx_cache_evicted_bytes_total,
             tx_cache_dropped_too_large_total = tx_cache_dropped_too_large_total,
+            tx_feed_payloads = tx_feed_payloads,
+            tx_feed_bytes = tx_feed_bytes,
+            tx_feed_invalid_lines = tx_feed_invalid_lines,
+            tx_feed_cache_disabled = tx_feed_cache_disabled,
+            tx_feed_dropped_too_large = tx_feed_dropped_too_large,
         )
     }
 }
@@ -1355,6 +1405,11 @@ mod tests {
         assert_eq!(mempool.get_tx_data(&wtxid), Some(tx));
 
         let text = metrics.render_prometheus_text();
+        assert!(text.contains("forge_sidecar_tx_feed_payloads_total 1"));
+        assert!(text.contains("forge_sidecar_tx_feed_bytes_total 4"));
+        assert!(text.contains("forge_sidecar_tx_feed_invalid_lines_total 0"));
+        assert!(text.contains("forge_sidecar_tx_feed_cache_disabled_total 0"));
+        assert!(text.contains("forge_sidecar_tx_feed_dropped_too_large_total 0"));
         assert!(text.contains("forge_sidecar_tx_cache_entries 1"));
         assert!(text.contains("forge_sidecar_tx_cache_bytes 4"));
         assert!(text.contains("forge_sidecar_tx_cache_max_entries 8"));
@@ -1404,8 +1459,56 @@ mod tests {
         handle.abort();
         assert_eq!(mempool.get_tx_data(&wtxid), Some(tx));
         let text = metrics.render_prometheus_text();
+        assert!(text.contains("forge_sidecar_tx_feed_payloads_total 1"));
+        assert!(text.contains("forge_sidecar_tx_feed_bytes_total 4"));
         assert!(text.contains("forge_sidecar_tx_cache_entries 1"));
         assert!(text.contains("forge_sidecar_tx_cache_bytes 4"));
+    }
+
+    #[tokio::test]
+    async fn sidecar_tx_feed_listener_counts_invalid_lines() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::{TcpListener, TcpStream};
+
+        let mempool = Arc::new(SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
+            enabled: true,
+            max_entries: 8,
+            max_bytes: 1024,
+            max_tx_bytes: 512,
+        }));
+        let metrics = Arc::new(SidecarMetrics::default());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(run_tx_feed_listener(
+            listener,
+            Arc::clone(&mempool),
+            Arc::clone(&metrics),
+        ));
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"not-a-valid-feed-record\n")
+            .await
+            .unwrap();
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let text = metrics.render_prometheus_text();
+                if text.contains("forge_sidecar_tx_feed_invalid_lines_total 1") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("tx feed listener should count invalid lines");
+
+        handle.abort();
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("forge_sidecar_tx_feed_payloads_total 0"));
+        assert!(text.contains("forge_sidecar_tx_feed_invalid_lines_total 1"));
+        assert!(text.contains("forge_sidecar_tx_cache_entries 0"));
     }
 
     #[tokio::test]
@@ -1482,6 +1585,10 @@ mod tests {
         metrics.inc_submit_successes();
         metrics.inc_submit_duplicates();
         metrics.inc_submit_rejections();
+        metrics.inc_tx_feed_payload(512);
+        metrics.inc_tx_feed_invalid_lines();
+        metrics.inc_tx_feed_cache_disabled();
+        metrics.add_tx_feed_dropped_too_large(2);
         metrics.set_raw_segment_buffer_state(2, 4096);
         metrics.set_tx_cache_snapshot(&bedrock_forge::TxCacheSnapshot {
             entries: 3,
@@ -1519,6 +1626,11 @@ mod tests {
         assert!(text.contains("forge_sidecar_tx_cache_evicted_entries_total 1"));
         assert!(text.contains("forge_sidecar_tx_cache_evicted_bytes_total 128"));
         assert!(text.contains("forge_sidecar_tx_cache_dropped_too_large_total 2"));
+        assert!(text.contains("forge_sidecar_tx_feed_payloads_total 1"));
+        assert!(text.contains("forge_sidecar_tx_feed_bytes_total 512"));
+        assert!(text.contains("forge_sidecar_tx_feed_invalid_lines_total 1"));
+        assert!(text.contains("forge_sidecar_tx_feed_cache_disabled_total 1"));
+        assert!(text.contains("forge_sidecar_tx_feed_dropped_too_large_total 2"));
     }
 
     #[test]
