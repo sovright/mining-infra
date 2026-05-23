@@ -915,12 +915,15 @@ fn record_compact_reconstruction_outcome(
     match outcome {
         Ok(_) => metrics.inc_compact_reconstruction_completes(),
         Err(RelayBlockError::ReconstructionIncomplete {
+            missing_indexes: _,
             missing_wtxids,
             unresolved_short_ids,
         }) => {
             metrics.inc_compact_reconstruction_incompletes();
-            metrics
-                .add_compact_reconstruction_missing_detail(*missing_wtxids, *unresolved_short_ids);
+            metrics.add_compact_reconstruction_missing_detail(
+                missing_wtxids.len(),
+                unresolved_short_ids.len(),
+            );
         }
         Err(RelayBlockError::ReconstructionInvalid { .. }) => {
             metrics.inc_compact_reconstruction_invalids();
@@ -1604,8 +1607,13 @@ mod tests {
     fn compact_reconstruction_incomplete_records_missing_detail_metrics() {
         let metrics = SidecarMetrics::default();
         let outcome = Err(RelayBlockError::ReconstructionIncomplete {
-            missing_wtxids: 2,
-            unresolved_short_ids: 3,
+            missing_indexes: vec![1, 2, 3, 4, 5],
+            missing_wtxids: vec![make_wtxid(0x31), make_wtxid(0x32)],
+            unresolved_short_ids: vec![
+                bedrock_forge::ShortId::from_bytes([1, 2, 3, 4, 5, 6]),
+                bedrock_forge::ShortId::from_bytes([2, 3, 4, 5, 6, 7]),
+                bedrock_forge::ShortId::from_bytes([3, 4, 5, 6, 7, 8]),
+            ],
         });
 
         record_compact_reconstruction_outcome(&outcome, &metrics);

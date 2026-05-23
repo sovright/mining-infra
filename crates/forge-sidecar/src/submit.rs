@@ -10,7 +10,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use bedrock_forge::{
-    CompactBlock, CompactBlockReconstructor, MempoolProvider, ReconstructionResult,
+    CompactBlock, CompactBlockReconstructor, MempoolProvider, ReconstructionResult, ShortId, WtxId,
     ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
 };
 
@@ -83,8 +83,9 @@ pub enum RelayBlockError {
         short_ids: usize,
     },
     ReconstructionIncomplete {
-        missing_wtxids: usize,
-        unresolved_short_ids: usize,
+        missing_indexes: Vec<usize>,
+        missing_wtxids: Vec<WtxId>,
+        unresolved_short_ids: Vec<ShortId>,
     },
     ReconstructionInvalid {
         reason: String,
@@ -118,11 +119,15 @@ impl fmt::Display for RelayBlockError {
                 )
             }
             RelayBlockError::ReconstructionIncomplete {
+                missing_indexes,
                 missing_wtxids,
                 unresolved_short_ids,
             } => write!(
                 f,
-                "compact block reconstruction incomplete: missing_wtxids={missing_wtxids} unresolved_short_ids={unresolved_short_ids}"
+                "compact block reconstruction incomplete: missing_indexes={} missing_wtxids={} unresolved_short_ids={}",
+                missing_indexes.len(),
+                missing_wtxids.len(),
+                unresolved_short_ids.len(),
             ),
             RelayBlockError::ReconstructionInvalid { reason } => {
                 write!(f, "compact block reconstruction invalid: {reason}")
@@ -225,12 +230,17 @@ pub fn build_submission_candidate_with_mempool<M: MempoolProvider>(
             build_submission_candidate_from_transactions(&compact.header, &transactions)
         }
         ReconstructionResult::Incomplete {
+            partial,
             missing_wtxids,
             unresolved_short_ids,
-            ..
         } => Err(RelayBlockError::ReconstructionIncomplete {
-            missing_wtxids: missing_wtxids.len(),
-            unresolved_short_ids: unresolved_short_ids.len(),
+            missing_indexes: partial
+                .iter()
+                .enumerate()
+                .filter_map(|(index, tx)| tx.is_none().then_some(index))
+                .collect(),
+            missing_wtxids,
+            unresolved_short_ids,
         }),
         ReconstructionResult::Invalid { reason } => {
             Err(RelayBlockError::ReconstructionInvalid { reason })
@@ -572,8 +582,9 @@ mod tests {
         assert_eq!(
             err,
             RelayBlockError::ReconstructionIncomplete {
-                missing_wtxids: 0,
-                unresolved_short_ids: 1,
+                missing_indexes: vec![1],
+                missing_wtxids: Vec::new(),
+                unresolved_short_ids: vec![short_id],
             }
         );
     }
