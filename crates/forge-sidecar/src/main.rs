@@ -914,8 +914,13 @@ fn record_compact_reconstruction_outcome(
 ) {
     match outcome {
         Ok(_) => metrics.inc_compact_reconstruction_completes(),
-        Err(RelayBlockError::ReconstructionIncomplete { .. }) => {
+        Err(RelayBlockError::ReconstructionIncomplete {
+            missing_wtxids,
+            unresolved_short_ids,
+        }) => {
             metrics.inc_compact_reconstruction_incompletes();
+            metrics
+                .add_compact_reconstruction_missing_detail(*missing_wtxids, *unresolved_short_ids);
         }
         Err(RelayBlockError::ReconstructionInvalid { .. }) => {
             metrics.inc_compact_reconstruction_invalids();
@@ -931,6 +936,8 @@ struct SidecarMetrics {
     compact_reconstruction_completes: AtomicU64,
     compact_reconstruction_incompletes: AtomicU64,
     compact_reconstruction_invalids: AtomicU64,
+    compact_reconstruction_missing_wtxids: AtomicU64,
+    compact_reconstruction_unresolved_short_ids: AtomicU64,
     raw_segments_received: AtomicU64,
     raw_segment_sets_completed: AtomicU64,
     raw_segment_drops: AtomicU64,
@@ -979,6 +986,17 @@ impl SidecarMetrics {
     fn inc_compact_reconstruction_invalids(&self) {
         self.compact_reconstruction_invalids
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn add_compact_reconstruction_missing_detail(
+        &self,
+        missing_wtxids: usize,
+        unresolved_short_ids: usize,
+    ) {
+        self.compact_reconstruction_missing_wtxids
+            .fetch_add(missing_wtxids as u64, Ordering::Relaxed);
+        self.compact_reconstruction_unresolved_short_ids
+            .fetch_add(unresolved_short_ids as u64, Ordering::Relaxed);
     }
 
     fn inc_raw_segments_received(&self) {
@@ -1072,6 +1090,12 @@ impl SidecarMetrics {
             .load(Ordering::Relaxed);
         let compact_reconstruction_invalids =
             self.compact_reconstruction_invalids.load(Ordering::Relaxed);
+        let compact_reconstruction_missing_wtxids = self
+            .compact_reconstruction_missing_wtxids
+            .load(Ordering::Relaxed);
+        let compact_reconstruction_unresolved_short_ids = self
+            .compact_reconstruction_unresolved_short_ids
+            .load(Ordering::Relaxed);
         let raw_segments_received = self.raw_segments_received.load(Ordering::Relaxed);
         let raw_segment_sets_completed = self.raw_segment_sets_completed.load(Ordering::Relaxed);
         let raw_segment_drops = self.raw_segment_drops.load(Ordering::Relaxed);
@@ -1114,6 +1138,10 @@ impl SidecarMetrics {
                 "forge_sidecar_relay_compact_reconstruction_incompletes_total {compact_reconstruction_incompletes}\n",
                 "# TYPE forge_sidecar_relay_compact_reconstruction_invalids_total counter\n",
                 "forge_sidecar_relay_compact_reconstruction_invalids_total {compact_reconstruction_invalids}\n",
+                "# TYPE forge_sidecar_relay_compact_reconstruction_missing_wtxids_total counter\n",
+                "forge_sidecar_relay_compact_reconstruction_missing_wtxids_total {compact_reconstruction_missing_wtxids}\n",
+                "# TYPE forge_sidecar_relay_compact_reconstruction_unresolved_short_ids_total counter\n",
+                "forge_sidecar_relay_compact_reconstruction_unresolved_short_ids_total {compact_reconstruction_unresolved_short_ids}\n",
                 "# TYPE forge_sidecar_relay_raw_segments_received_total counter\n",
                 "forge_sidecar_relay_raw_segments_received_total {raw_segments_received}\n",
                 "# TYPE forge_sidecar_relay_raw_segment_sets_completed_total counter\n",
@@ -1166,6 +1194,9 @@ impl SidecarMetrics {
             compact_reconstruction_completes = compact_reconstruction_completes,
             compact_reconstruction_incompletes = compact_reconstruction_incompletes,
             compact_reconstruction_invalids = compact_reconstruction_invalids,
+            compact_reconstruction_missing_wtxids = compact_reconstruction_missing_wtxids,
+            compact_reconstruction_unresolved_short_ids =
+                compact_reconstruction_unresolved_short_ids,
             raw_segments_received = raw_segments_received,
             raw_segment_sets_completed = raw_segment_sets_completed,
             raw_segment_drops = raw_segment_drops,
@@ -1570,6 +1601,26 @@ mod tests {
     }
 
     #[test]
+    fn compact_reconstruction_incomplete_records_missing_detail_metrics() {
+        let metrics = SidecarMetrics::default();
+        let outcome = Err(RelayBlockError::ReconstructionIncomplete {
+            missing_wtxids: 2,
+            unresolved_short_ids: 3,
+        });
+
+        record_compact_reconstruction_outcome(&outcome, &metrics);
+
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_incompletes_total 1"));
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_missing_wtxids_total 2"));
+        assert!(
+            text.contains(
+                "forge_sidecar_relay_compact_reconstruction_unresolved_short_ids_total 3"
+            )
+        );
+    }
+
+    #[test]
     fn sidecar_metrics_render_prometheus_text() {
         let metrics = SidecarMetrics::default();
         metrics.inc_compact_blocks_received();
@@ -1577,6 +1628,7 @@ mod tests {
         metrics.inc_compact_reconstruction_completes();
         metrics.inc_compact_reconstruction_incompletes();
         metrics.inc_compact_reconstruction_invalids();
+        metrics.add_compact_reconstruction_missing_detail(2, 3);
         metrics.inc_raw_segments_received();
         metrics.inc_raw_segment_sets_completed();
         metrics.inc_raw_segment_drops();
@@ -1608,6 +1660,12 @@ mod tests {
         assert!(text.contains("forge_sidecar_relay_compact_reconstruction_completes_total 1"));
         assert!(text.contains("forge_sidecar_relay_compact_reconstruction_incompletes_total 1"));
         assert!(text.contains("forge_sidecar_relay_compact_reconstruction_invalids_total 1"));
+        assert!(text.contains("forge_sidecar_relay_compact_reconstruction_missing_wtxids_total 2"));
+        assert!(
+            text.contains(
+                "forge_sidecar_relay_compact_reconstruction_unresolved_short_ids_total 3"
+            )
+        );
         assert!(text.contains("forge_sidecar_relay_raw_segments_received_total 1"));
         assert!(text.contains("forge_sidecar_relay_raw_segment_sets_completed_total 1"));
         assert!(text.contains("forge_sidecar_relay_raw_segment_drops_total 1"));
