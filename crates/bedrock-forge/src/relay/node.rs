@@ -194,6 +194,7 @@ impl<V: PowValidator> RelayNode<V> {
                     }
                 }
                 Ok(Err(e)) => {
+                    self.metrics.inc_socket_receive_errors();
                     self.running.store(false, Ordering::SeqCst);
                     return Err(TransportError::Io(e));
                 }
@@ -480,6 +481,10 @@ impl<V: PowValidator> RelayNode<V> {
         }
         drop(sessions);
 
+        if outbound.is_empty() && !chunks.is_empty() {
+            self.metrics.inc_forward_no_peer_chunks(chunks.len() as u64);
+        }
+
         let pacing = ForwardPacing::new(
             self.config.forward_burst_packets,
             self.config.forward_burst_delay,
@@ -489,8 +494,13 @@ impl<V: PowValidator> RelayNode<V> {
             let payload_count = payloads.len();
             let mut sent_since_delay = 0usize;
             for (idx, data) in payloads.into_iter().enumerate() {
-                let _ = socket.send_to(&data, peer_addr).await;
-                chunks_sent += 1;
+                match socket.send_to(&data, peer_addr).await {
+                    Ok(_) => chunks_sent += 1,
+                    Err(error) => {
+                        self.metrics.inc_packet_send_errors();
+                        warn!(peer = %peer_addr, %error, "Failed to forward relay packet");
+                    }
+                }
                 if pacing.should_delay(idx, payload_count, &mut sent_since_delay) {
                     sleep(pacing.delay).await;
                 }
@@ -718,6 +728,7 @@ impl<V: PowValidator> RelayNode<V> {
                 self.process_chunk_for_session(session, &chunk, block_hash, chunk_id, total_chunks)
             } else {
                 if sessions.len() >= self.config.max_sessions {
+                    self.metrics.inc_session_limit_rejections();
                     warn!(peer = %src_addr, max_sessions = self.config.max_sessions, "Relay session limit reached");
                     return Err(TransportError::ConnectionRefused(
                         "relay session limit reached".into(),
@@ -840,6 +851,7 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         if sessions.len() >= self.config.max_sessions {
+            self.metrics.inc_session_limit_rejections();
             warn!(peer = %src_addr, max_sessions = self.config.max_sessions, "Relay session limit reached");
             return Err(TransportError::ConnectionRefused(
                 "relay session limit reached".into(),
@@ -1004,8 +1016,10 @@ mod tests {
 
     #[test]
     fn relay_node_validates_config() {
-        let mut config = RelayConfig::default();
-        config.data_shards = 0; // Invalid
+        let config = RelayConfig {
+            data_shards: 0,
+            ..RelayConfig::default()
+        };
 
         let result = RelayNode::new(config);
         assert!(result.is_err());
@@ -1316,6 +1330,54 @@ mod tests {
             &parsed.payload,
             &parsed.header.hmac
         ));
+    }
+
+    #[tokio::test]
+    async fn forward_counts_chunks_without_eligible_receive_peers() {
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
+        let mut node = RelayNode::new(config).unwrap();
+        node.bind().await.unwrap();
+
+        let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(sender_addr, RelaySession::new(sender_addr, [0u8; 32]));
+        }
+
+        let block_hash = [0xab; 32];
+        let chunks = vec![(0u16, vec![1u8; 10]), (1u16, vec![2u8; 10])];
+
+        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 2, &chunks)
+            .await
+            .unwrap();
+
+        let metrics = node.metrics().snapshot();
+        assert_eq!(metrics.forward_no_peer_chunks, 2);
+        assert_eq!(metrics.packets_forwarded, 0);
+    }
+
+    #[tokio::test]
+    async fn keepalive_counts_session_limit_rejections() {
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true)
+            .with_max_sessions(1);
+        let node = RelayNode::new(config).unwrap();
+        let existing_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        let new_addr: SocketAddr = "127.0.0.1:12346".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(existing_addr, RelaySession::new(existing_addr, [0u8; 32]));
+        }
+
+        let keepalive = Chunk::new(
+            ChunkHeader::new_keepalive_authenticated([0u8; 32]),
+            Vec::new(),
+        );
+        let result = node.handle_keepalive(new_addr, &keepalive).await;
+
+        assert!(matches!(result, Err(TransportError::ConnectionRefused(_))));
+        assert_eq!(node.metrics().snapshot().session_limit_rejections, 1);
     }
 
     #[tokio::test]

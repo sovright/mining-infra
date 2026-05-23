@@ -38,6 +38,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 sessions,
                 packets_received = snapshot.packets_received,
                 packets_forwarded = snapshot.packets_forwarded,
+                socket_receive_errors = snapshot.socket_receive_errors,
+                packet_send_errors = snapshot.packet_send_errors,
+                forward_no_peer_chunks = snapshot.forward_no_peer_chunks,
                 compact_block_chunks_received = snapshot.compact_block_chunks_received,
                 compact_block_chunks_forwarded = snapshot.compact_block_chunks_forwarded,
                 raw_segment_chunks_received = snapshot.raw_segment_chunks_received,
@@ -51,6 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 invalid_chunks = snapshot.invalid_chunks,
                 sessions_created = snapshot.sessions_created,
                 sessions_expired = snapshot.sessions_expired,
+                session_limit_rejections = snapshot.session_limit_rejections,
                 "FORGE relay metrics"
             );
             if let Some(path) = &metrics_textfile {

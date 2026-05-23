@@ -9,6 +9,12 @@ pub struct RelayMetrics {
     pub packets_received: AtomicU64,
     /// Total packets forwarded
     pub packets_forwarded: AtomicU64,
+    /// Socket receive errors
+    pub socket_receive_errors: AtomicU64,
+    /// Packet send errors while forwarding
+    pub packet_send_errors: AtomicU64,
+    /// Forward-ready chunks with no eligible peer session
+    pub forward_no_peer_chunks: AtomicU64,
     /// Compact block data chunks received
     pub compact_block_chunks_received: AtomicU64,
     /// Compact block data chunks forwarded
@@ -35,6 +41,8 @@ pub struct RelayMetrics {
     pub sessions_created: AtomicU64,
     /// Sessions expired
     pub sessions_expired: AtomicU64,
+    /// Incoming packets rejected because the session limit was reached
+    pub session_limit_rejections: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -51,6 +59,22 @@ impl RelayMetrics {
     /// Increment packets forwarded
     pub fn inc_packets_forwarded(&self, count: u64) {
         self.packets_forwarded.fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Increment socket receive errors
+    pub fn inc_socket_receive_errors(&self) {
+        self.socket_receive_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment packet send errors
+    pub fn inc_packet_send_errors(&self) {
+        self.packet_send_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment forward-ready chunks that had no eligible receive peer
+    pub fn inc_forward_no_peer_chunks(&self, count: u64) {
+        self.forward_no_peer_chunks
+            .fetch_add(count, Ordering::Relaxed);
     }
 
     /// Increment compact block chunks received
@@ -127,11 +151,20 @@ impl RelayMetrics {
         self.sessions_expired.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Increment session limit rejections
+    pub fn inc_session_limit_rejections(&self) {
+        self.session_limit_rejections
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Get snapshot of current metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             packets_received: self.packets_received.load(Ordering::Relaxed),
             packets_forwarded: self.packets_forwarded.load(Ordering::Relaxed),
+            socket_receive_errors: self.socket_receive_errors.load(Ordering::Relaxed),
+            packet_send_errors: self.packet_send_errors.load(Ordering::Relaxed),
+            forward_no_peer_chunks: self.forward_no_peer_chunks.load(Ordering::Relaxed),
             compact_block_chunks_received: self
                 .compact_block_chunks_received
                 .load(Ordering::Relaxed),
@@ -157,6 +190,7 @@ impl RelayMetrics {
             invalid_chunks: self.invalid_chunks.load(Ordering::Relaxed),
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_expired: self.sessions_expired.load(Ordering::Relaxed),
+            session_limit_rejections: self.session_limit_rejections.load(Ordering::Relaxed),
         }
     }
 }
@@ -166,6 +200,9 @@ impl RelayMetrics {
 pub struct MetricsSnapshot {
     pub packets_received: u64,
     pub packets_forwarded: u64,
+    pub socket_receive_errors: u64,
+    pub packet_send_errors: u64,
+    pub forward_no_peer_chunks: u64,
     pub compact_block_chunks_received: u64,
     pub compact_block_chunks_forwarded: u64,
     pub raw_segment_chunks_received: u64,
@@ -179,6 +216,7 @@ pub struct MetricsSnapshot {
     pub invalid_chunks: u64,
     pub sessions_created: u64,
     pub sessions_expired: u64,
+    pub session_limit_rejections: u64,
 }
 
 /// Render relay metrics in Prometheus text exposition format.
@@ -204,6 +242,27 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "Total relay packets forwarded.",
         "counter",
         snapshot.packets_forwarded,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_socket_receive_errors_total",
+        "Total relay socket receive errors.",
+        "counter",
+        snapshot.socket_receive_errors,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_packet_send_errors_total",
+        "Total relay packet send errors while forwarding.",
+        "counter",
+        snapshot.packet_send_errors,
+    );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_forward_no_peer_chunks_total",
+        "Total forward-ready chunks with no eligible peer session.",
+        "counter",
+        snapshot.forward_no_peer_chunks,
     );
     push_metric(
         &mut text,
@@ -296,6 +355,13 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "counter",
         snapshot.sessions_expired,
     );
+    push_metric(
+        &mut text,
+        "bedrock_forge_relay_session_limit_rejections_total",
+        "Total incoming packets rejected because the relay session limit was reached.",
+        "counter",
+        snapshot.session_limit_rejections,
+    );
     text
 }
 
@@ -327,6 +393,8 @@ mod tests {
         metrics.inc_packets_received();
         metrics.inc_packets_received();
         metrics.inc_raw_segment_chunks_received();
+        metrics.inc_packet_send_errors();
+        metrics.inc_forward_no_peer_chunks(2);
         metrics.inc_raw_segment_validation_deferred();
         metrics.inc_raw_segment_validation_successes();
         metrics.inc_auth_failures();
@@ -338,6 +406,8 @@ mod tests {
         assert_eq!(snapshot.raw_segment_validation_successes, 1);
         assert_eq!(snapshot.auth_failures, 1);
         assert_eq!(snapshot.packets_forwarded, 0);
+        assert_eq!(snapshot.packet_send_errors, 1);
+        assert_eq!(snapshot.forward_no_peer_chunks, 2);
     }
 
     #[test]
@@ -345,6 +415,9 @@ mod tests {
         let snapshot = MetricsSnapshot {
             packets_received: 12,
             packets_forwarded: 7,
+            socket_receive_errors: 13,
+            packet_send_errors: 14,
+            forward_no_peer_chunks: 15,
             compact_block_chunks_received: 5,
             compact_block_chunks_forwarded: 4,
             raw_segment_chunks_received: 3,
@@ -358,6 +431,7 @@ mod tests {
             invalid_chunks: 2,
             sessions_created: 3,
             sessions_expired: 4,
+            session_limit_rejections: 6,
         };
 
         let text = render_prometheus_text(&snapshot, 5);
@@ -367,6 +441,9 @@ mod tests {
         assert!(text.contains("bedrock_forge_relay_sessions 5\n"));
         assert!(text.contains("bedrock_forge_relay_packets_received_total 12\n"));
         assert!(text.contains("bedrock_forge_relay_packets_forwarded_total 7\n"));
+        assert!(text.contains("bedrock_forge_relay_socket_receive_errors_total 13\n"));
+        assert!(text.contains("bedrock_forge_relay_packet_send_errors_total 14\n"));
+        assert!(text.contains("bedrock_forge_relay_forward_no_peer_chunks_total 15\n"));
         assert!(text.contains("bedrock_forge_relay_compact_block_chunks_received_total 5\n"));
         assert!(text.contains("bedrock_forge_relay_compact_block_chunks_forwarded_total 4\n"));
         assert!(text.contains("bedrock_forge_relay_raw_segment_chunks_received_total 3\n"));
@@ -380,5 +457,6 @@ mod tests {
         assert!(text.contains("bedrock_forge_relay_invalid_chunks_total 2\n"));
         assert!(text.contains("bedrock_forge_relay_sessions_created_total 3\n"));
         assert!(text.contains("bedrock_forge_relay_sessions_expired_total 4\n"));
+        assert!(text.contains("bedrock_forge_relay_session_limit_rejections_total 6\n"));
     }
 }
