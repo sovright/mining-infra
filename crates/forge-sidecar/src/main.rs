@@ -19,7 +19,8 @@ use forge_sidecar::compact::build_compact_block;
 use forge_sidecar::config;
 use forge_sidecar::rpc::ZebraRpc;
 use forge_sidecar::submit::{
-    SubmissionOutcome, SubmitBlockMode, handle_relay_compact_block, handle_relay_raw_block,
+    SubmissionOutcome, SubmitBlockMode, SubmitBlockStatus, handle_relay_compact_block,
+    handle_relay_raw_block,
 };
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::ForgeRelay;
@@ -572,16 +573,28 @@ fn log_submission_outcome(
                 "Relay block submit dry-run candidate"
             );
         }
-        Ok(SubmissionOutcome::Submitted { candidate, result }) => {
-            metrics.inc_submit_successes();
-            info!(
-                block_hash = %candidate.block_hash,
-                tx_count = candidate.tx_count,
-                block_bytes = candidate.block_bytes,
-                result = ?result,
-                "Relay block submitted to Zebra"
-            );
-        }
+        Ok(SubmissionOutcome::Submitted { candidate, status }) => match status {
+            SubmitBlockStatus::Accepted => {
+                metrics.inc_submit_successes();
+                info!(
+                    block_hash = %candidate.block_hash,
+                    tx_count = candidate.tx_count,
+                    block_bytes = candidate.block_bytes,
+                    submit_status = status.as_str(),
+                    "Relay block accepted by Zebra"
+                );
+            }
+            SubmitBlockStatus::Duplicate => {
+                metrics.inc_submit_duplicates();
+                info!(
+                    block_hash = %candidate.block_hash,
+                    tx_count = candidate.tx_count,
+                    block_bytes = candidate.block_bytes,
+                    submit_status = status.as_str(),
+                    "Relay block already known to Zebra"
+                );
+            }
+        },
         Err(error) => {
             metrics.inc_submit_rejections();
             warn!(%error, "Relay block is not a submit candidate");
@@ -598,6 +611,7 @@ struct SidecarMetrics {
     raw_segment_reassembly_failures: AtomicU64,
     submit_dry_run_candidates: AtomicU64,
     submit_successes: AtomicU64,
+    submit_duplicates: AtomicU64,
     submit_rejections: AtomicU64,
     raw_segment_incomplete_blocks: AtomicUsize,
     raw_segment_payload_bytes: AtomicUsize,
@@ -635,6 +649,10 @@ impl SidecarMetrics {
         self.submit_successes.fetch_add(1, Ordering::Relaxed);
     }
 
+    fn inc_submit_duplicates(&self) {
+        self.submit_duplicates.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn inc_submit_rejections(&self) {
         self.submit_rejections.fetch_add(1, Ordering::Relaxed);
     }
@@ -655,6 +673,7 @@ impl SidecarMetrics {
             self.raw_segment_reassembly_failures.load(Ordering::Relaxed);
         let submit_dry_run_candidates = self.submit_dry_run_candidates.load(Ordering::Relaxed);
         let submit_successes = self.submit_successes.load(Ordering::Relaxed);
+        let submit_duplicates = self.submit_duplicates.load(Ordering::Relaxed);
         let submit_rejections = self.submit_rejections.load(Ordering::Relaxed);
         let raw_segment_incomplete_blocks =
             self.raw_segment_incomplete_blocks.load(Ordering::Relaxed);
@@ -676,6 +695,8 @@ impl SidecarMetrics {
                 "forge_sidecar_relay_submit_dry_run_candidates_total {submit_dry_run_candidates}\n",
                 "# TYPE forge_sidecar_relay_submit_successes_total counter\n",
                 "forge_sidecar_relay_submit_successes_total {submit_successes}\n",
+                "# TYPE forge_sidecar_relay_submit_duplicates_total counter\n",
+                "forge_sidecar_relay_submit_duplicates_total {submit_duplicates}\n",
                 "# TYPE forge_sidecar_relay_submit_rejections_total counter\n",
                 "forge_sidecar_relay_submit_rejections_total {submit_rejections}\n",
                 "# TYPE forge_sidecar_raw_segment_incomplete_blocks gauge\n",
@@ -690,6 +711,7 @@ impl SidecarMetrics {
             raw_segment_reassembly_failures = raw_segment_reassembly_failures,
             submit_dry_run_candidates = submit_dry_run_candidates,
             submit_successes = submit_successes,
+            submit_duplicates = submit_duplicates,
             submit_rejections = submit_rejections,
             raw_segment_incomplete_blocks = raw_segment_incomplete_blocks,
             raw_segment_payload_bytes = raw_segment_payload_bytes,
@@ -803,6 +825,7 @@ mod tests {
         metrics.inc_raw_segment_reassembly_failures();
         metrics.inc_submit_dry_run_candidates();
         metrics.inc_submit_successes();
+        metrics.inc_submit_duplicates();
         metrics.inc_submit_rejections();
         metrics.set_raw_segment_buffer_state(2, 4096);
 
@@ -815,6 +838,7 @@ mod tests {
         assert!(text.contains("forge_sidecar_relay_raw_segment_reassembly_failures_total 1"));
         assert!(text.contains("forge_sidecar_relay_submit_dry_run_candidates_total 1"));
         assert!(text.contains("forge_sidecar_relay_submit_successes_total 1"));
+        assert!(text.contains("forge_sidecar_relay_submit_duplicates_total 1"));
         assert!(text.contains("forge_sidecar_relay_submit_rejections_total 1"));
         assert!(text.contains("forge_sidecar_raw_segment_incomplete_blocks 2"));
         assert!(text.contains("forge_sidecar_raw_segment_payload_bytes 4096"));

@@ -52,8 +52,24 @@ pub enum SubmissionOutcome {
     DryRun(SubmissionCandidate),
     Submitted {
         candidate: SubmissionCandidate,
-        result: Option<String>,
+        status: SubmitBlockStatus,
     },
+}
+
+/// Classified Zebra `submitblock` result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitBlockStatus {
+    Accepted,
+    Duplicate,
+}
+
+impl SubmitBlockStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmitBlockStatus::Accepted => "accepted",
+            SubmitBlockStatus::Duplicate => "duplicate",
+        }
+    }
 }
 
 /// Errors that prevent a relay block from being submitted.
@@ -67,6 +83,7 @@ pub enum RelayBlockError {
     RawBlockHashMismatch,
     InvalidCompactSize,
     SubmitFailed(String),
+    SubmitRejected(String),
 }
 
 impl fmt::Display for RelayBlockError {
@@ -97,7 +114,8 @@ impl fmt::Display for RelayBlockError {
             RelayBlockError::InvalidCompactSize => {
                 write!(f, "invalid transaction count compactSize")
             }
-            RelayBlockError::SubmitFailed(error) => write!(f, "submitblock failed: {error}"),
+            RelayBlockError::SubmitFailed(error) => write!(f, "submitblock RPC failed: {error}"),
+            RelayBlockError::SubmitRejected(reason) => write!(f, "submitblock rejected: {reason}"),
         }
     }
 }
@@ -207,7 +225,8 @@ pub async fn handle_relay_compact_block<S: SubmitBlock + Sync>(
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            Ok(SubmissionOutcome::Submitted { candidate, result })
+            let status = classify_submitblock_result(result)?;
+            Ok(SubmissionOutcome::Submitted { candidate, status })
         }
     }
 }
@@ -227,8 +246,19 @@ pub async fn handle_relay_raw_block<S: SubmitBlock + Sync>(
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            Ok(SubmissionOutcome::Submitted { candidate, result })
+            let status = classify_submitblock_result(result)?;
+            Ok(SubmissionOutcome::Submitted { candidate, status })
         }
+    }
+}
+
+fn classify_submitblock_result(
+    result: Option<String>,
+) -> Result<SubmitBlockStatus, RelayBlockError> {
+    match result.as_deref() {
+        None => Ok(SubmitBlockStatus::Accepted),
+        Some("duplicate") => Ok(SubmitBlockStatus::Duplicate),
+        Some(reason) => Err(RelayBlockError::SubmitRejected(reason.to_owned())),
     }
 }
 

@@ -2,19 +2,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bedrock_forge::{CompactBlock, PrefilledTx, ShortId, zcash_block_hash};
 use forge_sidecar::submit::{
-    RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitFuture,
-    build_raw_block_submission_candidate, build_submission_candidate, handle_relay_compact_block,
-    handle_relay_raw_block,
+    RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
+    SubmitFuture, build_raw_block_submission_candidate, build_submission_candidate,
+    handle_relay_compact_block, handle_relay_raw_block,
 };
 
 struct CountingSubmitter {
     calls: AtomicUsize,
+    result: Option<String>,
 }
 
 impl CountingSubmitter {
     fn new() -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            result: None,
+        }
+    }
+
+    fn with_result(result: impl Into<String>) -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+            result: Some(result.into()),
         }
     }
 }
@@ -22,7 +31,7 @@ impl CountingSubmitter {
 impl SubmitBlock for CountingSubmitter {
     fn submit_block<'a>(&'a self, _block_hex: &'a str) -> SubmitFuture<'a> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Box::pin(async { Ok(None) })
+        Box::pin(async move { Ok(self.result.clone()) })
     }
 }
 
@@ -130,7 +139,64 @@ async fn live_mode_submits_candidate_to_zebra() {
         .await
         .unwrap();
 
-    assert!(matches!(outcome, SubmissionOutcome::Submitted { .. }));
+    assert!(matches!(
+        outcome,
+        SubmissionOutcome::Submitted {
+            status: SubmitBlockStatus::Accepted,
+            ..
+        }
+    ));
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn live_mode_treats_duplicate_submitblock_as_idempotent() {
+    let submitter = CountingSubmitter::with_result("duplicate");
+    let compact = CompactBlock::new(
+        header(),
+        0,
+        vec![],
+        vec![PrefilledTx {
+            index: 0,
+            tx_data: vec![0x01],
+        }],
+    );
+
+    let outcome = handle_relay_compact_block(&submitter, &compact, SubmitBlockMode::Live)
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome,
+        SubmissionOutcome::Submitted {
+            status: SubmitBlockStatus::Duplicate,
+            ..
+        }
+    ));
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn live_mode_rejects_non_duplicate_submitblock_reason() {
+    let submitter = CountingSubmitter::with_result("bad-cb-amount");
+    let compact = CompactBlock::new(
+        header(),
+        0,
+        vec![],
+        vec![PrefilledTx {
+            index: 0,
+            tx_data: vec![0x01],
+        }],
+    );
+
+    let err = handle_relay_compact_block(&submitter, &compact, SubmitBlockMode::Live)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        err,
+        RelayBlockError::SubmitRejected("bad-cb-amount".to_string())
+    );
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
 }
 
