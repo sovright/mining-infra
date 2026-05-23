@@ -22,11 +22,16 @@ pub struct Message {
 pub struct Inventory {
     pub inv_type: u32,
     pub hash: [u8; 32],
+    pub auth_digest: Option<[u8; 32]>,
 }
 
 impl Inventory {
     pub fn is_block(&self) -> bool {
         self.inv_type == MSG_BLOCK
+    }
+
+    pub fn is_transaction(&self) -> bool {
+        matches!(self.inv_type, MSG_TX | MSG_WTX)
     }
 }
 
@@ -140,6 +145,9 @@ pub fn encode_inventory(items: &[Inventory]) -> Vec<u8> {
     for item in items {
         out.extend_from_slice(&item.inv_type.to_le_bytes());
         out.extend_from_slice(&item.hash);
+        if item.inv_type == MSG_WTX {
+            out.extend_from_slice(&item.auth_digest.unwrap_or([0u8; 32]));
+        }
     }
     out
 }
@@ -158,15 +166,22 @@ pub fn parse_inventory(payload: &[u8]) -> Result<Vec<Inventory>> {
         let inv_type = read_u32_le(payload, &mut cursor)?;
         let mut hash = [0u8; 32];
         read_exact(payload, &mut cursor, &mut hash)?;
-        if inv_type == MSG_WTX {
+        let auth_digest = if inv_type == MSG_WTX {
             let mut auth_digest = [0u8; 32];
             read_exact(payload, &mut cursor, &mut auth_digest)?;
+            Some(auth_digest)
         } else if !matches!(inv_type, MSG_TX | MSG_BLOCK | MSG_FILTERED_BLOCK) {
             return Err(IngressError::Wire(format!(
                 "unrecognized inventory type: {inv_type}"
             )));
-        }
-        items.push(Inventory { inv_type, hash });
+        } else {
+            None
+        };
+        items.push(Inventory {
+            inv_type,
+            hash,
+            auth_digest,
+        });
     }
     Ok(items)
 }
@@ -321,9 +336,24 @@ mod tests {
         let item = Inventory {
             inv_type: MSG_BLOCK,
             hash: [0xab; 32],
+            auth_digest: None,
         };
         let payload = encode_inventory(&[item]);
         let parsed = parse_inventory(&payload).unwrap();
+        assert_eq!(parsed, vec![item]);
+    }
+
+    #[test]
+    fn wtx_inventory_roundtrip_preserves_auth_digest() {
+        let item = Inventory {
+            inv_type: MSG_WTX,
+            hash: [0xaa; 32],
+            auth_digest: Some([0xbb; 32]),
+        };
+
+        let payload = encode_inventory(&[item]);
+        let parsed = parse_inventory(&payload).unwrap();
+
         assert_eq!(parsed, vec![item]);
     }
 
@@ -339,6 +369,7 @@ mod tests {
         let parsed = parse_inventory(&payload).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].inv_type, MSG_WTX);
+        assert_eq!(parsed[0].auth_digest, Some([0xbb; 32]));
         assert_eq!(parsed[1].inv_type, MSG_BLOCK);
     }
 

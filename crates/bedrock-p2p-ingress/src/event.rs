@@ -164,6 +164,54 @@ impl EventSink {
         }))
     }
 
+    pub fn p2p_tx_inv(&self, peer: &str, kind: &str, hash: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_tx_inv",
+            "peer": peer,
+            "kind": kind,
+            "hash": hash,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    pub fn p2p_tx_getdata_sent(&self, peer: &str, kind: &str, hash: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_tx_getdata_sent",
+            "peer": peer,
+            "kind": kind,
+            "hash": hash,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn p2p_tx_received(
+        &self,
+        peer: &str,
+        kind: &str,
+        hash: &str,
+        bytes: usize,
+        cache_entries: usize,
+        cache_bytes: usize,
+        evicted_entries: usize,
+        evicted_bytes: usize,
+        dropped_too_large: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_tx_received",
+            "peer": peer,
+            "kind": kind,
+            "hash": hash,
+            "bytes": bytes,
+            "cache_entries": cache_entries,
+            "cache_bytes": cache_bytes,
+            "evicted_entries": evicted_entries,
+            "evicted_bytes": evicted_bytes,
+            "dropped_too_large": dropped_too_large,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     pub fn p2p_block_received(&self, peer: &str, hash: &str, bytes: usize) -> Result<()> {
         self.write(json!({
             "event": "p2p_block_received",

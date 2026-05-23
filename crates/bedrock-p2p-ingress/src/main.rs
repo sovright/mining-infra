@@ -6,6 +6,7 @@ mod event;
 mod forge;
 mod hash;
 mod peer;
+mod tx_cache;
 mod wire;
 
 use std::collections::HashSet;
@@ -21,6 +22,7 @@ use crawler::{Crawler, PeerOutcome};
 use error::Result;
 use event::EventSink;
 use forge::ForgeBridge;
+use tx_cache::{TxCache, TxCacheConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -31,6 +33,13 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let events = EventSink::new(config.event_log.clone())?;
     let forge = ForgeBridge::from_config(&config).await?;
+    let tx_cache = config.tx_cache_enabled.then(|| {
+        TxCache::new(TxCacheConfig {
+            max_entries: config.tx_cache_max_entries,
+            max_bytes: config.tx_cache_max_bytes,
+            max_tx_bytes: config.tx_cache_max_tx_bytes,
+        })
+    });
     let peers = discover_peers(&config).await;
     let crawler = Crawler::new(&config, peers);
 
@@ -39,6 +48,7 @@ async fn main() -> Result<()> {
         max_peers = config.max_peers,
         crawler_enabled = config.crawler_enabled,
         rotation_enabled = config.rotation_enabled,
+        tx_cache_enabled = tx_cache.is_some(),
         "starting P2P ingress"
     );
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
@@ -55,6 +65,7 @@ async fn main() -> Result<()> {
                 config.clone(),
                 events.clone(),
                 forge.clone(),
+                tx_cache.clone(),
                 crawler.clone(),
             ));
         }
@@ -83,6 +94,7 @@ fn spawn_peer(
     config: Config,
     events: EventSink,
     forge: Option<ForgeBridge>,
+    tx_cache: Option<TxCache>,
     crawler: Crawler,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -90,11 +102,26 @@ fn spawn_peer(
         let peer_runtime = config.peer_runtime;
         let peer_score_error = config.peer_score_error;
         let result = if peer_runtime.is_zero() {
-            peer::run_peer(peer, config, events.clone(), forge, crawler.clone()).await
+            peer::run_peer(
+                peer,
+                config,
+                events.clone(),
+                forge,
+                tx_cache,
+                crawler.clone(),
+            )
+            .await
         } else {
             match tokio::time::timeout(
                 peer_runtime,
-                peer::run_peer(peer, config, events.clone(), forge, crawler.clone()),
+                peer::run_peer(
+                    peer,
+                    config,
+                    events.clone(),
+                    forge,
+                    tx_cache,
+                    crawler.clone(),
+                ),
             )
             .await
             {

@@ -12,6 +12,7 @@ use crate::error::{IngressError, Result};
 use crate::event::EventSink;
 use crate::forge::ForgeBridge;
 use crate::hash::{display_hash_from_header, inventory_hash_to_display};
+use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
@@ -26,6 +27,7 @@ pub async fn run_peer(
     config: Config,
     events: EventSink,
     forge: Option<ForgeBridge>,
+    tx_cache: Option<TxCache>,
     crawler: Crawler,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
@@ -50,6 +52,9 @@ pub async fn run_peer(
     let mut seen_inv = HashSet::new();
     let mut requested = HashSet::new();
     let mut pending_block_responses = VecDeque::new();
+    let mut seen_tx_inv = HashSet::new();
+    let mut requested_tx = HashSet::new();
+    let mut pending_tx_responses = VecDeque::new();
 
     loop {
         let msg = timeout(Duration::from_secs(90), read_message(&mut reader))
@@ -113,21 +118,36 @@ pub async fn run_peer(
                 }
                 let invs = parse_inventory(&msg.payload)?;
                 let mut block_requests = Vec::new();
-                for inv in invs.into_iter().filter(Inventory::is_block) {
-                    if !seen_inv.insert(inv.hash) {
-                        continue;
-                    }
-                    let display = inventory_hash_to_display(&inv.hash);
-                    events.p2p_block_inv(&peer, &display)?;
-                    crawler.score_peer(
-                        peer_addr,
-                        config.peer_score_block_inv,
-                        "block_inv",
-                        &events,
-                    )?;
-                    if requested.insert(inv.hash) {
-                        pending_block_responses.push_back(inv.hash);
-                        block_requests.push(inv);
+                let mut tx_requests = Vec::new();
+                for inv in invs {
+                    if inv.is_block() {
+                        if !seen_inv.insert(inv.hash) {
+                            continue;
+                        }
+                        let display = inventory_hash_to_display(&inv.hash);
+                        events.p2p_block_inv(&peer, &display)?;
+                        crawler.score_peer(
+                            peer_addr,
+                            config.peer_score_block_inv,
+                            "block_inv",
+                            &events,
+                        )?;
+                        if requested.insert(inv.hash) {
+                            pending_block_responses.push_back(inv.hash);
+                            block_requests.push(inv);
+                        }
+                    } else if inv.is_transaction()
+                        && let Some(key) = queue_tx_request(
+                            inv,
+                            tx_cache.is_some(),
+                            config.tx_request_limit_per_inv,
+                            &mut seen_tx_inv,
+                            &mut requested_tx,
+                            &mut pending_tx_responses,
+                            &mut tx_requests,
+                        )
+                    {
+                        events.p2p_tx_inv(&peer, key.kind(), &key.display_hash())?;
                     }
                 }
                 if !block_requests.is_empty() {
@@ -139,6 +159,17 @@ pub async fn run_peer(
                     write_message(&mut writer, "getdata", &request).await?;
                     for hash in requested_hashes {
                         events.p2p_getdata_sent(&peer, &hash)?;
+                    }
+                }
+                if !tx_requests.is_empty() {
+                    let requested_keys: Vec<TxInventoryKey> = tx_requests
+                        .iter()
+                        .filter_map(TxInventoryKey::from_inventory)
+                        .collect();
+                    let request = encode_inventory(&tx_requests);
+                    write_message(&mut writer, "getdata", &request).await?;
+                    for key in requested_keys {
+                        events.p2p_tx_getdata_sent(&peer, key.kind(), &key.display_hash())?;
                     }
                 }
             }
@@ -180,8 +211,55 @@ pub async fn run_peer(
                     }
                 }
             }
+            "tx" => {
+                if !saw_verack {
+                    continue;
+                }
+                if let (Some(cache), Some(key)) = (&tx_cache, pending_tx_responses.pop_front()) {
+                    let outcome = cache.insert(key, msg.payload.clone());
+                    events.p2p_tx_received(
+                        &peer,
+                        key.kind(),
+                        &key.display_hash(),
+                        msg.payload.len(),
+                        outcome.entries,
+                        outcome.bytes,
+                        outcome.evicted_entries,
+                        outcome.evicted_bytes,
+                        outcome.dropped_too_large,
+                    )?;
+                } else if tx_cache.is_some() {
+                    events
+                        .p2p_peer_error(&peer, "received tx without pending transaction request")?;
+                }
+            }
             _ => {}
         }
+    }
+}
+
+fn queue_tx_request(
+    inv: Inventory,
+    tx_cache_enabled: bool,
+    request_limit: usize,
+    seen: &mut HashSet<TxInventoryKey>,
+    requested: &mut HashSet<TxInventoryKey>,
+    pending: &mut VecDeque<TxInventoryKey>,
+    requests: &mut Vec<Inventory>,
+) -> Option<TxInventoryKey> {
+    if !tx_cache_enabled || requests.len() >= request_limit {
+        return None;
+    }
+    let key = TxInventoryKey::from_inventory(&inv)?;
+    if !seen.insert(key) {
+        return None;
+    }
+    if requested.insert(key) {
+        pending.push_back(key);
+        requests.push(key.to_inventory());
+        Some(key)
+    } else {
+        None
     }
 }
 
@@ -270,6 +348,8 @@ fn nonce() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_cache::TxInventoryKey;
+    use crate::wire::{MSG_TX, MSG_WTX};
 
     #[test]
     fn version_payload_contains_user_agent() {
@@ -320,5 +400,73 @@ mod tests {
         let nonce = 42u64;
         assert_eq!(pong_nonce(&nonce.to_le_bytes()), Some(42));
         assert_eq!(pong_nonce(&[1, 2, 3]), None);
+    }
+
+    #[test]
+    fn queues_transaction_inventory_for_getdata_when_cache_enabled() {
+        let inv = Inventory {
+            inv_type: MSG_WTX,
+            hash: [0x11; 32],
+            auth_digest: Some([0x22; 32]),
+        };
+        let mut seen = HashSet::new();
+        let mut requested = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut requests = Vec::new();
+
+        let queued = queue_tx_request(
+            inv,
+            true,
+            1,
+            &mut seen,
+            &mut requested,
+            &mut pending,
+            &mut requests,
+        );
+
+        let key = TxInventoryKey::wtx([0x11; 32], [0x22; 32]);
+        assert_eq!(queued, Some(key));
+        assert!(seen.contains(&key));
+        assert!(requested.contains(&key));
+        assert_eq!(pending.pop_front(), Some(key));
+        assert_eq!(requests, vec![inv]);
+    }
+
+    #[test]
+    fn skips_transaction_inventory_when_cache_disabled_or_limit_reached() {
+        let inv = Inventory {
+            inv_type: MSG_TX,
+            hash: [0x33; 32],
+            auth_digest: None,
+        };
+        let mut seen = HashSet::new();
+        let mut requested = HashSet::new();
+        let mut pending = VecDeque::new();
+        let mut requests = Vec::new();
+
+        assert_eq!(
+            queue_tx_request(
+                inv,
+                false,
+                1,
+                &mut seen,
+                &mut requested,
+                &mut pending,
+                &mut requests,
+            ),
+            None
+        );
+        assert_eq!(
+            queue_tx_request(
+                inv,
+                true,
+                0,
+                &mut seen,
+                &mut requested,
+                &mut pending,
+                &mut requests,
+            ),
+            None
+        );
     }
 }

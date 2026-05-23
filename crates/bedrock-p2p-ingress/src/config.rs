@@ -30,6 +30,11 @@ pub struct Config {
     pub peer_score_block_received: i64,
     pub peer_score_forge_forwarded: i64,
     pub peer_score_error: i64,
+    pub tx_cache_enabled: bool,
+    pub tx_cache_max_entries: usize,
+    pub tx_cache_max_bytes: usize,
+    pub tx_cache_max_tx_bytes: usize,
+    pub tx_request_limit_per_inv: usize,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
@@ -64,6 +69,11 @@ impl Config {
         let peer_score_block_received = env_i64("BEDROCK_P2P_PEER_SCORE_BLOCK_RECEIVED", 25)?;
         let peer_score_forge_forwarded = env_i64("BEDROCK_P2P_PEER_SCORE_FORGE_FORWARDED", 10)?;
         let peer_score_error = env_i64("BEDROCK_P2P_PEER_SCORE_ERROR", -50)?;
+        let tx_cache_enabled = env_bool("BEDROCK_P2P_TX_CACHE_ENABLED", false)?;
+        let tx_cache_max_entries = env_usize("BEDROCK_P2P_TX_CACHE_MAX_ENTRIES", 200_000)?;
+        let tx_cache_max_bytes = env_usize("BEDROCK_P2P_TX_CACHE_MAX_BYTES", 536_870_912)?;
+        let tx_cache_max_tx_bytes = env_usize("BEDROCK_P2P_TX_CACHE_MAX_TX_BYTES", 2_097_152)?;
+        let tx_request_limit_per_inv = env_usize("BEDROCK_P2P_TX_REQUEST_LIMIT_PER_INV", 256)?;
         let event_log = env::var("BEDROCK_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("BEDROCK_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("BEDROCK_P2P_RELAY_BIND_ADDR")
@@ -107,6 +117,11 @@ impl Config {
             peer_score_block_received,
             peer_score_forge_forwarded,
             peer_score_error,
+            tx_cache_enabled,
+            tx_cache_max_entries,
+            tx_cache_max_bytes,
+            tx_cache_max_tx_bytes,
+            tx_request_limit_per_inv,
             event_log,
             relay_peers,
             relay_bind_addr,
