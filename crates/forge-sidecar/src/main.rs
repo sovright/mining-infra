@@ -1,8 +1,8 @@
 //! Forge sidecar for Stratum V1 mining pools
 
 use bedrock_forge::{
-    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, WtxId,
-    reassemble_raw_block,
+    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, TxCache,
+    TxCacheConfig, TxCacheSnapshot, WtxId, reassemble_raw_block,
 };
 use clap::Parser;
 use std::collections::HashMap;
@@ -80,6 +80,22 @@ struct Args {
     #[arg(long)]
     compact_reconstruction_enabled: bool,
 
+    /// Maintain a sidecar-local transaction cache for compact reconstruction
+    #[arg(long)]
+    tx_cache_enabled: bool,
+
+    /// Maximum transactions to keep in the sidecar transaction cache
+    #[arg(long, default_value = "50000")]
+    tx_cache_max_entries: usize,
+
+    /// Maximum total transaction bytes to keep in the sidecar transaction cache
+    #[arg(long, default_value = "134217728")]
+    tx_cache_max_bytes: usize,
+
+    /// Maximum individual transaction payload size to cache
+    #[arg(long, default_value = "2097152")]
+    tx_cache_max_tx_bytes: usize,
+
     /// Maximum incomplete raw blocks to buffer while waiting for segments
     #[arg(long, default_value = "128")]
     raw_segment_max_incomplete_blocks: usize,
@@ -129,6 +145,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         receive_relay_blocks,
         enable_submitblock,
         compact_reconstruction_enabled,
+        tx_cache_enabled,
+        tx_cache_max_entries,
+        tx_cache_max_bytes,
+        tx_cache_max_tx_bytes,
         raw_segment_max_incomplete_blocks,
         raw_segment_max_payload_bytes,
         raw_segment_ttl_secs,
@@ -149,6 +169,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.receive_relay_blocks,
             cfg.enable_submitblock,
             cfg.compact_reconstruction_enabled,
+            cfg.tx_cache_enabled,
+            cfg.tx_cache_max_entries,
+            cfg.tx_cache_max_bytes,
+            cfg.tx_cache_max_tx_bytes,
             cfg.raw_segment_max_incomplete_blocks,
             cfg.raw_segment_max_payload_bytes,
             cfg.raw_segment_ttl_secs,
@@ -194,6 +218,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.receive_relay_blocks,
             args.enable_submitblock,
             args.compact_reconstruction_enabled,
+            args.tx_cache_enabled,
+            args.tx_cache_max_entries,
+            args.tx_cache_max_bytes,
+            args.tx_cache_max_tx_bytes,
             args.raw_segment_max_incomplete_blocks,
             args.raw_segment_max_payload_bytes,
             args.raw_segment_ttl_secs,
@@ -220,8 +248,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     info!(zebra_url = %zebra_url, "Starting forge sidecar");
     let metrics = Arc::new(SidecarMetrics::default());
+    let mempool = Arc::new(SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
+        enabled: tx_cache_enabled,
+        max_entries: tx_cache_max_entries,
+        max_bytes: tx_cache_max_bytes,
+        max_tx_bytes: tx_cache_max_tx_bytes,
+    }));
+    if let Some(snapshot) = mempool.tx_cache_snapshot() {
+        metrics.set_tx_cache_snapshot(&snapshot);
+    }
     if let Some(path) = metrics_textfile {
-        spawn_metrics_textfile_writer(Arc::clone(&metrics), path);
+        spawn_metrics_textfile_writer(Arc::clone(&metrics), mempool.tx_cache(), path);
     }
 
     // Initialize Zebra RPC client
@@ -253,7 +290,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             compact_reconstruction_enabled,
             raw_segment_buffer_config,
             Arc::clone(&metrics),
-            Arc::new(EmptyMempool),
+            Arc::clone(&mempool),
         );
     } else {
         relay.start().await?;
@@ -444,6 +481,7 @@ fn spawn_relay_block_handler<M>(
     });
 }
 
+#[derive(Clone)]
 struct EmptyMempool;
 
 impl MempoolProvider for EmptyMempool {
@@ -453,6 +491,61 @@ impl MempoolProvider for EmptyMempool {
 
     fn get_tx_data(&self, _wtxid: &WtxId) -> Option<Vec<u8>> {
         None
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SidecarTxCacheConfig {
+    enabled: bool,
+    max_entries: usize,
+    max_bytes: usize,
+    max_tx_bytes: usize,
+}
+
+#[derive(Clone)]
+enum SidecarMempool {
+    Empty(EmptyMempool),
+    TxCache(TxCache),
+}
+
+impl SidecarMempool {
+    fn from_tx_cache_config(config: SidecarTxCacheConfig) -> Self {
+        if config.enabled {
+            Self::TxCache(TxCache::new(TxCacheConfig {
+                max_entries: config.max_entries,
+                max_bytes: config.max_bytes,
+                max_tx_bytes: config.max_tx_bytes,
+            }))
+        } else {
+            Self::Empty(EmptyMempool)
+        }
+    }
+
+    fn tx_cache(&self) -> Option<TxCache> {
+        match self {
+            Self::Empty(_) => None,
+            Self::TxCache(cache) => Some(cache.clone()),
+        }
+    }
+
+    fn tx_cache_snapshot(&self) -> Option<TxCacheSnapshot> {
+        self.tx_cache().map(|cache| cache.snapshot())
+    }
+}
+
+impl MempoolProvider for SidecarMempool {
+    fn get_wtxids(&self) -> Vec<WtxId> {
+        match self {
+            Self::Empty(mempool) => mempool.get_wtxids(),
+            Self::TxCache(cache) => cache.get_wtxids(),
+        }
+    }
+
+    fn get_tx_data(&self, wtxid: &WtxId) -> Option<Vec<u8>> {
+        match self {
+            Self::Empty(mempool) => mempool.get_tx_data(wtxid),
+            Self::TxCache(cache) => cache.get_tx_data(wtxid),
+        }
     }
 }
 
@@ -731,6 +824,14 @@ struct SidecarMetrics {
     submit_rejections: AtomicU64,
     raw_segment_incomplete_blocks: AtomicUsize,
     raw_segment_payload_bytes: AtomicUsize,
+    tx_cache_entries: AtomicUsize,
+    tx_cache_bytes: AtomicUsize,
+    tx_cache_max_entries: AtomicUsize,
+    tx_cache_max_bytes: AtomicUsize,
+    tx_cache_max_tx_bytes: AtomicUsize,
+    tx_cache_evicted_entries_total: AtomicUsize,
+    tx_cache_evicted_bytes_total: AtomicUsize,
+    tx_cache_dropped_too_large_total: AtomicUsize,
 }
 
 impl SidecarMetrics {
@@ -800,6 +901,24 @@ impl SidecarMetrics {
             .store(payload_bytes, Ordering::Relaxed);
     }
 
+    fn set_tx_cache_snapshot(&self, snapshot: &TxCacheSnapshot) {
+        self.tx_cache_entries
+            .store(snapshot.entries, Ordering::Relaxed);
+        self.tx_cache_bytes.store(snapshot.bytes, Ordering::Relaxed);
+        self.tx_cache_max_entries
+            .store(snapshot.max_entries, Ordering::Relaxed);
+        self.tx_cache_max_bytes
+            .store(snapshot.max_bytes, Ordering::Relaxed);
+        self.tx_cache_max_tx_bytes
+            .store(snapshot.max_tx_bytes, Ordering::Relaxed);
+        self.tx_cache_evicted_entries_total
+            .store(snapshot.evicted_entries_total, Ordering::Relaxed);
+        self.tx_cache_evicted_bytes_total
+            .store(snapshot.evicted_bytes_total, Ordering::Relaxed);
+        self.tx_cache_dropped_too_large_total
+            .store(snapshot.dropped_too_large_total, Ordering::Relaxed);
+    }
+
     fn render_prometheus_text(&self) -> String {
         let compact_blocks_received = self.compact_blocks_received.load(Ordering::Relaxed);
         let compact_reconstruction_attempts =
@@ -824,6 +943,18 @@ impl SidecarMetrics {
         let raw_segment_incomplete_blocks =
             self.raw_segment_incomplete_blocks.load(Ordering::Relaxed);
         let raw_segment_payload_bytes = self.raw_segment_payload_bytes.load(Ordering::Relaxed);
+        let tx_cache_entries = self.tx_cache_entries.load(Ordering::Relaxed);
+        let tx_cache_bytes = self.tx_cache_bytes.load(Ordering::Relaxed);
+        let tx_cache_max_entries = self.tx_cache_max_entries.load(Ordering::Relaxed);
+        let tx_cache_max_bytes = self.tx_cache_max_bytes.load(Ordering::Relaxed);
+        let tx_cache_max_tx_bytes = self.tx_cache_max_tx_bytes.load(Ordering::Relaxed);
+        let tx_cache_evicted_entries_total =
+            self.tx_cache_evicted_entries_total.load(Ordering::Relaxed);
+        let tx_cache_evicted_bytes_total =
+            self.tx_cache_evicted_bytes_total.load(Ordering::Relaxed);
+        let tx_cache_dropped_too_large_total = self
+            .tx_cache_dropped_too_large_total
+            .load(Ordering::Relaxed);
 
         format!(
             concat!(
@@ -857,6 +988,22 @@ impl SidecarMetrics {
                 "forge_sidecar_raw_segment_incomplete_blocks {raw_segment_incomplete_blocks}\n",
                 "# TYPE forge_sidecar_raw_segment_payload_bytes gauge\n",
                 "forge_sidecar_raw_segment_payload_bytes {raw_segment_payload_bytes}\n",
+                "# TYPE forge_sidecar_tx_cache_entries gauge\n",
+                "forge_sidecar_tx_cache_entries {tx_cache_entries}\n",
+                "# TYPE forge_sidecar_tx_cache_bytes gauge\n",
+                "forge_sidecar_tx_cache_bytes {tx_cache_bytes}\n",
+                "# TYPE forge_sidecar_tx_cache_max_entries gauge\n",
+                "forge_sidecar_tx_cache_max_entries {tx_cache_max_entries}\n",
+                "# TYPE forge_sidecar_tx_cache_max_bytes gauge\n",
+                "forge_sidecar_tx_cache_max_bytes {tx_cache_max_bytes}\n",
+                "# TYPE forge_sidecar_tx_cache_max_tx_bytes gauge\n",
+                "forge_sidecar_tx_cache_max_tx_bytes {tx_cache_max_tx_bytes}\n",
+                "# TYPE forge_sidecar_tx_cache_evicted_entries_total counter\n",
+                "forge_sidecar_tx_cache_evicted_entries_total {tx_cache_evicted_entries_total}\n",
+                "# TYPE forge_sidecar_tx_cache_evicted_bytes_total counter\n",
+                "forge_sidecar_tx_cache_evicted_bytes_total {tx_cache_evicted_bytes_total}\n",
+                "# TYPE forge_sidecar_tx_cache_dropped_too_large_total counter\n",
+                "forge_sidecar_tx_cache_dropped_too_large_total {tx_cache_dropped_too_large_total}\n",
             ),
             compact_blocks_received = compact_blocks_received,
             compact_reconstruction_attempts = compact_reconstruction_attempts,
@@ -873,15 +1020,30 @@ impl SidecarMetrics {
             submit_rejections = submit_rejections,
             raw_segment_incomplete_blocks = raw_segment_incomplete_blocks,
             raw_segment_payload_bytes = raw_segment_payload_bytes,
+            tx_cache_entries = tx_cache_entries,
+            tx_cache_bytes = tx_cache_bytes,
+            tx_cache_max_entries = tx_cache_max_entries,
+            tx_cache_max_bytes = tx_cache_max_bytes,
+            tx_cache_max_tx_bytes = tx_cache_max_tx_bytes,
+            tx_cache_evicted_entries_total = tx_cache_evicted_entries_total,
+            tx_cache_evicted_bytes_total = tx_cache_evicted_bytes_total,
+            tx_cache_dropped_too_large_total = tx_cache_dropped_too_large_total,
         )
     }
 }
 
-fn spawn_metrics_textfile_writer(metrics: Arc<SidecarMetrics>, path: PathBuf) {
+fn spawn_metrics_textfile_writer(
+    metrics: Arc<SidecarMetrics>,
+    tx_cache: Option<TxCache>,
+    path: PathBuf,
+) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
             interval.tick().await;
+            if let Some(cache) = &tx_cache {
+                metrics.set_tx_cache_snapshot(&cache.snapshot());
+            }
             let text = metrics.render_prometheus_text();
             if let Err(error) = write_metrics_textfile(&path, &text) {
                 warn!(%error, path = %path.display(), "Failed to write forge sidecar metrics textfile");
@@ -1043,6 +1205,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sidecar_mempool_uses_tx_cache_when_enabled() {
+        let mempool = SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
+            enabled: true,
+            max_entries: 8,
+            max_bytes: 1024,
+            max_tx_bytes: 512,
+        });
+        let tx_cache = mempool.tx_cache().expect("tx cache provider");
+        let wtxid = make_wtxid(0x42);
+        let tx = vec![0xde, 0xad, 0xbe, 0xef];
+
+        tx_cache.insert(wtxid, tx.clone());
+
+        assert_eq!(mempool.get_tx_data(&wtxid), Some(tx));
+        assert_eq!(mempool.tx_cache_snapshot().unwrap().max_entries, 8);
+    }
+
     #[tokio::test]
     async fn relay_compact_handler_uses_injected_mempool_for_short_ids() {
         let header = vec![0xcd; bedrock_forge::ZCASH_FULL_HEADER_SIZE];
@@ -1118,6 +1298,16 @@ mod tests {
         metrics.inc_submit_duplicates();
         metrics.inc_submit_rejections();
         metrics.set_raw_segment_buffer_state(2, 4096);
+        metrics.set_tx_cache_snapshot(&bedrock_forge::TxCacheSnapshot {
+            entries: 3,
+            bytes: 2048,
+            max_entries: 8,
+            max_bytes: 4096,
+            max_tx_bytes: 512,
+            evicted_entries_total: 1,
+            evicted_bytes_total: 128,
+            dropped_too_large_total: 2,
+        });
 
         let text = metrics.render_prometheus_text();
 
@@ -1136,6 +1326,14 @@ mod tests {
         assert!(text.contains("forge_sidecar_relay_submit_rejections_total 1"));
         assert!(text.contains("forge_sidecar_raw_segment_incomplete_blocks 2"));
         assert!(text.contains("forge_sidecar_raw_segment_payload_bytes 4096"));
+        assert!(text.contains("forge_sidecar_tx_cache_entries 3"));
+        assert!(text.contains("forge_sidecar_tx_cache_bytes 2048"));
+        assert!(text.contains("forge_sidecar_tx_cache_max_entries 8"));
+        assert!(text.contains("forge_sidecar_tx_cache_max_bytes 4096"));
+        assert!(text.contains("forge_sidecar_tx_cache_max_tx_bytes 512"));
+        assert!(text.contains("forge_sidecar_tx_cache_evicted_entries_total 1"));
+        assert!(text.contains("forge_sidecar_tx_cache_evicted_bytes_total 128"));
+        assert!(text.contains("forge_sidecar_tx_cache_dropped_too_large_total 2"));
     }
 
     #[test]

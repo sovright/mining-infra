@@ -52,6 +52,22 @@ pub struct Config {
     #[serde(default)]
     pub compact_reconstruction_enabled: bool,
 
+    /// Maintain a sidecar-local transaction cache for compact reconstruction.
+    #[serde(default)]
+    pub tx_cache_enabled: bool,
+
+    /// Maximum transactions to keep in the sidecar transaction cache.
+    #[serde(default = "default_tx_cache_max_entries")]
+    pub tx_cache_max_entries: usize,
+
+    /// Maximum total transaction bytes to keep in the sidecar transaction cache.
+    #[serde(default = "default_tx_cache_max_bytes")]
+    pub tx_cache_max_bytes: usize,
+
+    /// Maximum individual transaction payload size to accept into the cache.
+    #[serde(default = "default_tx_cache_max_tx_bytes")]
+    pub tx_cache_max_tx_bytes: usize,
+
     /// Maximum incomplete raw blocks to buffer while waiting for segments.
     #[serde(default = "default_raw_segment_max_incomplete_blocks")]
     pub raw_segment_max_incomplete_blocks: usize,
@@ -112,6 +128,18 @@ fn default_raw_segment_max_payload_bytes() -> usize {
 
 fn default_raw_segment_ttl_secs() -> u64 {
     120
+}
+
+fn default_tx_cache_max_entries() -> usize {
+    50_000
+}
+
+fn default_tx_cache_max_bytes() -> usize {
+    128 * 1024 * 1024
+}
+
+fn default_tx_cache_max_tx_bytes() -> usize {
+    2 * 1024 * 1024
 }
 
 impl Config {
@@ -197,6 +225,10 @@ mod tests {
         assert_eq!(config.send_burst_packets, 0);
         assert_eq!(config.send_burst_delay_micros, 0);
         assert_eq!(config.metrics_textfile, None);
+        assert!(!config.tx_cache_enabled);
+        assert_eq!(config.tx_cache_max_entries, 50_000);
+        assert_eq!(config.tx_cache_max_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.tx_cache_max_tx_bytes, 2 * 1024 * 1024);
     }
 
     #[test]
@@ -274,5 +306,23 @@ mod tests {
             config.metrics_textfile,
             Some(PathBuf::from("/var/lib/forge-sidecar/metrics.prom"))
         );
+    }
+
+    #[test]
+    fn config_parses_tx_cache_provider_settings() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            tx_cache_enabled = true
+            tx_cache_max_entries = 123
+            tx_cache_max_bytes = 456
+            tx_cache_max_tx_bytes = 789
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(config.tx_cache_enabled);
+        assert_eq!(config.tx_cache_max_entries, 123);
+        assert_eq!(config.tx_cache_max_bytes, 456);
+        assert_eq!(config.tx_cache_max_tx_bytes, 789);
     }
 }
