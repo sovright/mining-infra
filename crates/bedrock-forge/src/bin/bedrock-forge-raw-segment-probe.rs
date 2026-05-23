@@ -1,12 +1,14 @@
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
+use std::time::Duration;
 
 use bedrock_forge::{
     BlockChunker, Chunk, ChunkHeader, RelaySession, ZCASH_FULL_HEADER_SIZE, split_raw_block,
 };
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
+use tokio::time::sleep;
 
 const DEFAULT_BIND_ADDR: &str = "0.0.0.0:0";
 const DEFAULT_SEGMENT_FRAME_BYTES: usize = 64 * 1024;
@@ -27,6 +29,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         "BEDROCK_FORGE_RAW_SEGMENT_FRAME_BYTES",
         DEFAULT_SEGMENT_FRAME_BYTES,
     )?;
+    let packet_delay =
+        Duration::from_micros(env_u64("BEDROCK_FORGE_PROBE_PACKET_DELAY_MICROS", 0)?);
+    let segment_delay = Duration::from_millis(env_u64("BEDROCK_FORGE_PROBE_SEGMENT_DELAY_MS", 0)?);
 
     let raw_block = raw_block_from_env()?;
     if raw_block.len() < ZCASH_FULL_HEADER_SIZE {
@@ -50,6 +55,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let auth_chunk = authenticate_raw_segment_chunk(&session, &chunk);
                 socket.send_to(&auth_chunk.to_bytes(), relay_addr).await?;
                 packets_sent += 1;
+                if !packet_delay.is_zero() {
+                    sleep(packet_delay).await;
+                }
+            }
+            if !segment_delay.is_zero() {
+                sleep(segment_delay).await;
             }
         }
     }
@@ -97,6 +108,13 @@ fn env_usize(
     name: &str,
     default: usize,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    match env::var(name) {
+        Ok(value) => Ok(value.parse()?),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
     match env::var(name) {
         Ok(value) => Ok(value.parse()?),
         Err(_) => Ok(default),
