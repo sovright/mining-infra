@@ -302,84 +302,105 @@ fn spawn_relay_block_handler(
 ) {
     tokio::spawn(async move {
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
-        while let Some(payload) = receiver.recv_payload().await {
-            match payload {
-                RelayPayload::CompactBlock(compact) => {
-                    metrics.inc_compact_blocks_received();
-                    log_submission_outcome(
-                        handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
-                        metrics.as_ref(),
-                    );
-                }
-                RelayPayload::RawBlockSegment(segment) => {
-                    metrics.inc_raw_segments_received();
-                    let block_hash = segment.block_hash;
-                    let segment_index = segment.segment_index;
-                    let segment_count = segment.segment_count;
-                    let segment_payload_bytes = segment.payload.len();
-                    info!(
-                        block_hash = %hex::encode(block_hash),
-                        segment_index,
-                        segment_count,
-                        segment_payload_bytes,
-                        "Relay raw block segment received"
-                    );
-                    match raw_segments.insert(segment, Instant::now()) {
-                        RawSegmentInsert::Pending => {
-                            raw_segments.update_metrics(metrics.as_ref());
+        let mut cleanup_interval =
+            tokio::time::interval(raw_segment_cleanup_interval(raw_segment_buffer_config.ttl));
+        cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                payload = receiver.recv_payload() => {
+                    let Some(payload) = payload else {
+                        warn!("Relay block receiver closed");
+                        break;
+                    };
+                    match payload {
+                        RelayPayload::CompactBlock(compact) => {
+                            metrics.inc_compact_blocks_received();
+                            log_submission_outcome(
+                                handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
+                                metrics.as_ref(),
+                            );
+                        }
+                        RelayPayload::RawBlockSegment(segment) => {
+                            metrics.inc_raw_segments_received();
+                            let block_hash = segment.block_hash;
+                            let segment_index = segment.segment_index;
+                            let segment_count = segment.segment_count;
+                            let segment_payload_bytes = segment.payload.len();
                             info!(
                                 block_hash = %hex::encode(block_hash),
                                 segment_index,
                                 segment_count,
-                                "Relay raw block segment buffered"
+                                segment_payload_bytes,
+                                "Relay raw block segment received"
                             );
-                        }
-                        RawSegmentInsert::Complete(segments) => {
-                            metrics.inc_raw_segment_sets_completed();
-                            raw_segments.update_metrics(metrics.as_ref());
-                            let completed_segments = segments.len();
-                            match reassemble_raw_block(&segments) {
-                                Ok(raw_block) => {
+                            match raw_segments.insert(segment, Instant::now()) {
+                                RawSegmentInsert::Pending => {
+                                    raw_segments.update_metrics(metrics.as_ref());
                                     info!(
                                         block_hash = %hex::encode(block_hash),
-                                        segment_count = completed_segments,
-                                        raw_block_bytes = raw_block.len(),
-                                        "Relay raw block segments complete"
-                                    );
-                                    log_submission_outcome(
-                                        handle_relay_raw_block(
-                                            rpc.as_ref(),
-                                            &raw_block,
-                                            Some(block_hash),
-                                            mode,
-                                        )
-                                        .await,
-                                        metrics.as_ref(),
+                                        segment_index,
+                                        segment_count,
+                                        "Relay raw block segment buffered"
                                     );
                                 }
-                                Err(error) => {
-                                    metrics.inc_raw_segment_reassembly_failures();
-                                    warn!(%error, "Relay raw block segments did not reassemble");
+                                RawSegmentInsert::Complete(segments) => {
+                                    metrics.inc_raw_segment_sets_completed();
+                                    raw_segments.update_metrics(metrics.as_ref());
+                                    let completed_segments = segments.len();
+                                    match reassemble_raw_block(&segments) {
+                                        Ok(raw_block) => {
+                                            info!(
+                                                block_hash = %hex::encode(block_hash),
+                                                segment_count = completed_segments,
+                                                raw_block_bytes = raw_block.len(),
+                                                "Relay raw block segments complete"
+                                            );
+                                            log_submission_outcome(
+                                                handle_relay_raw_block(
+                                                    rpc.as_ref(),
+                                                    &raw_block,
+                                                    Some(block_hash),
+                                                    mode,
+                                                )
+                                                .await,
+                                                metrics.as_ref(),
+                                            );
+                                        }
+                                        Err(error) => {
+                                            metrics.inc_raw_segment_reassembly_failures();
+                                            warn!(%error, "Relay raw block segments did not reassemble");
+                                        }
+                                    }
+                                }
+                                RawSegmentInsert::Dropped { reason } => {
+                                    metrics.inc_raw_segment_drops();
+                                    raw_segments.update_metrics(metrics.as_ref());
+                                    warn!(
+                                        block_hash = %hex::encode(block_hash),
+                                        segment_index,
+                                        segment_count,
+                                        reason,
+                                        "Dropping relay raw block segment"
+                                    );
                                 }
                             }
                         }
-                        RawSegmentInsert::Dropped { reason } => {
-                            metrics.inc_raw_segment_drops();
-                            raw_segments.update_metrics(metrics.as_ref());
-                            warn!(
-                                block_hash = %hex::encode(block_hash),
-                                segment_index,
-                                segment_count,
-                                reason,
-                                "Dropping relay raw block segment"
-                            );
-                        }
                     }
+                }
+                _ = cleanup_interval.tick() => {
+                    expire_raw_segment_buffer(
+                        &mut raw_segments,
+                        metrics.as_ref(),
+                        Instant::now(),
+                    );
                 }
             }
         }
-        warn!("Relay block receiver closed");
     });
+}
+
+fn raw_segment_cleanup_interval(ttl: Duration) -> Duration {
+    std::cmp::min(ttl, Duration::from_secs(30))
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -518,7 +539,7 @@ impl RawSegmentBuffer {
         }
     }
 
-    fn expire(&mut self, now: Instant) {
+    fn expire(&mut self, now: Instant) -> usize {
         let expired: Vec<[u8; 32]> = self
             .entries
             .iter()
@@ -529,9 +550,11 @@ impl RawSegmentBuffer {
                 expired.then_some(*block_hash)
             })
             .collect();
+        let expired_count = expired.len();
         for block_hash in expired {
             self.remove_entry(&block_hash);
         }
+        expired_count
     }
 
     fn evict_oldest_until_below_block_limit(&mut self) {
@@ -557,6 +580,22 @@ impl RawSegmentBuffer {
     fn update_metrics(&self, metrics: &SidecarMetrics) {
         metrics.set_raw_segment_buffer_state(self.entries.len(), self.total_payload_bytes);
     }
+}
+
+fn expire_raw_segment_buffer(
+    raw_segments: &mut RawSegmentBuffer,
+    metrics: &SidecarMetrics,
+    now: Instant,
+) -> usize {
+    let expired_count = raw_segments.expire(now);
+    if expired_count > 0 {
+        raw_segments.update_metrics(metrics);
+        info!(
+            expired_raw_segment_blocks = expired_count,
+            "Expired incomplete relay raw block segment sets"
+        );
+    }
+    expired_count
 }
 
 fn log_submission_outcome(
@@ -812,6 +851,53 @@ mod tests {
         assert_eq!(
             metrics.raw_segment_payload_bytes.load(Ordering::Relaxed),
             segments[0].payload.len()
+        );
+    }
+
+    #[test]
+    fn raw_segment_cleanup_refreshes_metrics_without_new_segments() {
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(1)));
+        let metrics = SidecarMetrics::default();
+        let now = Instant::now();
+        let segments =
+            split_raw_block([0x07; 32], &[1, 2, 3, 4], RawBlockSegment::HEADER_LEN + 2).unwrap();
+
+        assert!(matches!(
+            buffer.insert(segments[0].clone(), now),
+            RawSegmentInsert::Pending
+        ));
+        buffer.update_metrics(&metrics);
+        assert_eq!(
+            metrics
+                .raw_segment_incomplete_blocks
+                .load(Ordering::Relaxed),
+            1
+        );
+
+        let expired =
+            expire_raw_segment_buffer(&mut buffer, &metrics, now + Duration::from_secs(2));
+
+        assert_eq!(expired, 1);
+        assert!(buffer.entries.is_empty());
+        assert_eq!(buffer.total_payload_bytes, 0);
+        assert_eq!(
+            metrics
+                .raw_segment_incomplete_blocks
+                .load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(metrics.raw_segment_payload_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn raw_segment_cleanup_interval_caps_long_ttls() {
+        assert_eq!(
+            raw_segment_cleanup_interval(Duration::from_secs(120)),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            raw_segment_cleanup_interval(Duration::from_secs(10)),
+            Duration::from_secs(10)
         );
     }
 
