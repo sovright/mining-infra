@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
+use super::MessageType;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use std::collections::VecDeque;
@@ -25,6 +26,8 @@ struct ChunkKey {
 pub struct BlockAssembly {
     /// Block hash (from chunk headers)
     pub block_hash: [u8; 32],
+    /// Relay message type for this assembly
+    pub msg_type: MessageType,
     /// Total expected chunks
     pub total_chunks: usize,
     /// Received chunk payloads (indexed by chunk_id)
@@ -42,8 +45,18 @@ pub struct BlockAssembly {
 impl BlockAssembly {
     /// Create a new block assembly
     pub fn new(block_hash: [u8; 32], total_chunks: usize) -> Self {
+        Self::new_for_message(block_hash, total_chunks, MessageType::Block)
+    }
+
+    /// Create a new block assembly for a specific relay message type.
+    pub fn new_for_message(
+        block_hash: [u8; 32],
+        total_chunks: usize,
+        msg_type: MessageType,
+    ) -> Self {
         Self {
             block_hash,
+            msg_type,
             total_chunks,
             chunks: vec![None; total_chunks],
             started_at: Instant::now(),
@@ -197,16 +210,36 @@ impl RelaySession {
         block_hash: [u8; 32],
         total_chunks: usize,
     ) -> Option<&mut BlockAssembly> {
+        self.get_or_create_assembly_for_message(block_hash, total_chunks, MessageType::Block)
+    }
+
+    /// Get or create an assembly for a specific relay message type.
+    pub fn get_or_create_assembly_for_message(
+        &mut self,
+        block_hash: [u8; 32],
+        total_chunks: usize,
+        msg_type: MessageType,
+    ) -> Option<&mut BlockAssembly> {
         use std::collections::hash_map::Entry;
 
         let at_capacity = self.pending_blocks.len() >= MAX_PENDING_BLOCKS;
         match self.pending_blocks.entry(block_hash) {
-            Entry::Occupied(entry) => Some(entry.into_mut()),
+            Entry::Occupied(entry) => {
+                let assembly = entry.into_mut();
+                if assembly.total_chunks != total_chunks || assembly.msg_type != msg_type {
+                    return None;
+                }
+                Some(assembly)
+            }
             Entry::Vacant(entry) => {
                 if at_capacity {
                     return None;
                 }
-                Some(entry.insert(BlockAssembly::new(block_hash, total_chunks)))
+                Some(entry.insert(BlockAssembly::new_for_message(
+                    block_hash,
+                    total_chunks,
+                    msg_type,
+                )))
             }
         }
     }
@@ -322,6 +355,25 @@ mod tests {
         let mut overflow_hash = [0u8; 32];
         overflow_hash[0] = 0xff;
         assert!(session.get_or_create_assembly(overflow_hash, 1).is_none());
+    }
+
+    #[test]
+    fn session_rejects_assembly_message_type_mismatch() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let key = [0x33; 32];
+        let mut session = RelaySession::new(addr, key);
+        let hash = [0x66; 32];
+
+        assert!(
+            session
+                .get_or_create_assembly_for_message(hash, 13, MessageType::RawBlockSegment)
+                .is_some()
+        );
+        assert!(
+            session
+                .get_or_create_assembly_for_message(hash, 13, MessageType::Block)
+                .is_none()
+        );
     }
 
     #[test]
