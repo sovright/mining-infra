@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -22,6 +23,7 @@ const MAX_PENDING_BLOCKS_CLIENT: usize = 64;
 const RECENT_DELIVERED_TTL: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const KEEPALIVE_BLOCK_HASH: [u8; 32] = [0u8; 32];
+const CLIENT_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
 /// Payload delivered through the relay client.
 #[derive(Clone, Debug)]
@@ -137,7 +139,22 @@ impl RelayClient {
 
     /// Bind the client socket
     pub async fn bind(&mut self) -> Result<(), TransportError> {
-        let socket = UdpSocket::bind(self.config.bind_addr).await?;
+        let domain = if self.config.bind_addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_nonblocking(true)?;
+        socket.set_recv_buffer_size(CLIENT_RECV_BUFFER_BYTES)?;
+        socket.bind(&self.config.bind_addr.into())?;
+
+        let socket = UdpSocket::from_std(socket.into())?;
+        info!(
+            local_addr = ?socket.local_addr().ok(),
+            recv_buffer_bytes = CLIENT_RECV_BUFFER_BYTES,
+            "Relay client socket bound"
+        );
         self.socket = Some(Arc::new(socket));
         Ok(())
     }

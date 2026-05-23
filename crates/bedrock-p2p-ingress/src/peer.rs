@@ -4,7 +4,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::crawler::Crawler;
@@ -206,11 +206,18 @@ fn received_block_display_hash(
     pending_block_responses: &mut VecDeque<[u8; 32]>,
     block_payload: &[u8],
 ) -> Result<String> {
+    let actual_hash = display_hash_from_header(block_payload)?;
     if let Some(hash) = pending_block_responses.pop_front() {
-        return Ok(inventory_hash_to_display(&hash));
+        let requested_hash = inventory_hash_to_display(&hash);
+        if requested_hash != actual_hash {
+            warn!(
+                requested_hash,
+                actual_hash, "Received block hash did not match next requested inventory hash"
+            );
+        }
     }
 
-    display_hash_from_header(block_payload)
+    Ok(actual_hash)
 }
 
 fn version_payload(peer_addr: SocketAddr) -> Vec<u8> {
@@ -292,17 +299,19 @@ mod tests {
     }
 
     #[test]
-    fn received_block_display_uses_requested_inventory_hash() {
-        let mut pending = std::collections::VecDeque::new();
+    fn received_block_display_uses_payload_header_hash() {
+        let mut pending = VecDeque::new();
         let mut hash = [0u8; 32];
         hash[0] = 0x5c;
         hash[31] = 0x01;
         pending.push_back(hash);
+        let block_payload = vec![0u8; bedrock_forge::ZCASH_FULL_HEADER_SIZE];
+        let expected = display_hash_from_header(&block_payload).unwrap();
 
-        let display = received_block_display_hash(&mut pending, &[0u8; 4]).unwrap();
+        let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
 
-        assert!(display.starts_with("01"));
-        assert!(display.ends_with("5c"));
+        assert_eq!(display, expected);
+        assert_ne!(display, inventory_hash_to_display(&hash));
         assert!(pending.is_empty());
     }
 
