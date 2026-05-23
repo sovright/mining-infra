@@ -53,6 +53,8 @@ async fn main() -> Result<()> {
         rotation_enabled = config.rotation_enabled,
         tx_cache_enabled = tx_cache.is_some(),
         tx_feed_enabled = tx_feed.is_some(),
+        relay_compact_from_tx_cache = config.relay_compact_from_tx_cache,
+        relay_raw_fallback_with_tx_cache = config.relay_raw_fallback_with_tx_cache,
         "starting P2P ingress"
     );
     let mut handles: Vec<JoinHandle<()>> = Vec::new();

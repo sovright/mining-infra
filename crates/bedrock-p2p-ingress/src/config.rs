@@ -45,6 +45,7 @@ pub struct Config {
     pub relay_send_burst_packets: usize,
     pub relay_send_burst_delay_micros: u64,
     pub relay_compact_from_tx_cache: bool,
+    pub relay_raw_fallback_with_tx_cache: bool,
 }
 
 impl Config {
@@ -96,6 +97,8 @@ impl Config {
             env_u64("BEDROCK_P2P_RELAY_SEND_BURST_DELAY_MICROS", 0)?;
         let relay_compact_from_tx_cache =
             env_bool("BEDROCK_P2P_RELAY_COMPACT_FROM_TX_CACHE", false)?;
+        let relay_raw_fallback_with_tx_cache =
+            env_bool("BEDROCK_P2P_RELAY_RAW_FALLBACK_WITH_TX_CACHE", false)?;
 
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -137,6 +140,7 @@ impl Config {
             relay_send_burst_packets,
             relay_send_burst_delay_micros,
             relay_compact_from_tx_cache,
+            relay_raw_fallback_with_tx_cache,
         })
     }
 }

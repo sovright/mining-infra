@@ -21,6 +21,7 @@ pub struct ForgeBridge {
     data_shards: usize,
     parity_shards: usize,
     compact_from_tx_cache: bool,
+    raw_fallback_with_tx_cache: bool,
 }
 
 impl ForgeBridge {
@@ -56,6 +57,7 @@ impl ForgeBridge {
             data_shards: config.relay_data_shards,
             parity_shards: config.relay_parity_shards,
             compact_from_tx_cache: config.relay_compact_from_tx_cache,
+            raw_fallback_with_tx_cache: config.relay_raw_fallback_with_tx_cache,
         }))
     }
 
@@ -71,6 +73,7 @@ impl ForgeBridge {
             data_shards: config.relay_data_shards,
             parity_shards: config.relay_parity_shards,
             compact_from_tx_cache: config.relay_compact_from_tx_cache,
+            raw_fallback_with_tx_cache: config.relay_raw_fallback_with_tx_cache,
         })
     }
 
@@ -123,9 +126,29 @@ impl ForgeBridge {
             return Err(self.with_segment_plan(error, &compact, block_payload));
         }
         self.sender
-            .send(compact)
+            .send(compact.clone())
             .await
             .map_err(map_transport_error)?;
+        if self.raw_fallback_with_tx_cache
+            && self.compact_from_tx_cache
+            && !compact.short_ids.is_empty()
+        {
+            let segments =
+                self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
+            let segment_count = segments.len();
+            for segment in segments {
+                self.sender
+                    .send_raw_block_segment(segment)
+                    .await
+                    .map_err(map_transport_error)?;
+            }
+            return Ok(ForwardedBlock {
+                tx_count,
+                bytes: block_payload.len(),
+                relay_objects: segment_count + 1,
+                mode: ForwardMode::CompactBlockWithRawFallback,
+            });
+        }
         Ok(ForwardedBlock {
             tx_count,
             bytes: block_payload.len(),
@@ -218,6 +241,7 @@ pub struct ForwardedBlock {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForwardMode {
     CompactBlock,
+    CompactBlockWithRawFallback,
     RawBlockSegments,
 }
 
@@ -225,6 +249,7 @@ impl ForwardMode {
     pub fn as_str(self) -> &'static str {
         match self {
             ForwardMode::CompactBlock => "compact_block",
+            ForwardMode::CompactBlockWithRawFallback => "compact_block_with_raw_fallback",
             ForwardMode::RawBlockSegments => "raw_block_segments",
         }
     }
@@ -244,6 +269,7 @@ fn map_transport_error(error: TransportError) -> IngressError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_cache::{TxCacheConfig, TxInventoryKey};
     use bedrock_forge::{
         PrefilledTx, RawBlockSegment, RelayPayload, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
     };
@@ -259,7 +285,28 @@ mod tests {
             data_shards: 10,
             parity_shards: 3,
             compact_from_tx_cache: false,
+            raw_fallback_with_tx_cache: false,
         }
+    }
+
+    fn minimal_v1_tx(tag: u8) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&1u32.to_le_bytes());
+        crate::wire::encode_compact_size(0, &mut tx);
+        crate::wire::encode_compact_size(0, &mut tx);
+        tx.extend_from_slice(&(tag as u32).to_le_bytes());
+        tx
+    }
+
+    fn two_tx_raw_block() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        let tx0 = minimal_v1_tx(0x11);
+        let tx1 = minimal_v1_tx(0x22);
+        let mut block = header;
+        crate::wire::encode_compact_size(2, &mut block);
+        block.extend_from_slice(&tx0);
+        block.extend_from_slice(&tx1);
+        (block, tx0, tx1)
     }
 
     fn large_raw_block() -> Vec<u8> {
@@ -340,6 +387,7 @@ mod tests {
             data_shards: 10,
             parity_shards: 3,
             compact_from_tx_cache: false,
+            raw_fallback_with_tx_cache: false,
         };
         let raw_block = large_raw_block();
 
@@ -359,6 +407,58 @@ mod tests {
 
         let reassembled = reassemble_raw_block(&segments).unwrap();
         assert_eq!(reassembled, raw_block);
+    }
+
+    #[tokio::test]
+    async fn tx_cache_compact_forwarding_can_send_raw_fallback_segments() {
+        let mut client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let sender = client.sender();
+        let (_receiver, mut outgoing) = client.take_receiver().unwrap();
+        let bridge = ForgeBridge {
+            sender,
+            data_shards: 10,
+            parity_shards: 3,
+            compact_from_tx_cache: true,
+            raw_fallback_with_tx_cache: true,
+        };
+        let (raw_block, _tx0, tx1) = two_tx_raw_block();
+        let tx_cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4_096,
+            max_tx_bytes: 2_048,
+        });
+        tx_cache.insert(TxInventoryKey::wtx([0x41; 32], [0x42; 32]).to_wtxid(), tx1);
+
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&tx_cache))
+            .await
+            .unwrap();
+
+        assert_eq!(forwarded.mode, ForwardMode::CompactBlockWithRawFallback);
+        assert!(forwarded.relay_objects > 1);
+
+        let first = outgoing.recv().await.expect("compact block queued");
+        match first {
+            RelayPayload::CompactBlock(compact) => {
+                assert_eq!(compact.tx_count(), 2);
+                assert_eq!(compact.short_ids.len(), 1);
+            }
+            RelayPayload::RawBlockSegment(_) => panic!("compact block should be sent first"),
+        }
+
+        let mut segments = Vec::new();
+        for _ in 1..forwarded.relay_objects {
+            let payload = outgoing.recv().await.expect("raw fallback segment queued");
+            match payload {
+                RelayPayload::RawBlockSegment(segment) => segments.push(segment),
+                RelayPayload::CompactBlock(_) => panic!("expected raw fallback segment"),
+            }
+        }
+        assert_eq!(reassemble_raw_block(&segments).unwrap(), raw_block);
     }
 
     fn test_config() -> Config {
@@ -396,6 +496,7 @@ mod tests {
             relay_send_burst_packets: 0,
             relay_send_burst_delay_micros: 0,
             relay_compact_from_tx_cache: false,
+            relay_raw_fallback_with_tx_cache: false,
         }
     }
 
@@ -412,5 +513,12 @@ mod tests {
         let bridge = ForgeBridge::new_for_config(&test_config()).unwrap();
 
         assert!(!bridge.compact_from_tx_cache);
+    }
+
+    #[test]
+    fn bridge_keeps_raw_fallback_disabled_by_default() {
+        let bridge = ForgeBridge::new_for_config(&test_config()).unwrap();
+
+        assert!(!bridge.raw_fallback_with_tx_cache);
     }
 }

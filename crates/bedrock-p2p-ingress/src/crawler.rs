@@ -321,6 +321,7 @@ mod tests {
             relay_send_burst_packets: 0,
             relay_send_burst_delay_micros: 0,
             relay_compact_from_tx_cache: false,
+            relay_raw_fallback_with_tx_cache: false,
         }
     }
 
