@@ -18,6 +18,7 @@ use crate::wire::{
 };
 
 const PROTOCOL_VERSION: i32 = 170_140;
+const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 const USER_AGENT: &str = "/bedrock-p2p-ingress:0.1.0/";
 
 pub async fn run_peer(
@@ -61,6 +62,11 @@ pub async fn run_peer(
                 let remote_version = remote_version(&msg.payload).unwrap_or_default();
                 info!(%peer, remote_version, "received version");
                 events.p2p_peer_version(&peer, remote_version)?;
+                if !is_acceptable_remote_version(remote_version) {
+                    return Err(IngressError::Wire(format!(
+                        "remote protocol version too old: {remote_version} < {MIN_ACCEPTABLE_REMOTE_VERSION}"
+                    )));
+                }
                 if !sent_verack {
                     write_message(&mut writer, "verack", &[]).await?;
                     sent_verack = true;
@@ -164,6 +170,10 @@ fn remote_version(payload: &[u8]) -> Result<i32> {
     read_i32_le(payload, &mut cursor)
 }
 
+fn is_acceptable_remote_version(remote_version: i32) -> bool {
+    remote_version >= MIN_ACCEPTABLE_REMOTE_VERSION
+}
+
 fn pong_nonce(payload: &[u8]) -> Option<u64> {
     if payload.len() == 8 {
         Some(u64::from_le_bytes(payload.try_into().ok()?))
@@ -242,6 +252,14 @@ mod tests {
                 .windows(USER_AGENT.len())
                 .any(|w| w == USER_AGENT.as_bytes())
         );
+    }
+
+    #[test]
+    fn rejects_remote_versions_below_zcash_mainnet_floor() {
+        assert!(!is_acceptable_remote_version(170_020));
+        assert!(!is_acceptable_remote_version(170_119));
+        assert!(is_acceptable_remote_version(170_120));
+        assert!(is_acceptable_remote_version(PROTOCOL_VERSION));
     }
 
     #[test]
