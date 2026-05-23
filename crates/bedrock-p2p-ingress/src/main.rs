@@ -16,7 +16,7 @@ use tokio::net::lookup_host;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
-use config::{Config, seed_socket};
+use config::{Config, is_denied_peer_addr, seed_socket};
 use crawler::{Crawler, PeerOutcome};
 use error::Result;
 use event::EventSink;
@@ -133,13 +133,21 @@ async fn reap_finished(handles: &mut Vec<JoinHandle<()>>) {
 
 async fn discover_peers(config: &Config) -> Vec<SocketAddr> {
     let mut peers = HashSet::new();
-    peers.extend(config.peers.iter().copied());
+    peers.extend(
+        config
+            .peers
+            .iter()
+            .copied()
+            .filter(|peer| !is_denied_peer_addr(peer)),
+    );
 
     for seed in &config.seeds {
         match lookup_host(seed_socket(seed)).await {
             Ok(addrs) => {
                 for addr in addrs {
-                    peers.insert(addr);
+                    if !is_denied_peer_addr(&addr) {
+                        peers.insert(addr);
+                    }
                 }
             }
             Err(error) => warn!(%seed, %error, "failed to resolve DNS seed"),

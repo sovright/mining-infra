@@ -6,6 +6,10 @@ use std::time::Duration;
 use crate::error::{IngressError, Result};
 use crate::wire::DEFAULT_PORT;
 
+/// Known Zcash forks that reused the Zcash network magic and gossip into
+/// Zcash address books, but whose blocks are not Zcash mainnet blocks.
+const DENIED_PEER_PORTS: &[u16] = &[16_125, 26_125];
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub seeds: Vec<String>,
@@ -162,6 +166,10 @@ pub fn seed_socket(seed: &str) -> String {
     }
 }
 
+pub fn is_denied_peer_addr(peer: &SocketAddr) -> bool {
+    DENIED_PEER_PORTS.contains(&peer.port())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,5 +184,12 @@ mod tests {
     fn parses_auth_key() {
         let key = parse_auth_key(&"42".repeat(32)).unwrap();
         assert_eq!(key, [0x42; 32]);
+    }
+
+    #[test]
+    fn identifies_known_zcash_fork_ports() {
+        assert!(is_denied_peer_addr(&"127.0.0.1:16125".parse().unwrap()));
+        assert!(is_denied_peer_addr(&"127.0.0.1:26125".parse().unwrap()));
+        assert!(!is_denied_peer_addr(&"127.0.0.1:8233".parse().unwrap()));
     }
 }

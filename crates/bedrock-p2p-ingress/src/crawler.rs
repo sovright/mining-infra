@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::config::{Config, is_denied_peer_addr};
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
 
@@ -50,6 +50,9 @@ impl Crawler {
         let mut queue = VecDeque::new();
         let now = Instant::now();
         for peer in initial_peers {
+            if is_denied_peer_addr(&peer) {
+                continue;
+            }
             if peers
                 .insert(
                     peer,
@@ -168,6 +171,9 @@ impl Crawler {
                 .lock()
                 .map_err(|_| IngressError::Wire("crawler mutex poisoned".to_string()))?;
             for peer in peers {
+                if is_denied_peer_addr(&peer) {
+                    continue;
+                }
                 if inner.peers.len() >= self.max_known_peers {
                     break;
                 }
@@ -286,5 +292,23 @@ mod tests {
         assert_eq!(accepted, 1);
         assert_eq!(crawler.next_peer(), Some(discovered));
         assert_eq!(crawler.next_peer(), None);
+    }
+
+    #[test]
+    fn crawler_rejects_known_zcash_fork_ports() {
+        let zcash_peer: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let flux_peer: SocketAddr = "127.0.0.2:16125".parse().unwrap();
+        let flux_alt_peer: SocketAddr = "127.0.0.3:26125".parse().unwrap();
+        let crawler = Crawler::new(&config(true), [zcash_peer, flux_peer]);
+
+        assert_eq!(crawler.known_len(), 1);
+        assert_eq!(crawler.next_peer(), Some(zcash_peer));
+
+        let accepted = crawler
+            .add_discovered("127.0.0.9:8233", [flux_peer, flux_alt_peer], &events())
+            .unwrap();
+
+        assert_eq!(accepted, 0);
+        assert_eq!(crawler.known_len(), 1);
     }
 }
