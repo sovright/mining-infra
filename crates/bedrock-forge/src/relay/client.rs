@@ -463,9 +463,15 @@ impl RelayClient {
         if !pending.contains_key(&block_hash) && pending.len() >= MAX_PENDING_BLOCKS_CLIENT {
             return;
         }
-        let (assembly, original_len) = pending
-            .entry(block_hash)
-            .or_insert_with(|| (BlockAssembly::new(block_hash, total_chunks), 0));
+        let (assembly, original_len) = pending.entry(block_hash).or_insert_with(|| {
+            (
+                BlockAssembly::new_for_message(block_hash, total_chunks, chunk.header.msg_type),
+                0,
+            )
+        });
+        if assembly.total_chunks != total_chunks || assembly.msg_type != chunk.header.msg_type {
+            return;
+        }
 
         // Drop duplicate chunk to avoid unnecessary work
         if let Some(existing) = assembly.chunks.get(chunk_id)
@@ -652,6 +658,33 @@ mod tests {
             .await;
 
         let (assembly, _) = pending.get(&block_hash).unwrap();
+        assert_eq!(assembly.received_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_tracks_raw_segment_assembly_type() {
+        let config =
+            ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32]).with_fec(2, 1);
+        let client = RelayClient::new(config).unwrap();
+
+        let (tx, _rx) = mpsc::channel(1);
+        let mut client = client;
+        client.incoming_tx = Some(tx);
+
+        let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
+
+        let block_hash = [0xcd; 32];
+        let header = ChunkHeader::new_raw_block_segment(&block_hash, 0, 3, 4);
+        let chunk = Chunk::new(header, vec![1, 2, 3, 4]);
+
+        let mut recent_delivered = HashMap::new();
+        client
+            .handle_incoming_chunk(chunk, &mut pending, &mut recent_delivered)
+            .await;
+
+        let (assembly, _) = pending.get(&block_hash).unwrap();
+        assert_eq!(assembly.msg_type, MessageType::RawBlockSegment);
+        assert_eq!(assembly.total_chunks, 3);
         assert_eq!(assembly.received_count(), 1);
     }
 }

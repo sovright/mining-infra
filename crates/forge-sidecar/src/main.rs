@@ -275,11 +275,33 @@ fn spawn_relay_block_handler(
                     let block_hash = segment.block_hash;
                     let segment_index = segment.segment_index;
                     let segment_count = segment.segment_count;
+                    let segment_payload_bytes = segment.payload.len();
+                    info!(
+                        block_hash = %hex::encode(block_hash),
+                        segment_index,
+                        segment_count,
+                        segment_payload_bytes,
+                        "Relay raw block segment received"
+                    );
                     match raw_segments.insert(segment, Instant::now()) {
-                        RawSegmentInsert::Pending => {}
+                        RawSegmentInsert::Pending => {
+                            info!(
+                                block_hash = %hex::encode(block_hash),
+                                segment_index,
+                                segment_count,
+                                "Relay raw block segment buffered"
+                            );
+                        }
                         RawSegmentInsert::Complete(segments) => {
+                            let completed_segments = segments.len();
                             match reassemble_raw_block(&segments) {
                                 Ok(raw_block) => {
+                                    info!(
+                                        block_hash = %hex::encode(block_hash),
+                                        segment_count = completed_segments,
+                                        raw_block_bytes = raw_block.len(),
+                                        "Relay raw block segments complete"
+                                    );
                                     log_submission_outcome(
                                         handle_relay_raw_block(
                                             rpc.as_ref(),
