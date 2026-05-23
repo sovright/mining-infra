@@ -25,6 +25,11 @@ pub struct Config {
     pub rotation_cooldown: Duration,
     pub rotation_failure_cooldown: Duration,
     pub accept_nonstandard_ports: bool,
+    pub peer_scoring_enabled: bool,
+    pub peer_score_block_inv: i64,
+    pub peer_score_block_received: i64,
+    pub peer_score_forge_forwarded: i64,
+    pub peer_score_error: i64,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
@@ -54,6 +59,11 @@ impl Config {
         let rotation_failure_cooldown =
             Duration::from_secs(env_u64("BEDROCK_P2P_ROTATION_FAILURE_COOLDOWN_SECS", 120)?);
         let accept_nonstandard_ports = env_bool("BEDROCK_P2P_ACCEPT_NONSTANDARD_PORTS", false)?;
+        let peer_scoring_enabled = env_bool("BEDROCK_P2P_PEER_SCORING_ENABLED", false)?;
+        let peer_score_block_inv = env_i64("BEDROCK_P2P_PEER_SCORE_BLOCK_INV", 5)?;
+        let peer_score_block_received = env_i64("BEDROCK_P2P_PEER_SCORE_BLOCK_RECEIVED", 25)?;
+        let peer_score_forge_forwarded = env_i64("BEDROCK_P2P_PEER_SCORE_FORGE_FORWARDED", 10)?;
+        let peer_score_error = env_i64("BEDROCK_P2P_PEER_SCORE_ERROR", -50)?;
         let event_log = env::var("BEDROCK_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("BEDROCK_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("BEDROCK_P2P_RELAY_BIND_ADDR")
@@ -92,6 +102,11 @@ impl Config {
             rotation_cooldown,
             rotation_failure_cooldown,
             accept_nonstandard_ports,
+            peer_scoring_enabled,
+            peer_score_block_inv,
+            peer_score_block_received,
+            peer_score_forge_forwarded,
+            peer_score_error,
             event_log,
             relay_peers,
             relay_bind_addr,
@@ -148,6 +163,15 @@ fn env_usize(name: &str, default: usize) -> Result<usize> {
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(value) => value
+            .parse()
+            .map_err(|e| IngressError::Config(format!("invalid {name}: {e}"))),
+        Err(_) => Ok(default),
+    }
+}
+
+fn env_i64(name: &str, default: i64) -> Result<i64> {
     match env::var(name) {
         Ok(value) => value
             .parse()

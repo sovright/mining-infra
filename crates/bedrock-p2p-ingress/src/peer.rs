@@ -119,6 +119,12 @@ pub async fn run_peer(
                     }
                     let display = inventory_hash_to_display(&inv.hash);
                     events.p2p_block_inv(&peer, &display)?;
+                    crawler.score_peer(
+                        peer_addr,
+                        config.peer_score_block_inv,
+                        "block_inv",
+                        &events,
+                    )?;
                     if requested.insert(inv.hash) {
                         pending_block_responses.push_back(inv.hash);
                         block_requests.push(inv);
@@ -143,6 +149,12 @@ pub async fn run_peer(
                 let display =
                     received_block_display_hash(&mut pending_block_responses, &msg.payload)?;
                 events.p2p_block_received(&peer, &display, msg.payload.len())?;
+                crawler.score_peer(
+                    peer_addr,
+                    config.peer_score_block_received,
+                    "block_received",
+                    &events,
+                )?;
                 if let Some(forge) = &forge {
                     match forge.forward_block(&msg.payload).await {
                         Ok(forwarded) => {
@@ -153,6 +165,12 @@ pub async fn run_peer(
                                 forwarded.tx_count,
                                 forwarded.mode.as_str(),
                                 forwarded.relay_objects,
+                            )?;
+                            crawler.score_peer(
+                                peer_addr,
+                                config.peer_score_forge_forwarded,
+                                "forge_forwarded",
+                                &events,
                             )?;
                         }
                         Err(error) => {

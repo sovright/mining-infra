@@ -16,11 +16,13 @@ pub struct Crawler {
     rotation_failure_cooldown: Duration,
     max_known_peers: usize,
     accept_nonstandard_ports: bool,
+    peer_scoring_enabled: bool,
 }
 
 struct CrawlerInner {
     peers: HashMap<SocketAddr, PeerRecord>,
     queue: VecDeque<SocketAddr>,
+    next_sequence: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +45,8 @@ struct PeerRecord {
     active: bool,
     queued: bool,
     eligible_at: Instant,
+    score: i64,
+    sequence: u64,
 }
 
 impl Crawler {
@@ -50,6 +54,7 @@ impl Crawler {
         let mut peers = HashMap::new();
         let mut queue = VecDeque::new();
         let now = Instant::now();
+        let mut next_sequence = 0u64;
         for peer in initial_peers {
             if !is_accepted_peer_addr(&peer, config.accept_nonstandard_ports) {
                 continue;
@@ -61,28 +66,40 @@ impl Crawler {
                         active: false,
                         queued: true,
                         eligible_at: now,
+                        score: 0,
+                        sequence: next_sequence,
                     },
                 )
                 .is_none()
             {
                 queue.push_back(peer);
+                next_sequence = next_sequence.saturating_add(1);
             }
         }
 
         Self {
-            inner: Arc::new(Mutex::new(CrawlerInner { peers, queue })),
+            inner: Arc::new(Mutex::new(CrawlerInner {
+                peers,
+                queue,
+                next_sequence,
+            })),
             enabled: config.crawler_enabled,
             rotation_enabled: config.rotation_enabled,
             rotation_cooldown: config.rotation_cooldown,
             rotation_failure_cooldown: config.rotation_failure_cooldown,
             max_known_peers: config.crawler_max_known_peers,
             accept_nonstandard_ports: config.accept_nonstandard_ports,
+            peer_scoring_enabled: config.peer_scoring_enabled,
         }
     }
 
     pub fn next_peer(&self) -> Option<SocketAddr> {
         let mut inner = self.inner.lock().ok()?;
         let now = Instant::now();
+        if self.peer_scoring_enabled {
+            return Self::next_scored_peer(&mut inner, now);
+        }
+
         let candidates = inner.queue.len();
         for _ in 0..candidates {
             let peer = inner.queue.pop_front()?;
@@ -101,6 +118,35 @@ impl Crawler {
             inner.queue.push_back(peer);
         }
         None
+    }
+
+    fn next_scored_peer(inner: &mut CrawlerInner, now: Instant) -> Option<SocketAddr> {
+        let mut best = None;
+        for (index, peer) in inner.queue.iter().enumerate() {
+            let Some(record) = inner.peers.get(peer) else {
+                continue;
+            };
+            if record.active || record.eligible_at > now {
+                continue;
+            }
+            let is_better = match best {
+                None => true,
+                Some((_, best_score, best_sequence)) => {
+                    record.score > best_score
+                        || (record.score == best_score && record.sequence < best_sequence)
+                }
+            };
+            if is_better {
+                best = Some((index, record.score, record.sequence));
+            }
+        }
+
+        let (index, _, _) = best?;
+        let peer = inner.queue.remove(index)?;
+        let record = inner.peers.get_mut(&peer)?;
+        record.queued = false;
+        record.active = true;
+        Some(peer)
     }
 
     pub fn queue_len(&self) -> usize {
@@ -156,6 +202,33 @@ impl Crawler {
         )
     }
 
+    pub fn score_peer(
+        &self,
+        peer: SocketAddr,
+        delta: i64,
+        reason: &str,
+        events: &EventSink,
+    ) -> Result<()> {
+        if !self.peer_scoring_enabled || delta == 0 {
+            return Ok(());
+        }
+
+        let Some(score) = ({
+            let mut inner = self
+                .inner
+                .lock()
+                .map_err(|_| IngressError::Wire("crawler mutex poisoned".to_string()))?;
+            inner.peers.get_mut(&peer).map(|record| {
+                record.score = record.score.saturating_add(delta);
+                record.score
+            })
+        }) else {
+            return Ok(());
+        };
+
+        events.p2p_peer_score(&peer.to_string(), score, reason)
+    }
+
     pub fn add_discovered(
         &self,
         source_peer: &str,
@@ -179,15 +252,23 @@ impl Crawler {
                 if inner.peers.len() >= self.max_known_peers {
                     break;
                 }
-                if let std::collections::hash_map::Entry::Vacant(entry) = inner.peers.entry(peer) {
-                    entry.insert(PeerRecord {
+                if inner.peers.contains_key(&peer) {
+                    continue;
+                }
+                let sequence = inner.next_sequence;
+                inner.next_sequence = inner.next_sequence.saturating_add(1);
+                inner.peers.insert(
+                    peer,
+                    PeerRecord {
                         active: false,
                         queued: true,
                         eligible_at: Instant::now(),
-                    });
-                    inner.queue.push_back(peer);
-                    accepted.push(peer);
-                }
+                        score: 0,
+                        sequence,
+                    },
+                );
+                inner.queue.push_back(peer);
+                accepted.push(peer);
             }
         }
 
@@ -220,6 +301,11 @@ mod tests {
             rotation_cooldown: Duration::from_secs(0),
             rotation_failure_cooldown: Duration::from_secs(30),
             accept_nonstandard_ports: false,
+            peer_scoring_enabled: false,
+            peer_score_block_inv: 5,
+            peer_score_block_received: 25,
+            peer_score_forge_forwarded: 10,
+            peer_score_error: -50,
             event_log: None::<PathBuf>,
             relay_peers: Vec::new(),
             relay_bind_addr: "0.0.0.0:0".parse().unwrap(),
@@ -334,5 +420,58 @@ mod tests {
 
         assert_eq!(accepted, 0);
         assert_eq!(crawler.known_len(), 1);
+    }
+
+    #[test]
+    fn scored_scheduler_prefers_higher_score() {
+        let first: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:8233".parse().unwrap();
+        let third: SocketAddr = "127.0.0.3:8233".parse().unwrap();
+        let mut cfg = config(true);
+        cfg.peer_scoring_enabled = true;
+        let crawler = Crawler::new(&cfg, [first, second, third]);
+
+        crawler
+            .score_peer(third, 20, "block_received", &events())
+            .unwrap();
+        crawler
+            .score_peer(second, 10, "block_inv", &events())
+            .unwrap();
+
+        assert_eq!(crawler.next_peer(), Some(third));
+        assert_eq!(crawler.next_peer(), Some(second));
+        assert_eq!(crawler.next_peer(), Some(first));
+    }
+
+    #[test]
+    fn scored_scheduler_keeps_fifo_for_equal_scores() {
+        let first: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let second: SocketAddr = "127.0.0.2:8233".parse().unwrap();
+        let mut cfg = config(true);
+        cfg.peer_scoring_enabled = true;
+        let crawler = Crawler::new(&cfg, [first, second]);
+
+        assert_eq!(crawler.next_peer(), Some(first));
+        assert_eq!(crawler.next_peer(), Some(second));
+    }
+
+    #[test]
+    fn scored_scheduler_skips_ineligible_high_score_peer() {
+        let high_score: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let low_score: SocketAddr = "127.0.0.2:8233".parse().unwrap();
+        let mut cfg = config(true);
+        cfg.peer_scoring_enabled = true;
+        cfg.rotation_cooldown = Duration::from_secs(30);
+        let crawler = Crawler::new(&cfg, [high_score, low_score]);
+
+        crawler
+            .score_peer(high_score, 20, "block_received", &events())
+            .unwrap();
+        assert_eq!(crawler.next_peer(), Some(high_score));
+        crawler
+            .release_peer(high_score, PeerOutcome::Rotated, &events())
+            .unwrap();
+
+        assert_eq!(crawler.next_peer(), Some(low_score));
     }
 }

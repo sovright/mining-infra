@@ -87,11 +87,13 @@ fn spawn_peer(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let peer_text = peer.to_string();
-        let result = if config.peer_runtime.is_zero() {
+        let peer_runtime = config.peer_runtime;
+        let peer_score_error = config.peer_score_error;
+        let result = if peer_runtime.is_zero() {
             peer::run_peer(peer, config, events.clone(), forge, crawler.clone()).await
         } else {
             match tokio::time::timeout(
-                config.peer_runtime,
+                peer_runtime,
                 peer::run_peer(peer, config, events.clone(), forge, crawler.clone()),
             )
             .await
@@ -109,6 +111,7 @@ fn spawn_peer(
             Ok(()) => PeerOutcome::Rotated,
             Err(error) => {
                 let _ = events.p2p_peer_error(&peer_text, &error.to_string());
+                let _ = crawler.score_peer(peer, peer_score_error, "peer_error", &events);
                 warn!(peer = %peer_text, %error, "peer task exited");
                 PeerOutcome::Errored
             }
