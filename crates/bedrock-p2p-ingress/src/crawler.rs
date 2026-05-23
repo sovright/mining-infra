@@ -319,6 +319,7 @@ mod tests {
             relay_parity_shards: 3,
             relay_send_burst_packets: 0,
             relay_send_burst_delay_micros: 0,
+            relay_compact_from_tx_cache: false,
         }
     }
 

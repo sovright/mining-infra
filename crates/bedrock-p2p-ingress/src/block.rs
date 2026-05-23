@@ -1,6 +1,7 @@
-use bedrock_forge::{CompactBlock, PrefilledTx, ZCASH_FULL_HEADER_SIZE};
+use bedrock_forge::{CompactBlock, PrefilledTx, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE};
 
 use crate::error::{IngressError, Result};
+use crate::tx_cache::TxCache;
 use crate::wire::{decode_compact_size, read_u32_le};
 
 const OVERWINTERED_FLAG: u32 = 1 << 31;
@@ -19,6 +20,25 @@ const ORCHARD_ACTION_SIZE: usize = 5 * 32 + 580 + 80;
 const REDDSA_SIGNATURE_SIZE: usize = 64;
 
 pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<CompactBlock> {
+    compact_block_from_raw_block_with_resolver(block_payload, |_| None)
+}
+
+pub(crate) fn compact_block_from_raw_block_with_tx_cache(
+    block_payload: &[u8],
+    tx_cache: &TxCache,
+) -> Result<CompactBlock> {
+    compact_block_from_raw_block_with_resolver(block_payload, |tx_payload| {
+        tx_cache.wtxid_for_payload(tx_payload)
+    })
+}
+
+fn compact_block_from_raw_block_with_resolver<F>(
+    block_payload: &[u8],
+    mut resolve_wtxid: F,
+) -> Result<CompactBlock>
+where
+    F: FnMut(&[u8]) -> Option<WtxId>,
+{
     let header = block_payload
         .get(..ZCASH_FULL_HEADER_SIZE)
         .ok_or_else(|| IngressError::Wire("block payload shorter than Zcash header".to_string()))?
@@ -37,6 +57,9 @@ pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<Compa
         )));
     }
 
+    let header_hash = bedrock_forge::zcash_block_hash(&header);
+    let nonce = 0;
+    let mut short_ids = Vec::new();
     let mut prefilled_txs = Vec::with_capacity(tx_count as usize);
     let mut last_prefilled_index: i64 = -1;
     for index in 0..tx_count {
@@ -44,12 +67,17 @@ pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<Compa
         skip_transaction(block_payload, &mut cursor)?;
         let tx_data = block_payload
             .get(start..cursor)
-            .ok_or_else(|| IngressError::Wire("transaction cursor escaped block".to_string()))?
-            .to_vec();
+            .ok_or_else(|| IngressError::Wire("transaction cursor escaped block".to_string()))?;
+        if index > 0
+            && let Some(wtxid) = resolve_wtxid(tx_data)
+        {
+            short_ids.push(ShortId::compute(&wtxid, &header_hash, nonce));
+            continue;
+        }
         let diff = index as i64 - last_prefilled_index - 1;
         prefilled_txs.push(PrefilledTx {
             index: diff as u16,
-            tx_data,
+            tx_data: tx_data.to_vec(),
         });
         last_prefilled_index = index as i64;
     }
@@ -61,7 +89,7 @@ pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<Compa
         )));
     }
 
-    Ok(CompactBlock::new(header, 0, Vec::new(), prefilled_txs))
+    Ok(CompactBlock::new(header, nonce, short_ids, prefilled_txs))
 }
 
 fn skip_transaction(payload: &[u8], cursor: &mut usize) -> Result<()> {
@@ -316,6 +344,8 @@ fn skip_bytes(payload: &[u8], cursor: &mut usize, len: usize, label: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tx_cache::{TxCache, TxCacheConfig, TxInventoryKey};
+    use bedrock_forge::{CompactBlockReconstructor, ReconstructionResult, ShortId};
 
     const NU5_CONSENSUS_BRANCH_ID: u32 = 0xC2D6_D0B4;
 
@@ -430,6 +460,54 @@ mod tests {
             reconstructed.extend_from_slice(&tx.tx_data);
         }
         assert_eq!(reconstructed, block);
+    }
+
+    #[test]
+    fn cached_non_coinbase_transactions_become_short_ids() {
+        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        let tx0 = minimal_v5_tx(0x11);
+        let tx1 = minimal_v5_tx(0x22);
+        let tx2 = minimal_v5_tx(0x33);
+
+        let mut block = header.clone();
+        crate::wire::encode_compact_size(3, &mut block);
+        block.extend_from_slice(&tx0);
+        block.extend_from_slice(&tx1);
+        block.extend_from_slice(&tx2);
+
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4_096,
+            max_tx_bytes: 2_048,
+        });
+        let cached_key = TxInventoryKey::wtx([0x41; 32], [0x42; 32]);
+        cache.insert(cached_key, tx1.clone());
+
+        let compact = compact_block_from_raw_block_with_tx_cache(&block, &cache).unwrap();
+
+        let header_hash = bedrock_forge::zcash_block_hash(&header);
+        let expected_short_id = ShortId::compute(&cached_key.to_wtxid(), &header_hash, 0);
+        assert_eq!(compact.header, header);
+        assert_eq!(compact.short_ids, vec![expected_short_id]);
+        assert_eq!(compact.prefilled_txs.len(), 2);
+        assert_eq!(compact.prefilled_txs[0].index, 0);
+        assert_eq!(compact.prefilled_txs[0].tx_data, tx0);
+        assert_eq!(compact.prefilled_txs[1].index, 1);
+        assert_eq!(compact.prefilled_txs[1].tx_data, tx2);
+
+        let mut reconstructor = CompactBlockReconstructor::new(&cache);
+        reconstructor.prepare(&header_hash, compact.nonce);
+        match reconstructor.reconstruct(&compact) {
+            ReconstructionResult::Complete { transactions } => {
+                assert_eq!(transactions, vec![tx0, tx1, tx2]);
+            }
+            ReconstructionResult::Incomplete { .. } => {
+                panic!("expected cached compact block to reconstruct");
+            }
+            ReconstructionResult::Invalid { reason } => {
+                panic!("unexpected invalid compact block: {reason}");
+            }
+        }
     }
 
     #[test]

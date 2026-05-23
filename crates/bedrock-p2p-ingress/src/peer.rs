@@ -187,7 +187,7 @@ pub async fn run_peer(
                     &events,
                 )?;
                 if let Some(forge) = &forge {
-                    match forge.forward_block(&msg.payload).await {
+                    match forge.forward_block(&msg.payload, tx_cache.as_ref()).await {
                         Ok(forwarded) => {
                             events.p2p_forge_block_forwarded(
                                 &peer,

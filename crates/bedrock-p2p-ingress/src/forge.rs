@@ -8,9 +8,10 @@ use bedrock_forge::{
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
-use crate::block::compact_block_from_raw_block;
+use crate::block::{compact_block_from_raw_block, compact_block_from_raw_block_with_tx_cache};
 use crate::config::Config;
 use crate::error::{IngressError, Result};
+use crate::tx_cache::TxCache;
 
 const FORGE_LEN_PREFIX_BYTES: usize = 4;
 
@@ -19,6 +20,7 @@ pub struct ForgeBridge {
     sender: BlockSender,
     data_shards: usize,
     parity_shards: usize,
+    compact_from_tx_cache: bool,
 }
 
 impl ForgeBridge {
@@ -53,6 +55,7 @@ impl ForgeBridge {
             sender,
             data_shards: config.relay_data_shards,
             parity_shards: config.relay_parity_shards,
+            compact_from_tx_cache: config.relay_compact_from_tx_cache,
         }))
     }
 
@@ -67,6 +70,7 @@ impl ForgeBridge {
             sender,
             data_shards: config.relay_data_shards,
             parity_shards: config.relay_parity_shards,
+            compact_from_tx_cache: config.relay_compact_from_tx_cache,
         })
     }
 
@@ -82,9 +86,21 @@ impl ForgeBridge {
         RelayClient::new(client_config).map_err(|e| IngressError::Forge(e.to_string()))
     }
 
-    pub async fn forward_block(&self, block_payload: &[u8]) -> Result<ForwardedBlock> {
-        let compact = compact_block_from_raw_block(block_payload)?;
-        let tx_count = compact.prefilled_txs.len();
+    pub async fn forward_block(
+        &self,
+        block_payload: &[u8],
+        tx_cache: Option<&TxCache>,
+    ) -> Result<ForwardedBlock> {
+        let compact = if self.compact_from_tx_cache {
+            if let Some(tx_cache) = tx_cache {
+                compact_block_from_raw_block_with_tx_cache(block_payload, tx_cache)?
+            } else {
+                compact_block_from_raw_block(block_payload)?
+            }
+        } else {
+            compact_block_from_raw_block(block_payload)?
+        };
+        let tx_count = compact.tx_count();
         if let Err(error) = self.preflight_chunks(&compact) {
             let text = error.to_string();
             if text.contains("all-prefilled compact block too large") {
@@ -242,6 +258,7 @@ mod tests {
             sender: client.sender(),
             data_shards: 10,
             parity_shards: 3,
+            compact_from_tx_cache: false,
         }
     }
 
@@ -322,10 +339,11 @@ mod tests {
             sender,
             data_shards: 10,
             parity_shards: 3,
+            compact_from_tx_cache: false,
         };
         let raw_block = large_raw_block();
 
-        let forwarded = bridge.forward_block(&raw_block).await.unwrap();
+        let forwarded = bridge.forward_block(&raw_block, None).await.unwrap();
 
         assert_eq!(forwarded.mode, ForwardMode::RawBlockSegments);
         assert!(forwarded.relay_objects > 1);
@@ -376,6 +394,7 @@ mod tests {
             relay_parity_shards: 32,
             relay_send_burst_packets: 0,
             relay_send_burst_delay_micros: 0,
+            relay_compact_from_tx_cache: false,
         }
     }
 
@@ -385,5 +404,12 @@ mod tests {
 
         assert_eq!(bridge.data_shards, 96);
         assert_eq!(bridge.parity_shards, 32);
+    }
+
+    #[test]
+    fn bridge_keeps_tx_cache_compaction_disabled_by_default() {
+        let bridge = ForgeBridge::new_for_config(&test_config()).unwrap();
+
+        assert!(!bridge.compact_from_tx_cache);
     }
 }
