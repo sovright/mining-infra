@@ -226,6 +226,8 @@ mod tests {
             relay_auth_key: None,
             relay_data_shards: 10,
             relay_parity_shards: 3,
+            relay_send_burst_packets: 0,
+            relay_send_burst_delay_micros: 0,
         }
     }
 

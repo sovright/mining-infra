@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::fec::FecError;
@@ -478,11 +479,20 @@ impl<V: PowValidator> RelayNode<V> {
         }
         drop(sessions);
 
+        let pacing = ForwardPacing::new(
+            self.config.forward_burst_packets,
+            self.config.forward_burst_delay,
+        );
         for (peer_addr, payloads) in outbound {
             let mut chunks_sent: u64 = 0;
-            for data in payloads {
+            let payload_count = payloads.len();
+            let mut sent_since_delay = 0usize;
+            for (idx, data) in payloads.into_iter().enumerate() {
                 let _ = socket.send_to(&data, peer_addr).await;
                 chunks_sent += 1;
+                if pacing.should_delay(idx, payload_count, &mut sent_since_delay) {
+                    sleep(pacing.delay).await;
+                }
             }
             if chunks_sent > 0 {
                 self.metrics.inc_packets_forwarded(chunks_sent);
@@ -547,6 +557,38 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         self.collect_ready_chunks(session)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForwardPacing {
+    burst_packets: usize,
+    delay: Duration,
+}
+
+impl ForwardPacing {
+    fn new(burst_packets: usize, delay: Duration) -> Self {
+        Self {
+            burst_packets,
+            delay,
+        }
+    }
+
+    fn should_delay(
+        self,
+        packet_idx: usize,
+        packet_count: usize,
+        sent_since_delay: &mut usize,
+    ) -> bool {
+        if self.burst_packets == 0 || self.delay.is_zero() {
+            return false;
+        }
+        *sent_since_delay += 1;
+        if *sent_since_delay < self.burst_packets || packet_idx + 1 >= packet_count {
+            return false;
+        }
+        *sent_since_delay = 0;
+        true
     }
 }
 
@@ -1189,5 +1231,33 @@ mod tests {
 
         node.stop();
         let _ = handle.await;
+    }
+
+    #[test]
+    fn forward_pacing_delays_after_configured_bursts() {
+        let pacing = ForwardPacing::new(3, Duration::from_millis(1));
+        let mut sent_since_delay = 0;
+
+        assert!(!pacing.should_delay(0, 7, &mut sent_since_delay));
+        assert!(!pacing.should_delay(1, 7, &mut sent_since_delay));
+        assert!(pacing.should_delay(2, 7, &mut sent_since_delay));
+        assert_eq!(sent_since_delay, 0);
+        assert!(!pacing.should_delay(3, 7, &mut sent_since_delay));
+        assert!(!pacing.should_delay(4, 7, &mut sent_since_delay));
+        assert!(pacing.should_delay(5, 7, &mut sent_since_delay));
+        assert!(!pacing.should_delay(6, 7, &mut sent_since_delay));
+    }
+
+    #[test]
+    fn forward_pacing_disabled_with_zero_delay_or_burst() {
+        for pacing in [
+            ForwardPacing::new(0, Duration::from_millis(1)),
+            ForwardPacing::new(3, Duration::ZERO),
+        ] {
+            let mut sent_since_delay = 0;
+            assert!(!pacing.should_delay(0, 3, &mut sent_since_delay));
+            assert!(!pacing.should_delay(1, 3, &mut sent_since_delay));
+            assert!(!pacing.should_delay(2, 3, &mut sent_since_delay));
+        }
     }
 }

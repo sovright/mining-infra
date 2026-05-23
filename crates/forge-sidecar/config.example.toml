@@ -42,3 +42,8 @@ enable_submitblock = false
 raw_segment_max_incomplete_blocks = 128
 raw_segment_max_payload_bytes = 67108864
 raw_segment_ttl_secs = 120
+
+# Optional client-side UDP pacing for outbound relay announcements.
+# Zero disables pacing. Useful for large raw-block fallback drills.
+send_burst_packets = 0
+send_burst_delay_micros = 0

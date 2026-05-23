@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use bedrock_forge::{
     BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_PAYLOAD_SIZE, RelayClient,
@@ -71,6 +72,10 @@ impl ForgeBridge {
         let client_config = ClientConfig::new(config.relay_peers.clone(), auth_key)
             .with_bind_addr(config.relay_bind_addr)
             .with_fec(config.relay_data_shards, config.relay_parity_shards)
+            .with_send_pacing(
+                config.relay_send_burst_packets,
+                Duration::from_micros(config.relay_send_burst_delay_micros),
+            )
             .with_auth_required(true);
         RelayClient::new(client_config).map_err(|e| IngressError::Forge(e.to_string()))
     }
@@ -347,6 +352,8 @@ mod tests {
             relay_auth_key: Some([0x42; 32]),
             relay_data_shards: 96,
             relay_parity_shards: 32,
+            relay_send_burst_packets: 0,
+            relay_send_burst_delay_micros: 0,
         }
     }
 

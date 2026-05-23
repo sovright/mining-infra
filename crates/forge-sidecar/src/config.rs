@@ -59,6 +59,15 @@ pub struct Config {
     /// Maximum age for an incomplete raw block segment set.
     #[serde(default = "default_raw_segment_ttl_secs")]
     pub raw_segment_ttl_secs: u64,
+
+    /// Number of outbound relay packets to send before applying
+    /// `send_burst_delay_micros`. Zero disables client-side pacing.
+    #[serde(default)]
+    pub send_burst_packets: usize,
+
+    /// Optional client-side delay after each outbound relay packet burst.
+    #[serde(default)]
+    pub send_burst_delay_micros: u64,
 }
 
 fn default_zebra_url() -> String {
@@ -176,6 +185,8 @@ mod tests {
         assert_eq!(config.raw_segment_max_incomplete_blocks, 128);
         assert_eq!(config.raw_segment_max_payload_bytes, 64 * 1024 * 1024);
         assert_eq!(config.raw_segment_ttl_secs, 120);
+        assert_eq!(config.send_burst_packets, 0);
+        assert_eq!(config.send_burst_delay_micros, 0);
     }
 
     #[test]
@@ -222,5 +233,19 @@ mod tests {
         assert_eq!(config.raw_segment_max_incomplete_blocks, 16);
         assert_eq!(config.raw_segment_max_payload_bytes, 1_048_576);
         assert_eq!(config.raw_segment_ttl_secs, 30);
+    }
+
+    #[test]
+    fn config_parses_send_pacing() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            send_burst_packets = 32
+            send_burst_delay_micros = 1000
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.send_burst_packets, 32);
+        assert_eq!(config.send_burst_delay_micros, 1000);
     }
 }

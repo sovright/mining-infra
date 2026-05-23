@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tracing::{debug, warn};
 
 use crate::compact_block::CompactBlock;
@@ -342,8 +343,11 @@ impl RelayClient {
         let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
 
         // Send to all relay nodes
+        let pacing = SendPacing::new(self.config.send_burst_packets, self.config.send_burst_delay);
         for relay_addr in &self.config.relay_addrs {
-            for chunk in &chunks {
+            let chunk_count = chunks.len();
+            let mut sent_since_delay = 0usize;
+            for (idx, chunk) in chunks.iter().enumerate() {
                 // Compute HMAC for this chunk
                 let hmac = session.compute_hmac(
                     &chunk.header.block_hash,
@@ -381,6 +385,9 @@ impl RelayClient {
 
                 let data = auth_chunk.to_bytes();
                 socket.send_to(&data, relay_addr).await?;
+                if pacing.should_delay(idx, chunk_count, &mut sent_since_delay) {
+                    sleep(pacing.delay).await;
+                }
             }
         }
 
@@ -531,6 +538,38 @@ impl RelayClient {
                 .map(RelayPayload::RawBlockSegment),
             MessageType::Keepalive | MessageType::Auth => None,
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SendPacing {
+    burst_packets: usize,
+    delay: Duration,
+}
+
+impl SendPacing {
+    fn new(burst_packets: usize, delay: Duration) -> Self {
+        Self {
+            burst_packets,
+            delay,
+        }
+    }
+
+    fn should_delay(
+        self,
+        packet_idx: usize,
+        packet_count: usize,
+        sent_since_delay: &mut usize,
+    ) -> bool {
+        if self.burst_packets == 0 || self.delay.is_zero() {
+            return false;
+        }
+        *sent_since_delay += 1;
+        if *sent_since_delay < self.burst_packets || packet_idx + 1 >= packet_count {
+            return false;
+        }
+        *sent_since_delay = 0;
+        true
     }
 }
 
@@ -686,5 +725,33 @@ mod tests {
         assert_eq!(assembly.msg_type, MessageType::RawBlockSegment);
         assert_eq!(assembly.total_chunks, 3);
         assert_eq!(assembly.received_count(), 1);
+    }
+
+    #[test]
+    fn send_pacing_delays_after_configured_bursts() {
+        let pacing = SendPacing::new(3, Duration::from_millis(1));
+        let mut sent_since_delay = 0;
+
+        assert!(!pacing.should_delay(0, 7, &mut sent_since_delay));
+        assert!(!pacing.should_delay(1, 7, &mut sent_since_delay));
+        assert!(pacing.should_delay(2, 7, &mut sent_since_delay));
+        assert_eq!(sent_since_delay, 0);
+        assert!(!pacing.should_delay(3, 7, &mut sent_since_delay));
+        assert!(!pacing.should_delay(4, 7, &mut sent_since_delay));
+        assert!(pacing.should_delay(5, 7, &mut sent_since_delay));
+        assert!(!pacing.should_delay(6, 7, &mut sent_since_delay));
+    }
+
+    #[test]
+    fn send_pacing_disabled_with_zero_delay_or_burst() {
+        for pacing in [
+            SendPacing::new(0, Duration::from_millis(1)),
+            SendPacing::new(3, Duration::ZERO),
+        ] {
+            let mut sent_since_delay = 0;
+            assert!(!pacing.should_delay(0, 3, &mut sent_since_delay));
+            assert!(!pacing.should_delay(1, 3, &mut sent_since_delay));
+            assert!(!pacing.should_delay(2, 3, &mut sent_since_delay));
+        }
     }
 }

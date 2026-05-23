@@ -31,6 +31,8 @@ pub struct Config {
     pub relay_auth_key: Option<[u8; 32]>,
     pub relay_data_shards: usize,
     pub relay_parity_shards: usize,
+    pub relay_send_burst_packets: usize,
+    pub relay_send_burst_delay_micros: u64,
 }
 
 impl Config {
@@ -66,6 +68,9 @@ impl Config {
         };
         let relay_data_shards = env_usize("BEDROCK_P2P_RELAY_DATA_SHARDS", 10)?;
         let relay_parity_shards = env_usize("BEDROCK_P2P_RELAY_PARITY_SHARDS", 3)?;
+        let relay_send_burst_packets = env_usize("BEDROCK_P2P_RELAY_SEND_BURST_PACKETS", 0)?;
+        let relay_send_burst_delay_micros =
+            env_u64("BEDROCK_P2P_RELAY_SEND_BURST_DELAY_MICROS", 0)?;
 
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -93,6 +98,8 @@ impl Config {
             relay_auth_key,
             relay_data_shards,
             relay_parity_shards,
+            relay_send_burst_packets,
+            relay_send_burst_delay_micros,
         })
     }
 }

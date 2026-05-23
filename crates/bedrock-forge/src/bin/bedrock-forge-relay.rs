@@ -68,6 +68,8 @@ fn config_from_env() -> Result<RelayConfig, Box<dyn std::error::Error + Send + S
     let default_assembly_timeout_secs = config.assembly_timeout.as_secs();
     let default_max_sessions = config.max_sessions;
     let default_chunk_size = config.chunk_size;
+    let default_forward_burst_packets = config.forward_burst_packets;
+    let default_forward_burst_delay_micros = micros_from_duration(config.forward_burst_delay)?;
 
     let auth_keys = auth_keys_from_env()?;
     let allow_unauthenticated = env_bool("BEDROCK_FORGE_ALLOW_UNAUTHENTICATED", false)?;
@@ -91,7 +93,17 @@ fn config_from_env() -> Result<RelayConfig, Box<dyn std::error::Error + Send + S
         .with_max_sessions(env_usize(
             "BEDROCK_FORGE_MAX_SESSIONS",
             default_max_sessions,
-        )?);
+        )?)
+        .with_forward_pacing(
+            env_usize(
+                "BEDROCK_FORGE_FORWARD_BURST_PACKETS",
+                default_forward_burst_packets,
+            )?,
+            Duration::from_micros(env_u64(
+                "BEDROCK_FORGE_FORWARD_BURST_DELAY_MICROS",
+                default_forward_burst_delay_micros,
+            )?),
+        );
     config.chunk_size = env_usize("BEDROCK_FORGE_CHUNK_SIZE", default_chunk_size)?;
 
     Ok(config)
@@ -153,6 +165,12 @@ fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + 
         Ok(value) => Ok(value.parse()?),
         Err(_) => Ok(default),
     }
+}
+
+fn micros_from_duration(
+    duration: Duration,
+) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(duration.as_micros().try_into()?)
 }
 
 fn write_metrics_textfile(

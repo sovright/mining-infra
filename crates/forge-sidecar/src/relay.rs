@@ -3,6 +3,7 @@
 use bedrock_forge::{BlockReceiver, BlockSender, ClientConfig, CompactBlock, RelayClient};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -20,10 +21,13 @@ impl ForgeRelay {
         bind_addr: SocketAddr,
         data_shards: usize,
         parity_shards: usize,
+        send_burst_packets: usize,
+        send_burst_delay: Duration,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = ClientConfig::new(relay_peers, auth_key)
             .with_bind_addr(bind_addr)
-            .with_fec(data_shards, parity_shards);
+            .with_fec(data_shards, parity_shards)
+            .with_send_pacing(send_burst_packets, send_burst_delay);
         let config = config.with_auth_required(true);
 
         let client = RelayClient::new(config)?;
@@ -98,7 +102,7 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "0.0.0.0:0".parse().unwrap();
 
-        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 10, 3);
+        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO);
         assert!(relay.is_ok());
     }
 
@@ -107,7 +111,8 @@ mod tests {
         let peers = vec!["127.0.0.1:8333".parse().unwrap()];
         let auth_key = [0x42; 32];
         let bind_addr = "127.0.0.1:0".parse().unwrap();
-        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 10, 3).unwrap();
+        let relay =
+            ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO).unwrap();
         relay.init().await.unwrap();
 
         let mut receiver = relay.start_with_receiver().await.unwrap();
@@ -125,7 +130,7 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "127.0.0.1:0".parse().unwrap();
 
-        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 255, 2);
+        let relay = ForgeRelay::new_with_fec(peers, auth_key, bind_addr, 255, 2, 0, Duration::ZERO);
 
         assert!(relay.is_err());
     }

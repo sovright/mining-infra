@@ -80,6 +80,14 @@ struct Args {
     /// Maximum age in seconds for an incomplete raw block segment set
     #[arg(long, default_value = "120")]
     raw_segment_ttl_secs: u64,
+
+    /// Outbound relay packets to send before applying send-burst-delay-micros
+    #[arg(long, default_value = "0")]
+    send_burst_packets: usize,
+
+    /// Optional client-side delay after each outbound relay packet burst
+    #[arg(long, default_value = "0")]
+    send_burst_delay_micros: u64,
 }
 
 #[tokio::main]
@@ -108,6 +116,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         raw_segment_max_incomplete_blocks,
         raw_segment_max_payload_bytes,
         raw_segment_ttl_secs,
+        send_burst_packets,
+        send_burst_delay_micros,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -124,6 +134,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.raw_segment_max_incomplete_blocks,
             cfg.raw_segment_max_payload_bytes,
             cfg.raw_segment_ttl_secs,
+            cfg.send_burst_packets,
+            cfg.send_burst_delay_micros,
         )
     } else {
         // Use CLI args
@@ -165,6 +177,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.raw_segment_max_incomplete_blocks,
             args.raw_segment_max_payload_bytes,
             args.raw_segment_ttl_secs,
+            args.send_burst_packets,
+            args.send_burst_delay_micros,
         )
     };
 
@@ -196,6 +210,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         bind_addr,
         data_shards,
         parity_shards,
+        send_burst_packets,
+        Duration::from_micros(send_burst_delay_micros),
     )?;
     relay.init().await?;
     if receive_relay_blocks {
