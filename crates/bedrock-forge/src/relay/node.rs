@@ -211,12 +211,19 @@ impl<V: PowValidator> RelayNode<V> {
         if data.len() < 4 {
             return None;
         }
-        let header_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if header_len == 0 || data.len() < 4 + header_len {
+        let content_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
+        if content_len < 4 || data.len() < 4 + content_len {
             return None;
         }
 
-        let header = &data[4..4 + header_len];
+        let content = &data[4..4 + content_len];
+        let header_len =
+            u32::from_le_bytes([content[0], content[1], content[2], content[3]]) as usize;
+        if header_len == 0 || content.len() < 4 + header_len {
+            return None;
+        }
+
+        let header = &content[4..4 + header_len];
         match self.validator.validate(header) {
             PowResult::Valid => Some(true),
             PowResult::Invalid => Some(false),
@@ -324,10 +331,11 @@ impl<V: PowValidator> RelayNode<V> {
         // chunks yet to extract a header; in that case we keep the current
         // `pow_validated` state (false) and suppress forwarding until a future
         // chunk provides enough data to decide.
-        if is_new && !assembly.pow_validated {
-            if let Some(valid) = self.validate_pow_from_assembly(assembly) {
-                assembly.pow_validated = valid;
-            }
+        if is_new
+            && !assembly.pow_validated
+            && let Some(valid) = self.validate_pow_from_assembly(assembly)
+        {
+            assembly.pow_validated = valid;
         }
 
         if !assembly.pow_validated {
@@ -336,11 +344,11 @@ impl<V: PowValidator> RelayNode<V> {
 
         let mut ready = Vec::new();
         for (idx, payload) in assembly.chunks.iter().enumerate() {
-            if let Some(data) = payload {
-                if !assembly.forwarded[idx] {
-                    assembly.forwarded[idx] = true;
-                    ready.push((idx as u16, data.clone()));
-                }
+            if let Some(data) = payload
+                && !assembly.forwarded[idx]
+            {
+                assembly.forwarded[idx] = true;
+                ready.push((idx as u16, data.clone()));
             }
         }
 
@@ -595,8 +603,22 @@ impl<V: PowValidator> RelayNode<V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::CompactBlock;
     use std::time::Duration;
     use tokio::time::timeout;
+
+    #[derive(Clone)]
+    struct HeaderPrefixValidator([u8; 4]);
+
+    impl PowValidator for HeaderPrefixValidator {
+        fn validate(&self, header: &[u8]) -> PowResult {
+            if header.starts_with(&self.0) {
+                PowResult::Valid
+            } else {
+                PowResult::Invalid
+            }
+        }
+    }
 
     #[test]
     fn relay_node_creation() {
@@ -626,6 +648,30 @@ mod tests {
 
         let result = RelayNode::new(config);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn pow_validation_extracts_header_after_content_length_prefix() {
+        let marker = [0x04, 0x00, 0x00, 0x00];
+        let mut compact_header = marker.to_vec();
+        compact_header.resize(256, 0x42);
+        let compact = CompactBlock::new(compact_header, 0, Vec::new(), Vec::new());
+        let block_hash = compact.header_hash();
+        let chunker = BlockChunker::new(10, 3).unwrap();
+        let chunks = chunker
+            .compact_block_to_chunks(&compact, block_hash.as_bytes())
+            .unwrap();
+
+        let mut assembly = BlockAssembly::new(*block_hash.as_bytes(), chunks.len());
+        for chunk in chunks {
+            assembly.add_chunk(chunk.header.chunk_id as usize, chunk.payload);
+        }
+
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
+        let node = RelayNode::with_validator(config, HeaderPrefixValidator(marker)).unwrap();
+
+        assert_eq!(node.validate_pow_from_assembly(&assembly), Some(true));
     }
 
     #[tokio::test]

@@ -6,8 +6,8 @@ use std::time::{Duration, Instant};
 
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use std::collections::VecDeque;
+use subtle::ConstantTimeEq;
 
 type HmacSha256 = Hmac<Sha256>;
 const MAX_PENDING_BLOCKS: usize = 64;
@@ -161,13 +161,16 @@ impl RelaySession {
 
     /// Track a chunk to prevent replay; returns false if seen recently
     pub fn mark_chunk_seen(&mut self, block_hash: [u8; 32], chunk_id: u16) -> bool {
-        let key = ChunkKey { block_hash, chunk_id };
+        let key = ChunkKey {
+            block_hash,
+            chunk_id,
+        };
         let now = Instant::now();
 
-        if let Some(seen_at) = self.recent_chunks.get(&key) {
-            if now.duration_since(*seen_at) <= RECENT_CHUNK_TTL {
-                return false;
-            }
+        if let Some(seen_at) = self.recent_chunks.get(&key)
+            && now.duration_since(*seen_at) <= RECENT_CHUNK_TTL
+        {
+            return false;
         }
 
         self.recent_chunks.insert(key, now);
@@ -210,8 +213,9 @@ impl RelaySession {
 
     /// Remove completed or expired assemblies
     pub fn cleanup_assemblies(&mut self, assembly_timeout: Duration) {
-        self.pending_blocks
-            .retain(|_, assembly| !assembly.is_expired(assembly_timeout) && !assembly.is_complete());
+        self.pending_blocks.retain(|_, assembly| {
+            !assembly.is_expired(assembly_timeout) && !assembly.is_complete()
+        });
     }
 
     /// Cleanup old replay entries
@@ -275,14 +279,7 @@ mod tests {
         ));
 
         // Wrong chunk_id should fail
-        assert!(!session.verify_hmac(
-            &block_hash,
-            6,
-            total_chunks,
-            payload_len,
-            &payload,
-            &hmac
-        ));
+        assert!(!session.verify_hmac(&block_hash, 6, total_chunks, payload_len, &payload, &hmac));
     }
 
     #[test]
