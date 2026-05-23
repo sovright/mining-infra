@@ -47,6 +47,18 @@ pub struct Config {
     /// Submit eligible relay-received blocks to Zebra.
     #[serde(default)]
     pub enable_submitblock: bool,
+
+    /// Maximum incomplete raw blocks to buffer while waiting for segments.
+    #[serde(default = "default_raw_segment_max_incomplete_blocks")]
+    pub raw_segment_max_incomplete_blocks: usize,
+
+    /// Maximum total raw segment payload bytes to hold in memory.
+    #[serde(default = "default_raw_segment_max_payload_bytes")]
+    pub raw_segment_max_payload_bytes: usize,
+
+    /// Maximum age for an incomplete raw block segment set.
+    #[serde(default = "default_raw_segment_ttl_secs")]
+    pub raw_segment_ttl_secs: u64,
 }
 
 fn default_zebra_url() -> String {
@@ -71,6 +83,18 @@ fn default_parity_shards() -> usize {
 
 fn default_announce_templates() -> bool {
     true
+}
+
+fn default_raw_segment_max_incomplete_blocks() -> usize {
+    128
+}
+
+fn default_raw_segment_max_payload_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_raw_segment_ttl_secs() -> u64 {
+    120
 }
 
 impl Config {
@@ -149,6 +173,9 @@ mod tests {
         assert!(config.announce_templates);
         assert!(!config.receive_relay_blocks);
         assert!(!config.enable_submitblock);
+        assert_eq!(config.raw_segment_max_incomplete_blocks, 128);
+        assert_eq!(config.raw_segment_max_payload_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.raw_segment_ttl_secs, 120);
     }
 
     #[test]
@@ -179,5 +206,21 @@ mod tests {
 
         assert_eq!(config.data_shards, 96);
         assert_eq!(config.parity_shards, 32);
+    }
+
+    #[test]
+    fn config_parses_raw_segment_buffer_limits() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            raw_segment_max_incomplete_blocks = 16
+            raw_segment_max_payload_bytes = 1048576
+            raw_segment_ttl_secs = 30
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.raw_segment_max_incomplete_blocks, 16);
+        assert_eq!(config.raw_segment_max_payload_bytes, 1_048_576);
+        assert_eq!(config.raw_segment_ttl_secs, 30);
     }
 }

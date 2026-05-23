@@ -37,3 +37,8 @@ receive_relay_blocks = false
 # Submit eligible relay-received blocks to Zebra.
 # Requires receive_relay_blocks = true. Keep false until mainnet cutover signoff.
 enable_submitblock = false
+
+# Bounds for incomplete segmented raw blocks received from FORGE.
+raw_segment_max_incomplete_blocks = 128
+raw_segment_max_payload_bytes = 67108864
+raw_segment_ttl_secs = 120
