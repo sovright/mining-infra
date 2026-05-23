@@ -1,7 +1,8 @@
 //! Forge sidecar for Stratum V1 mining pools
 
 use bedrock_forge::{
-    BlockReceiver, MempoolProvider, RawBlockSegment, RelayPayload, WtxId, reassemble_raw_block,
+    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, WtxId,
+    reassemble_raw_block,
 };
 use clap::Parser;
 use std::collections::HashMap;
@@ -21,7 +22,7 @@ use forge_sidecar::compact::build_compact_block;
 use forge_sidecar::config;
 use forge_sidecar::rpc::ZebraRpc;
 use forge_sidecar::submit::{
-    RelayBlockError, SubmissionOutcome, SubmitBlockMode, SubmitBlockStatus,
+    RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
     handle_relay_compact_block, handle_relay_compact_block_with_mempool, handle_relay_raw_block,
 };
 use poller::{TemplatePoller, TemplateUpdate};
@@ -252,6 +253,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             compact_reconstruction_enabled,
             raw_segment_buffer_config,
             Arc::clone(&metrics),
+            Arc::new(EmptyMempool),
         );
     } else {
         relay.start().await?;
@@ -303,14 +305,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-fn spawn_relay_block_handler(
+async fn handle_relay_compact_payload<S, M>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    compact_reconstruction_enabled: bool,
+    mempool: &M,
+    metrics: &SidecarMetrics,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    M: MempoolProvider,
+{
+    if compact_reconstruction_enabled && !compact.short_ids.is_empty() {
+        metrics.inc_compact_reconstruction_attempts();
+        let outcome =
+            handle_relay_compact_block_with_mempool(submitter, compact, mode, mempool).await;
+        record_compact_reconstruction_outcome(&outcome, metrics);
+        outcome
+    } else {
+        handle_relay_compact_block(submitter, compact, mode).await
+    }
+}
+
+fn spawn_relay_block_handler<M>(
     mut receiver: BlockReceiver,
     rpc: Arc<ZebraRpc>,
     mode: SubmitBlockMode,
     compact_reconstruction_enabled: bool,
     raw_segment_buffer_config: RawSegmentBufferConfig,
     metrics: Arc<SidecarMetrics>,
-) {
+    mempool: Arc<M>,
+) where
+    M: MempoolProvider + Send + Sync + 'static,
+{
     tokio::spawn(async move {
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
         let mut cleanup_interval =
@@ -326,24 +354,16 @@ fn spawn_relay_block_handler(
                     match payload {
                         RelayPayload::CompactBlock(compact) => {
                             metrics.inc_compact_blocks_received();
-                            if compact_reconstruction_enabled && !compact.short_ids.is_empty() {
-                                metrics.inc_compact_reconstruction_attempts();
-                                let mempool = EmptyMempool;
-                                let outcome = handle_relay_compact_block_with_mempool(
-                                    rpc.as_ref(),
-                                    &compact,
-                                    mode,
-                                    &mempool,
-                                )
-                                .await;
-                                record_compact_reconstruction_outcome(&outcome, metrics.as_ref());
-                                log_submission_outcome(outcome, metrics.as_ref());
-                            } else {
-                                log_submission_outcome(
-                                    handle_relay_compact_block(rpc.as_ref(), &compact, mode).await,
-                                    metrics.as_ref(),
-                                );
-                            }
+                            let outcome = handle_relay_compact_payload(
+                                rpc.as_ref(),
+                                &compact,
+                                mode,
+                                compact_reconstruction_enabled,
+                                mempool.as_ref(),
+                                metrics.as_ref(),
+                            )
+                            .await;
+                            log_submission_outcome(outcome, metrics.as_ref());
                         }
                         RelayPayload::RawBlockSegment(segment) => {
                             metrics.inc_raw_segments_received();
@@ -886,8 +906,31 @@ fn write_metrics_textfile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bedrock_forge::split_raw_block;
+    use bedrock_forge::{
+        AuthDigest, CompactBlockBuilder, TestMempool, TxId, WtxId, split_raw_block,
+    };
     use std::sync::atomic::Ordering;
+
+    use forge_sidecar::submit::{SubmitBlock, SubmitFuture};
+
+    #[derive(Default)]
+    struct CountingSubmitter {
+        calls: AtomicUsize,
+    }
+
+    impl SubmitBlock for CountingSubmitter {
+        fn submit_block<'a>(&'a self, _block_hex: &'a str) -> SubmitFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move { Ok(None) })
+        }
+    }
+
+    fn make_wtxid(seed: u8) -> WtxId {
+        WtxId::new(
+            TxId::from_bytes([seed; 32]),
+            AuthDigest::from_bytes([seed; 32]),
+        )
+    }
 
     fn buffer_config(
         max_incomplete_blocks: usize,
@@ -997,6 +1040,64 @@ mod tests {
         assert_eq!(
             raw_segment_cleanup_interval(Duration::from_secs(10)),
             Duration::from_secs(10)
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_compact_handler_uses_injected_mempool_for_short_ids() {
+        let header = vec![0xcd; bedrock_forge::ZCASH_FULL_HEADER_SIZE];
+        let nonce = 42;
+        let coinbase_wtxid = make_wtxid(0x01);
+        let tx1_wtxid = make_wtxid(0x02);
+        let coinbase = vec![0x01, 0x02];
+        let tx1 = vec![0x03, 0x04, 0x05];
+        let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
+        builder.add_transaction(coinbase_wtxid, coinbase.clone());
+        builder.add_transaction(tx1_wtxid, tx1.clone());
+
+        let mut peer_mempool = TestMempool::new();
+        peer_mempool.insert(tx1_wtxid, tx1.clone());
+        let compact = builder.build(&peer_mempool);
+        assert_eq!(compact.short_ids.len(), 1);
+
+        let mut sidecar_mempool = TestMempool::new();
+        sidecar_mempool.insert(tx1_wtxid, tx1.clone());
+        let metrics = SidecarMetrics::default();
+        let submitter = CountingSubmitter::default();
+
+        let outcome = handle_relay_compact_payload(
+            &submitter,
+            &compact,
+            SubmitBlockMode::DryRun,
+            true,
+            &sidecar_mempool,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        match outcome {
+            SubmissionOutcome::DryRun(candidate) => {
+                assert_eq!(candidate.tx_count, 2);
+                assert_eq!(
+                    candidate.block_bytes,
+                    header.len() + 1 + coinbase.len() + tx1.len()
+                );
+            }
+            SubmissionOutcome::Submitted { .. } => panic!("dry-run must not submit"),
+        }
+        assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            metrics
+                .compact_reconstruction_attempts
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            metrics
+                .compact_reconstruction_completes
+                .load(Ordering::Relaxed),
+            1
         );
     }
 
