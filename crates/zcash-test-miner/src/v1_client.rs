@@ -41,7 +41,15 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
     let mut reader = BufReader::new(reader);
     let mut next_id: u64 = 1;
 
-    // Step 1: mining.subscribe
+    // Step 1: mining.subscribe — mimic the real Bitmain Z15 (GodMiner) dialect
+    // captured from a live unit: 4 args, user agent "GodMiner/2.0.0", the host
+    // carries the stratum+tcp:// scheme (without the port), and the port is a
+    // *string*. This keeps the test miner a faithful stand-in for the Z15 so the
+    // proxy's subscribe handling is exercised against the real shape.
+    let (sub_host, sub_port) = match pool_addr.rsplit_once(':') {
+        Some((host, port)) => (format!("stratum+tcp://{}", host), port.to_string()),
+        None => (format!("stratum+tcp://{}", pool_addr), "3334".to_string()),
+    };
     let subscribe_id = next_id;
     next_id += 1;
     send_json(
@@ -49,7 +57,7 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
         &serde_json::json!({
             "id": subscribe_id,
             "method": "mining.subscribe",
-            "params": ["zcash-test-miner/1.0", null, pool_addr, 3334]
+            "params": ["GodMiner/2.0.0", null, sub_host, sub_port]
         }),
     )
     .await?;
@@ -67,18 +75,9 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
     )
     .await?;
 
-    // Step 3: mining.extranonce.subscribe
-    let extranonce_id = next_id;
-    next_id += 1;
-    send_json(
-        &mut writer,
-        &serde_json::json!({
-            "id": extranonce_id,
-            "method": "mining.extranonce.subscribe",
-            "params": []
-        }),
-    )
-    .await?;
+    // NOTE: the real Z15 (GodMiner) does NOT send mining.extranonce.subscribe,
+    // so neither do we. (The proxy still handles it if a miner does, but a
+    // faithful Z15 stand-in must not, or it tests a path the Z15 never exercises.)
 
     // State
     let mut nonce_1: Vec<u8> = Vec::new();
@@ -327,7 +326,10 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                 next_id += 1;
 
                 let nonce_2_hex = hex::encode(&nonce_2);
-                let time_hex = format!("{:08x}", time);
+                // ZIP 301: NTIME in mining.submit is "encoded as in a block header"
+                // (little-endian), same as in mining.notify. The real Z15 submits
+                // it this way, so we do too.
+                let time_hex = hex::encode(time.to_le_bytes());
                 let solution_hex = hex::encode(&solution);
 
                 send_json(
@@ -366,18 +368,13 @@ fn parse_subscribe_response(msg: &Value) -> Result<(Vec<u8>, String), String> {
         .get("result")
         .ok_or("missing result field")?;
 
-    // result = [["mining.notify", "session_id"], "nonce_1_hex"]
+    // ZIP 301: result = [SESSION_ID, NONCE_1] (session-id string + nonce_1 hex).
     let arr = result.as_array().ok_or("result is not an array")?;
     if arr.len() < 2 {
         return Err("result array too short".into());
     }
 
-    let session_id = arr[0]
-        .as_array()
-        .and_then(|a| a.get(1))
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
-        .to_string();
+    let session_id = arr[0].as_str().unwrap_or("unknown").to_string();
 
     let nonce_1_hex = arr[1].as_str().ok_or("nonce_1 is not a string")?;
     let nonce_1 = hex_decode(nonce_1_hex).map_err(|e| format!("bad nonce_1 hex: {}", e))?;
@@ -392,12 +389,12 @@ fn parse_notify(params: &Value) -> Result<V1Job, String> {
     }
 
     let job_id = arr[0].as_str().ok_or("job_id not string")?.to_string();
-    let version = parse_hex_u32(arr[1].as_str().ok_or("version not string")?)?;
+    let version = parse_hex_u32_le(arr[1].as_str().ok_or("version not string")?)?;
     let prev_hash = hex_to_32_reversed(arr[2].as_str().ok_or("prev_hash not string")?)?;
     let merkle_root = hex_to_32_reversed(arr[3].as_str().ok_or("merkle_root not string")?)?;
     let block_commitments = hex_to_32_reversed(arr[4].as_str().ok_or("reserved not string")?)?;
-    let time = parse_hex_u32(arr[5].as_str().ok_or("time not string")?)?;
-    let bits = parse_hex_u32(arr[6].as_str().ok_or("bits not string")?)?;
+    let time = parse_hex_u32_le(arr[5].as_str().ok_or("time not string")?)?;
+    let bits = parse_hex_u32_le(arr[6].as_str().ok_or("bits not string")?)?;
     let clean_jobs = arr[7].as_bool().unwrap_or(false);
 
     Ok(V1Job {
@@ -432,13 +429,23 @@ fn hex_to_32_reversed(input: &str) -> Result<[u8; 32], String> {
     Ok(arr)
 }
 
-fn parse_hex_u32(input: &str) -> Result<u32, String> {
+/// Parse a little-endian u32 from a hex string. ZIP 301 encodes the notify
+/// VERSION/NTIME/NBITS fields "as in a block header" — i.e. little-endian bytes
+/// — so "04000000" is version 4, not 0x04000000. The real Z15 (GodMiner) reads
+/// them this way, so the test miner must too.
+fn parse_hex_u32_le(input: &str) -> Result<u32, String> {
     let stripped = input
         .trim()
         .strip_prefix("0x")
         .or_else(|| input.trim().strip_prefix("0X"))
         .unwrap_or(input.trim());
-    u32::from_str_radix(stripped, 16).map_err(|e| format!("bad hex u32 '{}': {}", input, e))
+    let bytes = hex_decode(stripped).map_err(|e| format!("bad hex u32 '{}': {}", input, e))?;
+    if bytes.len() != 4 {
+        return Err(format!("expected 4 bytes for u32, got {} from '{}'", bytes.len(), input));
+    }
+    let mut b = [0u8; 4];
+    b.copy_from_slice(&bytes);
+    Ok(u32::from_le_bytes(b))
 }
 
 /// Simple hash of a string job_id to a u32 for the AtomicU32 cancellation check.

@@ -96,7 +96,8 @@ pub fn submit_to_v2(
     solution_hex: &str,
 ) -> Result<SubmitEquihashShare, TranslateError> {
     let nonce_2 = hex_to_bytes(nonce_2_hex)?;
-    let time = parse_hex_u32(time_hex)?;
+    // ZIP 301: submit NTIME is little-endian header bytes (same as notify).
+    let time = parse_hex_u32_le(time_hex)?;
     let solution = normalize_solution(solution_hex)?;
 
     Ok(SubmitEquihashShare {
@@ -129,6 +130,22 @@ pub fn parse_hex_u32(input: &str) -> Result<u32, TranslateError> {
     u32::from_str_radix(stripped, 16).map_err(|error| {
         TranslateError::new(format!("invalid u32 hex '{}': {}", input, error))
     })
+}
+
+/// Parse a little-endian u32 from a 4-byte hex string. ZIP 301 encodes
+/// NTIME/NBITS/VERSION "as in a block header" (little-endian), so a real Zcash
+/// miner's submit carries NTIME in this form.
+pub fn parse_hex_u32_le(input: &str) -> Result<u32, TranslateError> {
+    let bytes = hex_to_bytes(input)?;
+    if bytes.len() != 4 {
+        return Err(TranslateError::new(format!(
+            "expected 4-byte little-endian hex u32, got '{}'",
+            input
+        )));
+    }
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes);
+    Ok(u32::from_le_bytes(buf))
 }
 
 pub fn normalize_solution(solution_hex: &str) -> Result<[u8; 1344], TranslateError> {
