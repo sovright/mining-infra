@@ -64,14 +64,19 @@ pub fn reverse_hash(hash: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn job_to_notify(job: &NewEquihashJob) -> NotifyParams {
+    // version/ntime/nbits are sent as little-endian header bytes (the order
+    // they appear in the serialized Zcash block header), matching the
+    // real-world Zcash stratum dialect that ASIC firmware (e.g. Bitmain Z15 /
+    // GodMiner) expects. Previously these were big-endian readable hex, which
+    // Bedrock's own test miner tolerated but the Z15 rejected.
     NotifyParams(
         job.job_id.to_string(),
-        format!("{:08x}", job.version),
+        bytes_to_hex(&job.version.to_le_bytes()),
         bytes_to_hex(&reverse_hash(&job.prev_hash)),
         bytes_to_hex(&reverse_hash(&job.merkle_root)),
         bytes_to_hex(&reverse_hash(&job.block_commitments)),
-        format!("{:08x}", job.time),
-        format!("{:08x}", job.bits),
+        bytes_to_hex(&job.time.to_le_bytes()),
+        bytes_to_hex(&job.bits.to_le_bytes()),
         job.clean_jobs,
     )
 }
