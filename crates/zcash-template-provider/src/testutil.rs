@@ -158,6 +158,13 @@ impl TestTemplateFactory {
         self
     }
 
+    /// Set the block version (Zcash blocks use 4; ZIP 301 requires notify
+    /// VERSION == 4).
+    pub fn version(mut self, v: u32) -> Self {
+        self.version = v;
+        self
+    }
+
     /// Set the merkle root (64-char hex, display/big-endian order).
     pub fn merkle_root(mut self, h: &str) -> Self {
         self.merkle_root = h.to_string();

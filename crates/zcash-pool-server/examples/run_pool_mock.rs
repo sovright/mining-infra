@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = PoolConfig {
         listen_addr: "0.0.0.0:3333".parse()?,
-        initial_difficulty: 0.0001, // floor difficulty; no real shares expected
+        initial_difficulty: 1.0, // diff 1.0 -> realistic target (max_mainnet, leading zeros) instead of all-0xff
         target_shares_per_minute: 5.0,
         nonce_1_len: 4,
         noise_enabled: false,
@@ -52,6 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for _ in 0..7200 {
         mock.enqueue_template(
             TestTemplateFactory::new()
+                .version(4) // ZIP 301: notify VERSION must be 4 (Zcash block version)
                 .height(3_000_000)
                 .time(now)
                 .prev_hash(prev)
