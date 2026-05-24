@@ -36,9 +36,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // one per tick; once a template is processed, `current_template` stays set
     // even after the queue drains, so the pool keeps serving jobs. We still
     // enqueue a generous supply to keep the log quiet for a long test window.
+    // Use a CURRENT timestamp and a plausible non-zero prev-block hash so a
+    // real ASIC doesn't reject the job as stale (old ntime) or nonsensical
+    // (zero chain tip). Lets us distinguish a synthetic-content rejection from
+    // a proxy notify-translation bug.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let prev = "0007e1c4f8a2b3d6e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6";
     let mock = MockZebraRpc::new();
     for _ in 0..7200 {
-        mock.enqueue_template(TestTemplateFactory::new().build());
+        mock.enqueue_template(
+            TestTemplateFactory::new()
+                .height(3_000_000)
+                .time(now)
+                .prev_hash(prev)
+                .build(),
+        );
     }
 
     let tp_config = TemplateProviderConfig {
