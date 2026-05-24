@@ -23,7 +23,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/zcash-mining-protocol/fuzz/target
@@ -43,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/bedrock-forge/fuzz/target
@@ -71,7 +71,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/zcash-jd-server/fuzz/target
@@ -92,7 +92,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/zcash-equihash-validator/fuzz/target
@@ -112,7 +112,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/zcash-pool-common/fuzz/target
@@ -133,7 +133,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/zcash-template-provider/fuzz/target
@@ -153,7 +153,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/forge-sidecar/fuzz/target
@@ -173,7 +173,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/bedrock-noise/fuzz/target
@@ -192,7 +192,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
-      - run: cargo install cargo-fuzz --locked
+      - run: cargo install cargo-fuzz
       - uses: actions/cache@v4
         with:
           path: crates/zcash-pool-server/fuzz/target
