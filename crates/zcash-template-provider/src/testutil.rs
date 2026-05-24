@@ -158,6 +158,18 @@ impl TestTemplateFactory {
         self
     }
 
+    /// Set the merkle root (64-char hex, display/big-endian order).
+    pub fn merkle_root(mut self, h: &str) -> Self {
+        self.merkle_root = h.to_string();
+        self
+    }
+
+    /// Set the block commitments hash (64-char hex, display/big-endian order).
+    pub fn block_commitments_hash(mut self, h: &str) -> Self {
+        self.block_commitments_hash = h.to_string();
+        self
+    }
+
     /// Set the transactions included in the template.
     pub fn with_transactions(mut self, txs: Vec<TemplateTransaction>) -> Self {
         self.transactions = txs;

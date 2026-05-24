@@ -45,6 +45,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap()
         .as_secs();
     let prev = "0007e1c4f8a2b3d6e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f6";
+    // Non-zero merkle root so the job's notify doesn't carry an all-zeros
+    // merkle (a real ASIC may reject that as an invalid job).
+    let merkle = "9f3a7c1e5d2b4806af91e2c3d4b5a6978f0e1d2c3b4a5968778695a4b3c2d1e0";
     let mock = MockZebraRpc::new();
     for _ in 0..7200 {
         mock.enqueue_template(
@@ -52,6 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .height(3_000_000)
                 .time(now)
                 .prev_hash(prev)
+                .merkle_root(merkle)
                 .build(),
         );
     }
