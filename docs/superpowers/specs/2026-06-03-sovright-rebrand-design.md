@@ -27,7 +27,8 @@ The `zcash-*` crates keep their names; only their internal references to renamed
 - `crates/zcash-pool-server/src/forge.rs` → `relay.rs` (module `forge` → `relay`)
 - `crates/zcash-pool-server/tests/forge_integration_test.rs` → `relay_integration_test.rs`
 - Pool server config keys: `forge_relay_*` → `relay_*`. The `noise_*` keys are unchanged.
-- Prometheus metric names in `sovright-telemetry`: any `bedrock_` or `forge_` prefix → `sovright_`. This breaks existing dashboards/alerts; flag prominently in `deployment.md`.
+- Prometheus metric names in `sovright-telemetry`: `bedrock_pool_*` → `sovright_pool_*` (replace only the `bedrock` token; keep `pool`). This breaks existing dashboards/alerts; flag prominently in `deployment.md`.
+- Doc-comment code examples inside `*.rs` files (e.g. `use bedrock_strata::...`) are included in the rename sweep.
 - "FORGE" / "Forge" / "Bedrock" in comments, log messages, error strings, and tracing targets → "relay network" / "Sovright" as appropriate.
 
 No deprecation or fallback handling for old config keys: deployment is at internal-testnet stage, so the clean break is acceptable.
@@ -51,6 +52,7 @@ No deprecation or fallback handling for old config keys: deployment is at intern
 - Rename `sovright/bedrock` → `sovright/mining-infra` via `gh api` (GitHub auto-redirects the old URL).
 - Update the local `bedrock` git remote: rename the remote to `sovright` and point it at the new URL.
 - The `origin` remote (`iqlusioninc/zcash-mining-infra`) is left as-is.
+- Workspace `Cargo.toml` `repository` field → `https://github.com/sovright/mining-infra`.
 
 ## Verification
 
