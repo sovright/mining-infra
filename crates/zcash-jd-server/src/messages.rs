@@ -199,15 +199,22 @@ pub struct SetCustomMiningJobSuccess {
     pub request_id: u32,
     /// Server-assigned job identifier
     pub job_id: u32,
+    /// Pool-granted share target for this declared job.
+    ///
+    /// The pool (never the client) chooses this so fake-easy shares cannot
+    /// inflate payout credit. It is easier than the block target and is used by
+    /// the per-share validation path for declared jobs.
+    pub share_target: [u8; 32],
 }
 
 impl SetCustomMiningJobSuccess {
     /// Create a new success response
-    pub fn new(channel_id: u32, request_id: u32, job_id: u32) -> Self {
+    pub fn new(channel_id: u32, request_id: u32, job_id: u32, share_target: [u8; 32]) -> Self {
         Self {
             channel_id,
             request_id,
             job_id,
+            share_target,
         }
     }
 }

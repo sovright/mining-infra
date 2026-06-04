@@ -316,6 +316,8 @@ pub fn encode_set_custom_job_success(msg: &SetCustomMiningJobSuccess) -> Result<
     payload.write_u32::<LittleEndian>(msg.channel_id).unwrap();
     payload.write_u32::<LittleEndian>(msg.request_id).unwrap();
     payload.write_u32::<LittleEndian>(msg.job_id).unwrap();
+    // Pool-granted share target: 32 raw bytes appended at the END of the payload.
+    payload.write_all(&msg.share_target).unwrap();
 
     let frame = MessageFrame {
         extension_type: JD_EXTENSION_TYPE,
@@ -343,10 +345,17 @@ pub fn decode_set_custom_job_success(data: &[u8]) -> Result<SetCustomMiningJobSu
         .read_u32::<LittleEndian>()
         .map_err(|e| JdServerError::Protocol(e.to_string()))?;
 
+    // Pool-granted share target: 32 raw bytes at the END of the payload.
+    let mut share_target = [0u8; 32];
+    cursor
+        .read_exact(&mut share_target)
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+
     Ok(SetCustomMiningJobSuccess {
         channel_id,
         request_id,
         job_id,
+        share_target,
     })
 }
 
@@ -898,6 +907,7 @@ mod tests {
             channel_id: 1,
             request_id: 100,
             job_id: 42,
+            share_target: [0x3c; 32],
         };
 
         let encoded = encode_set_custom_job_success(&original).unwrap();
@@ -906,6 +916,7 @@ mod tests {
         assert_eq!(original.channel_id, decoded.channel_id);
         assert_eq!(original.request_id, decoded.request_id);
         assert_eq!(original.job_id, decoded.job_id);
+        assert_eq!(original.share_target, decoded.share_target);
     }
 
     #[test]

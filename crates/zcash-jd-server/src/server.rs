@@ -435,6 +435,8 @@ impl JdServer {
             bits: request.bits,
             time: request.time,
             coinbase_tx: request.coinbase_tx.clone(),
+            // Pool grants the share target (never the client) at declaration time.
+            share_target: self.config.share_target,
         };
 
         if let Err(e) = self
@@ -466,6 +468,7 @@ impl JdServer {
             request.channel_id,
             request.request_id,
             job_id,
+            self.config.share_target,
         ))
     }
 
@@ -817,6 +820,8 @@ impl JdServer {
             bits: job.bits,
             time: job.time,
             coinbase_tx: job.coinbase_tx.clone(),
+            // Pool grants the share target (never the client) at declaration time.
+            share_target: self.config.share_target,
         };
 
         self.token_manager
@@ -1184,6 +1189,7 @@ mod tests {
             full_template_enabled: false,
             full_template_validation: crate::validation::ValidationLevel::Standard,
             min_pool_payout: 0,
+            share_target: JdServerConfig::default().share_target,
         }
     }
 
@@ -1480,6 +1486,7 @@ mod tests {
             full_template_enabled: true, // Enable Full-Template mode
             full_template_validation: crate::validation::ValidationLevel::Standard,
             min_pool_payout: 0,
+            share_target: JdServerConfig::default().share_target,
         }
     }
 

@@ -46,6 +46,7 @@ fn test_config_coinbase_only() -> JdServerConfig {
         full_template_enabled: false,
         full_template_validation: ValidationLevel::Standard,
         min_pool_payout: 0,
+        share_target: JdServerConfig::default().share_target,
     }
 }
 
@@ -61,6 +62,7 @@ fn test_config_full_template() -> JdServerConfig {
         full_template_enabled: true,
         full_template_validation: ValidationLevel::Standard,
         min_pool_payout: 0,
+        share_target: JdServerConfig::default().share_target,
     }
 }
 
@@ -76,6 +78,7 @@ fn test_config_full_template_minimal() -> JdServerConfig {
         full_template_enabled: true,
         full_template_validation: ValidationLevel::Minimal,
         min_pool_payout: 0,
+        share_target: JdServerConfig::default().share_target,
     }
 }
 
@@ -91,6 +94,7 @@ fn test_config_full_template_strict() -> JdServerConfig {
         full_template_enabled: true,
         full_template_validation: ValidationLevel::Strict,
         min_pool_payout: 0,
+        share_target: JdServerConfig::default().share_target,
     }
 }
 

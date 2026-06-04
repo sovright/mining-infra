@@ -9,13 +9,18 @@
 use std::sync::Arc;
 use std::time::Duration;
 use zcash_jd_server::codec::{
-    decode_allocate_token, decode_push_solution, encode_allocate_token, encode_push_solution,
+    decode_allocate_token, decode_push_solution, decode_set_custom_job_success,
+    encode_allocate_token, encode_push_solution, encode_set_custom_job_success,
 };
 use zcash_jd_server::{
     AllocateMiningJobToken, JdServer, JdServerConfig, JobDeclarationMode, PushSolution,
-    SetCustomMiningJob, ValidationLevel,
+    SetCustomMiningJob, SetCustomMiningJobSuccess, ValidationLevel,
 };
 use zcash_pool_common::PayoutTracker;
+
+/// Distinctive share target used by the test configuration so tests can assert
+/// the pool-granted target is threaded all the way through.
+const TEST_SHARE_TARGET: [u8; 32] = [0x7e; 32];
 
 /// Create a test configuration
 fn test_config() -> JdServerConfig {
@@ -29,6 +34,7 @@ fn test_config() -> JdServerConfig {
         full_template_enabled: false,
         full_template_validation: ValidationLevel::Standard,
         min_pool_payout: 0,
+        share_target: TEST_SHARE_TARGET,
     }
 }
 
@@ -100,6 +106,35 @@ async fn test_job_declaration_flow() {
     assert_eq!(success.channel_id, 1);
     assert_eq!(success.request_id, 2);
     assert!(success.job_id > 0);
+
+    // The pool grants a share target (chosen by the pool, never the client) and
+    // returns it in the success message.
+    assert_eq!(success.share_target, TEST_SHARE_TARGET);
+
+    // The same target is recorded in the stored job for later share validation.
+    let stored = server
+        .token_manager()
+        .find_job_by_id(success.job_id)
+        .unwrap();
+    assert_eq!(stored.share_target, TEST_SHARE_TARGET);
+}
+
+#[test]
+fn test_set_custom_job_success_share_target_roundtrip() {
+    let original = SetCustomMiningJobSuccess {
+        channel_id: 7,
+        request_id: 99,
+        job_id: 1234,
+        share_target: [0xa5; 32],
+    };
+
+    let encoded = encode_set_custom_job_success(&original).unwrap();
+    let decoded = decode_set_custom_job_success(&encoded).unwrap();
+
+    assert_eq!(decoded.channel_id, original.channel_id);
+    assert_eq!(decoded.request_id, original.request_id);
+    assert_eq!(decoded.job_id, original.job_id);
+    assert_eq!(decoded.share_target, original.share_target);
 }
 
 #[test]

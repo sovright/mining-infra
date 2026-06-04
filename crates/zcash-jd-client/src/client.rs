@@ -111,6 +111,11 @@ pub struct JdClient {
     current_token: Arc<RwLock<Option<Vec<u8>>>>,
     /// Current job ID assigned by the pool
     current_job_id: Arc<RwLock<Option<u32>>>,
+    /// Pool-granted share target for the current declared job.
+    ///
+    /// The pool chooses this and returns it in `SetCustomMiningJobSuccess`. A
+    /// later task reads it to relay/validate per-share work for declared jobs.
+    current_share_target: Arc<RwLock<Option<[u8; 32]>>>,
     /// Mode granted by the pool (may differ from requested)
     granted_mode: Arc<RwLock<JobDeclarationMode>>,
     /// Transaction data cache for Full-Template mode (txid -> raw tx)
@@ -146,6 +151,7 @@ impl JdClient {
             template_provider: Arc::new(template_provider),
             current_token: Arc::new(RwLock::new(None)),
             current_job_id: Arc::new(RwLock::new(None)),
+            current_share_target: Arc::new(RwLock::new(None)),
             granted_mode: Arc::new(RwLock::new(JobDeclarationMode::CoinbaseOnly)),
             tx_cache: Arc::new(RwLock::new(HashMap::new())),
         })
@@ -376,12 +382,19 @@ impl JdClient {
             message_types::SET_CUSTOM_MINING_JOB_SUCCESS => {
                 let response = decode_set_custom_job_success(&full_message)?;
                 info!(
-                    "Job declared: job_id={}, height={}",
-                    response.job_id, template.height
+                    "Job declared: job_id={}, height={}, share_target={}",
+                    response.job_id,
+                    template.height,
+                    hex::encode(response.share_target)
                 );
 
                 let mut job_id = self.current_job_id.write().await;
                 *job_id = Some(response.job_id);
+                drop(job_id);
+
+                // Remember the pool-granted share target for later share relay/validation.
+                let mut share_target = self.current_share_target.write().await;
+                *share_target = Some(response.share_target);
             }
             message_types::SET_CUSTOM_MINING_JOB_ERROR => {
                 let error = decode_set_custom_job_error(&full_message)?;
@@ -526,6 +539,11 @@ impl JdClient {
     /// Get the current job ID
     pub async fn current_job_id(&self) -> Option<u32> {
         *self.current_job_id.read().await
+    }
+
+    /// Get the pool-granted share target for the current declared job.
+    pub async fn current_share_target(&self) -> Option<[u8; 32]> {
+        *self.current_share_target.read().await
     }
 
     /// Get the current template from the provider
