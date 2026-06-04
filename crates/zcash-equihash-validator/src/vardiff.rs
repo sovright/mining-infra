@@ -620,58 +620,79 @@ mod tests {
         assert!(diff > 100.0, "many shares: difficulty must increase, got {:.2}", diff);
     }
 
-    /// Kills mutants on line 205 (> vs <) and line 206 (* vs + or /).
-    /// When ratio > 0 (has shares), smoothing applies: final = current*0.5 + new*0.5.
-    /// When ratio == 0 (no shares), NO smoothing: final = new_difficulty directly.
+    /// Verifies the two phase-dependent adjustment formulas of the dead-zone/EMA
+    /// algorithm, using a deterministic ratio (the test sets `last_retarget` and
+    /// `shares_since_retarget` directly instead of relying on wall-clock timing).
     ///
-    /// The smoothing formula for ratio > 0:
-    ///   new_difficulty = current * ratio (clamped)
-    ///   final = current * 0.5 + new_difficulty * 0.5
-    ///        = current * 0.5 + current * ratio * 0.5
-    ///        = current * (1 + ratio) / 2
+    /// RampUp + moderate ratio (dead_zone_upper < ratio <= ramp_threshold):
+    ///   transitions to SteadyState and applies EMA smoothing:
+    ///   final = ema_alpha * (current * ratio) + (1 - ema_alpha) * current
+    ///   With current=100, ratio=2, alpha=0.3: final = 0.3*200 + 0.7*100 = 130
     ///
-    /// For zero shares (ratio == 0):
-    ///   adjustment = 0.5 (fallback)
-    ///   new_difficulty = current * 0.5
-    ///   final = new_difficulty (no smoothing) = current * 0.5
+    /// RampUp + extreme ratio (> ramp_threshold):
+    ///   aggressive unsmoothed jump: final = current * ratio (clamped to max)
     #[test]
     fn test_smoothing_formula_with_shares() {
-        // We want a known ratio. The simplest: set initial_difficulty to 100,
-        // produce shares such that ratio > 1.25 (outside tolerance), then verify
-        // the exact smoothing math.
-        //
-        // With many shares in a tiny interval, ratio is huge.
-        // new_difficulty = 100 * ratio, clamped to max_difficulty
-        // final = 100 * 0.5 + min(100*ratio, max) * 0.5
-        //
-        // If we set max_difficulty = 200 and produce enough shares for ratio > 2:
-        // new_difficulty = 200 (clamped)
-        // final = 100*0.5 + 200*0.5 = 50 + 100 = 150
+        // --- EMA path: ratio = 2.0 ---
         let config = VardiffConfig {
             initial_difficulty: 100.0,
             min_difficulty: 1.0,
-            max_difficulty: 200.0,
-            retarget_interval: Duration::from_millis(1),
+            max_difficulty: 1_000_000.0,
+            retarget_interval: Duration::from_secs(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
             ..Default::default()
         };
         let mut controller = VardiffController::new(config);
+        // 10 shares over exactly one minute at target 5/min -> ratio = 2.0,
+        // inside (dead_zone_upper=1.2, ramp_threshold=4.0] -> EMA transition.
+        controller.last_retarget = Instant::now() - Duration::from_secs(60);
+        controller.shares_since_retarget = 10;
 
-        // Record enough shares to get a huge ratio (clamped at max)
-        for _ in 0..1000 {
-            controller.record_share();
-        }
-        std::thread::sleep(Duration::from_millis(5));
+        let result = controller.maybe_retarget();
+        assert!(result.is_some(), "ratio 2.0 is outside the dead zone, must retarget");
+        let diff = result.unwrap();
+        // final = 0.3 * (100 * 2.0) + 0.7 * 100 = 130
+        // (loose tolerance absorbs the sub-millisecond elapsed() drift)
+        assert!(
+            (diff - 130.0).abs() < 1.0,
+            "EMA-smoothed difficulty should be ~130.0 (0.3*raw + 0.7*current), got {:.4}",
+            diff
+        );
+        assert_eq!(
+            controller.phase(),
+            VardiffPhase::SteadyState,
+            "moderate ratio must transition RampUp -> SteadyState"
+        );
+
+        // --- Aggressive path: ratio far above ramp_threshold ---
+        let config = VardiffConfig {
+            initial_difficulty: 100.0,
+            min_difficulty: 1.0,
+            max_difficulty: 200.0,
+            retarget_interval: Duration::from_secs(1),
+            target_shares_per_minute: 5.0,
+            variance_tolerance: 0.25,
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        // 1000 shares over one minute -> ratio = 200, way above ramp_threshold=4.
+        controller.last_retarget = Instant::now() - Duration::from_secs(60);
+        controller.shares_since_retarget = 1000;
 
         let result = controller.maybe_retarget();
         assert!(result.is_some(), "must retarget with extreme share rate");
         let diff = result.unwrap();
-        // final = current*0.5 + max_difficulty*0.5 = 100*0.5 + 200*0.5 = 150
+        // Unsmoothed jump current * ratio = 20000, clamped to max_difficulty = 200.
         assert!(
-            (diff - 150.0).abs() < 0.1,
-            "smoothed difficulty should be 150.0 (current*0.5 + max*0.5), got {:.4}",
+            (diff - 200.0).abs() < 0.1,
+            "aggressive ramp-up should jump to max_difficulty 200.0, got {:.4}",
             diff
+        );
+        assert_eq!(
+            controller.phase(),
+            VardiffPhase::RampUp,
+            "extreme ratio must stay in RampUp (no smoothing)"
         );
     }
 
@@ -1105,37 +1126,40 @@ mod tests {
         );
     }
 
-    /// Verifies that within-tolerance ratio returns None from maybe_retarget.
-    /// This kills mutants on the tolerance bound comparisons (lines 183-184, 186).
-    /// We use a carefully constructed scenario where ratio is exactly 1.0 by
-    /// ensuring actual_rate == target_rate.
+    /// Verifies that a ratio inside the dead zone returns None from maybe_retarget.
+    /// This kills mutants on the dead-zone bound comparisons.
+    /// Uses a deterministic ratio: `last_retarget` and `shares_since_retarget`
+    /// are set directly so actual_rate == target_rate (ratio = 1.0).
     #[test]
     fn test_within_tolerance_no_retarget() {
-        // Strategy: use retarget_interval=100ms, target=5/min, record 0 shares initially
-        // to trigger one retarget and lower difficulty. Then for the second window,
-        // we need ratio in [0.75, 1.25].
-        //
-        // Alternative approach: verify that after reset, recording 0 shares makes
-        // ratio=0 (outside tolerance). This is already covered. Instead, let's
-        // verify the boundary by checking that for extreme tolerance (0.99),
-        // almost any ratio is within bounds and returns None.
         let config = VardiffConfig {
             initial_difficulty: 100.0,
             min_difficulty: 1.0,
             max_difficulty: 1_000_000.0,
-            retarget_interval: Duration::from_millis(1),
+            retarget_interval: Duration::from_secs(1),
             target_shares_per_minute: 5.0,
-            // Very wide tolerance: ratio must be outside [0.01, 1.99] to trigger
-            variance_tolerance: 0.99,
+            variance_tolerance: 0.25,
             ..Default::default()
         };
-        // With variance_tolerance=0.99: lower_bound = 0.01, upper_bound = 1.99
-        // The validated() method requires tolerance < 1.0, so 0.99 is fine.
-        let validated = config.validated();
-        assert!((validated.variance_tolerance - 0.99).abs() < 0.001);
+        let mut ctrl = VardiffController::new(config);
+        // 5 shares over exactly one minute at target 5/min -> ratio = 1.0,
+        // inside the dead zone [0.8, 1.2] -> no retarget.
+        ctrl.last_retarget = Instant::now() - Duration::from_secs(60);
+        ctrl.shares_since_retarget = 5;
+        assert!(
+            ctrl.maybe_retarget().is_none(),
+            "ratio 1.0 is inside the dead zone, must not retarget"
+        );
+        assert_eq!(
+            ctrl.current_difficulty(),
+            100.0,
+            "difficulty must be unchanged inside the dead zone"
+        );
+        // The dead-zone pass resets the window.
+        assert_eq!(ctrl.shares_since_retarget, 0, "window must reset after check");
 
-        // This test verifies the complementary case: retarget interval
-        // NOT elapsed should always return None regardless of shares.
+        // Complementary case: before the interval elapses, share counts below the
+        // early-retarget threshold (4x expected shares per interval) return None.
         let config2 = VardiffConfig {
             initial_difficulty: 100.0,
             min_difficulty: 1.0,
@@ -1146,10 +1170,33 @@ mod tests {
             ..Default::default()
         };
         let mut ctrl = VardiffController::new(config2);
-        // Even with extreme shares, no retarget before interval
-        for _ in 0..10000 {
+        // Expected shares per 3600s interval = 5 * 60 = 300; early-retarget
+        // triggers above 1200. Stay below it.
+        for _ in 0..100 {
             ctrl.record_share();
         }
-        assert!(ctrl.maybe_retarget().is_none());
+        assert!(
+            ctrl.maybe_retarget().is_none(),
+            "below early-retarget threshold, must not retarget before interval"
+        );
+
+        // And above the early-retarget threshold the controller retargets
+        // immediately, without waiting out the interval (new-design behavior).
+        let mut ctrl = VardiffController::new(VardiffConfig {
+            initial_difficulty: 100.0,
+            min_difficulty: 1.0,
+            max_difficulty: 1_000_000.0,
+            retarget_interval: Duration::from_secs(3600),
+            target_shares_per_minute: 5.0,
+            variance_tolerance: 0.25,
+            ..Default::default()
+        });
+        for _ in 0..10_000 {
+            ctrl.record_share();
+        }
+        assert!(
+            ctrl.maybe_retarget().is_some(),
+            "far above early-retarget threshold, must retarget before interval"
+        );
     }
 }
