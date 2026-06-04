@@ -42,10 +42,10 @@ zcash-pool-server (main orchestrator)
 ├── zcash-equihash-validator    # Share validation + vardiff algorithm
 ├── zcash-pool-common           # Shared types (PayoutTracker)
 ├── zcash-jd-server             # Job Declaration Server (miner-controlled templates)
-├── bedrock-noise               # Noise_NK encryption
-├── bedrock-strata              # Prometheus metrics, tracing
-├── bedrock-forge               # Compact block relay
-└── forge-sidecar               # FORGE relay sidecar binary
+├── sovright-noise              # Noise_NK encryption
+├── sovright-telemetry          # Prometheus metrics, tracing
+├── sovright-relay              # Compact block relay
+└── sovright-relay-sidecar      # Relay sidecar binary (relay-sidecar)
 
 zcash-jd-client (standalone binary)
 ├── zcash-template-provider
@@ -61,7 +61,7 @@ zcash-jd-client (standalone binary)
 4. **ShareProcessor** validates solutions using **EquihashValidator**
 5. **VardiffController** adjusts per-miner difficulty targeting ~5 shares/min
 6. **PayoutTracker** records PPS contributions
-7. Found blocks announced to **ForgeRelay** then submitted to Zebra
+7. Found blocks announced to the **relay network** (`RelayHandle`) then submitted to Zebra
 
 ### Key Zcash-Specific Details
 
@@ -87,6 +87,7 @@ zcash-jd-client (standalone binary)
 | `crates/zcash-equihash-validator/src/vardiff.rs` | Adaptive difficulty |
 | `crates/zcash-template-provider/src/provider.rs` | Zebra RPC integration |
 | `crates/zcash-jd-server/src/server.rs` | Job Declaration Server |
+| `crates/zcash-pool-server/src/relay.rs` | Relay integration (`RelayHandle`, `relay` feature) |
 
 ## Configuration
 
@@ -97,7 +98,7 @@ Pool server config fields:
 - `initial_difficulty`: Starting share difficulty
 - `target_shares_per_minute`: Vardiff target (default 5.0)
 - `jd_listen_addr`: Optional Job Declaration port (3334)
-- `forge_relay_*`: Optional FORGE relay settings
+- `relay_*`: Optional relay settings (`relay_enabled`, `relay_peers`, `relay_bind_addr`, `relay_auth_key`, `relay_data_shards`, `relay_parity_shards`)
 - `noise_*`: Optional Noise encryption keypair
 
 ## External Dependencies

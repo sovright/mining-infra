@@ -73,7 +73,7 @@ network = "Mainnet"
 ### 3. Generate Noise Keypair
 
 ```bash
-cargo run --release -p bedrock-noise --example generate_keys
+cargo run --release -p sovright-noise --example generate_keys
 
 # Output:
 # Private key: 7a8b9c...  (KEEP SECRET)

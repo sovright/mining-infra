@@ -34,7 +34,7 @@ The EROSION attack exploits BGP (Border Gateway Protocol) hijacking to intercept
 
 **Code Analysis:**
 
-In `crates/bedrock-noise/src/transport.rs`, decryption failures return an error:
+In `crates/sovright-noise/src/transport.rs`, decryption failures return an error:
 
 ```rust
 transport
@@ -135,7 +135,7 @@ This directly steals mining revenue from victims.
 
 **Code Analysis:**
 
-The Noise_NK pattern provides server authentication in `crates/bedrock-noise/src/handshake.rs`:
+The Noise_NK pattern provides server authentication in `crates/sovright-noise/src/handshake.rs`:
 
 ```rust
 let mut handshake = builder
@@ -191,7 +191,7 @@ This provides:
 
 **Code Analysis:**
 
-In `crates/bedrock-noise/src/transport.rs`, messages are processed without sequence validation:
+In `crates/sovright-noise/src/transport.rs`, messages are processed without sequence validation:
 
 ```rust
 pub async fn read_message(&mut self) -> io::Result<Vec<u8>> {

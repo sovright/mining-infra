@@ -206,7 +206,7 @@ writer.write_all(&solution)?;  // Raw bytes, no hex
 #### Step 5: Add Noise Support (Optional but Recommended)
 
 ```rust
-use bedrock_noise::{NoiseInitiator, PublicKey};
+use sovright_noise::{NoiseInitiator, PublicKey};
 
 // Before: plain TCP
 let stream = TcpStream::connect(pool_addr)?;

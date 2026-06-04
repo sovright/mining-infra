@@ -1,6 +1,29 @@
-# Bedrock Pool Server — Testnet Deployment
+# Sovright Pool Server — Testnet Deployment
 
-This documents the internal testnet deployment of the Bedrock Zcash Stratum V2 mining pool on GCP.
+This documents the internal testnet deployment of the Sovright Zcash Stratum V2 mining pool on GCP.
+
+## Breaking changes from the Bedrock-era naming
+
+The project was rebranded from Bedrock/Forge to Sovright. The rename touches operationally significant surfaces. Anything deployed against the old names must be migrated:
+
+**Config keys (`forge_*` → `relay_*`)** — update pool server config files:
+
+| Old key | New key |
+|---------|---------|
+| `forge_relay_enabled` | `relay_enabled` |
+| `forge_relay_peers` | `relay_peers` |
+| `forge_bind_addr` | `relay_bind_addr` |
+| `forge_auth_key` | `relay_auth_key` |
+| `forge_data_shards` | `relay_data_shards` |
+| `forge_parity_shards` | `relay_parity_shards` |
+
+(The `noise_*` keys are unchanged.)
+
+**Prometheus metrics** — `bedrock_pool_*` → `sovright_pool_*` (and in the V1 proxy, `bedrock_v1_proxy_*` → `sovright_v1_stratum_proxy_*`). All Grafana dashboards and alerting rules referencing the old metric names must be updated.
+
+**Binary** — `forge-sidecar` → `relay-sidecar` (built from the `sovright-relay-sidecar` crate). Update any systemd units, Dockerfiles, or process supervisors that invoke the old binary name.
+
+**Testnet network name** — `BedrockTestnet` → `SovrightTestnet`. Nodes on different network names will not peer; all nodes must be redeployed together so they share the new `network_name`.
 
 ## Infrastructure
 
@@ -44,7 +67,7 @@ curl -s -X POST -H 'Content-Type: application/json' \
 
 **Rebuild:**
 ```bash
-cd ~/bedrock
+cd ~/mining-infra
 docker build -t zebra-internal-miner testnet/
 docker stop zebra-testnet && docker rm zebra-testnet
 docker run -d --name zebra-testnet \
@@ -81,7 +104,7 @@ curl -s http://127.0.0.1:9090/metrics | head -20
 screen -X -S pool quit
 
 # Rebuild and restart
-cd ~/bedrock
+cd ~/mining-infra
 git pull
 screen -dmS pool bash -c 'cargo run --release --example run_pool_testnet -p zcash-pool-server 2>&1 | tee /tmp/pool.log'
 ```
@@ -96,10 +119,10 @@ Submits dummy shares to the pool server for protocol-level testing.
 
 **Run on the VM (Docker):**
 ```bash
-cd ~/bedrock
-docker build -f testnet/Dockerfile.test-miner -t bedrock-test-miner .
+cd ~/mining-infra
+docker build -f testnet/Dockerfile.test-miner -t sovright-test-miner .
 docker run -d --name test-miner --network host \
-  bedrock-test-miner --pool 127.0.0.1:3333 --rate 5
+  sovright-test-miner --pool 127.0.0.1:3333 --rate 5
 
 # View output
 docker logs -f test-miner
@@ -134,15 +157,15 @@ Currently open ports:
 |------|---------|------|
 | 18232 | Zebra RPC | Opened during initial setup |
 | 3333 | Stratum V2 | Opened during initial setup |
-| 8080 | Bedrock API | `bedrock-product-testnet` |
-| 3000 | Frontend | `bedrock-product-testnet` |
+| 8080 | Sovright API | `sovright-product-testnet` |
+| 3000 | Frontend | `sovright-product-testnet` |
 
 ```bash
 # Add product stack ports (run once)
-gcloud compute firewall-rules create bedrock-product-testnet \
+gcloud compute firewall-rules create sovright-product-testnet \
   --allow tcp:3000,tcp:8080 \
   --source-ranges 0.0.0.0/0 \
-  --target-tags bedrock-testnet \
+  --target-tags sovright-testnet \
   --project mining-pool-491623
 ```
 
@@ -163,9 +186,9 @@ GCP VM: zebra-testnet (34.72.217.47)
 ├── Test Miner (Docker)
 │   └── Connects to pool at 127.0.0.1:3333
 │
-└── Product Stack (see Bedrock-product/deployment.md)
+└── Product Stack (see Sovright-product/deployment.md)
     ├── TimescaleDB: 127.0.0.1:5433
-    ├── Bedrock API: 0.0.0.0:8080
+    ├── Sovright API: 0.0.0.0:8080
     │   ├── Polls pool Prometheus (127.0.0.1:9090)
     │   └── Calls Zebra RPC (127.0.0.1:18232) for payouts
     └── Frontend: 0.0.0.0:3000
