@@ -316,8 +316,10 @@ mod tests {
 
     #[test]
     fn test_token_rate_limiting() {
-        let mut config = JdServerConfig::default();
-        config.max_tokens_per_client = 3;
+        let config = JdServerConfig {
+            max_tokens_per_client: 3,
+            ..Default::default()
+        };
         let manager = TokenManager::new(config);
 
         // Should succeed: tokens 1, 2, 3

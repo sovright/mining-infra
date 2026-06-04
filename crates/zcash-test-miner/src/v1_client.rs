@@ -90,9 +90,9 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
     let (solution_tx, mut solution_rx) =
         mpsc::channel::<(String, Vec<u8>, u32, Vec<u8>)>(32);
 
-    // Current job for solver thread
-    let current_job: Arc<std::sync::Mutex<Option<(V1Job, Vec<u8>, usize)>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    // Current job for solver thread: (job, serialized header prefix, nonce_2 size).
+    type SharedCurrentJob = Arc<std::sync::Mutex<Option<(V1Job, Vec<u8>, usize)>>>;
+    let current_job: SharedCurrentJob = Arc::new(std::sync::Mutex::new(None));
     let current_job_id = Arc::new(AtomicU32::new(0));
 
     // Spawn solver thread (reuses same Equihash logic as V2 mode)

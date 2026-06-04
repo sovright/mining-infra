@@ -506,8 +506,8 @@ mod tests {
     /// Kill mutants on lines 180-181:
     /// - `before - miners.len()` vs `before + miners.len()` (line 180)
     /// - `removed > 0` vs `removed == 0` / `removed < 0` / `removed >= 0` (line 181)
-    /// Uses partial removal so before != 0 and miners.len() != 0 after retain,
-    /// making `before - miners.len()` differ from `before + miners.len()`.
+    ///   Uses partial removal so before != 0 and miners.len() != 0 after retain,
+    ///   making `before - miners.len()` differ from `before + miners.len()`.
     #[test]
     fn test_cleanup_stale_miners_partial_removal() {
         let tracker = PayoutTracker::new(Duration::from_millis(100));

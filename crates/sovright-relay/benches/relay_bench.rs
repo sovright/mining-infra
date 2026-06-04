@@ -7,8 +7,14 @@ use sovright_relay::{
     TestMempool, TxId, WtxId,
 };
 
+/// A transaction's wtxid paired with its serialized bytes.
+type BenchTransaction = (WtxId, Vec<u8>);
+
+/// A synthetic block: its hash, the serialized header, and its transactions.
+type BenchBlock = (BlockHash, Vec<u8>, Vec<BenchTransaction>);
+
 /// Create a synthetic block for benchmarking
-fn create_bench_block(tx_count: usize, tx_size: usize) -> (BlockHash, Vec<u8>, Vec<(WtxId, Vec<u8>)>) {
+fn create_bench_block(tx_count: usize, tx_size: usize) -> BenchBlock {
     let mut header = vec![0u8; 1487];
     header[0..4].copy_from_slice(&4u32.to_le_bytes());
 

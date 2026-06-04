@@ -30,7 +30,5 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      # Warnings are not yet denied: the codebase carries pre-existing clippy
-      # warnings. Tighten to `-- -D warnings` once they are cleaned up.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --workspace --all-targets -- -D warnings

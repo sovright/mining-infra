@@ -9,8 +9,11 @@ use sovright_relay::{
     RelayConfig, RelayNode, ShortId, TestMempool, WtxId,
 };
 
-// Import test fixtures
+// Import test fixtures. This module is shared test support code loaded by
+// several integration-test binaries via `#[path]`; the duplicate load is
+// intentional and restructuring the test tree is out of scope here.
 #[path = "../fixtures/mod.rs"]
+#[allow(clippy::duplicate_mod)]
 mod fixtures;
 use fixtures::blocks::{create_synthetic_block, create_testnet_block, TestBlock};
 

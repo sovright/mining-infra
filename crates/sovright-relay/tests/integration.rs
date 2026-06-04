@@ -88,7 +88,7 @@ fn round_trip_with_missing_transactions() {
     let tx2 = make_wtxid(2);
     let tx3 = make_wtxid(3);
 
-    let tx_data = vec![
+    let tx_data = [
         vec![0u8; 50],   // coinbase
         vec![1u8; 100],  // tx1
         vec![2u8; 9000], // tx2 (large shielded tx)

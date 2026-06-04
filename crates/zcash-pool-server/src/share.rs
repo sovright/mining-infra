@@ -273,11 +273,10 @@ mod tests {
         };
         let result = processor.validate_share_with_job(&valid_time_share, &job, &detector, &block_target).unwrap();
         // Should NOT be rejected for timestamp - will be rejected for invalid solution instead
-        match result.result {
-            ShareResult::Rejected(RejectReason::Other(_)) => {
-                panic!("Valid timestamp should not trigger timestamp rejection");
-            }
-            _ => {} // Any other result (accepted or rejected for solution) is fine
+        // Any result other than an Other-rejection (accepted or rejected for
+        // solution) is fine.
+        if let ShareResult::Rejected(RejectReason::Other(_)) = result.result {
+            panic!("Valid timestamp should not trigger timestamp rejection");
         }
     }
 

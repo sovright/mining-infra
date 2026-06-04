@@ -510,8 +510,10 @@ mod tests {
 
     #[test]
     fn relay_node_validates_config() {
-        let mut config = RelayConfig::default();
-        config.data_shards = 0; // Invalid
+        let config = RelayConfig {
+            data_shards: 0, // Invalid
+            ..Default::default()
+        };
 
         let result = RelayNode::new(config);
         assert!(result.is_err());

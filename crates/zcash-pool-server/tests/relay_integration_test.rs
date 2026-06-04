@@ -10,10 +10,12 @@ mod relay_tests {
     /// Test that RelayHandle can be created with valid config
     #[test]
     fn test_relay_creation() {
-        let mut config = PoolConfig::default();
-        config.relay_enabled = true;
-        config.relay_peers = vec!["127.0.0.1:8336".parse().unwrap()];
-        config.relay_auth_key = Some([0x42; 32]);
+        let config = PoolConfig {
+            relay_enabled: true,
+            relay_peers: vec!["127.0.0.1:8336".parse().unwrap()],
+            relay_auth_key: Some([0x42; 32]),
+            ..Default::default()
+        };
 
         let relay = RelayHandle::new(&config);
         assert!(relay.is_ok(), "RelayHandle should create successfully");
@@ -22,9 +24,11 @@ mod relay_tests {
     /// Test that RelayHandle fails with empty peers
     #[test]
     fn test_relay_requires_peers() {
-        let mut config = PoolConfig::default();
-        config.relay_enabled = true;
-        config.relay_peers = vec![]; // Empty!
+        let config = PoolConfig {
+            relay_enabled: true,
+            relay_peers: vec![], // Empty!
+            ..Default::default()
+        };
 
         let relay = RelayHandle::new(&config);
         assert!(relay.is_err(), "RelayHandle should fail with empty peers");

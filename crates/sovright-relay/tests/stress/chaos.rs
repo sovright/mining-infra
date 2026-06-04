@@ -9,11 +9,16 @@ use sovright_relay::{
     StubPowValidator, ShortId, WtxId,
 };
 
+// The harness/ and fixtures/ modules are shared test support code loaded by
+// several integration-test binaries via `#[path]`. The duplicate load is
+// intentional and restructuring the test tree is out of scope here.
 #[path = "../harness/mod.rs"]
+#[allow(clippy::duplicate_mod)]
 mod harness;
 use harness::network::{NetworkConditions, PacketFate, SimulatedNetwork};
 
 #[path = "../fixtures/mod.rs"]
+#[allow(clippy::duplicate_mod)]
 mod fixtures;
 use fixtures::blocks::{create_synthetic_block, TestBlock};
 
@@ -163,7 +168,6 @@ async fn stress_concurrent_senders() {
     let mut sender_handles = Vec::new();
 
     for sender_id in 0..num_senders {
-        let addr = addr;
         sender_handles.push(tokio::spawn(async move {
             let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let chunk_data = vec![sender_id as u8; 512];

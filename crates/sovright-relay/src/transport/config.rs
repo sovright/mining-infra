@@ -280,19 +280,25 @@ mod tests {
         assert!(valid_config.validate().is_ok());
 
         // Invalid data shards
-        let mut config = RelayConfig::default();
-        config.data_shards = 0;
+        let config = RelayConfig {
+            data_shards: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         // Invalid parity shards
-        let mut config = RelayConfig::default();
-        config.parity_shards = 0;
+        let config = RelayConfig {
+            parity_shards: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
 
         // Too many shards
-        let mut config = RelayConfig::default();
-        config.data_shards = 200;
-        config.parity_shards = 100;
+        let config = RelayConfig {
+            data_shards: 200,
+            parity_shards: 100,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
     }
 

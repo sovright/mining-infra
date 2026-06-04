@@ -131,6 +131,9 @@ impl ProxyConfig {
         Ok(config)
     }
 
+    // Each argument maps to one optional CLI override for a distinct config
+    // field; grouping them into a struct would just duplicate the config type.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_overrides(
         &mut self,
         listen: Option<SocketAddr>,

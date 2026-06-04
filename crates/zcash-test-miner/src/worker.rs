@@ -533,8 +533,8 @@ mod tests {
         assert_eq!(target[30], 0xff);
         assert_eq!(target[29], 0xff);
         // All other bytes should be zero
-        for i in 0..29 {
-            assert_eq!(target[i], 0, "byte {i} should be zero");
+        for (i, byte) in target.iter().enumerate().take(29) {
+            assert_eq!(*byte, 0, "byte {i} should be zero");
         }
     }
 
