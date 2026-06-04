@@ -292,13 +292,20 @@ impl JdClient {
                     }
                 }
                 _ = flush.tick() => {
-                    if !batcher.is_empty() {
-                        for batch in batcher.flush_all() {
-                            if let Err(e) = self.relay_shares(&mut transport, batch).await {
-                                error!("Share relay flush error: {}", e);
-                                break;
-                            }
+                    // A flush-time relay failure is fatal, exactly like the
+                    // eager relay arm above: either way the JD transport is
+                    // broken, so we tear down rather than silently dropping
+                    // batches against a dead connection.
+                    let mut fatal = None;
+                    for batch in batcher.flush_all() {
+                        if let Err(e) = self.relay_shares(&mut transport, batch).await {
+                            error!("Share relay flush error: {}", e);
+                            fatal = Some(e);
+                            break;
                         }
+                    }
+                    if let Some(e) = fatal {
+                        break Err(e);
                     }
                 }
             }
@@ -690,9 +697,11 @@ impl JdClient {
         }
     }
 
-    /// Get the share-relay sender, wiring it on first call.
+    /// Get a handle to the shared current-declared-job state.
     ///
-    /// Used by tests and by `run()` to inject shares as if from the listener.
+    /// This is the same state the downstream listener reads to serve declared
+    /// jobs to the proxy; exposed for tests and for callers that wire the
+    /// listener externally.
     pub fn declared_job_state(&self) -> Arc<DeclaredJobState> {
         self.declared_job_state.clone()
     }

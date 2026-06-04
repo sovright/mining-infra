@@ -40,6 +40,12 @@ use zcash_mining_protocol::messages::{
 const MAX_SEEN_SHARES: usize = 10_000;
 
 /// Maximum read-buffer size for a single downstream connection (64 KB).
+///
+/// This cap assumes a single well-behaved proxy downstream (the SV1->V2
+/// translator). A `SubmitEquihashShare` frame is ~1.4 KB, so 64 KB comfortably
+/// holds several pipelined submissions; it is a backstop against a misbehaving
+/// peer streaming bytes without a frame boundary, not a multi-tenant fairness
+/// mechanism.
 const MAX_BUFFER_SIZE: usize = 65_536;
 
 /// A locally-validated share to relay to the pool, plus the side effects the
@@ -70,6 +76,16 @@ struct BlockSink {
 /// batched relay to the pool. `push_tx` carries block-meeting shares so the JD
 /// loop can also send a `PushSolution`. Block submission to Zebra happens
 /// in-session via `submitter`.
+///
+/// HEAD-OF-LINE / BACKPRESSURE: every session funnels its accepted shares
+/// through the single bounded `relay_tx`, and the JD session loop relays them
+/// over one serialized JD transport (one `SubmitSharesJd` in flight at a time,
+/// awaiting the pool's response). A slow pool response therefore backpressures
+/// `relay_tx.send` and, once the channel fills, the submitting session's
+/// `handle_share` await — this is the intended degradation mode (the design
+/// assumes a single trusted proxy downstream, so cross-session fairness is a
+/// non-goal; correctness of credit, owned by the pool, takes precedence over
+/// relay throughput).
 pub async fn run_listener(
     listen_addr: SocketAddr,
     state: Arc<DeclaredJobState>,
@@ -117,7 +133,15 @@ struct DownstreamSession {
     block_sink: BlockSink,
     peer: SocketAddr,
     /// Per-session dedup of seen share keys (register-before-verify).
+    ///
+    /// Dedup scope is per-job (matching the pool side): the set is cleared
+    /// whenever the session's current job_id changes, so the [`MAX_SEEN_SHARES`]
+    /// cap bounds a single job's distinct shares rather than the connection's
+    /// lifetime. See `last_job_id`.
     seen_shares: HashSet<[u8; 32]>,
+    /// The job_id the `seen_shares` set is currently scoped to, if any. When a
+    /// share arrives for a different job, the dedup set is reset.
+    last_job_id: Option<u32>,
 }
 
 impl DownstreamSession {
@@ -136,6 +160,7 @@ impl DownstreamSession {
             block_sink,
             peer,
             seen_shares: HashSet::new(),
+            last_job_id: None,
         }
     }
 
@@ -153,7 +178,11 @@ impl DownstreamSession {
 
         loop {
             tokio::select! {
-                // Job updates from the JD session loop.
+                // Job updates from the JD session loop. The watch channel
+                // coalesces intentionally: if several declarations land between
+                // wakeups we only ever read the newest via `current()`, which is
+                // exactly what we want — stale intermediate jobs must not be
+                // served to the proxy.
                 changed = updates.changed() => {
                     if changed.is_err() {
                         // State dropped; nothing more to serve.
@@ -272,6 +301,17 @@ impl DownstreamSession {
                 .await;
         }
 
+        // Dedup is per-job: when the current job_id changes, the previous job's
+        // seen-share keys are irrelevant (and could falsely reject distinct
+        // shares of the new job once the cap is hit). Reset the set on every
+        // job transition so MAX_SEEN_SHARES bounds a single job, not the whole
+        // connection. (The job-update select arm is where a new job is served;
+        // resetting here also covers the share path directly.)
+        if self.last_job_id != Some(job.job_id) {
+            self.seen_shares.clear();
+            self.last_job_id = Some(job.job_id);
+        }
+
         // 2. Reassemble the full nonce (validates nonce_2 length == 28).
         let Some(nonce) = share_path::reassemble_nonce(&self.nonce_1, &share.nonce_2) else {
             return self
@@ -307,18 +347,18 @@ impl DownstreamSession {
         // 5. Verify the Equihash solution against the share target.
         let outcome = share_path::verify_share(&job, share.time, &nonce, &share.solution);
 
+        // Respond downstream via the outcome's wire mapping (single source of
+        // truth for outcome -> ShareResult), then handle relay/block side
+        // effects only on acceptance.
+        self.respond(writer, seq, outcome.to_share_result()).await?;
+
         match outcome {
-            ShareOutcome::Rejected(reason) => {
-                self.respond(writer, seq, ShareResult::Rejected(reason))
-                    .await
-            }
+            ShareOutcome::Rejected(_) => Ok(()),
             ShareOutcome::Accepted {
                 nonce,
                 meets_block_target,
             } => {
-                // 6. Respond Accepted immediately, then queue for relay.
-                self.respond(writer, seq, ShareResult::Accepted).await?;
-
+                // 6. Share accepted: queue for relay to the pool.
                 let relay = RelayShare {
                     job_id: job.job_id,
                     share: JdShare {

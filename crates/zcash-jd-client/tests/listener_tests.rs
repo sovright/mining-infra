@@ -273,6 +273,59 @@ async fn duplicate_share_rejected() {
 }
 
 #[tokio::test]
+async fn dedup_set_resets_on_job_change() {
+    // A share registered under job A must NOT be treated as a duplicate of a
+    // byte-identical-keyed share submitted under job B: dedup scope is per-job.
+    let (addr, state, _relay, _push) = spawn_listener().await;
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+
+    // Job A (job_id 20). Submit a garbage share -> InvalidSolution, key
+    // registered under job A's dedup scope.
+    state.set(sample_job(20)).await;
+    let frame_a = try_read_frame(&mut stream, Duration::from_secs(2))
+        .await
+        .expect("job A");
+    let job_a = decode_new_equihash_job(&frame_a).unwrap();
+    let channel_id = job_a.channel_id;
+
+    let share_a = make_share(channel_id, 1, 20, 28, 0x05);
+    stream.write_all(&share_a).await.unwrap();
+    let r_a = try_read_frame(&mut stream, Duration::from_secs(2))
+        .await
+        .expect("response A");
+    assert_eq!(
+        decode_submit_shares_response(&r_a).unwrap().result,
+        ShareResult::Rejected(RejectReason::InvalidSolution)
+    );
+
+    // Job update to job B (job_id 21). channel_id (hence nonce_1) is stable
+    // per session, so the SAME nonce_2/time/solution yields the SAME dedup key.
+    state.set(sample_job(21)).await;
+    let frame_b = try_read_frame(&mut stream, Duration::from_secs(2))
+        .await
+        .expect("job B");
+    let job_b = decode_new_equihash_job(&frame_b).unwrap();
+    assert_eq!(job_b.job_id, 21);
+    assert_eq!(job_b.channel_id, channel_id);
+
+    // Submit the colliding-key share under job B. If the per-job dedup set were
+    // NOT reset, this would be Duplicate. With the reset it must reach verify
+    // and be rejected InvalidSolution.
+    let share_b = make_share(channel_id, 2, 21, 28, 0x05);
+    stream.write_all(&share_b).await.unwrap();
+    let r_b = try_read_frame(&mut stream, Duration::from_secs(2))
+        .await
+        .expect("response B");
+    let resp_b = decode_submit_shares_response(&r_b).unwrap();
+    assert_eq!(resp_b.sequence_number, 2);
+    assert_eq!(
+        resp_b.result,
+        ShareResult::Rejected(RejectReason::InvalidSolution),
+        "dedup set should reset on job change, not falsely report Duplicate"
+    );
+}
+
+#[tokio::test]
 async fn unexpected_message_type_ignored() {
     let (addr, state, _relay, _push) = spawn_listener().await;
     let (mut stream, _channel_id) = connect_with_job(addr, &state, 14).await;
