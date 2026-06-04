@@ -2,7 +2,7 @@
 use libfuzzer_sys::fuzz_target;
 use snow::Builder;
 
-/// Noise NK pattern used by bedrock-noise
+/// Noise NK pattern used by sovright-noise
 const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
 
 fuzz_target!(|data: &[u8]| {

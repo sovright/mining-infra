@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zcash-mining-protocol = { path = "../zcash-mining-protocol" }
-bedrock-noise = { path = "../bedrock-noise" }
+sovright-noise = { path = "../sovright-noise" }
 equihash = { workspace = true, features = ["solver"] }
 tokio = { workspace = true }
 tracing = { workspace = true }

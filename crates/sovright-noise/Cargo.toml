@@ -1,9 +1,9 @@
 [package]
-name = "bedrock-noise"
+name = "sovright-noise"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Noise Protocol encryption for Bedrock mining infrastructure"
+description = "Noise Protocol encryption for Sovright mining infrastructure"
 
 [dependencies]
 snow = "0.9"

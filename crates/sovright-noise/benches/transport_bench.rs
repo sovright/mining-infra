@@ -1,14 +1,14 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use bedrock_noise::handshake::{NoiseInitiator, NoiseResponder};
-use bedrock_noise::keys::Keypair;
+use sovright_noise::handshake::{NoiseInitiator, NoiseResponder};
+use sovright_noise::keys::Keypair;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::runtime::Runtime;
 
 /// Set up a Noise-encrypted client/server pair over localhost TCP.
 async fn make_noise_pair() -> (
-    bedrock_noise::NoiseStream<TcpStream>,
-    bedrock_noise::NoiseStream<TcpStream>,
+    sovright_noise::NoiseStream<TcpStream>,
+    sovright_noise::NoiseStream<TcpStream>,
 ) {
     let server_keypair = Keypair::generate();
     let server_public = server_keypair.public.clone();

@@ -4,7 +4,7 @@ use tokio::net::TcpStream;
 use tracing::info;
 use zcash_mining_protocol::codec::MessageFrame;
 
-use bedrock_noise::{NoiseInitiator, NoiseStream, PublicKey};
+use sovright_noise::{NoiseInitiator, NoiseStream, PublicKey};
 
 pub enum MinerTransport {
     Plain {

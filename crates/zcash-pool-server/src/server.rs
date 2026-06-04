@@ -37,7 +37,7 @@ use zcash_jd_server::{
     JdTransport,
 };
 use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
-use bedrock_noise::{Keypair, NoiseResponder};
+use sovright_noise::{Keypair, NoiseResponder};
 use bedrock_strata::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
 use zcash_template_provider::types::BlockTemplate;
 use zcash_template_provider::{SubmitBlockResult, SubmitMode, TemplateProvider, TemplateProviderConfig};

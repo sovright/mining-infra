@@ -1,6 +1,6 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use bedrock_noise::Keypair;
+use sovright_noise::Keypair;
 
 fuzz_target!(|data: &[u8]| {
     // Fuzz Keypair::from_private with arbitrary 32-byte arrays

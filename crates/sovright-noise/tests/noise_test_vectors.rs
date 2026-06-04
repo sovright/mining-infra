@@ -5,7 +5,7 @@
 
 use snow::Builder;
 
-/// The pattern string that bedrock-noise must use.
+/// The pattern string that sovright-noise must use.
 const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
 
 /// Fixed server private key (32 bytes) for deterministic tests.
@@ -166,11 +166,11 @@ fn test_handshake_message_lengths() {
 fn test_noise_pattern_string_matches() {
     // Regression anchor: verify the crate's NOISE_PATTERN constant
     assert_eq!(
-        bedrock_noise::NOISE_PATTERN,
+        sovright_noise::NOISE_PATTERN,
         "Noise_NK_25519_ChaChaPoly_BLAKE2s",
         "NOISE_PATTERN must be exactly Noise_NK_25519_ChaChaPoly_BLAKE2s"
     );
 
     // Also verify it parses successfully as a snow pattern
-    let _params: snow::params::NoiseParams = bedrock_noise::NOISE_PATTERN.parse().unwrap();
+    let _params: snow::params::NoiseParams = sovright_noise::NOISE_PATTERN.parse().unwrap();
 }

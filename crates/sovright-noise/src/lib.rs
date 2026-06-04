@@ -1,4 +1,4 @@
-//! Noise Protocol encryption for Bedrock mining infrastructure
+//! Noise Protocol encryption for Sovright mining infrastructure
 //!
 //! Implements the Noise NK handshake pattern as specified by SV2.
 //! - Server has static keypair (known to clients)

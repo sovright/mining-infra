@@ -27,7 +27,7 @@ zcash-template-provider = { path = "../zcash-template-provider" }
 zcash-jd-server = { path = "../zcash-jd-server" }
 zcash-mining-protocol = { path = "../zcash-mining-protocol" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
-bedrock-noise = { path = "../bedrock-noise" }
+sovright-noise = { path = "../sovright-noise" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 
 [dev-dependencies]

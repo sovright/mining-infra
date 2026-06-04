@@ -18,7 +18,7 @@ zcash-mining-protocol = { path = "../zcash-mining-protocol" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 zcash-jd-server = { path = "../zcash-jd-server" }
-bedrock-noise = { path = "../bedrock-noise" }
+sovright-noise = { path = "../sovright-noise" }
 bedrock-strata = { path = "../bedrock-strata" }
 bedrock-forge = { path = "../bedrock-forge", optional = true }
 byteorder.workspace = true

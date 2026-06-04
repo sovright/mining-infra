@@ -1,4 +1,4 @@
-# bedrock-noise
+# sovright-noise
 
 > Formerly `zcash-stratum-noise`.
 
@@ -16,7 +16,7 @@ Implements the Noise NK handshake pattern as used by SV2:
 ### Server Side
 
 ```rust
-use bedrock_noise::{Keypair, NoiseResponder};
+use sovright_noise::{Keypair, NoiseResponder};
 
 let keypair = Keypair::generate();
 println!("Public key: {}", keypair.public);
@@ -28,7 +28,7 @@ let encrypted_stream = responder.accept(tcp_stream).await?;
 ### Client Side
 
 ```rust
-use bedrock_noise::{NoiseInitiator, PublicKey};
+use sovright_noise::{NoiseInitiator, PublicKey};
 
 let server_key = PublicKey::from_hex("...")?;
 let initiator = NoiseInitiator::new(server_key);

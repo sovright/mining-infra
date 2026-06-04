@@ -44,7 +44,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d036a3c4ab069c7b410a2ce876bd74808d2d0888a82667669f8e783a898bf1"
 
 [[package]]
-name = "bedrock-noise"
+name = "sovright-noise"
 version = "0.1.0"
 dependencies = [
  "hex",
@@ -58,10 +58,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "bedrock-noise-fuzz"
+name = "sovright-noise-fuzz"
 version = "0.0.0"
 dependencies = [
- "bedrock-noise",
+ "sovright-noise",
  "libfuzzer-sys",
  "snow",
 ]

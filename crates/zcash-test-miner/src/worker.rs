@@ -7,7 +7,7 @@ use rand::Rng;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
-use bedrock_noise::PublicKey;
+use sovright_noise::PublicKey;
 use zcash_mining_protocol::codec::encode_submit_share;
 use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult, SubmitEquihashShare};
 

@@ -20,7 +20,7 @@ use zcash_mining_protocol::messages::{
     message_types, NewEquihashJob, SetTarget, ShareResult, SubmitEquihashShare,
     SubmitSharesResponse,
 };
-use bedrock_noise::NoiseStream;
+use sovright_noise::NoiseStream;
 
 /// Messages sent from session to server
 #[derive(Debug)]

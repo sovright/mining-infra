@@ -6,7 +6,7 @@ mod worker;
 use clap::Parser;
 use tokio::sync::watch;
 
-use bedrock_noise::PublicKey;
+use sovright_noise::PublicKey;
 use worker::{run_worker, WorkerConfig};
 
 #[derive(Parser, Debug)]

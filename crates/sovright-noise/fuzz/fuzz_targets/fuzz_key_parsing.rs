@@ -1,7 +1,7 @@
 #![no_main]
 use libfuzzer_sys::fuzz_target;
-use bedrock_noise::PublicKey;
-use bedrock_noise::Keypair;
+use sovright_noise::PublicKey;
+use sovright_noise::Keypair;
 
 fuzz_target!(|data: &[u8]| {
     // Fuzz PublicKey::from_hex with arbitrary bytes interpreted as a string
