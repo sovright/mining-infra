@@ -13,6 +13,12 @@ const MAX_SHARES_PER_JOB: usize = 100_000;
 
 /// Trait for duplicate share detection
 pub trait DuplicateDetector: Send + Sync {
+    /// Start a new job epoch.
+    ///
+    /// This clears stale entries for a reused job ID before shares for the new
+    /// epoch are recorded.
+    fn start_job(&self, job_id: u32);
+
     /// Check if a share is a duplicate (and record it if not)
     /// Returns true if it IS a duplicate, false if it's new
     fn check_and_record(&self, job_id: u32, nonce_2: &[u8], solution: &[u8]) -> bool;
@@ -72,6 +78,16 @@ impl Default for InMemoryDuplicateDetector {
 }
 
 impl DuplicateDetector for InMemoryDuplicateDetector {
+    fn start_job(&self, job_id: u32) {
+        let mut jobs = self.jobs.write().unwrap_or_else(|e| {
+            warn!(
+                "Duplicate detector lock was poisoned in start_job, recovering"
+            );
+            e.into_inner()
+        });
+        jobs.remove(&job_id);
+    }
+
     fn check_and_record(&self, job_id: u32, nonce_2: &[u8], solution: &[u8]) -> bool {
         let hash = Self::hash_share(nonce_2, solution);
 
@@ -212,5 +228,20 @@ mod tests {
         // Jobs 2 and 3 still have their state, so same shares are duplicates
         assert!(detector.check_and_record(2, &nonce_2, &solution));
         assert!(detector.check_and_record(3, &nonce_2, &solution));
+    }
+
+    #[test]
+    fn test_start_job_clears_stale_duplicate_state_for_reused_id() {
+        let detector = InMemoryDuplicateDetector::new();
+
+        let nonce_2 = vec![0x01, 0x02, 0x03];
+        let solution = vec![0xaa; 1344];
+
+        assert!(!detector.check_and_record(1, &nonce_2, &solution));
+        assert!(detector.check_and_record(1, &nonce_2, &solution));
+
+        detector.start_job(1);
+
+        assert!(!detector.check_and_record(1, &nonce_2, &solution));
     }
 }

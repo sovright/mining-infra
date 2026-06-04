@@ -34,10 +34,14 @@ fuzz_target!(|data: &[u8]| {
             | SequenceCheckResult::StaleSequence => {}
         }
 
-        // If the result was processable (Valid or ValidOutOfOrder or GapTooLarge),
-        // the sequence was added to the window, so re-validating must be Replay.
+        // If the result was accepted (Valid or ValidOutOfOrder), the sequence
+        // was added to the window, so re-validating must be Replay.
         // StaleSequence does NOT add to window, so re-validate could be Stale again.
-        if result != SequenceCheckResult::StaleSequence {
+        // GapTooLarge does NOT advance state (a rejected jump must not poison
+        // the validator), so re-validating yields GapTooLarge again.
+        if result != SequenceCheckResult::StaleSequence
+            && result != SequenceCheckResult::GapTooLarge
+        {
             let replay_result = validator.validate(channel_id, sequence);
             assert_eq!(
                 replay_result,

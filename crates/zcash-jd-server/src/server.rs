@@ -32,6 +32,31 @@ use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
 use sovright_noise::NoiseStream;
 
+const MAX_JOB_ID: u32 = u32::MAX - 1;
+
+fn next_positive_job_id(counter: &AtomicU32) -> u32 {
+    loop {
+        let current = counter.load(Ordering::SeqCst);
+        let job_id = if current == 0 || current > MAX_JOB_ID {
+            1
+        } else {
+            current
+        };
+        let next = if job_id >= MAX_JOB_ID {
+            1
+        } else {
+            job_id + 1
+        };
+
+        if counter
+            .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return job_id;
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CurrentTemplateContext {
     pub version: u32,
@@ -400,7 +425,7 @@ impl JdServer {
             .await?;
 
         // 5. Allocate job_id
-        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let job_id = next_positive_job_id(&self.next_job_id);
 
         // 6. Store job info with token
         let job_info = DeclaredJobInfo {
@@ -765,7 +790,7 @@ impl JdServer {
         token_info: &crate::token::MiningJobToken,
     ) -> Result<u32> {
         // Generate job ID
-        let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);
+        let job_id = next_positive_job_id(&self.next_job_id);
 
         // Store job info with token
         let job_info = DeclaredJobInfo {
@@ -1140,6 +1165,7 @@ pub async fn handle_jd_client_with_transport(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     fn test_config() -> JdServerConfig {
@@ -1218,6 +1244,37 @@ mod tests {
         assert_eq!(response.channel_id, 1);
         assert_eq!(response.request_id, 2);
         assert!(response.job_id > 0);
+    }
+
+    #[tokio::test]
+    async fn test_declare_job_wraps_reserved_job_ids_to_one() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        let prev_hash = [0xaa; 32];
+        server.set_current_prev_hash(prev_hash).await;
+        server.next_job_id.store(u32::MAX, Ordering::SeqCst);
+
+        let token_response = server
+            .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
+            .unwrap();
+
+        let job_request = SetCustomMiningJob {
+            channel_id: 1,
+            request_id: 2,
+            mining_job_token: token_response.mining_job_token,
+            version: 5,
+            prev_hash,
+            merkle_root: [0xbb; 32],
+            block_commitments: [0xcc; 32],
+            coinbase_tx: minimal_tx(),
+            time: 1700000000,
+            bits: 0x1d00ffff,
+        };
+
+        let response = server.handle_declare_job(job_request).await.unwrap();
+        assert_eq!(response.job_id, 1);
     }
 
     #[tokio::test]
