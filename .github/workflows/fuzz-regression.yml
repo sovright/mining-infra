@@ -34,7 +34,7 @@ jobs:
           key: fuzz-mining-${{ matrix.target }}-${{ hashFiles('crates/zcash-mining-protocol/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/zcash-mining-protocol
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-sovright-relay:
     runs-on: ubuntu-latest
@@ -58,7 +58,7 @@ jobs:
           key: fuzz-relay-${{ matrix.target }}-${{ hashFiles('crates/sovright-relay/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/sovright-relay
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-jd-server:
     runs-on: ubuntu-latest
@@ -90,7 +90,7 @@ jobs:
           key: fuzz-jd-${{ matrix.target }}-${{ hashFiles('crates/zcash-jd-server/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/zcash-jd-server
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-equihash-validator:
     runs-on: ubuntu-latest
@@ -115,7 +115,7 @@ jobs:
           key: fuzz-equihash-${{ matrix.target }}-${{ hashFiles('crates/zcash-equihash-validator/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/zcash-equihash-validator
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-pool-common:
     runs-on: ubuntu-latest
@@ -139,7 +139,7 @@ jobs:
           key: fuzz-pool-common-${{ matrix.target }}-${{ hashFiles('crates/zcash-pool-common/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/zcash-pool-common
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-template-provider:
     runs-on: ubuntu-latest
@@ -164,7 +164,7 @@ jobs:
           key: fuzz-template-${{ matrix.target }}-${{ hashFiles('crates/zcash-template-provider/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/zcash-template-provider
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-sovright-relay-sidecar:
     runs-on: ubuntu-latest
@@ -188,7 +188,7 @@ jobs:
           key: fuzz-sidecar-${{ matrix.target }}-${{ hashFiles('crates/sovright-relay-sidecar/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/sovright-relay-sidecar
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-sovright-noise:
     runs-on: ubuntu-latest
@@ -212,7 +212,7 @@ jobs:
           key: fuzz-noise-${{ matrix.target }}-${{ hashFiles('crates/sovright-noise/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/sovright-noise
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-pool-server:
     runs-on: ubuntu-latest
@@ -235,4 +235,4 @@ jobs:
           key: fuzz-pool-server-${{ matrix.target }}-${{ hashFiles('crates/zcash-pool-server/**/*.rs') }}
       - name: Run corpus regression
         working-directory: crates/zcash-pool-server
-        run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
