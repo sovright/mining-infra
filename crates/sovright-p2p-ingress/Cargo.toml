@@ -1,0 +1,18 @@
+[package]
+name = "sovright-p2p-ingress"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Native Zcash P2P ingress daemon for the Sovright relay network"
+repository.workspace = true
+
+[dependencies]
+sovright-relay = { path = "../sovright-relay" }
+blake2b_simd = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

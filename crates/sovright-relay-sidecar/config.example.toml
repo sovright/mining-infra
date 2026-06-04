@@ -17,6 +17,36 @@ relay_peers = [
 # Local bind address for UDP socket
 bind_addr = "0.0.0.0:0"
 
+# FEC profile for relay traffic. These values must match the relay nodes and
+# any P2P ingress bridge sending into the same canary path.
+data_shards = 10
+parity_shards = 3
+
 # Template poll interval in milliseconds
 # Lower = faster detection, higher CPU usage
 poll_interval_ms = 100
+
+# Announce local Zebra templates into the relay network.
+# Keep true for a tip-synced pool sidecar; set false for receive-only dry runs.
+announce_templates = true
+
+# Receive reconstructed compact blocks from the Sovright relay client.
+# Dry-run receive is safe for observability; it does not call submitblock.
+receive_relay_blocks = false
+
+# Submit eligible relay-received blocks to Zebra.
+# Requires receive_relay_blocks = true. Keep false until mainnet cutover signoff.
+enable_submitblock = false
+
+# Bounds for incomplete segmented raw blocks received from the relay network.
+raw_segment_max_incomplete_blocks = 128
+raw_segment_max_payload_bytes = 67108864
+raw_segment_ttl_secs = 120
+
+# Optional client-side UDP pacing for outbound relay announcements.
+# Zero disables pacing. Useful for large raw-block fallback drills.
+send_burst_packets = 0
+send_burst_delay_micros = 0
+
+# Optional Prometheus textfile for receive/reassembly/submit metrics.
+# metrics_textfile = "/var/lib/sovright-relay-sidecar/metrics.prom"

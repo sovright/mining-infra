@@ -67,12 +67,7 @@ impl CompactBlockBuilder {
 
     /// Compute header hash for short ID calculation
     fn compute_header_hash(&self) -> [u8; 32] {
-        use sha2::{Digest, Sha256};
-        let first = Sha256::digest(&self.header);
-        let second = Sha256::digest(first);
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&second);
-        hash
+        crate::zcash_block_hash(&self.header)
     }
 }
 

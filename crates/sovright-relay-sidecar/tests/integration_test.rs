@@ -26,6 +26,18 @@ fn sidecar_help() {
         stdout.contains("--config"),
         "Expected help text to contain '--config'"
     );
+    assert!(
+        stdout.contains("--receive-relay-blocks"),
+        "Expected help text to contain '--receive-relay-blocks'"
+    );
+    assert!(
+        stdout.contains("--disable-template-announcements"),
+        "Expected help text to contain '--disable-template-announcements'"
+    );
+    assert!(
+        stdout.contains("--enable-submitblock"),
+        "Expected help text to contain '--enable-submitblock'"
+    );
 }
 
 /// Test configuration parsing

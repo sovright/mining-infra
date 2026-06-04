@@ -7,11 +7,6 @@ use std::io;
 /// Protocol magic number: "ZCHR" (Zcash Relay)
 pub const CHUNK_MAGIC: u32 = 0x5A434852;
 
-/// Maximum payload size to fit in standard MTU
-/// MTU (1500) - IP header (20) - UDP header (8) - Chunk header (44) = 1428
-/// Round down to 1396 for safety
-pub const MAX_PAYLOAD_SIZE: usize = 1396;
-
 /// Chunk header size in bytes (version 2 with HMAC)
 pub const HEADER_SIZE: usize = 76;
 
@@ -20,6 +15,17 @@ pub const HEADER_SIZE_V1: usize = 44;
 
 /// Version 2 header size (with HMAC)
 pub const HEADER_SIZE_V2: usize = 76;
+
+/// Conservative UDP datagram budget for authenticated relay packets.
+pub const MAX_AUTHENTICATED_DATAGRAM_SIZE: usize = 1200;
+
+/// Maximum FEC payload bytes per relay chunk.
+///
+/// Production relays require authenticated version-2 chunks, so the full UDP
+/// datagram is `HEADER_SIZE_V2 + payload`. Keeping the datagram at 1200 bytes
+/// avoids fragmentation on tunneled/cloud paths while leaving room for IP/UDP
+/// headers.
+pub const MAX_PAYLOAD_SIZE: usize = MAX_AUTHENTICATED_DATAGRAM_SIZE - HEADER_SIZE_V2;
 
 /// Maximum allowed chunks per block
 pub const MAX_TOTAL_CHUNKS: u16 = 256;
@@ -35,6 +41,8 @@ pub enum MessageType {
     Keepalive = 1,
     /// Authentication handshake
     Auth = 2,
+    /// Segmented raw block object chunk
+    RawBlockSegment = 3,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -45,6 +53,7 @@ impl TryFrom<u8> for MessageType {
             0 => Ok(MessageType::Block),
             1 => Ok(MessageType::Keepalive),
             2 => Ok(MessageType::Auth),
+            3 => Ok(MessageType::RawBlockSegment),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid message type: {}", value),
@@ -83,10 +92,42 @@ impl ChunkHeader {
         total_chunks: u16,
         payload_len: u16,
     ) -> Self {
+        Self::new(
+            MessageType::Block,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )
+    }
+
+    /// Create a new chunk header for raw block segment data
+    pub fn new_raw_block_segment(
+        object_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+    ) -> Self {
+        Self::new(
+            MessageType::RawBlockSegment,
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )
+    }
+
+    fn new(
+        msg_type: MessageType,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+    ) -> Self {
         Self {
             magic: CHUNK_MAGIC,
             version: 1,
-            msg_type: MessageType::Block,
+            msg_type,
             block_hash: *block_hash,
             chunk_id,
             total_chunks,
@@ -103,14 +144,64 @@ impl ChunkHeader {
         payload_len: u16,
         hmac: [u8; 32],
     ) -> Self {
+        Self::new_authenticated(
+            MessageType::Block,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )
+    }
+
+    /// Create a new authenticated raw block segment chunk header
+    pub fn new_raw_block_segment_authenticated(
+        object_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        hmac: [u8; 32],
+    ) -> Self {
+        Self::new_authenticated(
+            MessageType::RawBlockSegment,
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )
+    }
+
+    fn new_authenticated(
+        msg_type: MessageType,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        hmac: [u8; 32],
+    ) -> Self {
         Self {
             magic: CHUNK_MAGIC,
             version: 2,
-            msg_type: MessageType::Block,
+            msg_type,
             block_hash: *block_hash,
             chunk_id,
             total_chunks,
             payload_len,
+            hmac,
+        }
+    }
+
+    /// Create a new authenticated keepalive header.
+    pub fn new_keepalive_authenticated(hmac: [u8; 32]) -> Self {
+        Self {
+            magic: CHUNK_MAGIC,
+            version: 2,
+            msg_type: MessageType::Keepalive,
+            block_hash: [0u8; 32],
+            chunk_id: 0,
+            total_chunks: 0,
+            payload_len: 0,
             hmac,
         }
     }
@@ -142,7 +233,10 @@ impl ChunkHeader {
         if magic != CHUNK_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("invalid magic: expected {:08x}, got {:08x}", CHUNK_MAGIC, magic),
+                format!(
+                    "invalid magic: expected {:08x}, got {:08x}",
+                    CHUNK_MAGIC, magic
+                ),
             ));
         }
 
@@ -164,7 +258,10 @@ impl ChunkHeader {
         if total_chunks > MAX_TOTAL_CHUNKS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("total_chunks {} exceeds max {}", total_chunks, MAX_TOTAL_CHUNKS),
+                format!(
+                    "total_chunks {} exceeds max {}",
+                    total_chunks, MAX_TOTAL_CHUNKS
+                ),
             ));
         }
         let payload_len = u16::from_be_bytes([buf[42], buf[43]]);
@@ -177,10 +274,11 @@ impl ChunkHeader {
                 ),
             ));
         }
-        if msg_type == MessageType::Block && payload_len == 0 {
+        if matches!(msg_type, MessageType::Block | MessageType::RawBlockSegment) && payload_len == 0
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "payload_len must be > 0 for block messages",
+                "payload_len must be > 0 for data messages",
             ));
         }
 
@@ -352,12 +450,7 @@ mod tests {
     #[test]
     fn rejects_total_chunks_over_max() {
         let block_hash = [0xab; 32];
-        let header = ChunkHeader::new_block(
-            &block_hash,
-            0,
-            MAX_TOTAL_CHUNKS.saturating_add(1),
-            10,
-        );
+        let header = ChunkHeader::new_block(&block_hash, 0, MAX_TOTAL_CHUNKS.saturating_add(1), 10);
         let bytes = header.to_bytes();
 
         let result = ChunkHeader::from_bytes(&bytes);
@@ -391,5 +484,16 @@ mod tests {
         assert_eq!(parsed.header.version, 2);
         assert_eq!(parsed.header.hmac, hmac);
         assert_eq!(parsed.payload, payload);
+    }
+
+    #[test]
+    fn authenticated_max_payload_fits_datagram_budget() {
+        let block_hash = [0xcd; 32];
+        let hmac = [0xef; 32];
+        let header =
+            ChunkHeader::new_block_authenticated(&block_hash, 0, 1, MAX_PAYLOAD_SIZE as u16, hmac);
+        let chunk = Chunk::new(header, vec![0xab; MAX_PAYLOAD_SIZE]);
+
+        assert!(chunk.to_bytes().len() <= MAX_AUTHENTICATED_DATAGRAM_SIZE);
     }
 }

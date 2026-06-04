@@ -17,7 +17,10 @@ pub struct GetBlockTxn {
 impl GetBlockTxn {
     /// Create a new request
     pub fn new(block_hash: BlockHash, indexes: Vec<u16>) -> Self {
-        Self { block_hash, indexes }
+        Self {
+            block_hash,
+            indexes,
+        }
     }
 
     /// Create request for unresolved short IDs after reconstruction failure
@@ -41,13 +44,16 @@ impl GetBlockTxn {
                 });
             }
             let diff = idx.saturating_sub(prev);
-            let diff_u16 = u16::try_from(diff)
-                .map_err(|_| CompactBlockError::IndexOverflow { index: idx })?;
+            let diff_u16 =
+                u16::try_from(diff).map_err(|_| CompactBlockError::IndexOverflow { index: idx })?;
             indexes.push(diff_u16);
             prev = idx + 1;
         }
 
-        Ok(Self { block_hash, indexes })
+        Ok(Self {
+            block_hash,
+            indexes,
+        })
     }
 }
 

@@ -7,20 +7,40 @@ pub mod builder;
 pub mod compact_block;
 pub mod error;
 pub mod fec;
+pub mod hash;
 pub mod mempool;
 pub mod messages;
 pub mod reconstructor;
 pub mod relay;
+pub mod segmented_block;
 pub mod transport;
+pub mod tx_feed;
 pub mod types;
 
 pub use builder::CompactBlockBuilder;
 pub use compact_block::{CompactBlock, PrefilledTx};
 pub use error::CompactBlockError;
 pub use fec::FecError;
-pub use mempool::{MempoolError, MempoolProvider, TestMempool};
+pub use hash::zcash_block_hash;
+pub use mempool::{
+    MempoolError, MempoolProvider, TestMempool, TxCache, TxCacheConfig, TxCacheInsertOutcome,
+    TxCacheSnapshot,
+};
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
-pub use transport::{BlockAssembly, BlockChunker, Chunk, ChunkHeader, ClientConfig, EquihashPowValidator, MessageType, PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession, StubPowValidator, TransportError, CHUNK_MAGIC, EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, MAX_PAYLOAD_SIZE, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE};
-pub use relay::{BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode};
+pub use relay::{
+    BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
+    RelayPayload, render_prometheus_text,
+};
+pub use segmented_block::{
+    RawBlockSegment, SegmentedBlockError, reassemble_raw_block, segment_object_hash,
+    split_raw_block,
+};
+pub use transport::{
+    BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,
+    EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, MAX_PAYLOAD_SIZE, MessageType,
+    PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession, StubPowValidator,
+    TransportError, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+};
+pub use tx_feed::{TxFeedError, TxFeedRecord};
 pub use types::{AuthDigest, BlockHash, ShortId, TxId, WtxId};

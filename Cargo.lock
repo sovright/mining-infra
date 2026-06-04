@@ -2625,10 +2625,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovright-p2p-ingress"
+version = "0.1.0"
+dependencies = [
+ "blake2b_simd",
+ "hex",
+ "serde_json",
+ "sha2",
+ "sovright-relay",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sovright-relay"
 version = "0.1.0"
 dependencies = [
  "arbitrary",
+ "blake2b_simd",
  "bytes",
  "criterion",
  "equihash",
@@ -2645,6 +2661,7 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

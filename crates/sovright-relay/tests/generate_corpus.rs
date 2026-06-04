@@ -2,7 +2,7 @@
 //! Run: cargo test -p sovright-relay --features generate-corpus --test generate_corpus
 #![cfg(feature = "generate-corpus")]
 
-use sovright_relay::{ChunkHeader, Chunk, CHUNK_MAGIC};
+use sovright_relay::{CHUNK_MAGIC, Chunk, ChunkHeader};
 use std::fs;
 
 #[test]

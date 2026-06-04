@@ -2,7 +2,7 @@
 
 use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Error type alias for config operations
 type ConfigError = Box<dyn std::error::Error + Send + Sync>;
@@ -24,9 +24,78 @@ pub struct Config {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: String,
 
+    /// Number of FEC data shards for relay traffic.
+    #[serde(default = "default_data_shards")]
+    pub data_shards: usize,
+
+    /// Number of FEC parity shards for relay traffic.
+    #[serde(default = "default_parity_shards")]
+    pub parity_shards: usize,
+
     /// Poll interval in milliseconds
     #[serde(default = "default_poll_interval")]
     pub poll_interval_ms: u64,
+
+    /// Announce local Zebra templates into the relay network.
+    #[serde(default = "default_announce_templates")]
+    pub announce_templates: bool,
+
+    /// Receive relay-reconstructed compact blocks from the relay network.
+    #[serde(default)]
+    pub receive_relay_blocks: bool,
+
+    /// Submit eligible relay-received blocks to Zebra.
+    #[serde(default)]
+    pub enable_submitblock: bool,
+
+    /// Reconstruct short-id compact blocks using the sidecar mempool.
+    #[serde(default)]
+    pub compact_reconstruction_enabled: bool,
+
+    /// Maintain a sidecar-local transaction cache for compact reconstruction.
+    #[serde(default)]
+    pub tx_cache_enabled: bool,
+
+    /// Optional local TCP bind address for transaction-feed ingestion.
+    #[serde(default)]
+    pub tx_feed_bind_addr: Option<String>,
+
+    /// Maximum transactions to keep in the sidecar transaction cache.
+    #[serde(default = "default_tx_cache_max_entries")]
+    pub tx_cache_max_entries: usize,
+
+    /// Maximum total transaction bytes to keep in the sidecar transaction cache.
+    #[serde(default = "default_tx_cache_max_bytes")]
+    pub tx_cache_max_bytes: usize,
+
+    /// Maximum individual transaction payload size to accept into the cache.
+    #[serde(default = "default_tx_cache_max_tx_bytes")]
+    pub tx_cache_max_tx_bytes: usize,
+
+    /// Maximum incomplete raw blocks to buffer while waiting for segments.
+    #[serde(default = "default_raw_segment_max_incomplete_blocks")]
+    pub raw_segment_max_incomplete_blocks: usize,
+
+    /// Maximum total raw segment payload bytes to hold in memory.
+    #[serde(default = "default_raw_segment_max_payload_bytes")]
+    pub raw_segment_max_payload_bytes: usize,
+
+    /// Maximum age for an incomplete raw block segment set.
+    #[serde(default = "default_raw_segment_ttl_secs")]
+    pub raw_segment_ttl_secs: u64,
+
+    /// Number of outbound relay packets to send before applying
+    /// `send_burst_delay_micros`. Zero disables client-side pacing.
+    #[serde(default)]
+    pub send_burst_packets: usize,
+
+    /// Optional client-side delay after each outbound relay packet burst.
+    #[serde(default)]
+    pub send_burst_delay_micros: u64,
+
+    /// Optional Prometheus textfile path for sidecar receive metrics.
+    #[serde(default)]
+    pub metrics_textfile: Option<PathBuf>,
 }
 
 fn default_zebra_url() -> String {
@@ -39,6 +108,42 @@ fn default_bind_addr() -> String {
 
 fn default_poll_interval() -> u64 {
     100
+}
+
+fn default_data_shards() -> usize {
+    10
+}
+
+fn default_parity_shards() -> usize {
+    3
+}
+
+fn default_announce_templates() -> bool {
+    true
+}
+
+fn default_raw_segment_max_incomplete_blocks() -> usize {
+    128
+}
+
+fn default_raw_segment_max_payload_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+fn default_raw_segment_ttl_secs() -> u64 {
+    120
+}
+
+fn default_tx_cache_max_entries() -> usize {
+    50_000
+}
+
+fn default_tx_cache_max_bytes() -> usize {
+    128 * 1024 * 1024
+}
+
+fn default_tx_cache_max_tx_bytes() -> usize {
+    2 * 1024 * 1024
 }
 
 impl Config {
@@ -111,6 +216,133 @@ mod tests {
 
         assert_eq!(config.zebra_url, "http://127.0.0.1:8232");
         assert_eq!(config.bind_addr, "0.0.0.0:0");
+        assert_eq!(config.data_shards, 10);
+        assert_eq!(config.parity_shards, 3);
         assert_eq!(config.poll_interval_ms, 100);
+        assert!(config.announce_templates);
+        assert!(!config.receive_relay_blocks);
+        assert!(!config.enable_submitblock);
+        assert!(!config.compact_reconstruction_enabled);
+        assert_eq!(config.raw_segment_max_incomplete_blocks, 128);
+        assert_eq!(config.raw_segment_max_payload_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.raw_segment_ttl_secs, 120);
+        assert_eq!(config.send_burst_packets, 0);
+        assert_eq!(config.send_burst_delay_micros, 0);
+        assert_eq!(config.metrics_textfile, None);
+        assert!(!config.tx_cache_enabled);
+        assert_eq!(config.tx_feed_bind_addr, None);
+        assert_eq!(config.tx_cache_max_entries, 50_000);
+        assert_eq!(config.tx_cache_max_bytes, 128 * 1024 * 1024);
+        assert_eq!(config.tx_cache_max_tx_bytes, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn config_parses_submit_safety_flags() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            announce_templates = false
+            receive_relay_blocks = true
+            enable_submitblock = true
+            compact_reconstruction_enabled = true
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(!config.announce_templates);
+        assert!(config.receive_relay_blocks);
+        assert!(config.enable_submitblock);
+        assert!(config.compact_reconstruction_enabled);
+    }
+
+    #[test]
+    fn config_parses_relay_fec_profile() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            data_shards = 96
+            parity_shards = 32
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.data_shards, 96);
+        assert_eq!(config.parity_shards, 32);
+    }
+
+    #[test]
+    fn config_parses_raw_segment_buffer_limits() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            raw_segment_max_incomplete_blocks = 16
+            raw_segment_max_payload_bytes = 1048576
+            raw_segment_ttl_secs = 30
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.raw_segment_max_incomplete_blocks, 16);
+        assert_eq!(config.raw_segment_max_payload_bytes, 1_048_576);
+        assert_eq!(config.raw_segment_ttl_secs, 30);
+    }
+
+    #[test]
+    fn config_parses_send_pacing() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            send_burst_packets = 32
+            send_burst_delay_micros = 1000
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(config.send_burst_packets, 32);
+        assert_eq!(config.send_burst_delay_micros, 1000);
+    }
+
+    #[test]
+    fn config_parses_metrics_textfile() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            metrics_textfile = "/var/lib/sovright-relay-sidecar/metrics.prom"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            config.metrics_textfile,
+            Some(PathBuf::from("/var/lib/sovright-relay-sidecar/metrics.prom"))
+        );
+    }
+
+    #[test]
+    fn config_parses_tx_cache_provider_settings() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            tx_cache_enabled = true
+            tx_cache_max_entries = 123
+            tx_cache_max_bytes = 456
+            tx_cache_max_tx_bytes = 789
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(config.tx_cache_enabled);
+        assert_eq!(config.tx_cache_max_entries, 123);
+        assert_eq!(config.tx_cache_max_bytes, 456);
+        assert_eq!(config.tx_cache_max_tx_bytes, 789);
+    }
+
+    #[test]
+    fn config_parses_tx_feed_bind_addr() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+            tx_feed_bind_addr = "127.0.0.1:19091"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert_eq!(
+            config.tx_feed_bind_addr,
+            Some("127.0.0.1:19091".to_string())
+        );
     }
 }
