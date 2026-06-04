@@ -395,12 +395,9 @@ impl JdServer {
         }
         drop(current_prev_hash);
 
-        if let Err(error) = self
+        self
             .validate_custom_job_request(&request, &token_info.client_id)
-            .await
-        {
-            return Err(error);
-        }
+            .await?;
 
         // 5. Allocate job_id
         let job_id = self.next_job_id.fetch_add(1, Ordering::SeqCst);

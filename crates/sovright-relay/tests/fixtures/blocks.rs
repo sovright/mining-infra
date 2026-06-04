@@ -52,7 +52,7 @@ pub fn create_synthetic_block(tx_count: usize, tx_size: usize) -> TestBlock {
         hasher.update(&header[..140]);
         let first = hasher.finalize();
         let mut hasher = Sha256::new();
-        hasher.update(&first);
+        hasher.update(first);
         let result = hasher.finalize();
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&result);
@@ -73,7 +73,7 @@ pub fn create_synthetic_block(tx_count: usize, tx_size: usize) -> TestBlock {
             hasher.update(&tx_data);
             let first = hasher.finalize();
             let mut hasher = Sha256::new();
-            hasher.update(&first);
+            hasher.update(first);
             let result = hasher.finalize();
             let mut arr = [0u8; 32];
             arr.copy_from_slice(&result);

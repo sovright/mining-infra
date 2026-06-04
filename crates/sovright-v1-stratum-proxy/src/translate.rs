@@ -29,7 +29,7 @@ pub fn hex_to_bytes(input: &str) -> Result<Vec<u8>, TranslateError> {
     if stripped.is_empty() {
         return Ok(Vec::new());
     }
-    if stripped.len() % 2 != 0 {
+    if !stripped.len().is_multiple_of(2) {
         return Err(TranslateError::new(format!(
             "hex string must contain an even number of digits: '{}'",
             input

@@ -85,7 +85,7 @@ pub fn compute_coinbase_auth_digest(
 /// Compute SHA256d (double SHA-256) transaction ID for v4 transactions.
 pub fn compute_v4_txid(raw_tx: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(raw_tx);
-    let second = Sha256::digest(&first);
+    let second = Sha256::digest(first);
     let mut result = [0u8; 32];
     result.copy_from_slice(&second);
     result

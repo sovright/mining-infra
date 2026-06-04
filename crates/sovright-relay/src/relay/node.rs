@@ -324,11 +324,10 @@ impl<V: PowValidator> RelayNode<V> {
         // chunks yet to extract a header; in that case we keep the current
         // `pow_validated` state (false) and suppress forwarding until a future
         // chunk provides enough data to decide.
-        if is_new && !assembly.pow_validated {
-            if let Some(valid) = self.validate_pow_from_assembly(assembly) {
+        if is_new && !assembly.pow_validated
+            && let Some(valid) = self.validate_pow_from_assembly(assembly) {
                 assembly.pow_validated = valid;
             }
-        }
 
         if !assembly.pow_validated {
             return None;
@@ -336,12 +335,11 @@ impl<V: PowValidator> RelayNode<V> {
 
         let mut ready = Vec::new();
         for (idx, payload) in assembly.chunks.iter().enumerate() {
-            if let Some(data) = payload {
-                if !assembly.forwarded[idx] {
+            if let Some(data) = payload
+                && !assembly.forwarded[idx] {
                     assembly.forwarded[idx] = true;
                     ready.push((idx as u16, data.clone()));
                 }
-            }
         }
 
         if ready.is_empty() {

@@ -460,8 +460,8 @@ impl MinerSession {
         request_id: Value,
         submit: Submit,
     ) -> Result<(), SessionError> {
-        if let Some(worker_name) = &self.worker_name {
-            if submit.worker_name != *worker_name {
+        if let Some(worker_name) = &self.worker_name
+            && submit.worker_name != *worker_name {
                 warn!(
                     expected = %worker_name,
                     got = %submit.worker_name,
@@ -474,7 +474,6 @@ impl MinerSession {
                 .await?;
                 return Ok(());
             }
-        }
 
         let Some(channel_id) = self.channel_id else {
             self.send_json(&messages::submit_error_response(

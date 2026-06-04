@@ -53,15 +53,14 @@ impl MinerTransport {
             }
             MinerTransport::Plain { stream, read_buf } => {
                 loop {
-                    if read_buf.len() >= MessageFrame::HEADER_SIZE {
-                        if let Ok(frame) = MessageFrame::decode(read_buf) {
+                    if read_buf.len() >= MessageFrame::HEADER_SIZE
+                        && let Ok(frame) = MessageFrame::decode(read_buf) {
                             let total = MessageFrame::HEADER_SIZE + frame.length as usize;
                             if read_buf.len() >= total {
                                 let msg: Vec<u8> = read_buf.drain(..total).collect();
                                 return Ok(msg);
                             }
                         }
-                    }
                     let mut tmp = [0u8; 4096];
                     let n = stream.read(&mut tmp).await?;
                     if n == 0 {

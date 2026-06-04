@@ -30,7 +30,7 @@ fn full_round_trip_synchronized_mempools() {
     let nonce = 0xdeadbeef_u64;
 
     let coinbase = make_wtxid(0);
-    let txs: Vec<_> = (1..=10).map(|i| make_wtxid(i)).collect();
+    let txs: Vec<_> = (1..=10).map(make_wtxid).collect();
     let tx_data: Vec<Vec<u8>> = (0..=10).map(|i| vec![i as u8; 100]).collect();
 
     // Sender's view: receiver has all transactions

@@ -131,12 +131,11 @@ impl ReconnectManager {
         let now = Instant::now();
 
         // Check if we should reset backoff
-        if let Some(last) = self.last_connected_at {
-            if now.duration_since(last) > self.config.reset_after_stable {
+        if let Some(last) = self.last_connected_at
+            && now.duration_since(last) > self.config.reset_after_stable {
                 debug!("Connection was stable, resetting backoff");
                 self.reset();
             }
-        }
 
         self.last_connected_at = Some(now);
     }
@@ -162,15 +161,14 @@ impl ReconnectManager {
         });
 
         // Check if we've exceeded max attempts
-        if let Some(max) = self.config.max_attempts {
-            if self.attempt_count >= max {
+        if let Some(max) = self.config.max_attempts
+            && self.attempt_count >= max {
                 warn!(
                     "Maximum reconnection attempts ({}) exceeded",
                     max
                 );
                 return None;
             }
-        }
 
         // Calculate next delay with exponential backoff
         self.attempt_count += 1;

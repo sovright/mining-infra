@@ -16,7 +16,7 @@ fn generate_fuzz_corpus() {
     let frame = MessageFrame { extension_type: 0, msg_type: 0x20, length: 100 };
     fs::write(format!("{}/valid_frame", dir), frame.encode()).unwrap();
     fs::write(format!("{}/empty", dir), &[] as &[u8]).unwrap();
-    fs::write(format!("{}/short", dir), &[0x00, 0x00]).unwrap();
+    fs::write(format!("{}/short", dir), [0x00, 0x00]).unwrap();
 
     // NewEquihashJob corpus
     let dir = format!("{}/fuzz_decode_new_job", corpus_base);

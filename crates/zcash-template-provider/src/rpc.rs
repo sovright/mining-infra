@@ -103,11 +103,10 @@ impl ZebraRpc {
 
         let body: Value = response.json().await?;
 
-        if let Some(error) = body.get("error") {
-            if !error.is_null() {
+        if let Some(error) = body.get("error")
+            && !error.is_null() {
                 return Err(Error::Rpc(error.to_string()));
             }
-        }
 
         let result = body
             .get("result")

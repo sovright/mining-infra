@@ -164,11 +164,10 @@ impl RelaySession {
         let key = ChunkKey { block_hash, chunk_id };
         let now = Instant::now();
 
-        if let Some(seen_at) = self.recent_chunks.get(&key) {
-            if now.duration_since(*seen_at) <= RECENT_CHUNK_TTL {
+        if let Some(seen_at) = self.recent_chunks.get(&key)
+            && now.duration_since(*seen_at) <= RECENT_CHUNK_TTL {
                 return false;
             }
-        }
 
         self.recent_chunks.insert(key, now);
         self.recent_order.push_back((key, now));

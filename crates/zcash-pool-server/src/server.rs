@@ -735,11 +735,10 @@ impl PoolServer {
                 }
 
                 // Track disconnection for attack pattern detection
-                if connection_tracking_enabled {
-                    if connection_tracker.on_disconnect(addr, connected_at, decryption_error) {
+                if connection_tracking_enabled
+                    && connection_tracker.on_disconnect(addr, connected_at, decryption_error) {
                         metrics.inc_flagged_addresses();
                     }
-                }
 
                 // Clean up sequence validator state
                 sequence_validator.remove_channel(channel_id);
@@ -848,12 +847,11 @@ impl PoolServer {
             {
                 let mut channels = self.channels.write().await;
                 for (channel_id, sender) in &session_senders {
-                    if let Some(channel) = channels.get_mut(channel_id) {
-                        if let Some(job) = distributor.create_job(channel, clean_jobs) {
+                    if let Some(channel) = channels.get_mut(channel_id)
+                        && let Some(job) = distributor.create_job(channel, clean_jobs) {
                             channel.add_job(job.clone(), clean_jobs);
                             jobs.push((sender.clone(), job));
                         }
-                    }
                 }
             }
 
@@ -965,8 +963,8 @@ impl PoolServer {
         // Check rate limit BEFORE any expensive validation
         {
             let mut channels = self.channels.write().await;
-            if let Some(channel) = channels.get_mut(&channel_id) {
-                if !channel.check_rate_limit() {
+            if let Some(channel) = channels.get_mut(&channel_id)
+                && !channel.check_rate_limit() {
                     debug!("Rate limiting channel {}", channel_id);
                     return response_tx
                         .send(ShareResult::Rejected(
@@ -975,7 +973,6 @@ impl PoolServer {
                         .map_err(|_| PoolError::ChannelSend)
                         .map(|_| ());
                 }
-            }
         }
 
         // Get block target
@@ -1144,13 +1141,12 @@ impl PoolServer {
         };
 
         // Apply vardiff target update if needed
-        if let Some(target) = maybe_new_target {
-            if let Some(sender) = self.sessions.read().await.get(&channel_id) {
+        if let Some(target) = maybe_new_target
+            && let Some(sender) = self.sessions.read().await.get(&channel_id) {
                 let _ = sender
                     .send(ServerMessage::SetTarget { target })
                     .await;
             }
-        }
 
         // Apply timing jitter before response (mitigates timing attacks)
         if self.config.timing_jitter_enabled {

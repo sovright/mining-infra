@@ -248,7 +248,7 @@ mod tests {
         let result = compute_header_hash(&input);
 
         // Manually compute double-SHA256
-        let first = Sha256::digest(&input);
+        let first = Sha256::digest(input);
         let second = Sha256::digest(first);
         let mut expected = [0u8; 32];
         expected.copy_from_slice(&second);

@@ -20,7 +20,7 @@ fn make_realistic_compact_block() -> CompactBlock {
     let nonce = 0xdeadbeef_u64;
 
     let coinbase = make_wtxid(0);
-    let txs: Vec<_> = (1..=50).map(|i| make_wtxid(i)).collect();
+    let txs: Vec<_> = (1..=50).map(make_wtxid).collect();
 
     let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
     builder.add_transaction(coinbase, vec![0u8; 500]); // Coinbase

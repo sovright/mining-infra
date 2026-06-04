@@ -60,7 +60,7 @@ proptest! {
         let mut controller = VardiffController::new(config);
         controller.set_difficulty(set_to);
         let d = controller.current_difficulty();
-        prop_assert!(d >= 10.0 && d <= 1000.0, "difficulty {} not in [10, 1000]", d);
+        prop_assert!((10.0..=1000.0).contains(&d), "difficulty {} not in [10, 1000]", d);
     }
 
     #[test]

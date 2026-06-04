@@ -324,20 +324,18 @@ impl RelayClient {
             .or_insert_with(|| (BlockAssembly::new(block_hash, total_chunks), 0));
 
         // Drop duplicate chunk to avoid unnecessary work
-        if let Some(existing) = assembly.chunks.get(chunk_id) {
-            if existing.is_some() {
+        if let Some(existing) = assembly.chunks.get(chunk_id)
+            && existing.is_some() {
                 return;
             }
-        }
         // Add chunk
         assembly.add_chunk(chunk_id, chunk.payload);
 
         // Set original length estimate once we know shard size
-        if *original_len == 0 {
-            if let Some(shard) = assembly.chunks.iter().filter_map(|c| c.as_ref()).next() {
+        if *original_len == 0
+            && let Some(shard) = assembly.chunks.iter().filter_map(|c| c.as_ref()).next() {
                 *original_len = shard.len() * self.config.data_shards;
             }
-        }
 
         // Try to reconstruct if we have enough chunks
         if assembly.can_reconstruct(self.config.data_shards) {
@@ -347,19 +345,17 @@ impl RelayClient {
             // Estimate original length from first chunk if available
             let est_len = *original_len;
 
-            if est_len > 0 {
-                if let Ok(block) = self.chunker.chunks_to_compact_block(shard_opts, est_len) {
+            if est_len > 0
+                && let Ok(block) = self.chunker.chunks_to_compact_block(shard_opts, est_len) {
                     // Send to receiver
-                    if let Some(tx) = &self.incoming_tx {
-                        if tx.send(block).await.is_err() {
+                    if let Some(tx) = &self.incoming_tx
+                        && tx.send(block).await.is_err() {
                             warn!("Failed to deliver reconstructed block (receiver dropped)");
                         }
-                    }
                     recent_delivered.insert(block_hash, Instant::now());
                     // Remove from pending
                     pending.remove(&block_hash);
                 }
-            }
         }
     }
 }
