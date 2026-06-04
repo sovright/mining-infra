@@ -1,9 +1,9 @@
 [package]
-name = "bedrock-strata"
+name = "sovright-telemetry"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Strata: Monitoring and analytics layer for Bedrock mining infrastructure"
+description = "Telemetry: monitoring and analytics layer for Sovright mining infrastructure"
 
 [dependencies]
 prometheus = "0.14"

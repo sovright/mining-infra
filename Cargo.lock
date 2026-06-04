@@ -244,22 +244,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bedrock-strata"
-version = "0.1.0"
-dependencies = [
- "hyper 0.14.32",
- "opentelemetry",
- "opentelemetry-otlp",
- "opentelemetry_sdk",
- "prometheus",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-opentelemetry",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "bedrock-v1-proxy"
 version = "0.1.0"
 dependencies = [
@@ -2697,6 +2681,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovright-telemetry"
+version = "0.1.0"
+dependencies = [
+ "hyper 0.14.32",
+ "opentelemetry",
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "prometheus",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3922,7 +3922,6 @@ name = "zcash-pool-server"
 version = "0.1.0"
 dependencies = [
  "bedrock-forge",
- "bedrock-strata",
  "byteorder",
  "criterion",
  "hex",
@@ -3931,6 +3930,7 @@ dependencies = [
  "serde",
  "sha2",
  "sovright-noise",
+ "sovright-telemetry",
  "thiserror 1.0.69",
  "tokio",
  "tracing",

@@ -58,7 +58,7 @@ impl FromStr for LogFormat {
 /// # Example
 ///
 /// ```no_run
-/// use bedrock_strata::{init_logging, LogFormat};
+/// use sovright_telemetry::{init_logging, LogFormat};
 ///
 /// // Initialize with pretty format and info level
 /// init_logging(LogFormat::Pretty, "info");
@@ -105,7 +105,7 @@ pub fn init_logging(format: LogFormat, default_level: &str) {
 /// # Example
 ///
 /// ```no_run
-/// use bedrock_strata::logging::init_logging_from_env;
+/// use sovright_telemetry::logging::init_logging_from_env;
 ///
 /// init_logging_from_env();
 /// ```

@@ -19,7 +19,7 @@ zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 zcash-jd-server = { path = "../zcash-jd-server" }
 sovright-noise = { path = "../sovright-noise" }
-bedrock-strata = { path = "../bedrock-strata" }
+sovright-telemetry = { path = "../sovright-telemetry" }
 bedrock-forge = { path = "../bedrock-forge", optional = true }
 byteorder.workspace = true
 hex.workspace = true

@@ -1,4 +1,4 @@
-//! Observability for Bedrock mining infrastructure
+//! Observability for Sovright mining infrastructure
 //!
 //! Provides:
 //! - Prometheus metrics endpoint

@@ -1,6 +1,6 @@
 //! Prometheus metrics for pool monitoring
 //!
-//! Provides comprehensive metrics for monitoring Bedrock mining infrastructure pool operations
+//! Provides comprehensive metrics for monitoring Sovright mining infrastructure pool operations
 //! including connections, shares, blocks, hashrate, and latency measurements.
 
 use hyper::service::{make_service_fn, service_fn};
@@ -40,7 +40,7 @@ pub struct PoolMetrics {
     /// Total rejected shares, labeled by rejection reason
     pub shares_rejected: IntCounterVec,
 
-    // Per-worker metrics (for Bedrock API ingest)
+    // Per-worker metrics (for Sovright API ingest)
     /// Per-worker hashrate in sol/s
     pub worker_hashrate: prometheus::GaugeVec,
     /// Per-worker accepted shares (counter)
@@ -103,13 +103,13 @@ impl PoolMetrics {
         // Connection metrics
         let connections_total = IntCounter::with_opts(
             Opts::new("pool_connections_total", "Total miner connections established")
-                .namespace("bedrock"),
+                .namespace("sovright"),
         )
         .expect("metric can be created");
 
         let connections_active = IntGauge::with_opts(
             Opts::new("pool_connections_active", "Currently active miner connections")
-                .namespace("bedrock"),
+                .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -118,7 +118,7 @@ impl PoolMetrics {
                 "pool_jd_connections_total",
                 "Total Job Declarator connections established",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -127,32 +127,32 @@ impl PoolMetrics {
                 "pool_jd_connections_active",
                 "Currently active Job Declarator connections",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
         // Share metrics
         let shares_submitted = IntCounterVec::new(
             Opts::new("pool_shares_submitted_total", "Total shares submitted")
-                .namespace("bedrock"),
+                .namespace("sovright"),
             &["difficulty_tier"],
         )
         .expect("metric can be created");
 
         let shares_accepted = IntCounter::with_opts(
             Opts::new("pool_shares_accepted_total", "Total accepted shares")
-                .namespace("bedrock"),
+                .namespace("sovright"),
         )
         .expect("metric can be created");
 
         let shares_rejected = IntCounterVec::new(
             Opts::new("pool_shares_rejected_total", "Total rejected shares")
-                .namespace("bedrock"),
+                .namespace("sovright"),
             &["reason"],
         )
         .expect("metric can be created");
 
-        // Per-worker metrics (names match what Bedrock API ingest expects)
+        // Per-worker metrics (names match what Sovright API ingest expects)
         let worker_hashrate = prometheus::GaugeVec::new(
             Opts::new("hashrate_sol_s", "Worker hashrate in solutions per second"),
             &["worker"],
@@ -203,7 +203,7 @@ impl PoolMetrics {
         // Block metrics
         let blocks_found = IntCounter::with_opts(
             Opts::new("pool_blocks_found_total", "Total blocks found by the pool")
-                .namespace("bedrock"),
+                .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -212,14 +212,14 @@ impl PoolMetrics {
                 "pool_blocks_submitted_total",
                 "Total blocks submitted to the network",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
         // Hashrate
         let estimated_hashrate = Gauge::with_opts(
             Opts::new("pool_estimated_hashrate", "Estimated pool hashrate in H/s")
-                .namespace("bedrock"),
+                .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -229,7 +229,7 @@ impl PoolMetrics {
                 "pool_share_validation_duration_seconds",
                 "Share validation duration in seconds",
             )
-            .namespace("bedrock")
+            .namespace("sovright")
             .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]),
         )
         .expect("metric can be created");
@@ -239,7 +239,7 @@ impl PoolMetrics {
                 "pool_template_fetch_duration_seconds",
                 "Template fetch duration in seconds",
             )
-            .namespace("bedrock")
+            .namespace("sovright")
             .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]),
         )
         .expect("metric can be created");
@@ -250,7 +250,7 @@ impl PoolMetrics {
                 "pool_noise_handshakes_total",
                 "Total Noise handshakes initiated",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -259,7 +259,7 @@ impl PoolMetrics {
                 "pool_noise_handshakes_failed_total",
                 "Total failed Noise handshakes",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -269,7 +269,7 @@ impl PoolMetrics {
                 "pool_decryption_failures_total",
                 "Total decryption failures (potential EROSION attack indicator)",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -278,7 +278,7 @@ impl PoolMetrics {
                 "pool_replay_attempts_total",
                 "Total replay attempts detected",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -287,7 +287,7 @@ impl PoolMetrics {
                 "pool_sequence_anomalies_total",
                 "Total sequence anomalies detected",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -296,7 +296,7 @@ impl PoolMetrics {
                 "pool_flagged_addresses",
                 "Currently flagged suspicious addresses",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -305,7 +305,7 @@ impl PoolMetrics {
                 "pool_short_lived_connections_total",
                 "Total short-lived connections (potential attack indicator)",
             )
-            .namespace("bedrock"),
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -314,7 +314,7 @@ impl PoolMetrics {
                 "pool_connection_duration_seconds",
                 "Connection duration in seconds",
             )
-            .namespace("bedrock")
+            .namespace("sovright")
             .buckets(vec![0.1, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0]),
         )
         .expect("metric can be created");
@@ -656,9 +656,9 @@ mod tests {
         let metrics = PoolMetrics::new();
         // Verify metrics are created and can be encoded
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_connections_total"));
-        assert!(encoded.contains("bedrock_pool_connections_active"));
-        assert!(encoded.contains("bedrock_pool_shares_accepted_total"));
+        assert!(encoded.contains("sovright_pool_connections_total"));
+        assert!(encoded.contains("sovright_pool_connections_active"));
+        assert!(encoded.contains("sovright_pool_shares_accepted_total"));
     }
 
     #[test]
@@ -670,8 +670,8 @@ mod tests {
         metrics.record_disconnection();
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_connections_total 2"));
-        assert!(encoded.contains("bedrock_pool_connections_active 1"));
+        assert!(encoded.contains("sovright_pool_connections_total 2"));
+        assert!(encoded.contains("sovright_pool_connections_active 1"));
     }
 
     #[test]
@@ -684,9 +684,9 @@ mod tests {
         metrics.record_share_rejected("invalid_solution");
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_shares_submitted_total"));
-        assert!(encoded.contains("bedrock_pool_shares_accepted_total 1"));
-        assert!(encoded.contains("bedrock_pool_shares_rejected_total"));
+        assert!(encoded.contains("sovright_pool_shares_submitted_total"));
+        assert!(encoded.contains("sovright_pool_shares_accepted_total 1"));
+        assert!(encoded.contains("sovright_pool_shares_rejected_total"));
     }
 
     #[test]
@@ -697,8 +697,8 @@ mod tests {
         metrics.record_block_submitted();
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_blocks_found_total 1"));
-        assert!(encoded.contains("bedrock_pool_blocks_submitted_total 1"));
+        assert!(encoded.contains("sovright_pool_blocks_found_total 1"));
+        assert!(encoded.contains("sovright_pool_blocks_submitted_total 1"));
     }
 
     #[test]
@@ -708,7 +708,7 @@ mod tests {
         metrics.set_hashrate(1_000_000.0);
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_estimated_hashrate 1000000"));
+        assert!(encoded.contains("sovright_pool_estimated_hashrate 1000000"));
     }
 
     #[test]
@@ -719,8 +719,8 @@ mod tests {
         metrics.observe_template_fetch(0.05);
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_share_validation_duration_seconds"));
-        assert!(encoded.contains("bedrock_pool_template_fetch_duration_seconds"));
+        assert!(encoded.contains("sovright_pool_share_validation_duration_seconds"));
+        assert!(encoded.contains("sovright_pool_template_fetch_duration_seconds"));
     }
 
     #[test]
@@ -732,8 +732,8 @@ mod tests {
         metrics.record_noise_handshake_failed();
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_noise_handshakes_total 2"));
-        assert!(encoded.contains("bedrock_pool_noise_handshakes_failed_total 1"));
+        assert!(encoded.contains("sovright_pool_noise_handshakes_total 2"));
+        assert!(encoded.contains("sovright_pool_noise_handshakes_failed_total 1"));
     }
 
     #[test]
@@ -744,8 +744,8 @@ mod tests {
         metrics.record_jd_disconnection();
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_jd_connections_total 1"));
-        assert!(encoded.contains("bedrock_pool_jd_connections_active 0"));
+        assert!(encoded.contains("sovright_pool_jd_connections_total 1"));
+        assert!(encoded.contains("sovright_pool_jd_connections_active 0"));
     }
 
     #[test]
@@ -767,11 +767,11 @@ mod tests {
         metrics.inc_flagged_addresses();
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_decryption_failures_total 2"));
-        assert!(encoded.contains("bedrock_pool_replay_attempts_total 1"));
-        assert!(encoded.contains("bedrock_pool_sequence_anomalies_total 1"));
-        assert!(encoded.contains("bedrock_pool_short_lived_connections_total 1"));
-        assert!(encoded.contains("bedrock_pool_flagged_addresses 1"));
+        assert!(encoded.contains("sovright_pool_decryption_failures_total 2"));
+        assert!(encoded.contains("sovright_pool_replay_attempts_total 1"));
+        assert!(encoded.contains("sovright_pool_sequence_anomalies_total 1"));
+        assert!(encoded.contains("sovright_pool_short_lived_connections_total 1"));
+        assert!(encoded.contains("sovright_pool_flagged_addresses 1"));
     }
 
     #[test]
@@ -782,7 +782,7 @@ mod tests {
         metrics.observe_connection_duration(120.0);
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_connection_duration_seconds"));
+        assert!(encoded.contains("sovright_pool_connection_duration_seconds"));
     }
 
     #[test]
@@ -794,6 +794,6 @@ mod tests {
         metrics.dec_flagged_addresses();
 
         let encoded = metrics.encode();
-        assert!(encoded.contains("bedrock_pool_flagged_addresses 1"));
+        assert!(encoded.contains("sovright_pool_flagged_addresses 1"));
     }
 }

@@ -32,7 +32,7 @@ pub struct TracingConfig {
 impl Default for TracingConfig {
     fn default() -> Self {
         Self {
-            service_name: "bedrock".to_string(),
+            service_name: "sovright".to_string(),
             otlp_endpoint: None,
             sampling_ratio: 1.0,
         }
@@ -63,12 +63,12 @@ impl TracingConfig {
     /// Create config from environment variables
     ///
     /// Reads:
-    /// - `OTEL_SERVICE_NAME`: Service name (default: "bedrock")
+    /// - `OTEL_SERVICE_NAME`: Service name (default: "sovright")
     /// - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint URL
     /// - `OTEL_TRACES_SAMPLER_ARG`: Sampling ratio (default: 1.0)
     pub fn from_env() -> Self {
         let service_name = std::env::var("OTEL_SERVICE_NAME")
-            .unwrap_or_else(|_| "bedrock".to_string());
+            .unwrap_or_else(|_| "sovright".to_string());
 
         let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
 
@@ -118,7 +118,7 @@ pub enum TracingError {
 /// # Example
 ///
 /// ```no_run
-/// use bedrock_strata::{init_tracing, TracingConfig};
+/// use sovright_telemetry::{init_tracing, TracingConfig};
 ///
 /// let config = TracingConfig::new("my-service")
 ///     .with_endpoint("http://localhost:4317")
@@ -187,7 +187,7 @@ pub fn init_tracing(config: TracingConfig) -> Result<(), TracingError> {
 /// # Example
 ///
 /// ```no_run
-/// use bedrock_strata::shutdown_tracing;
+/// use sovright_telemetry::shutdown_tracing;
 ///
 /// // At application shutdown
 /// shutdown_tracing();
@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn test_tracing_config_default() {
         let config = TracingConfig::default();
-        assert_eq!(config.service_name, "bedrock");
+        assert_eq!(config.service_name, "sovright");
         assert!(config.otlp_endpoint.is_none());
         assert_eq!(config.sampling_ratio, 1.0);
     }
@@ -272,6 +272,6 @@ mod tests {
         let config = TracingConfig::default();
         let debug_str = format!("{:?}", config);
         assert!(debug_str.contains("TracingConfig"));
-        assert!(debug_str.contains("bedrock"));
+        assert!(debug_str.contains("sovright"));
     }
 }
