@@ -5,12 +5,12 @@
 //! - Share difficulty validation
 //! - Adaptive variable difficulty (vardiff) algorithm
 
+pub mod difficulty;
 pub mod error;
 pub mod validator;
-pub mod difficulty;
 pub mod vardiff;
 
+pub use difficulty::{Target, compact_to_target, difficulty_to_target, target_to_difficulty};
 pub use error::ValidationError;
 pub use validator::EquihashValidator;
-pub use difficulty::{Target, compact_to_target, target_to_difficulty, difficulty_to_target};
-pub use vardiff::{VardiffController, VardiffConfig, VardiffStats};
+pub use vardiff::{VardiffConfig, VardiffController, VardiffStats};

@@ -91,7 +91,8 @@ impl TemplateBuilder {
             }
         }
 
-        let mut rebuilt = Vec::with_capacity(template.coinbase.len() + self.pool_coinbase_output.len());
+        let mut rebuilt =
+            Vec::with_capacity(template.coinbase.len() + self.pool_coinbase_output.len());
         rebuilt.extend_from_slice(&prefix);
         write_compact_size(vout_count, &mut rebuilt);
         for output in outputs {
@@ -120,9 +121,8 @@ impl TemplateBuilder {
         let mut txids = Vec::with_capacity(1 + template.transactions.len());
         txids.push(compute_txid(coinbase));
         for tx in &template.transactions {
-            let hash = Hash256::from_hex(&tx.hash).map_err(|e| {
-                JdClientError::Protocol(format!("invalid tx hash: {}", e))
-            })?;
+            let hash = Hash256::from_hex(&tx.hash)
+                .map_err(|e| JdClientError::Protocol(format!("invalid tx hash: {}", e)))?;
             txids.push(hash.0);
         }
 
@@ -193,7 +193,11 @@ fn merkle_root_from_txids(txids: &[[u8; 32]]) -> [u8; 32] {
         let mut i = 0;
         while i < layer.len() {
             let left = layer[i];
-            let right = if i + 1 < layer.len() { layer[i + 1] } else { left };
+            let right = if i + 1 < layer.len() {
+                layer[i + 1]
+            } else {
+                left
+            };
             let mut data = [0u8; 64];
             data[..32].copy_from_slice(&left);
             data[32..].copy_from_slice(&right);
@@ -223,7 +227,9 @@ fn parse_coinbase_outputs(tx: &[u8]) -> Result<CoinbaseOutputs> {
     cursor += 4;
     if (version & 0x8000_0000) != 0 {
         if cursor + 4 > tx.len() {
-            return Err(JdClientError::Protocol("coinbase missing version group id".to_string()));
+            return Err(JdClientError::Protocol(
+                "coinbase missing version group id".to_string(),
+            ));
         }
         cursor += 4;
     }
@@ -231,12 +237,16 @@ fn parse_coinbase_outputs(tx: &[u8]) -> Result<CoinbaseOutputs> {
     let vin_count = read_compact_size(tx, &mut cursor)?;
     for _ in 0..vin_count {
         if cursor + 36 > tx.len() {
-            return Err(JdClientError::Protocol("coinbase input out of bounds".to_string()));
+            return Err(JdClientError::Protocol(
+                "coinbase input out of bounds".to_string(),
+            ));
         }
         cursor += 36;
         let script_len = read_compact_size(tx, &mut cursor)? as usize;
         if cursor + script_len + 4 > tx.len() {
-            return Err(JdClientError::Protocol("coinbase scriptSig out of bounds".to_string()));
+            return Err(JdClientError::Protocol(
+                "coinbase scriptSig out of bounds".to_string(),
+            ));
         }
         cursor += script_len;
         cursor += 4;
@@ -250,7 +260,9 @@ fn parse_coinbase_outputs(tx: &[u8]) -> Result<CoinbaseOutputs> {
     let mut outputs = Vec::with_capacity((vout_count as usize).min(max_outputs));
     for _ in 0..vout_count {
         if cursor + 8 > tx.len() {
-            return Err(JdClientError::Protocol("coinbase output value out of bounds".to_string()));
+            return Err(JdClientError::Protocol(
+                "coinbase output value out of bounds".to_string(),
+            ));
         }
         let value = u64::from_le_bytes([
             tx[cursor],
@@ -266,7 +278,9 @@ fn parse_coinbase_outputs(tx: &[u8]) -> Result<CoinbaseOutputs> {
 
         let script_len = read_compact_size(tx, &mut cursor)? as usize;
         if cursor + script_len > tx.len() {
-            return Err(JdClientError::Protocol("coinbase output script out of bounds".to_string()));
+            return Err(JdClientError::Protocol(
+                "coinbase output script out of bounds".to_string(),
+            ));
         }
         let script = tx[cursor..cursor + script_len].to_vec();
         cursor += script_len;
@@ -297,11 +311,8 @@ mod tests {
 
     #[test]
     fn test_template_builder_with_miner_address() {
-        let builder = TemplateBuilder::new(
-            vec![0x76, 0xa9],
-            256,
-            Some("t1exampleaddress".to_string()),
-        );
+        let builder =
+            TemplateBuilder::new(vec![0x76, 0xa9], 256, Some("t1exampleaddress".to_string()));
 
         assert_eq!(builder.miner_payout_address(), Some("t1exampleaddress"));
     }

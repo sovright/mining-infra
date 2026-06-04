@@ -3,7 +3,7 @@
 //! Injects a pool tag into the coinbase scriptSig and reserializes the transaction.
 
 use crate::auth_digest;
-use crate::tx_parse::{self, push_compact_size, ParsedTx};
+use crate::tx_parse::{self, ParsedTx, push_compact_size};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -91,7 +91,11 @@ fn reserialize_with_script(parsed: &ParsedTx, new_script: &[u8]) -> Vec<u8> {
         buf.extend_from_slice(&input.prevout_hash);
         buf.extend_from_slice(&input.prevout_index.to_le_bytes());
 
-        let script = if i == 0 { new_script } else { &input.script_sig };
+        let script = if i == 0 {
+            new_script
+        } else {
+            &input.script_sig
+        };
         push_compact_size(&mut buf, script.len() as u64);
         buf.extend_from_slice(script);
 
@@ -132,10 +136,12 @@ mod tests {
     fn inject_tag_into_coinbase_scriptsig() {
         let original = tx_parse::minimal_v4_coinbase();
         let result = build_coinbase(&original, b"/Sovright/").unwrap();
-        assert!(result
-            .tx_bytes
-            .windows(b"/Sovright/".len())
-            .any(|w| w == b"/Sovright/"));
+        assert!(
+            result
+                .tx_bytes
+                .windows(b"/Sovright/".len())
+                .any(|w| w == b"/Sovright/")
+        );
     }
 
     #[test]

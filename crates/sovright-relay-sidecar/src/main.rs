@@ -1,11 +1,11 @@
 //! Relay sidecar for Stratum V1 mining pools
 
+use clap::Parser;
 use sovright_relay::{
     BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, TxCache,
     TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
     reassemble_raw_block,
 };
-use clap::Parser;
 use std::collections::HashMap;
 use std::fs;
 use std::net::SocketAddr;
@@ -21,6 +21,8 @@ use tracing::{debug, error, info, warn};
 mod poller;
 mod relay;
 
+use poller::{TemplatePoller, TemplateUpdate};
+use relay::RelayWrapper;
 use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
 use sovright_relay_sidecar::rpc::ZebraRpc;
@@ -28,8 +30,6 @@ use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
     handle_relay_compact_block, handle_relay_compact_block_with_mempool, handle_relay_raw_block,
 };
-use poller::{TemplatePoller, TemplateUpdate};
-use relay::RelayWrapper;
 
 #[derive(Parser, Debug)]
 #[command(name = "sovright-relay-sidecar")]
@@ -1786,13 +1786,17 @@ mod tests {
         record_compact_reconstruction_outcome(&outcome, &metrics);
 
         let text = metrics.render_prometheus_text();
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_incompletes_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_missing_wtxids_total 2"));
         assert!(
             text.contains(
-                "sovright_relay_sidecar_relay_compact_reconstruction_unresolved_short_ids_total 3"
+                "sovright_relay_sidecar_relay_compact_reconstruction_incompletes_total 1"
             )
         );
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_compact_reconstruction_missing_wtxids_total 2"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_compact_reconstruction_unresolved_short_ids_total 3"
+        ));
     }
 
     #[test]
@@ -1847,28 +1851,38 @@ mod tests {
         let text = metrics.render_prometheus_text();
 
         assert!(text.contains("sovright_relay_sidecar_relay_compact_blocks_received_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_attempts_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_completes_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_incompletes_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_invalids_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_compact_reconstruction_missing_wtxids_total 2"));
         assert!(
-            text.contains(
-                "sovright_relay_sidecar_relay_compact_reconstruction_unresolved_short_ids_total 3"
-            )
+            text.contains("sovright_relay_sidecar_relay_compact_reconstruction_attempts_total 1")
+        );
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_compact_reconstruction_completes_total 1")
         );
         assert!(
             text.contains(
-                "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requests_total 1"
+                "sovright_relay_sidecar_relay_compact_reconstruction_incompletes_total 1"
             )
         );
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_compact_reconstruction_invalids_total 1")
+        );
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_compact_reconstruction_missing_wtxids_total 2"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_compact_reconstruction_unresolved_short_ids_total 3"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requests_total 1"
+        ));
         assert!(text.contains(
             "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requested_transactions_total 4"
         ));
         assert!(text.contains("sovright_relay_sidecar_relay_raw_segments_received_total 1"));
         assert!(text.contains("sovright_relay_sidecar_relay_raw_segment_sets_completed_total 1"));
         assert!(text.contains("sovright_relay_sidecar_relay_raw_segment_drops_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_raw_segment_reassembly_failures_total 1"));
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_raw_segment_reassembly_failures_total 1")
+        );
         assert!(text.contains("sovright_relay_sidecar_relay_submit_dry_run_candidates_total 1"));
         assert!(text.contains("sovright_relay_sidecar_relay_submit_successes_total 1"));
         assert!(text.contains("sovright_relay_sidecar_relay_submit_duplicates_total 1"));

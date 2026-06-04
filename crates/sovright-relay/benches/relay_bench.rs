@@ -1,20 +1,17 @@
 //! Performance benchmarks for sovright-relay
 
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use sovright_relay::{
     AuthDigest, BlockChunker, BlockHash, CompactBlock, CompactBlockReconstructor, ShortId,
     TestMempool, TxId, WtxId,
     fec::{FecDecoder, FecEncoder},
 };
-use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 
 /// (hash, raw block bytes, transactions)
 type BenchBlock = (BlockHash, Vec<u8>, Vec<(WtxId, Vec<u8>)>);
 
 /// Create a synthetic block for benchmarking
-fn create_bench_block(
-    tx_count: usize,
-    tx_size: usize,
-) -> BenchBlock {
+fn create_bench_block(tx_count: usize, tx_size: usize) -> BenchBlock {
     let mut header = vec![0u8; 1487];
     header[0..4].copy_from_slice(&4u32.to_le_bytes());
 

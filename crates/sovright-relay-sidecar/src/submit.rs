@@ -501,7 +501,9 @@ fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sovright_relay::{AuthDigest, CompactBlock, PrefilledTx, ShortId, TestMempool, TxId, WtxId};
+    use sovright_relay::{
+        AuthDigest, CompactBlock, PrefilledTx, ShortId, TestMempool, TxId, WtxId,
+    };
 
     fn make_wtxid(seed: u8) -> WtxId {
         WtxId::new(

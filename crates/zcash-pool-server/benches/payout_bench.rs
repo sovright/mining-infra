@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use zcash_pool_server::PayoutTracker;
 
 fn bench_record_share(c: &mut Criterion) {

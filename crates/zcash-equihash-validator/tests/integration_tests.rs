@@ -2,8 +2,8 @@
 
 mod test_vectors;
 
-use zcash_equihash_validator::{EquihashValidator, VardiffController, VardiffConfig};
 use zcash_equihash_validator::difficulty::{difficulty_to_target, target_to_difficulty};
+use zcash_equihash_validator::{EquihashValidator, VardiffConfig, VardiffController};
 use zcash_mining_protocol::messages::{NewEquihashJob, SubmitEquihashShare};
 
 #[test]
@@ -99,7 +99,9 @@ fn test_difficulty_to_target_integration() {
         let ratio = recovered / diff;
         assert!(
             ratio > 0.99 && ratio < 1.01,
-            "Difficulty {} recovered as {}", diff, recovered
+            "Difficulty {} recovered as {}",
+            diff,
+            recovered
         );
     }
 }
@@ -154,7 +156,10 @@ fn test_header_construction_with_validator() {
     assert_eq!(&header[104..108], &[0xff, 0xff, 0x00, 0x1d]);
 
     // nonce at offset 108 (nonce_1 + nonce_2)
-    assert_eq!(&header[108..116], &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+    assert_eq!(
+        &header[108..116],
+        &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]
+    );
     assert_eq!(&header[116..140], &[0xaa; 24]);
 
     // Try to verify (should fail with invalid solution, but header should be accepted)
@@ -236,4 +241,3 @@ fn test_target_comparison_with_hash() {
     let same_target = Target::from_le_bytes(same);
     assert!(same_target.is_met_by(&same));
 }
-

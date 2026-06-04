@@ -9,6 +9,6 @@ pub mod logging;
 pub mod metrics;
 pub mod tracing_setup;
 
-pub use logging::{init_logging, LogFormat};
-pub use metrics::{start_metrics_server, PoolMetrics};
-pub use tracing_setup::{init_tracing, shutdown_tracing, TracingConfig, TracingError};
+pub use logging::{LogFormat, init_logging};
+pub use metrics::{PoolMetrics, start_metrics_server};
+pub use tracing_setup::{TracingConfig, TracingError, init_tracing, shutdown_tracing};

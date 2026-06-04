@@ -123,12 +123,18 @@ fn test_validator_rejects_wrong_solution_size() {
     // Too short
     let short_solution = vec![0u8; 1343];
     let result = validator.verify_solution(&header, &short_solution);
-    assert!(result.is_err(), "Solution shorter than 1344 bytes must be rejected");
+    assert!(
+        result.is_err(),
+        "Solution shorter than 1344 bytes must be rejected"
+    );
 
     // Too long
     let long_solution = vec![0u8; 1345];
     let result = validator.verify_solution(&header, &long_solution);
-    assert!(result.is_err(), "Solution longer than 1344 bytes must be rejected");
+    assert!(
+        result.is_err(),
+        "Solution longer than 1344 bytes must be rejected"
+    );
 
     // Empty
     let empty_solution: Vec<u8> = vec![];
@@ -146,12 +152,18 @@ fn test_validator_rejects_wrong_header_size() {
     // Too short
     let short_header = vec![0u8; 139];
     let result = validator.verify_solution(&short_header, &solution);
-    assert!(result.is_err(), "Header shorter than 140 bytes must be rejected");
+    assert!(
+        result.is_err(),
+        "Header shorter than 140 bytes must be rejected"
+    );
 
     // Too long
     let long_header = vec![0u8; 141];
     let result = validator.verify_solution(&long_header, &solution);
-    assert!(result.is_err(), "Header longer than 140 bytes must be rejected");
+    assert!(
+        result.is_err(),
+        "Header longer than 140 bytes must be rejected"
+    );
 
     // Empty
     let empty_header: Vec<u8> = vec![];

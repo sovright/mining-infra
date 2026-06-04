@@ -64,7 +64,11 @@ impl RpcProvider for MockZebraRpc {
             .unwrap_or_else(|| Err(Error::Rpc("no queued templates".into())))
     }
 
-    async fn submit_block(&self, block_hex: &str, _mode: Option<SubmitMode>) -> Result<SubmitBlockResult> {
+    async fn submit_block(
+        &self,
+        block_hex: &str,
+        _mode: Option<SubmitMode>,
+    ) -> Result<SubmitBlockResult> {
         self.submitted.lock().unwrap().push(block_hex.to_string());
         Ok(SubmitBlockResult::Accepted)
     }
@@ -218,7 +222,11 @@ mod tests {
         let template = TestTemplateFactory::new().build();
         let header = assemble_header(&template).expect("assemble_header should succeed");
         let bytes = header.serialize();
-        assert_eq!(bytes.len(), 140, "Equihash header must be exactly 140 bytes");
+        assert_eq!(
+            bytes.len(),
+            140,
+            "Equihash header must be exactly 140 bytes"
+        );
     }
 
     #[test]

@@ -373,7 +373,10 @@ mod tests {
             ("SOVRIGHT_P2P_PEERS", "".to_string()),
             ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
             ("SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX", "42".repeat(32)),
-            ("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_SEND_ROUNDS", "3".to_string()),
+            (
+                "SOVRIGHT_P2P_RELAY_RAW_SEGMENT_SEND_ROUNDS",
+                "3".to_string(),
+            ),
             (
                 "SOVRIGHT_P2P_RELAY_RAW_SEGMENT_ROUND_DELAY_MILLIS",
                 "25".to_string(),
@@ -391,7 +394,10 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::set(&[
             ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
-            ("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_SEND_ROUNDS", "0".to_string()),
+            (
+                "SOVRIGHT_P2P_RELAY_RAW_SEGMENT_SEND_ROUNDS",
+                "0".to_string(),
+            ),
         ]);
 
         let err = Config::from_env().unwrap_err();

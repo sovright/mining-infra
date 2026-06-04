@@ -207,7 +207,12 @@ mod tests {
             let recovered = target_to_difficulty(&target);
             // Allow 1% error due to floating point
             let ratio = recovered / diff;
-            assert!(ratio > 0.99 && ratio < 1.01, "diff={}, recovered={}", diff, recovered);
+            assert!(
+                ratio > 0.99 && ratio < 1.01,
+                "diff={}, recovered={}",
+                diff,
+                recovered
+            );
         }
     }
 
@@ -257,9 +262,12 @@ mod tests {
 
         // At difficulty 0.0001, target should be all-0xff (clamped)
         let t_low = difficulty_to_target(0.0001);
-        assert_eq!(t_low.to_le_bytes(), [0xff; 32],
+        assert_eq!(
+            t_low.to_le_bytes(),
+            [0xff; 32],
             "diff=0.0001 should produce all-ones target, got: {}",
-            hex::encode(t_low.to_le_bytes()));
+            hex::encode(t_low.to_le_bytes())
+        );
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::config::JdClientConfig;
 use crate::error::{JdClientError, Result};
 use crate::full_template::FullTemplateBuilder;
 use crate::template_builder::TemplateBuilder;
+use sovright_noise::{NoiseInitiator, NoiseStream, PublicKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -18,7 +19,6 @@ use tracing::{debug, error, info, warn};
 use zcash_jd_server::codec::*;
 use zcash_jd_server::messages::*;
 use zcash_mining_protocol::codec::MessageFrame;
-use sovright_noise::{NoiseInitiator, NoiseStream, PublicKey};
 use zcash_template_provider::types::{BlockTemplate, Hash256};
 use zcash_template_provider::{TemplateProvider, TemplateProviderConfig};
 
@@ -66,7 +66,8 @@ impl JdClientTransport {
                     if message.len() > MAX_FRAME_SIZE {
                         return Err(JdClientError::Protocol(format!(
                             "frame too large: {} bytes (max {})",
-                            message.len(), MAX_FRAME_SIZE
+                            message.len(),
+                            MAX_FRAME_SIZE
                         )));
                     }
                     Ok(Some(message))
@@ -168,30 +169,29 @@ impl JdClient {
         info!("Starting JD Client");
 
         // Connect to pool JD Server
-        let mut transport = if self.config.noise_enabled {
-            let public_key = PublicKey::from_hex(
-                self.config
-                    .pool_public_key
-                    .as_ref()
-                    .ok_or_else(|| JdClientError::Protocol("Missing pool public key".into()))?,
-            )
-            .map_err(|e| JdClientError::Protocol(e.to_string()))?;
+        let mut transport =
+            if self.config.noise_enabled {
+                let public_key =
+                    PublicKey::from_hex(self.config.pool_public_key.as_ref().ok_or_else(|| {
+                        JdClientError::Protocol("Missing pool public key".into())
+                    })?)
+                    .map_err(|e| JdClientError::Protocol(e.to_string()))?;
 
-            let tcp_stream = TcpStream::connect(&self.config.pool_jd_addr)
-                .await
-                .map_err(|e| JdClientError::ConnectionFailed(e.to_string()))?;
-            let initiator = NoiseInitiator::new(public_key);
-            let noise_stream = initiator
-                .connect(tcp_stream)
-                .await
-                .map_err(|e| JdClientError::Protocol(e.to_string()))?;
-            JdClientTransport::Noise(noise_stream)
-        } else {
-            let tcp_stream = TcpStream::connect(self.config.pool_jd_addr)
-                .await
-                .map_err(|e| JdClientError::ConnectionFailed(e.to_string()))?;
-            JdClientTransport::Plain(tcp_stream)
-        };
+                let tcp_stream = TcpStream::connect(&self.config.pool_jd_addr)
+                    .await
+                    .map_err(|e| JdClientError::ConnectionFailed(e.to_string()))?;
+                let initiator = NoiseInitiator::new(public_key);
+                let noise_stream = initiator
+                    .connect(tcp_stream)
+                    .await
+                    .map_err(|e| JdClientError::Protocol(e.to_string()))?;
+                JdClientTransport::Noise(noise_stream)
+            } else {
+                let tcp_stream = TcpStream::connect(self.config.pool_jd_addr)
+                    .await
+                    .map_err(|e| JdClientError::ConnectionFailed(e.to_string()))?;
+                JdClientTransport::Plain(tcp_stream)
+            };
 
         info!(
             "Connected to pool JD Server at {}",
@@ -278,7 +278,9 @@ impl JdClient {
             *mode = response.granted_mode;
         }
 
-        if self.config.full_template_mode && response.granted_mode != JobDeclarationMode::FullTemplate {
+        if self.config.full_template_mode
+            && response.granted_mode != JobDeclarationMode::FullTemplate
+        {
             warn!(
                 "Full-Template mode requested but not granted; falling back to {}",
                 response.granted_mode
@@ -319,9 +321,13 @@ impl JdClient {
         let granted_mode = *self.granted_mode.read().await;
         match granted_mode {
             JobDeclarationMode::FullTemplate => {
-                self.handle_full_template_job(transport, template, token).await
+                self.handle_full_template_job(transport, template, token)
+                    .await
             }
-            _ => self.handle_coinbase_only_job(transport, template, token).await,
+            _ => {
+                self.handle_coinbase_only_job(transport, template, token)
+                    .await
+            }
         }
     }
 
@@ -564,7 +570,10 @@ impl JdClient {
 
     /// Add multiple transactions to the cache
     /// Cache is automatically pruned when limits are exceeded.
-    pub async fn cache_transactions(&self, transactions: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>) {
+    pub async fn cache_transactions(
+        &self,
+        transactions: impl IntoIterator<Item = ([u8; 32], Vec<u8>)>,
+    ) {
         let mut cache = self.tx_cache.write().await;
         let mut total_bytes: usize = cache.values().map(|v| v.len()).sum();
 

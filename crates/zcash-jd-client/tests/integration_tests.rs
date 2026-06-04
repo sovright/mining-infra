@@ -6,7 +6,9 @@
 //! - Block hex construction
 //! - Error type handling
 
-use zcash_jd_client::{BlockSubmitter, JdClientConfig, JdClientError, TemplateBuilder, TxSelectionStrategy};
+use zcash_jd_client::{
+    BlockSubmitter, JdClientConfig, JdClientError, TemplateBuilder, TxSelectionStrategy,
+};
 
 #[test]
 fn test_client_config_defaults() {
@@ -65,11 +67,7 @@ fn test_template_builder() {
 
 #[test]
 fn test_template_builder_no_miner_address() {
-    let builder = TemplateBuilder::new(
-        vec![0x76, 0xa9, 0x14],
-        512,
-        None,
-    );
+    let builder = TemplateBuilder::new(vec![0x76, 0xa9, 0x14], 512, None);
 
     assert_eq!(builder.max_additional_size(), 512);
     assert!(builder.miner_payout_address().is_none());
@@ -204,12 +202,30 @@ fn test_config_socket_addr() {
 #[test]
 fn test_tx_selection_strategy_from_str() {
     // Test valid inputs
-    assert_eq!(TxSelectionStrategy::parse("all"), Some(TxSelectionStrategy::All));
-    assert_eq!(TxSelectionStrategy::parse("ALL"), Some(TxSelectionStrategy::All));
-    assert_eq!(TxSelectionStrategy::parse("by-fee-rate"), Some(TxSelectionStrategy::ByFeeRate));
-    assert_eq!(TxSelectionStrategy::parse("BY-FEE-RATE"), Some(TxSelectionStrategy::ByFeeRate));
-    assert_eq!(TxSelectionStrategy::parse("byfee"), Some(TxSelectionStrategy::ByFeeRate));
-    assert_eq!(TxSelectionStrategy::parse("fee"), Some(TxSelectionStrategy::ByFeeRate));
+    assert_eq!(
+        TxSelectionStrategy::parse("all"),
+        Some(TxSelectionStrategy::All)
+    );
+    assert_eq!(
+        TxSelectionStrategy::parse("ALL"),
+        Some(TxSelectionStrategy::All)
+    );
+    assert_eq!(
+        TxSelectionStrategy::parse("by-fee-rate"),
+        Some(TxSelectionStrategy::ByFeeRate)
+    );
+    assert_eq!(
+        TxSelectionStrategy::parse("BY-FEE-RATE"),
+        Some(TxSelectionStrategy::ByFeeRate)
+    );
+    assert_eq!(
+        TxSelectionStrategy::parse("byfee"),
+        Some(TxSelectionStrategy::ByFeeRate)
+    );
+    assert_eq!(
+        TxSelectionStrategy::parse("fee"),
+        Some(TxSelectionStrategy::ByFeeRate)
+    );
 
     // Test invalid inputs
     assert_eq!(TxSelectionStrategy::parse("invalid"), None);

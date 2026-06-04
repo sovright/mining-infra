@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use zcash_mining_protocol::messages::{NewEquihashJob, SubmitEquihashShare};
 use zcash_pool_server::{InMemoryDuplicateDetector, ShareProcessor};
 

@@ -10,8 +10,8 @@ use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
-use crate::relay_bridge::RelayBridge;
 use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
+use crate::relay_bridge::RelayBridge;
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
 use crate::wire::{

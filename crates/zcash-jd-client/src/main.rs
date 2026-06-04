@@ -2,7 +2,7 @@
 
 use clap::Parser;
 use tracing::info;
-use zcash_jd_client::{config::TxSelectionStrategy, JdClient, JdClientConfig};
+use zcash_jd_client::{JdClient, JdClientConfig, config::TxSelectionStrategy};
 
 #[derive(Parser, Debug)]
 #[command(name = "zcash-jd-client")]
@@ -69,9 +69,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Pool JD Server: {}", config.pool_jd_addr);
     info!("User ID: {}", config.user_identifier);
     info!("Poll interval: {}ms", config.template_poll_ms);
-    info!("Noise encryption: {}", if config.noise_enabled { "enabled" } else { "disabled" });
+    info!(
+        "Noise encryption: {}",
+        if config.noise_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     if config.full_template_mode {
-        info!("Full-Template mode: enabled (tx selection: {})", config.tx_selection);
+        info!(
+            "Full-Template mode: enabled (tx selection: {})",
+            config.tx_selection
+        );
     } else {
         info!("Full-Template mode: disabled (using Coinbase-Only)");
     }

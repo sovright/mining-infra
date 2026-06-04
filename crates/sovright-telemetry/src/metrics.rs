@@ -102,14 +102,20 @@ impl PoolMetrics {
 
         // Connection metrics
         let connections_total = IntCounter::with_opts(
-            Opts::new("pool_connections_total", "Total miner connections established")
-                .namespace("sovright"),
+            Opts::new(
+                "pool_connections_total",
+                "Total miner connections established",
+            )
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
         let connections_active = IntGauge::with_opts(
-            Opts::new("pool_connections_active", "Currently active miner connections")
-                .namespace("sovright"),
+            Opts::new(
+                "pool_connections_active",
+                "Currently active miner connections",
+            )
+            .namespace("sovright"),
         )
         .expect("metric can be created");
 
@@ -140,14 +146,12 @@ impl PoolMetrics {
         .expect("metric can be created");
 
         let shares_accepted = IntCounter::with_opts(
-            Opts::new("pool_shares_accepted_total", "Total accepted shares")
-                .namespace("sovright"),
+            Opts::new("pool_shares_accepted_total", "Total accepted shares").namespace("sovright"),
         )
         .expect("metric can be created");
 
         let shares_rejected = IntCounterVec::new(
-            Opts::new("pool_shares_rejected_total", "Total rejected shares")
-                .namespace("sovright"),
+            Opts::new("pool_shares_rejected_total", "Total rejected shares").namespace("sovright"),
             &["reason"],
         )
         .expect("metric can be created");
@@ -180,24 +184,28 @@ impl PoolMetrics {
         )
         .expect("metric can be created");
 
-        let pool_total_hashrate = Gauge::with_opts(
-            Opts::new("pool_total_hashrate_sol_s", "Pool aggregate hashrate in sol/s"),
-        )
+        let pool_total_hashrate = Gauge::with_opts(Opts::new(
+            "pool_total_hashrate_sol_s",
+            "Pool aggregate hashrate in sol/s",
+        ))
         .expect("metric can be created");
 
-        let pool_connected_miners = IntGauge::with_opts(
-            Opts::new("pool_connected_miners", "Number of connected miners"),
-        )
+        let pool_connected_miners = IntGauge::with_opts(Opts::new(
+            "pool_connected_miners",
+            "Number of connected miners",
+        ))
         .expect("metric can be created");
 
-        let pool_connected_workers = IntGauge::with_opts(
-            Opts::new("pool_connected_workers", "Number of connected workers"),
-        )
+        let pool_connected_workers = IntGauge::with_opts(Opts::new(
+            "pool_connected_workers",
+            "Number of connected workers",
+        ))
         .expect("metric can be created");
 
-        let network_difficulty = Gauge::with_opts(
-            Opts::new("network_difficulty", "Current network difficulty"),
-        )
+        let network_difficulty = Gauge::with_opts(Opts::new(
+            "network_difficulty",
+            "Current network difficulty",
+        ))
         .expect("metric can be created");
 
         // Block metrics
@@ -230,7 +238,9 @@ impl PoolMetrics {
                 "Share validation duration in seconds",
             )
             .namespace("sovright")
-            .buckets(vec![0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0]),
+            .buckets(vec![
+                0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0,
+            ]),
         )
         .expect("metric can be created");
 
@@ -315,19 +325,37 @@ impl PoolMetrics {
                 "Connection duration in seconds",
             )
             .namespace("sovright")
-            .buckets(vec![0.1, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0]),
+            .buckets(vec![
+                0.1, 1.0, 5.0, 10.0, 30.0, 60.0, 300.0, 600.0, 1800.0, 3600.0,
+            ]),
         )
         .expect("metric can be created");
 
         // Register per-worker and pool-level metrics
-        registry.register(Box::new(worker_hashrate.clone())).expect("metric can be registered");
-        registry.register(Box::new(worker_shares_accepted.clone())).expect("metric can be registered");
-        registry.register(Box::new(worker_shares_rejected.clone())).expect("metric can be registered");
-        registry.register(Box::new(worker_blocks_found.clone())).expect("metric can be registered");
-        registry.register(Box::new(pool_total_hashrate.clone())).expect("metric can be registered");
-        registry.register(Box::new(pool_connected_miners.clone())).expect("metric can be registered");
-        registry.register(Box::new(pool_connected_workers.clone())).expect("metric can be registered");
-        registry.register(Box::new(network_difficulty.clone())).expect("metric can be registered");
+        registry
+            .register(Box::new(worker_hashrate.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(worker_shares_accepted.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(worker_shares_rejected.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(worker_blocks_found.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(pool_total_hashrate.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(pool_connected_miners.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(pool_connected_workers.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(network_difficulty.clone()))
+            .expect("metric can be registered");
 
         // Register all metrics
         registry
@@ -476,12 +504,16 @@ impl PoolMetrics {
 
     /// Record an accepted share for a specific worker
     pub fn record_worker_share_accepted(&self, worker: &str) {
-        self.worker_shares_accepted.with_label_values(&[worker]).inc();
+        self.worker_shares_accepted
+            .with_label_values(&[worker])
+            .inc();
     }
 
     /// Record a rejected share for a specific worker
     pub fn record_worker_share_rejected(&self, worker: &str) {
-        self.worker_shares_rejected.with_label_values(&[worker]).inc();
+        self.worker_shares_rejected
+            .with_label_values(&[worker])
+            .inc();
     }
 
     /// Record a block found for a specific worker
@@ -491,7 +523,9 @@ impl PoolMetrics {
 
     /// Set the hashrate for a specific worker
     pub fn set_worker_hashrate(&self, worker: &str, hashrate: f64) {
-        self.worker_hashrate.with_label_values(&[worker]).set(hashrate);
+        self.worker_hashrate
+            .with_label_values(&[worker])
+            .set(hashrate);
     }
 
     /// Update pool-level aggregate metrics

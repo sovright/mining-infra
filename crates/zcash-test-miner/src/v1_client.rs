@@ -10,8 +10,8 @@
 
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -86,8 +86,7 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
     let mut job_map: HashMap<String, V1Job> = HashMap::new();
 
     // Solver channel
-    let (solution_tx, mut solution_rx) =
-        mpsc::channel::<(String, Vec<u8>, u32, Vec<u8>)>(32);
+    let (solution_tx, mut solution_rx) = mpsc::channel::<(String, Vec<u8>, u32, Vec<u8>)>(32);
 
     // Current job for solver thread: (job, serialized header prefix, nonce_2 size).
     type SharedCurrentJob = Arc<std::sync::Mutex<Option<(V1Job, Vec<u8>, usize)>>>;
@@ -149,14 +148,13 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                 full_nonce[nonce_1_len..nonce_1_len + nonce_2_len].copy_from_slice(&nonce_2);
 
                 let mut used = false;
-                let solutions =
-                    equihash::tromp::solve_200_9::<32>(&header_prefix, || {
-                        if used {
-                            return None;
-                        }
-                        used = true;
-                        Some(full_nonce)
-                    });
+                let solutions = equihash::tromp::solve_200_9::<32>(&header_prefix, || {
+                    if used {
+                        return None;
+                    }
+                    used = true;
+                    Some(full_nonce)
+                });
 
                 if !solutions.is_empty() {
                     if solver_job_id.load(Ordering::Relaxed) != my_job_id {
@@ -171,12 +169,7 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                     );
                     for sol in solutions {
                         if solver_tx
-                            .blocking_send((
-                                job.job_id.clone(),
-                                nonce_2.clone(),
-                                job.time,
-                                sol,
-                            ))
+                            .blocking_send((job.job_id.clone(), nonce_2.clone(), job.time, sol))
                             .is_err()
                         {
                             return;
@@ -364,9 +357,7 @@ async fn send_json(
 }
 
 fn parse_subscribe_response(msg: &Value) -> Result<(Vec<u8>, String), String> {
-    let result = msg
-        .get("result")
-        .ok_or("missing result field")?;
+    let result = msg.get("result").ok_or("missing result field")?;
 
     // ZIP 301: result = [SESSION_ID, NONCE_1] (session-id string + nonce_1 hex).
     let arr = result.as_array().ok_or("result is not an array")?;
@@ -441,7 +432,11 @@ fn parse_hex_u32_le(input: &str) -> Result<u32, String> {
         .unwrap_or(input.trim());
     let bytes = hex_decode(stripped).map_err(|e| format!("bad hex u32 '{}': {}", input, e))?;
     if bytes.len() != 4 {
-        return Err(format!("expected 4 bytes for u32, got {} from '{}'", bytes.len(), input));
+        return Err(format!(
+            "expected 4 bytes for u32, got {} from '{}'",
+            bytes.len(),
+            input
+        ));
     }
     let mut b = [0u8; 4];
     b.copy_from_slice(&bytes);

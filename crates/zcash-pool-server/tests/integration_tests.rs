@@ -102,7 +102,9 @@ fn test_job_distribution_flow() {
 
     // Create channel and job
     let channel = Channel::new(vec![0x01, 0x02, 0x03, 0x04], VardiffConfig::default()).unwrap();
-    let job = distributor.create_job(&channel, true).expect("Should create job");
+    let job = distributor
+        .create_job(&channel, true)
+        .expect("Should create job");
 
     // Verify job contains expected data
     assert_eq!(job.channel_id, channel.id);
@@ -224,14 +226,18 @@ fn test_payout_tracking() {
     tracker.record_share(&miner2, 200.0);
 
     // Verify stats
-    let stats1 = tracker.get_stats(&miner1).expect("miner1 should have stats");
+    let stats1 = tracker
+        .get_stats(&miner1)
+        .expect("miner1 should have stats");
     assert_eq!(stats1.total_shares, 2);
     assert_eq!(stats1.total_difficulty, 250.0);
     assert_eq!(stats1.window_shares, 2);
     assert_eq!(stats1.window_difficulty, 250.0);
     assert!(stats1.last_share.is_some());
 
-    let stats2 = tracker.get_stats(&miner2).expect("miner2 should have stats");
+    let stats2 = tracker
+        .get_stats(&miner2)
+        .expect("miner2 should have stats");
     assert_eq!(stats2.total_shares, 1);
     assert_eq!(stats2.total_difficulty, 200.0);
 
@@ -331,13 +337,19 @@ fn test_channel_job_management() {
     assert!(!channel.is_job_active(999)); // Unknown job
 
     // Add another job without clean
-    let job2 = NewEquihashJob { job_id: 2, ..job.clone() };
+    let job2 = NewEquihashJob {
+        job_id: 2,
+        ..job.clone()
+    };
     channel.add_job(job2, false);
     assert!(channel.is_job_active(1)); // Still active
     assert!(channel.is_job_active(2)); // New job also active
 
     // Add job with clean_jobs = true
-    let job3 = NewEquihashJob { job_id: 3, ..job.clone() };
+    let job3 = NewEquihashJob {
+        job_id: 3,
+        ..job.clone()
+    };
     channel.add_job(job3, true);
     assert!(!channel.is_job_active(1)); // Old job now stale
     assert!(!channel.is_job_active(2)); // Old job now stale

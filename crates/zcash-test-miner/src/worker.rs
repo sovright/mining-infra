@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use blake2b_simd::Params as Blake2bParams;
@@ -21,7 +21,7 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-use crate::protocol::{decode_server_message, ServerMessage};
+use crate::protocol::{ServerMessage, decode_server_message};
 use crate::transport::MinerTransport;
 
 /// Configuration for a single worker connection.
@@ -306,11 +306,7 @@ fn run_solver_thread(
     let nonce_1_len = nonce_1.len();
     let nonce_2_len = job.nonce_2_len as usize;
 
-    debug!(
-        thread_id,
-        job_id = job.job_id,
-        "Solver thread starting"
-    );
+    debug!(thread_id, job_id = job.job_id, "Solver thread starting");
 
     // The solver input is the first 108 bytes of the header (everything before the nonce).
     // We construct it once: version(4) + prev_hash(32) + merkle_root(32) + block_commitments(32) + time(4) + bits(4) = 108
@@ -346,8 +342,7 @@ fn run_solver_thread(
             nonce[..nonce_1_len].copy_from_slice(nonce_1);
             let counter_bytes = local_counter.to_le_bytes();
             let copy_len = 8.min(nonce_2_len);
-            nonce[nonce_1_len..nonce_1_len + copy_len]
-                .copy_from_slice(&counter_bytes[..copy_len]);
+            nonce[nonce_1_len..nonce_1_len + copy_len].copy_from_slice(&counter_bytes[..copy_len]);
             local_counter += total_threads as u64;
 
             Some(nonce)

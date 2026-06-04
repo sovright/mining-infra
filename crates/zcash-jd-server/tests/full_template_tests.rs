@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use sha2::{Digest, Sha256};
 use zcash_jd_server::codec::{
     decode_allocate_token, decode_allocate_token_success, decode_get_missing_transactions,
     decode_provide_missing_transactions, decode_set_custom_job, decode_set_full_template_job,
@@ -20,13 +21,12 @@ use zcash_jd_server::codec::{
     encode_provide_missing_transactions, encode_set_custom_job, encode_set_full_template_job,
     encode_set_full_template_job_error, encode_set_full_template_job_success,
 };
-use sha2::{Digest, Sha256};
 use zcash_jd_server::{
     AllocateMiningJobToken, AllocateMiningJobTokenSuccess, FullTemplateJobResponse,
     GetMissingTransactions, JdServer, JdServerConfig, JobDeclarationMode,
-    ProvideMissingTransactions, SetCustomMiningJob, SetFullTemplateJob,
-    SetFullTemplateJobError, SetFullTemplateJobErrorCode, SetFullTemplateJobSuccess,
-    TemplateValidator, ValidationLevel, ValidationResult,
+    ProvideMissingTransactions, SetCustomMiningJob, SetFullTemplateJob, SetFullTemplateJobError,
+    SetFullTemplateJobErrorCode, SetFullTemplateJobSuccess, TemplateValidator, ValidationLevel,
+    ValidationResult,
 };
 use zcash_pool_common::PayoutTracker;
 
@@ -117,7 +117,11 @@ fn merkle_root_for(coinbase: &[u8], txids: &[[u8; 32]]) -> [u8; 32] {
         let mut i = 0;
         while i < layer.len() {
             let left = layer[i];
-            let right = if i + 1 < layer.len() { layer[i + 1] } else { left };
+            let right = if i + 1 < layer.len() {
+                layer[i + 1]
+            } else {
+                left
+            };
             let mut data = [0u8; 64];
             data[..32].copy_from_slice(&left);
             data[32..].copy_from_slice(&right);
@@ -205,11 +209,8 @@ fn test_full_template_fallback_when_disabled() {
 #[test]
 fn test_allocate_token_mode_roundtrip() {
     // Test FullTemplate mode
-    let request = AllocateMiningJobToken::with_mode(
-        42,
-        "test-miner",
-        JobDeclarationMode::FullTemplate,
-    );
+    let request =
+        AllocateMiningJobToken::with_mode(42, "test-miner", JobDeclarationMode::FullTemplate);
     assert_eq!(request.requested_mode, JobDeclarationMode::FullTemplate);
 
     let encoded = encode_allocate_token(&request).expect("Encoding should succeed");
@@ -553,7 +554,10 @@ fn test_validation_pool_payout() {
         tx_data: vec![],
     };
 
-    assert!(matches!(validator.validate(&job), ValidationResult::Invalid(_)));
+    assert!(matches!(
+        validator.validate(&job),
+        ValidationResult::Invalid(_)
+    ));
 
     // Job with payout script succeeds
     let coinbase_with_payout = minimal_tx_with_script(&payout_script);
@@ -600,10 +604,8 @@ fn test_provide_missing_transactions_roundtrip() {
         transactions: vec![vec![0x01, 0x02], vec![0x03, 0x04]],
     };
 
-    let encoded =
-        encode_provide_missing_transactions(&provide).expect("Encoding should succeed");
-    let decoded =
-        decode_provide_missing_transactions(&encoded).expect("Decoding should succeed");
+    let encoded = encode_provide_missing_transactions(&provide).expect("Encoding should succeed");
+    let decoded = decode_provide_missing_transactions(&encoded).expect("Decoding should succeed");
 
     assert_eq!(decoded.channel_id, 1);
     assert_eq!(decoded.request_id, 42);
@@ -627,7 +629,10 @@ async fn test_missing_transactions_flow_complete() {
     let token_response = server
         .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
         .expect("Token allocation should succeed");
-    assert_eq!(token_response.granted_mode, JobDeclarationMode::FullTemplate);
+    assert_eq!(
+        token_response.granted_mode,
+        JobDeclarationMode::FullTemplate
+    );
 
     // Submit job with an unknown txid
     let tx_data = minimal_tx_with_script(&[0x52]);
@@ -700,7 +705,10 @@ async fn test_set_custom_mining_job_still_works() {
     let token_response = server
         .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
         .expect("Token allocation should succeed");
-    assert_eq!(token_response.granted_mode, JobDeclarationMode::CoinbaseOnly);
+    assert_eq!(
+        token_response.granted_mode,
+        JobDeclarationMode::CoinbaseOnly
+    );
 
     // Submit Coinbase-Only job
     let job = SetCustomMiningJob {
@@ -765,7 +773,10 @@ fn test_full_template_error_codes() {
 
     // InvalidTransactions error
     let error = SetFullTemplateJobError::invalid_transactions(1, 42, "bad tx");
-    assert_eq!(error.error_code, SetFullTemplateJobErrorCode::InvalidTransactions);
+    assert_eq!(
+        error.error_code,
+        SetFullTemplateJobErrorCode::InvalidTransactions
+    );
     assert_eq!(error.error_message, "bad tx");
 
     // InvalidToken error
@@ -774,7 +785,10 @@ fn test_full_template_error_codes() {
 
     // InvalidCoinbase error
     let error = SetFullTemplateJobError::invalid_coinbase(1, 42, "missing pool output");
-    assert_eq!(error.error_code, SetFullTemplateJobErrorCode::InvalidCoinbase);
+    assert_eq!(
+        error.error_code,
+        SetFullTemplateJobErrorCode::InvalidCoinbase
+    );
     assert_eq!(error.error_message, "missing pool output");
 }
 
@@ -794,8 +808,14 @@ fn test_error_code_byte_values() {
     assert_eq!(SetFullTemplateJobErrorCode::InvalidBits.as_u8(), 0x08);
     assert_eq!(SetFullTemplateJobErrorCode::ServerOverloaded.as_u8(), 0x09);
     assert_eq!(SetFullTemplateJobErrorCode::ModeMismatch.as_u8(), 0x0A);
-    assert_eq!(SetFullTemplateJobErrorCode::InvalidTransactions.as_u8(), 0x0B);
-    assert_eq!(SetFullTemplateJobErrorCode::TooManyTransactions.as_u8(), 0x0C);
+    assert_eq!(
+        SetFullTemplateJobErrorCode::InvalidTransactions.as_u8(),
+        0x0B
+    );
+    assert_eq!(
+        SetFullTemplateJobErrorCode::TooManyTransactions.as_u8(),
+        0x0C
+    );
     assert_eq!(SetFullTemplateJobErrorCode::Other.as_u8(), 0xFF);
 }
 
@@ -1092,11 +1112,14 @@ async fn test_server_minimal_validation() {
         time: 1700000000,
         bits: 0x1d00ffff,
         tx_short_ids: vec![[0x99; 32], [0x88; 32]], // Unknown txids
-        tx_data: vec![], // No tx_data
+        tx_data: vec![],                            // No tx_data
     };
 
     let result = server.handle_set_full_template_job(job).await;
-    assert!(result.is_ok(), "Minimal validation should accept any template");
+    assert!(
+        result.is_ok(),
+        "Minimal validation should accept any template"
+    );
 }
 
 /// Test server with Strict validation level

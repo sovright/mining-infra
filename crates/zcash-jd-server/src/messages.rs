@@ -544,7 +544,11 @@ impl SetFullTemplateJobError {
     }
 
     /// Create error for invalid transactions
-    pub fn invalid_transactions(channel_id: u32, request_id: u32, reason: impl Into<String>) -> Self {
+    pub fn invalid_transactions(
+        channel_id: u32,
+        request_id: u32,
+        reason: impl Into<String>,
+    ) -> Self {
         Self::new(
             channel_id,
             request_id,
@@ -724,10 +728,16 @@ mod tests {
     #[test]
     fn test_job_declaration_mode() {
         // Test default
-        assert_eq!(JobDeclarationMode::default(), JobDeclarationMode::CoinbaseOnly);
+        assert_eq!(
+            JobDeclarationMode::default(),
+            JobDeclarationMode::CoinbaseOnly
+        );
 
         // Test conversion roundtrip
-        for mode in [JobDeclarationMode::CoinbaseOnly, JobDeclarationMode::FullTemplate] {
+        for mode in [
+            JobDeclarationMode::CoinbaseOnly,
+            JobDeclarationMode::FullTemplate,
+        ] {
             let byte = mode.as_u8();
             let recovered = JobDeclarationMode::from_u8(byte).unwrap();
             assert_eq!(mode, recovered);
@@ -738,8 +748,14 @@ mod tests {
         assert!(JobDeclarationMode::from_u8(0xFF).is_none());
 
         // Test display
-        assert_eq!(format!("{}", JobDeclarationMode::CoinbaseOnly), "CoinbaseOnly");
-        assert_eq!(format!("{}", JobDeclarationMode::FullTemplate), "FullTemplate");
+        assert_eq!(
+            format!("{}", JobDeclarationMode::CoinbaseOnly),
+            "CoinbaseOnly"
+        );
+        assert_eq!(
+            format!("{}", JobDeclarationMode::FullTemplate),
+            "FullTemplate"
+        );
     }
 
     #[test]
@@ -855,18 +871,21 @@ mod tests {
         let error = SetCustomMiningJobError::invalid_coinbase(3, 44, "missing pool output");
         assert_eq!(error.channel_id, 3);
         assert_eq!(error.request_id, 44);
-        assert_eq!(error.error_code, SetCustomMiningJobErrorCode::InvalidCoinbase);
+        assert_eq!(
+            error.error_code,
+            SetCustomMiningJobErrorCode::InvalidCoinbase
+        );
         assert_eq!(error.error_message, "missing pool output");
     }
 
     #[test]
     fn test_push_solution() {
         let solution = PushSolution::new(
-            1,          // channel_id
-            100,        // job_id
-            5,          // version
-            1700000000, // time
-            [0x11; 32], // nonce
+            1,            // channel_id
+            100,          // job_id
+            5,            // version
+            1700000000,   // time
+            [0x11; 32],   // nonce
             [0x22; 1344], // solution
         );
 
@@ -1021,11 +1040,17 @@ mod tests {
         assert_eq!(error.error_code, SetFullTemplateJobErrorCode::ModeMismatch);
 
         let error = SetFullTemplateJobError::invalid_coinbase(1, 42, "bad coinbase");
-        assert_eq!(error.error_code, SetFullTemplateJobErrorCode::InvalidCoinbase);
+        assert_eq!(
+            error.error_code,
+            SetFullTemplateJobErrorCode::InvalidCoinbase
+        );
         assert_eq!(error.error_message, "bad coinbase");
 
         let error = SetFullTemplateJobError::invalid_transactions(1, 42, "malformed tx");
-        assert_eq!(error.error_code, SetFullTemplateJobErrorCode::InvalidTransactions);
+        assert_eq!(
+            error.error_code,
+            SetFullTemplateJobErrorCode::InvalidTransactions
+        );
         assert_eq!(error.error_message, "malformed tx");
     }
 
@@ -1059,19 +1084,27 @@ mod tests {
 
     #[test]
     fn test_full_template_error_code_display() {
-        assert_eq!(format!("{}", SetFullTemplateJobErrorCode::InvalidToken), "invalid token");
-        assert_eq!(format!("{}", SetFullTemplateJobErrorCode::ModeMismatch), "mode mismatch");
-        assert_eq!(format!("{}", SetFullTemplateJobErrorCode::InvalidTransactions), "invalid transactions");
-        assert_eq!(format!("{}", SetFullTemplateJobErrorCode::TooManyTransactions), "too many transactions");
+        assert_eq!(
+            format!("{}", SetFullTemplateJobErrorCode::InvalidToken),
+            "invalid token"
+        );
+        assert_eq!(
+            format!("{}", SetFullTemplateJobErrorCode::ModeMismatch),
+            "mode mismatch"
+        );
+        assert_eq!(
+            format!("{}", SetFullTemplateJobErrorCode::InvalidTransactions),
+            "invalid transactions"
+        );
+        assert_eq!(
+            format!("{}", SetFullTemplateJobErrorCode::TooManyTransactions),
+            "too many transactions"
+        );
     }
 
     #[test]
     fn test_get_missing_transactions() {
-        let msg = GetMissingTransactions::new(
-            1,
-            42,
-            vec![[0x11; 32], [0x22; 32], [0x33; 32]],
-        );
+        let msg = GetMissingTransactions::new(1, 42, vec![[0x11; 32], [0x22; 32], [0x33; 32]]);
 
         assert_eq!(msg.channel_id, 1);
         assert_eq!(msg.request_id, 42);
@@ -1086,10 +1119,7 @@ mod tests {
         let msg = ProvideMissingTransactions::new(
             1,
             42,
-            vec![
-                vec![0x01, 0x00, 0x00, 0x00],
-                vec![0x02, 0x00, 0x00, 0x00],
-            ],
+            vec![vec![0x01, 0x00, 0x00, 0x00], vec![0x02, 0x00, 0x00, 0x00]],
         );
 
         assert_eq!(msg.channel_id, 1);

@@ -5,11 +5,9 @@
 
 use zcash_equihash_validator::EquihashValidator;
 use zcash_mining_protocol::messages::{NewEquihashJob, SubmitEquihashShare};
-use zcash_pool_server::{InMemoryDuplicateDetector, ShareProcessor};
 use zcash_pool_common::write_compact_size;
-use zcash_template_provider::types::{
-    BlockTemplate, EquihashHeader, Hash256, TemplateTransaction,
-};
+use zcash_pool_server::{InMemoryDuplicateDetector, ShareProcessor};
+use zcash_template_provider::types::{BlockTemplate, EquihashHeader, Hash256, TemplateTransaction};
 
 // ---------------------------------------------------------------------------
 // Zcash mainnet genesis block test vectors
@@ -138,7 +136,9 @@ fn genesis_nonce_2() -> Vec<u8> {
 fn test_genesis_job_builds_correct_header() {
     let job = genesis_job();
     let nonce_2 = genesis_nonce_2();
-    let full_nonce = job.build_nonce(&nonce_2).expect("nonce_2 length must match");
+    let full_nonce = job
+        .build_nonce(&nonce_2)
+        .expect("nonce_2 length must match");
     let built_header = job.build_header(&full_nonce);
     let expected_header = genesis_header_bytes();
 
@@ -267,7 +267,10 @@ fn test_is_block_depends_on_block_target() {
     let hard_result = processor
         .validate_share_with_job(&share, &job, &detector2, &[0x00; 32])
         .unwrap();
-    assert!(hard_result.accepted, "Share should still be accepted (meets share target)");
+    assert!(
+        hard_result.accepted,
+        "Share should still be accepted (meets share target)"
+    );
     assert!(
         !hard_result.is_block,
         "Impossible block target: should NOT be a block"
@@ -355,7 +358,11 @@ fn test_block_serialization_structure() {
     let block_hex = hex::encode(&block);
 
     // 1. Header (140 bytes)
-    assert_eq!(&block[..140], &header[..], "Block must start with the header");
+    assert_eq!(
+        &block[..140],
+        &header[..],
+        "Block must start with the header"
+    );
 
     // 2. CompactSize for solution: 1344 = 0x0540, encoded as fd 40 05
     assert_eq!(
@@ -372,7 +379,11 @@ fn test_block_serialization_structure() {
     );
 
     // 4. Tx count (CompactSize for 2 = coinbase + 1 tx)
-    assert_eq!(block[143 + 1344], 0x02, "Tx count should be 2 (coinbase + 1 tx)");
+    assert_eq!(
+        block[143 + 1344],
+        0x02,
+        "Tx count should be 2 (coinbase + 1 tx)"
+    );
 
     // 5. Coinbase follows
     let coinbase_start = 143 + 1344 + 1;

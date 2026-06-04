@@ -8,8 +8,8 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, warn};
 
@@ -79,7 +79,10 @@ pub enum SequenceCheckResult {
 impl SequenceCheckResult {
     /// Check if the result indicates the message should be processed
     pub fn should_process(&self) -> bool {
-        matches!(self, SequenceCheckResult::Valid | SequenceCheckResult::ValidOutOfOrder)
+        matches!(
+            self,
+            SequenceCheckResult::Valid | SequenceCheckResult::ValidOutOfOrder
+        )
     }
 
     /// Check if this might indicate an attack
@@ -273,7 +276,7 @@ impl Default for ConnectionTracker {
         Self::new(
             Duration::from_secs(5),   // Connections < 5s are "short-lived"
             Duration::from_secs(300), // Track over 5 minute window
-            10,                        // Flag after 10 short-lived connections
+            10,                       // Flag after 10 short-lived connections
         )
     }
 }
@@ -339,18 +342,25 @@ impl ConnectionTracker {
             }
         }
 
-        connections.entry(addr).or_insert_with(|| ConnectionHistory {
-            recent_durations: VecDeque::with_capacity(32),
-            suspicious_count: 0,
-            is_flagged: false,
-        });
+        connections
+            .entry(addr)
+            .or_insert_with(|| ConnectionHistory {
+                recent_durations: VecDeque::with_capacity(32),
+                suspicious_count: 0,
+                is_flagged: false,
+            });
         now
     }
 
     /// Record a disconnection
     ///
     /// Returns `true` if this address should be flagged as suspicious
-    pub fn on_disconnect(&self, addr: SocketAddr, connected_at: Instant, decryption_error: bool) -> bool {
+    pub fn on_disconnect(
+        &self,
+        addr: SocketAddr,
+        connected_at: Instant,
+        decryption_error: bool,
+    ) -> bool {
         let now = Instant::now();
         let duration = now.duration_since(connected_at);
         let is_short_lived = duration < self.short_lived_threshold;
@@ -396,8 +406,8 @@ impl ConnectionTracker {
             .count();
 
         // Check if we should flag this address
-        let should_flag = short_lived_count >= self.max_short_lived_per_window
-            || decrypt_error_count >= 3;
+        let should_flag =
+            short_lived_count >= self.max_short_lived_per_window || decrypt_error_count >= 3;
 
         if should_flag && !history.is_flagged {
             history.is_flagged = true;
@@ -434,10 +444,15 @@ impl ConnectionTracker {
 
     /// Clear flag for an address (manual reset)
     pub fn clear_flag(&self, addr: &SocketAddr) {
-        if let Some(history) = self.connections.write().unwrap_or_else(|e| {
-            warn!("ConnectionTracker lock poisoned in clear_flag, recovering");
-            e.into_inner()
-        }).get_mut(&addr.ip()) {
+        if let Some(history) = self
+            .connections
+            .write()
+            .unwrap_or_else(|e| {
+                warn!("ConnectionTracker lock poisoned in clear_flag, recovering");
+                e.into_inner()
+            })
+            .get_mut(&addr.ip())
+        {
             history.is_flagged = false;
         }
     }
@@ -651,10 +666,7 @@ mod tests {
     #[test]
     fn test_sequence_first_message() {
         let validator = SequenceValidator::default();
-        assert_eq!(
-            validator.validate(1, 1),
-            SequenceCheckResult::Valid
-        );
+        assert_eq!(validator.validate(1, 1), SequenceCheckResult::Valid);
     }
 
     #[test]
@@ -689,10 +701,7 @@ mod tests {
     fn test_sequence_large_gap() {
         let validator = SequenceValidator::new(10, 64);
         validator.validate(1, 1);
-        assert_eq!(
-            validator.validate(1, 100),
-            SequenceCheckResult::GapTooLarge
-        );
+        assert_eq!(validator.validate(1, 100), SequenceCheckResult::GapTooLarge);
     }
 
     #[test]
@@ -700,16 +709,10 @@ mod tests {
         let validator = SequenceValidator::new(10, 64);
         validator.validate(1, 1);
 
-        assert_eq!(
-            validator.validate(1, 100),
-            SequenceCheckResult::GapTooLarge
-        );
+        assert_eq!(validator.validate(1, 100), SequenceCheckResult::GapTooLarge);
 
         assert_eq!(validator.validate(1, 2), SequenceCheckResult::Valid);
-        assert_eq!(
-            validator.validate(1, 100),
-            SequenceCheckResult::GapTooLarge
-        );
+        assert_eq!(validator.validate(1, 100), SequenceCheckResult::GapTooLarge);
     }
 
     #[test]
@@ -720,10 +723,7 @@ mod tests {
         validator.validate(1, 1);
 
         // Large gap triggers GapTooLarge
-        assert_eq!(
-            validator.validate(1, 100),
-            SequenceCheckResult::GapTooLarge
-        );
+        assert_eq!(validator.validate(1, 100), SequenceCheckResult::GapTooLarge);
 
         assert_eq!(validator.validate(1, 2), SequenceCheckResult::Valid);
         assert_eq!(validator.validate(1, 3), SequenceCheckResult::Valid);
@@ -733,15 +733,9 @@ mod tests {
     fn test_sequence_large_gap_is_not_recorded_as_replay() {
         let validator = SequenceValidator::new(10, 64);
         validator.validate(1, 1);
-        assert_eq!(
-            validator.validate(1, 100),
-            SequenceCheckResult::GapTooLarge
-        );
+        assert_eq!(validator.validate(1, 100), SequenceCheckResult::GapTooLarge);
 
-        assert_eq!(
-            validator.validate(1, 100),
-            SequenceCheckResult::GapTooLarge
-        );
+        assert_eq!(validator.validate(1, 100), SequenceCheckResult::GapTooLarge);
     }
 
     #[test]
@@ -757,11 +751,7 @@ mod tests {
 
     #[test]
     fn test_connection_tracker_normal() {
-        let tracker = ConnectionTracker::new(
-            Duration::from_secs(5),
-            Duration::from_secs(300),
-            10,
-        );
+        let tracker = ConnectionTracker::new(Duration::from_secs(5), Duration::from_secs(300), 10);
 
         let addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         let connected_at = tracker.on_connect(addr);
@@ -808,11 +798,8 @@ mod tests {
 
     #[test]
     fn test_connection_tracker_max_entries() {
-        let mut tracker = ConnectionTracker::new(
-            Duration::from_secs(5),
-            Duration::from_secs(300),
-            10,
-        );
+        let mut tracker =
+            ConnectionTracker::new(Duration::from_secs(5), Duration::from_secs(300), 10);
         // Set a small cap for testing
         tracker.max_tracked_addresses = 3;
 
@@ -839,10 +826,7 @@ mod tests {
 
     #[test]
     fn test_timing_jitter_range() {
-        let jitter = TimingJitter::new(
-            Duration::from_millis(10),
-            Duration::from_millis(100),
-        );
+        let jitter = TimingJitter::new(Duration::from_millis(10), Duration::from_millis(100));
 
         for _ in 0..100 {
             let delay = jitter.get_delay();

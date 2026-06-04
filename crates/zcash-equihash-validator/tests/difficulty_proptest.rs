@@ -1,6 +1,6 @@
 use proptest::prelude::*;
 use zcash_equihash_validator::{
-    Target, compact_to_target, target_to_difficulty, difficulty_to_target,
+    Target, compact_to_target, difficulty_to_target, target_to_difficulty,
 };
 
 proptest! {

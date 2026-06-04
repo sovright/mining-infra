@@ -7,8 +7,8 @@
 
 use crate::error::{ProtocolError, Result};
 use crate::messages::{
-    message_types, NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
-    SubmitSharesResponse,
+    NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
+    SubmitSharesResponse, message_types,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -76,7 +76,9 @@ pub fn encode_new_equihash_job(job: &NewEquihashJob) -> Result<Vec<u8>> {
 
     payload.write_u32::<LittleEndian>(job.channel_id).unwrap();
     payload.write_u32::<LittleEndian>(job.job_id).unwrap();
-    payload.write_u8(if job.future_job { 1 } else { 0 }).unwrap();
+    payload
+        .write_u8(if job.future_job { 1 } else { 0 })
+        .unwrap();
     payload.write_u32::<LittleEndian>(job.version).unwrap();
     payload.write_all(&job.prev_hash).unwrap();
     payload.write_all(&job.merkle_root).unwrap();
@@ -88,7 +90,9 @@ pub fn encode_new_equihash_job(job: &NewEquihashJob) -> Result<Vec<u8>> {
     payload.write_u32::<LittleEndian>(job.time).unwrap();
     payload.write_u32::<LittleEndian>(job.bits).unwrap();
     payload.write_all(&job.target).unwrap();
-    payload.write_u8(if job.clean_jobs { 1 } else { 0 }).unwrap();
+    payload
+        .write_u8(if job.clean_jobs { 1 } else { 0 })
+        .unwrap();
 
     let frame = MessageFrame {
         extension_type: 0,
@@ -116,43 +120,46 @@ pub fn decode_new_equihash_job(data: &[u8]) -> Result<NewEquihashJob> {
         });
     }
     if data.len() > total_len {
-        return Err(ProtocolError::EncodingError("trailing bytes in message".into()));
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in message".into(),
+        ));
     }
 
     let payload = &data[MessageFrame::HEADER_SIZE..total_len];
     let mut cursor = Cursor::new(payload);
 
-    let channel_id = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let job_id = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let future_job = cursor.read_u8().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })? != 0;
-    let version = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let job_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let future_job = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?
+        != 0;
+    let version = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let mut prev_hash = [0u8; 32];
-    cursor.read_exact(&mut prev_hash).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut prev_hash)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let mut merkle_root = [0u8; 32];
-    cursor.read_exact(&mut merkle_root).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut merkle_root)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let mut block_commitments = [0u8; 32];
-    cursor.read_exact(&mut block_commitments).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut block_commitments)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
-    let nonce_1_len = cursor.read_u8().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })? as usize;
+    let nonce_1_len = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))? as usize;
     // Validate nonce_1_len (Zcash nonce is 32 bytes total)
     if nonce_1_len > 32 {
         return Err(ProtocolError::EncodingError(format!(
@@ -161,13 +168,13 @@ pub fn decode_new_equihash_job(data: &[u8]) -> Result<NewEquihashJob> {
         )));
     }
     let mut nonce_1 = vec![0u8; nonce_1_len];
-    cursor.read_exact(&mut nonce_1).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut nonce_1)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
-    let nonce_2_len = cursor.read_u8().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let nonce_2_len = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
     // Validate nonce_2_len and that nonce_1 + nonce_2 == 32 bytes
     if nonce_2_len as usize > 32 {
         return Err(ProtocolError::EncodingError(format!(
@@ -182,21 +189,22 @@ pub fn decode_new_equihash_job(data: &[u8]) -> Result<NewEquihashJob> {
         )));
     }
 
-    let time = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let bits = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let time = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let bits = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let mut target = [0u8; 32];
-    cursor.read_exact(&mut target).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut target)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
-    let clean_jobs = cursor.read_u8().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })? != 0;
+    let clean_jobs = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?
+        != 0;
 
     Ok(NewEquihashJob {
         channel_id,
@@ -220,7 +228,9 @@ pub fn encode_submit_share(share: &SubmitEquihashShare) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
 
     payload.write_u32::<LittleEndian>(share.channel_id).unwrap();
-    payload.write_u32::<LittleEndian>(share.sequence_number).unwrap();
+    payload
+        .write_u32::<LittleEndian>(share.sequence_number)
+        .unwrap();
     payload.write_u32::<LittleEndian>(share.job_id).unwrap();
     // Variable-length nonce_2
     payload.write_u8(share.nonce_2.len() as u8).unwrap();
@@ -254,25 +264,27 @@ pub fn decode_submit_share(data: &[u8]) -> Result<SubmitEquihashShare> {
         });
     }
     if data.len() > total_len {
-        return Err(ProtocolError::EncodingError("trailing bytes in message".into()));
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in message".into(),
+        ));
     }
 
     let payload = &data[MessageFrame::HEADER_SIZE..total_len];
     let mut cursor = Cursor::new(payload);
 
-    let channel_id = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let sequence_number = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let job_id = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let sequence_number = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let job_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
-    let nonce_2_len = cursor.read_u8().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })? as usize;
+    let nonce_2_len = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))? as usize;
     // Validate nonce_2_len (Zcash nonce is 32 bytes total)
     if nonce_2_len > 32 {
         return Err(ProtocolError::EncodingError(format!(
@@ -281,18 +293,18 @@ pub fn decode_submit_share(data: &[u8]) -> Result<SubmitEquihashShare> {
         )));
     }
     let mut nonce_2 = vec![0u8; nonce_2_len];
-    cursor.read_exact(&mut nonce_2).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut nonce_2)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
-    let time = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let time = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let mut solution = [0u8; 1344];
-    cursor.read_exact(&mut solution).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut solution)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     Ok(SubmitEquihashShare {
         channel_id,
@@ -358,7 +370,9 @@ pub fn encode_submit_shares_response(resp: &SubmitSharesResponse) -> Result<Vec<
     let mut payload = Vec::new();
 
     payload.write_u32::<LittleEndian>(resp.channel_id).unwrap();
-    payload.write_u32::<LittleEndian>(resp.sequence_number).unwrap();
+    payload
+        .write_u32::<LittleEndian>(resp.sequence_number)
+        .unwrap();
 
     match &resp.result {
         ShareResult::Accepted => {
@@ -374,10 +388,14 @@ pub fn encode_submit_shares_response(resp: &SubmitSharesResponse) -> Result<Vec<
                     payload.write_u8(reject_reason_codes::DUPLICATE).unwrap();
                 }
                 RejectReason::InvalidSolution => {
-                    payload.write_u8(reject_reason_codes::INVALID_SOLUTION).unwrap();
+                    payload
+                        .write_u8(reject_reason_codes::INVALID_SOLUTION)
+                        .unwrap();
                 }
                 RejectReason::LowDifficulty => {
-                    payload.write_u8(reject_reason_codes::LOW_DIFFICULTY).unwrap();
+                    payload
+                        .write_u8(reject_reason_codes::LOW_DIFFICULTY)
+                        .unwrap();
                 }
                 RejectReason::Other(msg) => {
                     payload.write_u8(reject_reason_codes::OTHER).unwrap();
@@ -416,43 +434,49 @@ pub fn decode_submit_shares_response(data: &[u8]) -> Result<SubmitSharesResponse
         });
     }
     if data.len() > total_len {
-        return Err(ProtocolError::EncodingError("trailing bytes in message".into()));
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in message".into(),
+        ));
     }
 
     let payload = &data[MessageFrame::HEADER_SIZE..total_len];
     let mut cursor = Cursor::new(payload);
 
-    let channel_id = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let sequence_number = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
-    let result_code = cursor.read_u8().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let sequence_number = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let result_code = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let result = match result_code {
         share_result_codes::ACCEPTED => ShareResult::Accepted,
         share_result_codes::REJECTED => {
-            let reason_code = cursor.read_u8().map_err(|e| {
-                ProtocolError::EncodingError(e.to_string())
-            })?;
+            let reason_code = cursor
+                .read_u8()
+                .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
             let reason = match reason_code {
                 reject_reason_codes::STALE_JOB => RejectReason::StaleJob,
                 reject_reason_codes::DUPLICATE => RejectReason::Duplicate,
                 reject_reason_codes::INVALID_SOLUTION => RejectReason::InvalidSolution,
                 reject_reason_codes::LOW_DIFFICULTY => RejectReason::LowDifficulty,
                 reject_reason_codes::OTHER => {
-                    let msg_len = cursor.read_u8().map_err(|e| {
-                        ProtocolError::EncodingError(e.to_string())
-                    })? as usize;
+                    let msg_len = cursor
+                        .read_u8()
+                        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?
+                        as usize;
                     let mut msg_bytes = vec![0u8; msg_len];
-                    cursor.read_exact(&mut msg_bytes).map_err(|e| {
-                        ProtocolError::EncodingError(e.to_string())
-                    })?;
+                    cursor
+                        .read_exact(&mut msg_bytes)
+                        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
                     let msg = String::from_utf8(msg_bytes).map_err(|e| {
-                        ProtocolError::EncodingError(format!("invalid UTF-8 in reject reason: {}", e))
+                        ProtocolError::EncodingError(format!(
+                            "invalid UTF-8 in reject reason: {}",
+                            e
+                        ))
                     })?;
                     RejectReason::Other(msg)
                 }
@@ -513,25 +537,24 @@ pub fn decode_set_target(data: &[u8]) -> Result<SetTarget> {
         });
     }
     if data.len() > total_len {
-        return Err(ProtocolError::EncodingError("trailing bytes in message".into()));
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in message".into(),
+        ));
     }
 
     let payload = &data[MessageFrame::HEADER_SIZE..total_len];
     let mut cursor = Cursor::new(payload);
 
-    let channel_id = cursor.read_u32::<LittleEndian>().map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
     let mut target = [0u8; 32];
-    cursor.read_exact(&mut target).map_err(|e| {
-        ProtocolError::EncodingError(e.to_string())
-    })?;
+    cursor
+        .read_exact(&mut target)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
 
-    Ok(SetTarget {
-        channel_id,
-        target,
-    })
+    Ok(SetTarget { channel_id, target })
 }
 
 impl Encodable for SubmitSharesResponse {

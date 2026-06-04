@@ -27,10 +27,9 @@ pub fn assemble_header(template: &GetBlockTemplateResponse) -> Result<EquihashHe
         (Ok(history_root), Ok(auth_root)) => {
             calculate_block_commitments_hash(&history_root, &auth_root)
         }
-        _ => {
-            Hash256::from_hex_le(&template.default_roots.block_commitments_hash)
-                .map_err(|e| Error::InvalidTemplate(format!("invalid block_commitments_hash: {}", e)))?
-        }
+        _ => Hash256::from_hex_le(&template.default_roots.block_commitments_hash).map_err(|e| {
+            Error::InvalidTemplate(format!("invalid block_commitments_hash: {}", e))
+        })?,
     };
 
     let bits = u32::from_str_radix(&template.bits, 16)

@@ -129,7 +129,9 @@ impl std::fmt::Display for ConfigError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConfigError::InvalidNonce1Len(v) => write!(f, "nonce_1_len {} must be 1-31", v),
-            ConfigError::InvalidDifficulty(v) => write!(f, "initial_difficulty {} must be positive", v),
+            ConfigError::InvalidDifficulty(v) => {
+                write!(f, "initial_difficulty {} must be positive", v)
+            }
             ConfigError::InvalidTargetSharesPerMinute(v) => {
                 write!(f, "target_shares_per_minute {} must be positive", v)
             }
@@ -146,7 +148,11 @@ impl std::fmt::Display for ConfigError {
                 write!(f, "relay_enabled requires relay_auth_key")
             }
             ConfigError::InvalidFecConfig { data, parity } => {
-                write!(f, "FEC config invalid: data={}, parity={} (both must be >= 1)", data, parity)
+                write!(
+                    f,
+                    "FEC config invalid: data={}, parity={} (both must be >= 1)",
+                    data, parity
+                )
             }
             ConfigError::JdMissingPayoutScript => {
                 write!(f, "jd_listen_addr set but pool_payout_script is missing")
@@ -193,7 +199,9 @@ impl PoolConfig {
 
         // Need at least 1 validation thread
         if self.validation_threads == 0 {
-            return Err(ConfigError::InvalidValidationThreads(self.validation_threads));
+            return Err(ConfigError::InvalidValidationThreads(
+                self.validation_threads,
+            ));
         }
 
         // Template poll interval should be at least 100ms to avoid hammering Zebra
@@ -212,9 +220,7 @@ impl PoolConfig {
         }
 
         // FEC shards must be valid
-        if self.relay_enabled
-            && (self.relay_data_shards == 0 || self.relay_parity_shards == 0)
-        {
+        if self.relay_enabled && (self.relay_data_shards == 0 || self.relay_parity_shards == 0) {
             return Err(ConfigError::InvalidFecConfig {
                 data: self.relay_data_shards,
                 parity: self.relay_parity_shards,
@@ -394,10 +400,7 @@ mod tests {
     fn template_poll_99_rejected() {
         let mut cfg = valid_config();
         cfg.template_poll_ms = 99;
-        assert_eq!(
-            cfg.validate(),
-            Err(ConfigError::InvalidTemplatePollMs(99))
-        );
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidTemplatePollMs(99)));
     }
 
     #[test]
@@ -412,10 +415,7 @@ mod tests {
     fn max_connections_zero_rejected() {
         let mut cfg = valid_config();
         cfg.max_connections = 0;
-        assert_eq!(
-            cfg.validate(),
-            Err(ConfigError::InvalidMaxConnections(0))
-        );
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidMaxConnections(0)));
     }
 
     // 7. RelayMissingAuthKey
@@ -437,10 +437,7 @@ mod tests {
         cfg.relay_parity_shards = 3;
         assert_eq!(
             cfg.validate(),
-            Err(ConfigError::InvalidFecConfig {
-                data: 0,
-                parity: 3
-            })
+            Err(ConfigError::InvalidFecConfig { data: 0, parity: 3 })
         );
     }
 

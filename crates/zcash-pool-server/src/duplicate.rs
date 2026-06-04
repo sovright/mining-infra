@@ -80,9 +80,7 @@ impl Default for InMemoryDuplicateDetector {
 impl DuplicateDetector for InMemoryDuplicateDetector {
     fn start_job(&self, job_id: u32) {
         let mut jobs = self.jobs.write().unwrap_or_else(|e| {
-            warn!(
-                "Duplicate detector lock was poisoned in start_job, recovering"
-            );
+            warn!("Duplicate detector lock was poisoned in start_job, recovering");
             e.into_inner()
         });
         jobs.remove(&job_id);
@@ -93,9 +91,7 @@ impl DuplicateDetector for InMemoryDuplicateDetector {
 
         // Handle poisoned lock gracefully - continue operating even if another thread panicked
         let mut jobs = self.jobs.write().unwrap_or_else(|e| {
-            warn!(
-                "Duplicate detector lock was poisoned, recovering with potentially stale state"
-            );
+            warn!("Duplicate detector lock was poisoned, recovering with potentially stale state");
             e.into_inner()
         });
         let shares = jobs.entry(job_id).or_default();
@@ -120,9 +116,7 @@ impl DuplicateDetector for InMemoryDuplicateDetector {
 
     fn clear_job(&self, job_id: u32) {
         let mut jobs = self.jobs.write().unwrap_or_else(|e| {
-            warn!(
-                "Duplicate detector lock was poisoned in clear_job, recovering"
-            );
+            warn!("Duplicate detector lock was poisoned in clear_job, recovering");
             e.into_inner()
         });
         jobs.remove(&job_id);
@@ -130,9 +124,7 @@ impl DuplicateDetector for InMemoryDuplicateDetector {
 
     fn clear_all(&self) {
         let mut jobs = self.jobs.write().unwrap_or_else(|e| {
-            warn!(
-                "Duplicate detector lock was poisoned in clear_all, recovering"
-            );
+            warn!("Duplicate detector lock was poisoned in clear_all, recovering");
             e.into_inner()
         });
         jobs.clear();
@@ -140,9 +132,7 @@ impl DuplicateDetector for InMemoryDuplicateDetector {
 
     fn prune_inactive(&self, active_job_ids: &HashSet<u32>) {
         let mut jobs = self.jobs.write().unwrap_or_else(|e| {
-            warn!(
-                "Duplicate detector lock was poisoned in prune_inactive, recovering"
-            );
+            warn!("Duplicate detector lock was poisoned in prune_inactive, recovering");
             e.into_inner()
         });
         jobs.retain(|job_id, _| active_job_ids.contains(job_id));

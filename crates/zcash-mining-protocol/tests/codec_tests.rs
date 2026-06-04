@@ -1,4 +1,4 @@
-use zcash_mining_protocol::codec::{encode_message, decode_message};
+use zcash_mining_protocol::codec::{decode_message, encode_message};
 use zcash_mining_protocol::messages::{NewEquihashJob, SubmitEquihashShare};
 
 #[test]

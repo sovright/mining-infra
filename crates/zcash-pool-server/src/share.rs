@@ -8,7 +8,9 @@ use crate::error::{PoolError, Result};
 use tracing::{debug, warn};
 use zcash_equihash_validator::EquihashValidator;
 use zcash_equihash_validator::difficulty::{Target, target_to_difficulty};
-use zcash_mining_protocol::messages::{NewEquihashJob, RejectReason, ShareResult, SubmitEquihashShare};
+use zcash_mining_protocol::messages::{
+    NewEquihashJob, RejectReason, ShareResult, SubmitEquihashShare,
+};
 
 /// Result of share validation
 #[derive(Debug)]
@@ -108,9 +110,9 @@ impl ShareProcessor {
         }
 
         // 3. Build full nonce and header
-        let full_nonce = job.build_nonce(&share.nonce_2).ok_or_else(|| {
-            PoolError::InvalidMessage("Invalid nonce_2 length".to_string())
-        })?;
+        let full_nonce = job
+            .build_nonce(&share.nonce_2)
+            .ok_or_else(|| PoolError::InvalidMessage("Invalid nonce_2 length".to_string()))?;
 
         let mut header = job.build_header(&full_nonce);
         // Update time if miner changed it (already validated above)
@@ -120,7 +122,10 @@ impl ShareProcessor {
         //    verify_share calls verify_solution internally, so we only call it
         //    once to avoid the expensive (~144 MB) duplicate Equihash verification.
         let share_target = &job.target;
-        match self.validator.verify_share(&header, &share.solution, share_target) {
+        match self
+            .validator
+            .verify_share(&header, &share.solution, share_target)
+        {
             Ok(hash) => {
                 // Calculate share difficulty
                 let difficulty = self.hash_to_difficulty(&hash);
@@ -141,7 +146,10 @@ impl ShareProcessor {
                 })
             }
             Err(zcash_equihash_validator::ValidationError::TargetNotMet) => {
-                debug!("Share below target difficulty (target={})", hex::encode(share_target));
+                debug!(
+                    "Share below target difficulty (target={})",
+                    hex::encode(share_target)
+                );
                 Ok(ShareValidationResult {
                     accepted: false,
                     result: ShareResult::Rejected(RejectReason::LowDifficulty),
@@ -245,8 +253,13 @@ mod tests {
             time: job_time + 7201, // 2 hours + 1 second
             solution: [0; 1344],
         };
-        let result = processor.validate_share_with_job(&future_share, &job, &detector, &block_target).unwrap();
-        assert!(!result.accepted, "Share with timestamp >2h in future should be rejected");
+        let result = processor
+            .validate_share_with_job(&future_share, &job, &detector, &block_target)
+            .unwrap();
+        assert!(
+            !result.accepted,
+            "Share with timestamp >2h in future should be rejected"
+        );
 
         // Share with timestamp too far in the past (>60s before job)
         let past_share = SubmitEquihashShare {
@@ -257,8 +270,13 @@ mod tests {
             time: job_time - 61,
             solution: [0; 1344],
         };
-        let result = processor.validate_share_with_job(&past_share, &job, &detector, &block_target).unwrap();
-        assert!(!result.accepted, "Share with timestamp >60s before job time should be rejected");
+        let result = processor
+            .validate_share_with_job(&past_share, &job, &detector, &block_target)
+            .unwrap();
+        assert!(
+            !result.accepted,
+            "Share with timestamp >60s before job time should be rejected"
+        );
 
         // Share with valid timestamp (same as job time) should pass time check
         // (it will fail Equihash validation, but that's expected - the point is
@@ -271,7 +289,9 @@ mod tests {
             time: job_time,
             solution: [0; 1344],
         };
-        let result = processor.validate_share_with_job(&valid_time_share, &job, &detector, &block_target).unwrap();
+        let result = processor
+            .validate_share_with_job(&valid_time_share, &job, &detector, &block_target)
+            .unwrap();
         // Should NOT be rejected for timestamp - will be rejected for invalid solution instead
         // Any result other than an Other-rejection (accepted or rejected for
         // solution) is fine.
@@ -358,7 +378,9 @@ mod tests {
             solution: [0; 1344],
         };
 
-        let result = processor.validate_share(&share, &channel, &detector, &block_target).unwrap();
+        let result = processor
+            .validate_share(&share, &channel, &detector, &block_target)
+            .unwrap();
         assert!(!result.accepted);
         assert!(
             matches!(result.result, ShareResult::Rejected(RejectReason::StaleJob)),
@@ -392,7 +414,11 @@ mod tests {
         assert!(result.is_err());
         match result.unwrap_err() {
             PoolError::InvalidMessage(msg) => {
-                assert!(msg.contains("nonce"), "Error message should mention nonce: {}", msg);
+                assert!(
+                    msg.contains("nonce"),
+                    "Error message should mention nonce: {}",
+                    msg
+                );
             }
             other => panic!("Expected InvalidMessage, got: {:?}", other),
         }
@@ -420,17 +446,27 @@ mod tests {
         };
 
         // First submission -- will get InvalidSolution (dummy solution), but not Duplicate
-        let result1 = processor.validate_share(&share, &channel, &detector, &block_target).unwrap();
+        let result1 = processor
+            .validate_share(&share, &channel, &detector, &block_target)
+            .unwrap();
         assert!(
-            !matches!(result1.result, ShareResult::Rejected(RejectReason::Duplicate)),
+            !matches!(
+                result1.result,
+                ShareResult::Rejected(RejectReason::Duplicate)
+            ),
             "First submission should not be duplicate, got: {:?}",
             result1.result
         );
 
         // Second submission of exact same share -- should get Duplicate
-        let result2 = processor.validate_share(&share, &channel, &detector, &block_target).unwrap();
+        let result2 = processor
+            .validate_share(&share, &channel, &detector, &block_target)
+            .unwrap();
         assert!(
-            matches!(result2.result, ShareResult::Rejected(RejectReason::Duplicate)),
+            matches!(
+                result2.result,
+                ShareResult::Rejected(RejectReason::Duplicate)
+            ),
             "Second submission should be duplicate, got: {:?}",
             result2.result
         );
@@ -460,12 +496,11 @@ mod tests {
 
         let prev_hash = [0u8; 32]; // all zeros for genesis
 
-        let merkle_root: [u8; 32] = hex::decode(
-            "db4d7a85b768123f1dff1d4c4cece70083b2d27e117b4ac2e31d087988a5eac4",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let merkle_root: [u8; 32] =
+            hex::decode("db4d7a85b768123f1dff1d4c4cece70083b2d27e117b4ac2e31d087988a5eac4")
+                .unwrap()
+                .try_into()
+                .unwrap();
 
         let block_commitments = [0u8; 32]; // all zeros for genesis
 
@@ -474,12 +509,11 @@ mod tests {
         let bits: u32 = 0x1f07ffff;
 
         // Full 32-byte nonce from genesis header bytes [108..140]
-        let nonce_bytes: [u8; 32] = hex::decode(
-            "5712000000000000000000000000000000000000000000000000000000000000",
-        )
-        .unwrap()
-        .try_into()
-        .unwrap();
+        let nonce_bytes: [u8; 32] =
+            hex::decode("5712000000000000000000000000000000000000000000000000000000000000")
+                .unwrap()
+                .try_into()
+                .unwrap();
 
         // Split nonce into nonce_1 (pool prefix, 4 bytes) + nonce_2 (miner suffix, 28 bytes)
         let nonce_1 = nonce_bytes[..4].to_vec();
@@ -503,8 +537,13 @@ mod tests {
         };
 
         // Verify nonce reconstruction produces the original nonce
-        let reconstructed = job.build_nonce(&nonce_2).expect("nonce_2 length must match");
-        assert_eq!(reconstructed, nonce_bytes, "build_nonce must reconstruct original nonce");
+        let reconstructed = job
+            .build_nonce(&nonce_2)
+            .expect("nonce_2 length must match");
+        assert_eq!(
+            reconstructed, nonce_bytes,
+            "build_nonce must reconstruct original nonce"
+        );
 
         // Verify header reconstruction produces the original 140-byte genesis header
         let expected_header = hex::decode(
@@ -562,7 +601,9 @@ mod tests {
              ec01c4a68e41ce157",
         )
         .unwrap();
-        let solution: [u8; 1344] = solution_vec.try_into().expect("solution must be 1344 bytes");
+        let solution: [u8; 1344] = solution_vec
+            .try_into()
+            .expect("solution must be 1344 bytes");
 
         // --- Build the share ---
         let share = SubmitEquihashShare {
@@ -629,10 +670,15 @@ mod tests {
             time: job_time - 60,
             solution: [0; 1344],
         };
-        let result = processor.validate_share(&share_at_lower_bound, &channel, &detector1, &block_target).unwrap();
+        let result = processor
+            .validate_share(&share_at_lower_bound, &channel, &detector1, &block_target)
+            .unwrap();
         match result.result {
             ShareResult::Rejected(RejectReason::Other(ref msg)) if msg.contains("timestamp") => {
-                panic!("time=job_time-60 should be accepted by timestamp check, got: {:?}", result.result);
+                panic!(
+                    "time=job_time-60 should be accepted by timestamp check, got: {:?}",
+                    result.result
+                );
             }
             _ => {} // InvalidSolution or anything else is fine
         }
@@ -647,10 +693,15 @@ mod tests {
             time: job_time + 7200,
             solution: [0; 1344],
         };
-        let result = processor.validate_share(&share_at_upper_bound, &channel, &detector2, &block_target).unwrap();
+        let result = processor
+            .validate_share(&share_at_upper_bound, &channel, &detector2, &block_target)
+            .unwrap();
         match result.result {
             ShareResult::Rejected(RejectReason::Other(ref msg)) if msg.contains("timestamp") => {
-                panic!("time=job_time+7200 should be accepted by timestamp check, got: {:?}", result.result);
+                panic!(
+                    "time=job_time+7200 should be accepted by timestamp check, got: {:?}",
+                    result.result
+                );
             }
             _ => {} // InvalidSolution or anything else is fine
         }

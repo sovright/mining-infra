@@ -153,7 +153,9 @@ impl Channel {
                 .min_by_key(|(_, j)| j.created_at)
                 .map(|(&id, _)| id);
             match oldest_id {
-                Some(id) => { self.jobs.remove(&id); }
+                Some(id) => {
+                    self.jobs.remove(&id);
+                }
                 None => break,
             }
         }

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 fn null_value() -> Value {
     Value::Null
@@ -207,7 +207,9 @@ fn optional_u16(value: Option<&Value>) -> Result<Option<u16>, String> {
             .as_u64()
             .ok_or_else(|| "port must be an unsigned integer".to_string())
             .and_then(|port| {
-                u16::try_from(port).map(Some).map_err(|_| "port out of range".to_string())
+                u16::try_from(port)
+                    .map(Some)
+                    .map_err(|_| "port out of range".to_string())
             }),
         Some(Value::String(text)) => text
             .parse::<u16>()

@@ -5,9 +5,9 @@
 //! - SubmitEquihashShare: Miner → Pool share submission
 //! - Channel management messages
 
+pub mod codec;
 pub mod error;
 pub mod messages;
-pub mod codec;
 
 pub use error::ProtocolError;
-pub use messages::{NewEquihashJob, SubmitEquihashShare, SubmitSharesResponse, ShareResult};
+pub use messages::{NewEquihashJob, ShareResult, SubmitEquihashShare, SubmitSharesResponse};

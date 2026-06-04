@@ -4,8 +4,8 @@
 
 #[cfg(feature = "relay")]
 mod relay_tests {
-    use zcash_pool_server::config::PoolConfig;
     use zcash_pool_server::RelayHandle;
+    use zcash_pool_server::config::PoolConfig;
 
     /// Test that RelayHandle can be created with valid config
     #[test]

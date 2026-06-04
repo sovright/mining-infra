@@ -110,7 +110,6 @@ pub fn submit_to_v2(
     })
 }
 
-
 /// Parse a little-endian u32 from a 4-byte hex string. ZIP 301 encodes
 /// NTIME/NBITS/VERSION "as in a block header" (little-endian), so a real Zcash
 /// miner's submit carries NTIME in this form.
@@ -131,8 +130,9 @@ pub fn normalize_solution(solution_hex: &str) -> Result<[u8; 1344], TranslateErr
     let bytes = hex_to_bytes(solution_hex)?;
     let slice = match bytes.as_slice() {
         raw if raw.len() == SubmitEquihashShare::SOLUTION_SIZE => raw,
-        prefixed if prefixed.len() == SubmitEquihashShare::SOLUTION_SIZE + 3
-            && prefixed.starts_with(&[0xfd, 0x40, 0x05]) =>
+        prefixed
+            if prefixed.len() == SubmitEquihashShare::SOLUTION_SIZE + 3
+                && prefixed.starts_with(&[0xfd, 0x40, 0x05]) =>
         {
             &prefixed[3..]
         }

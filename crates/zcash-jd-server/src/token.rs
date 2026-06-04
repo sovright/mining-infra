@@ -5,8 +5,8 @@ use crate::error::{JdServerError, Result};
 use crate::messages::JobDeclarationMode;
 use rand::RngCore;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// A mining job token
@@ -194,7 +194,10 @@ impl TokenManager {
             .filter_map(|token| token.job_info.as_ref())
             .find(|job| job.job_id == job_id)
             .cloned()
-            .ok_or(JdServerError::Protocol(format!("unknown job id {}", job_id)))
+            .ok_or(JdServerError::Protocol(format!(
+                "unknown job id {}",
+                job_id
+            )))
     }
 
     /// Remove expired tokens
@@ -308,7 +311,9 @@ mod tests {
             coinbase_tx: vec![0x01; 100],
         };
 
-        manager.set_job_info(&token.token, job_info.clone()).unwrap();
+        manager
+            .set_job_info(&token.token, job_info.clone())
+            .unwrap();
 
         let retrieved = manager.get_job_info(&token.token).unwrap();
         assert_eq!(retrieved.job_id, 42);
