@@ -23,7 +23,7 @@ The `zcash-*` crates keep their names; only their internal references to renamed
 
 ## Code Identifiers
 
-- `ForgeRelay` → `RelayClient`
+- `ForgeRelay` → `RelayHandle` (originally planned as `RelayClient`, but the wrapped library type from `sovright-relay` is itself named `RelayClient`; the wrapper was named `RelayHandle` to avoid the collision — approved deviation)
 - `crates/zcash-pool-server/src/forge.rs` → `relay.rs` (module `forge` → `relay`)
 - `crates/zcash-pool-server/tests/forge_integration_test.rs` → `relay_integration_test.rs`
 - Pool server config keys: `forge_relay_*` → `relay_*`. The `noise_*` keys are unchanged.
