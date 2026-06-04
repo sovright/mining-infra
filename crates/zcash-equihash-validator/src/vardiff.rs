@@ -3,7 +3,7 @@
 //! Adjusts share difficulty per-miner to maintain a target share rate.
 //! Designed for Equihash's ~15-30 second solve times on ASICs.
 
-use crate::difficulty::{difficulty_to_target, Target};
+use crate::difficulty::{Target, difficulty_to_target};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
@@ -86,11 +86,15 @@ impl VardiffConfig {
         if self.min_difficulty > self.max_difficulty {
             tracing::warn!(
                 "min_difficulty {} > max_difficulty {}, swapping",
-                self.min_difficulty, self.max_difficulty
+                self.min_difficulty,
+                self.max_difficulty
             );
             std::mem::swap(&mut self.min_difficulty, &mut self.max_difficulty);
         }
-        if !self.variance_tolerance.is_finite() || self.variance_tolerance <= 0.0 || self.variance_tolerance >= 1.0 {
+        if !self.variance_tolerance.is_finite()
+            || self.variance_tolerance <= 0.0
+            || self.variance_tolerance >= 1.0
+        {
             tracing::warn!(
                 "Invalid variance_tolerance {}, using default 0.25",
                 self.variance_tolerance
@@ -104,7 +108,10 @@ impl VardiffConfig {
             );
             self.ramp_threshold = 4.0;
         }
-        if !self.dead_zone_lower.is_finite() || self.dead_zone_lower <= 0.0 || self.dead_zone_lower >= 1.0 {
+        if !self.dead_zone_lower.is_finite()
+            || self.dead_zone_lower <= 0.0
+            || self.dead_zone_lower >= 1.0
+        {
             tracing::warn!(
                 "Invalid dead_zone_lower {}, using default 0.8",
                 self.dead_zone_lower
@@ -119,16 +126,14 @@ impl VardiffConfig {
             self.dead_zone_upper = 1.2;
         }
         if !self.ema_alpha.is_finite() || self.ema_alpha <= 0.0 || self.ema_alpha >= 1.0 {
-            tracing::warn!(
-                "Invalid ema_alpha {}, using default 0.3",
-                self.ema_alpha
-            );
+            tracing::warn!("Invalid ema_alpha {}, using default 0.3", self.ema_alpha);
             self.ema_alpha = 0.3;
         }
         if self.dead_zone_lower >= self.dead_zone_upper {
             tracing::warn!(
                 "dead_zone_lower {} >= dead_zone_upper {}, using defaults",
-                self.dead_zone_lower, self.dead_zone_upper
+                self.dead_zone_lower,
+                self.dead_zone_upper
             );
             self.dead_zone_lower = 0.8;
             self.dead_zone_upper = 1.2;
@@ -164,10 +169,9 @@ impl VardiffController {
     pub fn new(config: VardiffConfig) -> Self {
         let config = config.validated();
         let now = Instant::now();
-        let initial = config.initial_difficulty.clamp(
-            config.min_difficulty,
-            config.max_difficulty,
-        );
+        let initial = config
+            .initial_difficulty
+            .clamp(config.min_difficulty, config.max_difficulty);
         Self {
             current_difficulty: initial,
             config,
@@ -195,10 +199,8 @@ impl VardiffController {
         } else {
             self.config.min_difficulty
         };
-        self.current_difficulty = safe.clamp(
-            self.config.min_difficulty,
-            self.config.max_difficulty,
-        );
+        self.current_difficulty =
+            safe.clamp(self.config.min_difficulty, self.config.max_difficulty);
         self.reset_window();
         info!("Difficulty set to {:.2}", self.current_difficulty);
     }
@@ -257,10 +259,8 @@ impl VardiffController {
 
         // Zero shares: full 50% cut regardless of phase (preserve regression fix)
         if self.shares_since_retarget == 0 {
-            let new_difficulty = (self.current_difficulty * 0.5).clamp(
-                self.config.min_difficulty,
-                self.config.max_difficulty,
-            );
+            let new_difficulty = (self.current_difficulty * 0.5)
+                .clamp(self.config.min_difficulty, self.config.max_difficulty);
             if (new_difficulty - self.current_difficulty).abs() > 0.01 {
                 info!(
                     "Vardiff adjustment (zero shares): {:.2} -> {:.2}",
@@ -283,9 +283,7 @@ impl VardiffController {
         // Phase-dependent adjustment
         let final_difficulty = match self.phase {
             VardiffPhase::RampUp => {
-                if ratio > self.config.ramp_threshold
-                    || ratio < 1.0 / self.config.ramp_threshold
-                {
+                if ratio > self.config.ramp_threshold || ratio < 1.0 / self.config.ramp_threshold {
                     // Aggressive jump, no smoothing
                     self.current_difficulty * ratio
                 } else {
@@ -299,9 +297,7 @@ impl VardiffController {
             VardiffPhase::SteadyState => {
                 // Re-enter RampUp if the share rate has diverged wildly,
                 // e.g. after a miner reconnects with very different hashrate.
-                if ratio > self.config.ramp_threshold
-                    || ratio < 1.0 / self.config.ramp_threshold
-                {
+                if ratio > self.config.ramp_threshold || ratio < 1.0 / self.config.ramp_threshold {
                     info!(
                         "Vardiff re-entering RampUp: ratio {:.2} exceeds ramp_threshold {:.2}",
                         ratio, self.config.ramp_threshold
@@ -316,10 +312,8 @@ impl VardiffController {
             }
         };
 
-        let final_difficulty = final_difficulty.clamp(
-            self.config.min_difficulty,
-            self.config.max_difficulty,
-        );
+        let final_difficulty =
+            final_difficulty.clamp(self.config.min_difficulty, self.config.max_difficulty);
 
         if (final_difficulty - self.current_difficulty).abs() > 0.01 {
             info!(
@@ -443,7 +437,10 @@ mod tests {
             ..Default::default()
         };
         let validated = config.validated();
-        assert!(validated.target_shares_per_minute.is_finite() && validated.target_shares_per_minute > 0.0);
+        assert!(
+            validated.target_shares_per_minute.is_finite()
+                && validated.target_shares_per_minute > 0.0
+        );
         assert!(validated.min_difficulty.is_finite() && validated.min_difficulty > 0.0);
         assert!(validated.max_difficulty.is_finite() && validated.max_difficulty > 0.0);
         assert!(validated.variance_tolerance.is_finite() && validated.variance_tolerance > 0.0);
@@ -517,7 +514,10 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
 
         let result = controller.maybe_retarget();
-        assert!(result.is_some(), "retarget must trigger after interval elapses");
+        assert!(
+            result.is_some(),
+            "retarget must trigger after interval elapses"
+        );
         let new_diff = result.unwrap();
         // Shares are coming MUCH faster than 5/min -> difficulty must increase
         assert!(
@@ -604,9 +604,16 @@ mod tests {
         let mut ctrl = VardiffController::new(config.clone());
         std::thread::sleep(Duration::from_millis(5));
         let result = ctrl.maybe_retarget();
-        assert!(result.is_some(), "0 shares: ratio=0 is below lower bound, must retarget");
+        assert!(
+            result.is_some(),
+            "0 shares: ratio=0 is below lower bound, must retarget"
+        );
         let diff = result.unwrap();
-        assert!(diff < 100.0, "0 shares: difficulty must decrease, got {:.2}", diff);
+        assert!(
+            diff < 100.0,
+            "0 shares: difficulty must decrease, got {:.2}",
+            diff
+        );
 
         // Case (b): many shares -> ratio >> 1.25
         let mut ctrl = VardiffController::new(config.clone());
@@ -615,9 +622,16 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(5));
         let result = ctrl.maybe_retarget();
-        assert!(result.is_some(), "100 shares in ms: ratio>>1, must retarget");
+        assert!(
+            result.is_some(),
+            "100 shares in ms: ratio>>1, must retarget"
+        );
         let diff = result.unwrap();
-        assert!(diff > 100.0, "many shares: difficulty must increase, got {:.2}", diff);
+        assert!(
+            diff > 100.0,
+            "many shares: difficulty must increase, got {:.2}",
+            diff
+        );
     }
 
     /// Verifies the two phase-dependent adjustment formulas of the dead-zone/EMA
@@ -650,7 +664,10 @@ mod tests {
         controller.shares_since_retarget = 10;
 
         let result = controller.maybe_retarget();
-        assert!(result.is_some(), "ratio 2.0 is outside the dead zone, must retarget");
+        assert!(
+            result.is_some(),
+            "ratio 2.0 is outside the dead zone, must retarget"
+        );
         let diff = result.unwrap();
         // final = 0.3 * (100 * 2.0) + 0.7 * 100 = 130
         // (loose tolerance absorbs the sub-millisecond elapsed() drift)
@@ -716,7 +733,10 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(5));
         let result = controller.maybe_retarget();
-        assert!(result.is_some(), "must retarget with 0 shares (below tolerance)");
+        assert!(
+            result.is_some(),
+            "must retarget with 0 shares (below tolerance)"
+        );
         let diff = result.unwrap();
         // ratio=0, adjustment=0.5, new=100*0.5=50, no smoothing -> final=50
         assert!(
@@ -745,7 +765,10 @@ mod tests {
         // 5 shares is below early-retarget threshold (4 * 5 = 20)
         // Interval hasn't elapsed either
         let result = controller.maybe_retarget();
-        assert!(result.is_none(), "should not retarget before interval elapses");
+        assert!(
+            result.is_none(),
+            "should not retarget before interval elapses"
+        );
         assert_eq!(controller.current_difficulty(), 100.0);
     }
 
@@ -768,7 +791,11 @@ mod tests {
         let new_diff = controller.maybe_retarget();
         assert!(new_diff.is_some(), "should retarget with high share rate");
         let diff = new_diff.unwrap();
-        assert!(diff > 10.0, "ramp-up should produce large jump, got {}", diff);
+        assert!(
+            diff > 10.0,
+            "ramp-up should produce large jump, got {}",
+            diff
+        );
     }
 
     #[test]
@@ -782,11 +809,15 @@ mod tests {
             ..Default::default()
         };
         let mut controller = VardiffController::new(config);
-        for _ in 0..21 { // > 4 * 5 = 20
+        for _ in 0..21 {
+            // > 4 * 5 = 20
             controller.record_share();
         }
         let new_diff = controller.maybe_retarget();
-        assert!(new_diff.is_some(), "early retarget should trigger at 4x shares");
+        assert!(
+            new_diff.is_some(),
+            "early retarget should trigger at 4x shares"
+        );
     }
 
     #[test]
@@ -818,10 +849,10 @@ mod tests {
     #[test]
     fn new_config_fields_validation() {
         let config = VardiffConfig {
-            ramp_threshold: 0.5, // invalid: <= 1.0
+            ramp_threshold: 0.5,   // invalid: <= 1.0
             dead_zone_lower: -1.0, // invalid: <= 0.0
-            dead_zone_upper: 0.5, // invalid: <= 1.0
-            ema_alpha: 2.0, // invalid: >= 1.0
+            dead_zone_upper: 0.5,  // invalid: <= 1.0
+            ema_alpha: 2.0,        // invalid: >= 1.0
             ..Default::default()
         };
         let validated = config.validated();
@@ -858,7 +889,10 @@ mod tests {
         }
         std::thread::sleep(Duration::from_millis(5));
         let result = controller.maybe_retarget();
-        assert!(result.is_some(), "large change (>>0.01) must trigger retarget");
+        assert!(
+            result.is_some(),
+            "large change (>>0.01) must trigger retarget"
+        );
 
         // Now test near-threshold: initial_difficulty close to min_difficulty=1.0
         // With 0 shares, new_diff = current*0.5, final=current*0.5
@@ -913,7 +947,8 @@ mod tests {
 
         // After retarget, shares count must be reset to 0
         assert_eq!(
-            controller.stats().shares_in_window, 0,
+            controller.stats().shares_in_window,
+            0,
             "shares_since_retarget must be 0 after reset_window"
         );
 
@@ -922,7 +957,8 @@ mod tests {
             controller.record_share();
         }
         assert_eq!(
-            controller.stats().shares_in_window, 5,
+            controller.stats().shares_in_window,
+            5,
             "after reset, new shares count should be 5, not cumulative"
         );
     }
@@ -960,7 +996,10 @@ mod tests {
         // (a) positive and finite
         // (b) computed as shares/minutes (not shares*minutes)
         assert!(stats.current_rate.is_finite(), "rate must be finite");
-        assert!(stats.current_rate > 0.0, "rate must be positive with shares recorded");
+        assert!(
+            stats.current_rate > 0.0,
+            "rate must be positive with shares recorded"
+        );
         // With 10 shares in ~100ms, rate should be thousands/min, not fractions
         // If the mutant replaced / with *, rate would be 10 * tiny_minutes = ~0.017
         assert!(
@@ -1066,7 +1105,8 @@ mod tests {
         assert!(
             diff_b > diff_a,
             "100 shares should produce higher difficulty ({:.2}) than 10 shares ({:.2})",
-            diff_b, diff_a
+            diff_b,
+            diff_a
         );
     }
 
@@ -1093,7 +1133,8 @@ mod tests {
         // set_difficulty should reset the window
         controller.set_difficulty(50.0);
         assert_eq!(
-            controller.stats().shares_in_window, 0,
+            controller.stats().shares_in_window,
+            0,
             "set_difficulty must reset shares_since_retarget to 0"
         );
     }
@@ -1156,7 +1197,10 @@ mod tests {
             "difficulty must be unchanged inside the dead zone"
         );
         // The dead-zone pass resets the window.
-        assert_eq!(ctrl.shares_since_retarget, 0, "window must reset after check");
+        assert_eq!(
+            ctrl.shares_since_retarget, 0,
+            "window must reset after check"
+        );
 
         // Complementary case: before the interval elapses, share counts below the
         // early-retarget threshold (4x expected shares per interval) return None.

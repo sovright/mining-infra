@@ -28,7 +28,10 @@ impl NoiseInitiator {
     }
 
     /// Perform handshake and return encrypted stream
-    pub async fn connect(self, mut stream: TcpStream) -> Result<NoiseStream<TcpStream>, HandshakeError> {
+    pub async fn connect(
+        self,
+        mut stream: TcpStream,
+    ) -> Result<NoiseStream<TcpStream>, HandshakeError> {
         debug!("Starting Noise NK handshake as initiator");
 
         let builder: Builder<'_> = Builder::new(crate::NOISE_PATTERN.parse().unwrap());
@@ -39,7 +42,9 @@ impl NoiseInitiator {
 
         // -> e, es (client sends ephemeral, establishes shared secret)
         let mut msg = vec![0u8; MAX_HANDSHAKE_MSG];
-        let len = handshake.write_message(&[], &mut msg).map_err(HandshakeError::Snow)?;
+        let len = handshake
+            .write_message(&[], &mut msg)
+            .map_err(HandshakeError::Snow)?;
         trace!("Sending handshake message: {} bytes", len);
 
         stream.write_u16(len as u16).await?;
@@ -55,10 +60,14 @@ impl NoiseInitiator {
         trace!("Received handshake response: {} bytes", len);
 
         let mut payload = vec![0u8; MAX_HANDSHAKE_MSG];
-        let _payload_len = handshake.read_message(&msg, &mut payload).map_err(HandshakeError::Snow)?;
+        let _payload_len = handshake
+            .read_message(&msg, &mut payload)
+            .map_err(HandshakeError::Snow)?;
 
         // Transition to transport mode
-        let transport = handshake.into_transport_mode().map_err(HandshakeError::Snow)?;
+        let transport = handshake
+            .into_transport_mode()
+            .map_err(HandshakeError::Snow)?;
         debug!("Noise handshake complete (initiator)");
 
         Ok(NoiseStream::new(stream, transport))
@@ -82,7 +91,10 @@ impl NoiseResponder {
     }
 
     /// Accept a connection and perform handshake
-    pub async fn accept(&self, mut stream: TcpStream) -> Result<NoiseStream<TcpStream>, HandshakeError> {
+    pub async fn accept(
+        &self,
+        mut stream: TcpStream,
+    ) -> Result<NoiseStream<TcpStream>, HandshakeError> {
         debug!("Starting Noise NK handshake as responder");
 
         let builder: Builder<'_> = Builder::new(crate::NOISE_PATTERN.parse().unwrap());
@@ -101,18 +113,24 @@ impl NoiseResponder {
         trace!("Received handshake message: {} bytes", len);
 
         let mut payload = vec![0u8; MAX_HANDSHAKE_MSG];
-        let _payload_len = handshake.read_message(&msg, &mut payload).map_err(HandshakeError::Snow)?;
+        let _payload_len = handshake
+            .read_message(&msg, &mut payload)
+            .map_err(HandshakeError::Snow)?;
 
         // -> e, ee (send server's ephemeral)
         let mut response = vec![0u8; MAX_HANDSHAKE_MSG];
-        let len = handshake.write_message(&[], &mut response).map_err(HandshakeError::Snow)?;
+        let len = handshake
+            .write_message(&[], &mut response)
+            .map_err(HandshakeError::Snow)?;
         trace!("Sending handshake response: {} bytes", len);
 
         stream.write_u16(len as u16).await?;
         stream.write_all(&response[..len]).await?;
 
         // Transition to transport mode
-        let transport = handshake.into_transport_mode().map_err(HandshakeError::Snow)?;
+        let transport = handshake
+            .into_transport_mode()
+            .map_err(HandshakeError::Snow)?;
         debug!("Noise handshake complete (responder)");
 
         Ok(NoiseStream::new(stream, transport))
@@ -180,21 +198,15 @@ mod tests {
         // Client uses the WRONG public key
         let initiator = NoiseInitiator::new(wrong_keypair.public.clone());
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            initiator.connect(client_stream),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), initiator.connect(client_stream)).await;
 
         // Should complete within timeout (not hang)
         let handshake_result = result.expect("handshake should not hang");
 
-        let server_result = tokio::time::timeout(
-            Duration::from_secs(5),
-            server_handle,
-        )
-        .await
-        .expect("server should not hang");
+        let server_result = tokio::time::timeout(Duration::from_secs(5), server_handle)
+            .await
+            .expect("server should not hang");
 
         // At least one side must fail
         let client_failed = handshake_result.is_err();
@@ -222,11 +234,8 @@ mod tests {
         let client_stream = TcpStream::connect(addr).await.unwrap();
         let initiator = NoiseInitiator::new(server_keypair.public.clone());
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            initiator.connect(client_stream),
-        )
-        .await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), initiator.connect(client_stream)).await;
 
         // Should complete within timeout
         let handshake_result = result.expect("handshake should not hang");
@@ -262,11 +271,7 @@ mod tests {
         client_stream.write_u16(garbage.len() as u16).await.unwrap();
         client_stream.write_all(&garbage).await.unwrap();
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(5),
-            server_handle,
-        )
-        .await;
+        let result = tokio::time::timeout(Duration::from_secs(5), server_handle).await;
 
         let server_result = result
             .expect("server should not hang")

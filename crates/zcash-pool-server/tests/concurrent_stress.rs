@@ -78,7 +78,9 @@ async fn test_payout_tracker_concurrent_writes() {
     assert_eq!(all.len(), 50, "expected 50 unique miners");
     for i in 0..50 {
         let miner_id = format!("miner_{}", i);
-        let stats = all.get(&miner_id).unwrap_or_else(|| panic!("missing {}", miner_id));
+        let stats = all
+            .get(&miner_id)
+            .unwrap_or_else(|| panic!("missing {}", miner_id));
         assert_eq!(stats.total_shares, 1000, "miner {} total_shares", i);
         assert!(
             (stats.total_difficulty - 1000.0).abs() < f64::EPSILON,

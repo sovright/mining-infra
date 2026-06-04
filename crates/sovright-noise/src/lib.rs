@@ -17,12 +17,12 @@
 //! let stream = initiator.connect(tcp_stream).await?;
 //! ```
 
-pub mod keys;
 pub mod handshake;
+pub mod keys;
 pub mod transport;
 
-pub use keys::{Keypair, PublicKey};
 pub use handshake::{NoiseInitiator, NoiseResponder};
+pub use keys::{Keypair, PublicKey};
 pub use transport::NoiseStream;
 
 /// Noise protocol pattern used (NK = known server key)

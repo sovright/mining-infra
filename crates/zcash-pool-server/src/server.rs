@@ -16,33 +16,34 @@ use crate::channel::Channel;
 use crate::config::PoolConfig;
 use crate::duplicate::{DuplicateDetector, InMemoryDuplicateDetector};
 use crate::error::{PoolError, Result};
-#[cfg(feature = "relay")]
-use crate::relay::RelayHandle;
 use crate::job::JobDistributor;
 use crate::payout::{MinerId, PayoutTracker};
+#[cfg(feature = "relay")]
+use crate::relay::RelayHandle;
 use crate::security::{ConnectionTracker, SequenceCheckResult, SequenceValidator, TimingJitter};
 use crate::session::{ServerMessage, Session, SessionMessage, Transport};
 use crate::share::ShareProcessor;
+use hex;
+use sovright_noise::{Keypair, NoiseResponder};
+use sovright_telemetry::{LogFormat, PoolMetrics, init_logging, start_metrics_server};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{mpsc, OwnedSemaphorePermit, RwLock, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
 use zcash_equihash_validator::VardiffConfig;
 use zcash_jd_server::{
-    handle_jd_client_with_transport, CurrentTemplateContext, JdServer, JdServerConfig,
-    JdTransport,
+    CurrentTemplateContext, JdServer, JdServerConfig, JdTransport, handle_jd_client_with_transport,
 };
-use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
-use sovright_noise::{Keypair, NoiseResponder};
-use sovright_telemetry::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
-use zcash_template_provider::types::BlockTemplate;
-use zcash_template_provider::{SubmitBlockResult, SubmitMode, TemplateProvider, TemplateProviderConfig};
 use zcash_mining_protocol::messages::SubmitEquihashShare;
-use hex;
+use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
+use zcash_template_provider::types::BlockTemplate;
+use zcash_template_provider::{
+    SubmitBlockResult, SubmitMode, TemplateProvider, TemplateProviderConfig,
+};
 
 #[derive(Clone)]
 struct ConnectionCtx {
@@ -197,8 +198,9 @@ impl PoolServer {
         let noise_responder = if config.noise_enabled || config.jd_noise_enabled {
             let keypair = if let Some(ref key_path) = config.noise_private_key_path {
                 // Load keypair from file
-                let key_hex = std::fs::read_to_string(key_path)
-                    .map_err(|e| PoolError::Config(format!("Failed to read noise key file: {}", e)))?;
+                let key_hex = std::fs::read_to_string(key_path).map_err(|e| {
+                    PoolError::Config(format!("Failed to read noise key file: {}", e))
+                })?;
                 Keypair::from_private_hex(key_hex.trim())
                     .map_err(|e| PoolError::Config(format!("Invalid noise private key: {}", e)))?
             } else {
@@ -208,7 +210,9 @@ impl PoolServer {
                     "Generated new Noise keypair. Public key: {}",
                     kp.public.to_hex()
                 );
-                info!("To persist this key, save the private key to a file and set noise_private_key_path");
+                info!(
+                    "To persist this key, save the private key to a file and set noise_private_key_path"
+                );
                 kp
             };
             Some(Arc::new(NoiseResponder::new(keypair)))
@@ -239,7 +243,8 @@ impl PoolServer {
             Duration::from_millis(config.timing_jitter_max_ms),
         ));
 
-        info!("Security features: sequence_validation={}, connection_tracking={}, timing_jitter={}",
+        info!(
+            "Security features: sequence_validation={}, connection_tracking={}, timing_jitter={}",
             config.sequence_validation_enabled,
             config.connection_tracking_enabled,
             config.timing_jitter_enabled
@@ -321,7 +326,10 @@ impl PoolServer {
         let tp = Arc::clone(&self.template_provider);
         tokio::spawn(async move {
             if let Err(e) = tp.run().await {
-                error!("CRITICAL: Template provider terminated: {}. Pool will serve stale jobs until restarted.", e);
+                error!(
+                    "CRITICAL: Template provider terminated: {}. Pool will serve stale jobs until restarted.",
+                    e
+                );
             }
         });
 
@@ -329,7 +337,10 @@ impl PoolServer {
         #[cfg(feature = "relay")]
         if let Some(ref relay) = self.relay {
             if let Err(e) = relay.init().await {
-                warn!("Failed to initialize relay: {}. Continuing without relay.", e);
+                warn!(
+                    "Failed to initialize relay: {}. Continuing without relay.",
+                    e
+                );
             } else {
                 match relay.start().await {
                     Ok(mut block_receiver) => {
@@ -756,9 +767,10 @@ impl PoolServer {
 
                 // Track disconnection for attack pattern detection
                 if connection_tracking_enabled
-                    && connection_tracker.on_disconnect(addr, connected_at, decryption_error) {
-                        metrics.inc_flagged_addresses();
-                    }
+                    && connection_tracker.on_disconnect(addr, connected_at, decryption_error)
+                {
+                    metrics.inc_flagged_addresses();
+                }
 
                 // Clean up sequence validator state
                 sequence_validator.remove_channel(channel_id);
@@ -766,7 +778,6 @@ impl PoolServer {
 
             metrics.record_disconnection();
         });
-
 
         info!("Session {} started", channel_id);
         Ok(())
@@ -832,7 +843,10 @@ impl PoolServer {
         if is_new_block {
             let active_job_ids: HashSet<u32> = {
                 let channels = self.channels.read().await;
-                channels.values().flat_map(|ch| ch.tracked_job_ids()).collect()
+                channels
+                    .values()
+                    .flat_map(|ch| ch.tracked_job_ids())
+                    .collect()
             };
             self.duplicate_detector.prune_inactive(&active_job_ids);
             info!("New block detected, pruned inactive jobs from duplicate detector");
@@ -868,10 +882,11 @@ impl PoolServer {
                 let mut channels = self.channels.write().await;
                 for (channel_id, sender) in &session_senders {
                     if let Some(channel) = channels.get_mut(channel_id)
-                        && let Some(job) = distributor.create_job(channel, clean_jobs) {
-                            channel.add_job(job.clone(), clean_jobs);
-                            jobs.push((sender.clone(), job));
-                        }
+                        && let Some(job) = distributor.create_job(channel, clean_jobs)
+                    {
+                        channel.add_job(job.clone(), clean_jobs);
+                        jobs.push((sender.clone(), job));
+                    }
                 }
             }
 
@@ -886,7 +901,8 @@ impl PoolServer {
                     broadcast_count += 1;
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Full(ServerMessage::NewJob(job)))
-                | Err(tokio::sync::mpsc::error::TrySendError::Closed(ServerMessage::NewJob(job))) => {
+                | Err(tokio::sync::mpsc::error::TrySendError::Closed(ServerMessage::NewJob(job))) =>
+                {
                     slow_or_closed.push(job.channel_id);
                 }
                 Err(_) => {}
@@ -944,7 +960,9 @@ impl PoolServer {
     ) -> Result<()> {
         // Validate sequence number for replay protection
         if self.config.sequence_validation_enabled {
-            let seq_result = self.sequence_validator.validate(channel_id, share.sequence_number);
+            let seq_result = self
+                .sequence_validator
+                .validate(channel_id, share.sequence_number);
             match seq_result {
                 SequenceCheckResult::Valid => {}
                 SequenceCheckResult::ValidOutOfOrder => {
@@ -954,8 +972,7 @@ impl PoolServer {
                         share.sequence_number, channel_id
                     );
                 }
-                SequenceCheckResult::GapTooLarge
-                | SequenceCheckResult::StaleSequence => {
+                SequenceCheckResult::GapTooLarge | SequenceCheckResult::StaleSequence => {
                     self.metrics.record_sequence_anomaly();
                     warn!(
                         "Rejecting non-monotonic sequence {} for channel {}",
@@ -990,15 +1007,18 @@ impl PoolServer {
         {
             let mut channels = self.channels.write().await;
             if let Some(channel) = channels.get_mut(&channel_id)
-                && !channel.check_rate_limit() {
-                    debug!("Rate limiting channel {}", channel_id);
-                    return response_tx
-                        .send(ShareResult::Rejected(
-                            zcash_mining_protocol::messages::RejectReason::Other("rate limited".to_string()),
-                        ))
-                        .map_err(|_| PoolError::ChannelSend)
-                        .map(|_| ());
-                }
+                && !channel.check_rate_limit()
+            {
+                debug!("Rate limiting channel {}", channel_id);
+                return response_tx
+                    .send(ShareResult::Rejected(
+                        zcash_mining_protocol::messages::RejectReason::Other(
+                            "rate limited".to_string(),
+                        ),
+                    ))
+                    .map_err(|_| PoolError::ChannelSend)
+                    .map(|_| ());
+            }
         }
 
         // Get block target
@@ -1009,7 +1029,9 @@ impl PoolServer {
         // matching the Quint spec's job expiry model.
         let job = {
             let channels = self.channels.read().await;
-            let channel = channels.get(&channel_id).ok_or(PoolError::UnknownChannel(channel_id))?;
+            let channel = channels
+                .get(&channel_id)
+                .ok_or(PoolError::UnknownChannel(channel_id))?;
             if !channel.is_job_active(share.job_id) {
                 return response_tx
                     .send(ShareResult::Rejected(
@@ -1018,9 +1040,11 @@ impl PoolServer {
                     .map_err(|_| PoolError::ChannelSend)
                     .map(|_| ());
             }
-            channel.get_job(share.job_id)
+            channel
+                .get_job(share.job_id)
                 .ok_or(PoolError::UnknownJob(share.job_id))?
-                .job.clone()
+                .job
+                .clone()
         };
 
         // Validate share without holding the channel lock
@@ -1031,7 +1055,8 @@ impl PoolServer {
             self.duplicate_detector.as_ref(),
             &block_target,
         );
-        self.metrics.observe_share_validation(validation_start.elapsed().as_secs_f64());
+        self.metrics
+            .observe_share_validation(validation_start.elapsed().as_secs_f64());
 
         // Apply vardiff update and record payout atomically under one lock.
         // This prevents the channel from being removed between the two operations.
@@ -1048,7 +1073,10 @@ impl PoolServer {
                     // and paid — the TOCTOU race modeled by ConcurrentShareValidation
                     // in the Quint spec.
                     if !channel.is_job_active(share.job_id) {
-                        debug!("Job {} became stale during validation for channel {}", share.job_id, channel_id);
+                        debug!(
+                            "Job {} became stale during validation for channel {}",
+                            share.job_id, channel_id
+                        );
                         stale_after_validation = true;
                         None
                     } else {
@@ -1109,13 +1137,16 @@ impl PoolServer {
                         // This gives the relay network a head start
                         #[cfg(feature = "relay")]
                         if let Some(ref relay) = self.relay {
-                            let header = job.build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
+                            let header = job
+                                .build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
 
                             // Clone all needed data atomically in one lock acquisition
                             let relay_data = {
                                 let distributor = self.job_distributor.read().await;
                                 distributor.current_template().map(|t| {
-                                    let tx_hashes: Vec<[u8; 32]> = t.transactions.iter()
+                                    let tx_hashes: Vec<[u8; 32]> = t
+                                        .transactions
+                                        .iter()
                                         .filter_map(|tx| {
                                             let bytes = hex::decode(&tx.hash).ok()?;
                                             if bytes.len() == 32 {
@@ -1136,7 +1167,9 @@ impl PoolServer {
                             if let Some((coinbase, tx_hashes)) = relay_data {
                                 let relay = Arc::clone(relay);
                                 tokio::spawn(async move {
-                                    if let Err(e) = relay.announce_block(&header, &coinbase, &tx_hashes).await {
+                                    if let Err(e) =
+                                        relay.announce_block(&header, &coinbase, &tx_hashes).await
+                                    {
                                         warn!("Failed to announce block to relay: {}", e);
                                     }
                                 });
@@ -1162,7 +1195,9 @@ impl PoolServer {
                 } else {
                     let worker_label = format!("channel_{}", channel_id);
                     let reason = match &validation.result {
-                        zcash_mining_protocol::messages::ShareResult::Rejected(r) => format!("{:?}", r),
+                        zcash_mining_protocol::messages::ShareResult::Rejected(r) => {
+                            format!("{:?}", r)
+                        }
                         _ => "unknown".to_string(),
                     };
                     self.metrics.record_share_rejected(&reason);
@@ -1181,11 +1216,10 @@ impl PoolServer {
 
         // Apply vardiff target update if needed
         if let Some(target) = maybe_new_target
-            && let Some(sender) = self.sessions.read().await.get(&channel_id) {
-                let _ = sender
-                    .send(ServerMessage::SetTarget { target })
-                    .await;
-            }
+            && let Some(sender) = self.sessions.read().await.get(&channel_id)
+        {
+            let _ = sender.send(ServerMessage::SetTarget { target }).await;
+        }
 
         // Apply timing jitter before response (mitigates timing attacks)
         if self.config.timing_jitter_enabled {
@@ -1201,9 +1235,9 @@ impl PoolServer {
     async fn submit_block(&self, job: &NewEquihashJob, share: &SubmitEquihashShare) -> Result<()> {
         let template = {
             let distributor = self.job_distributor.read().await;
-            distributor
-                .current_template()
-                .ok_or_else(|| PoolError::TemplateProvider("missing current template".to_string()))?
+            distributor.current_template().ok_or_else(|| {
+                PoolError::TemplateProvider("missing current template".to_string())
+            })?
         };
 
         if template.header.prev_hash.0 != job.prev_hash {
@@ -1216,20 +1250,42 @@ impl PoolServer {
         let block_hex = hex::encode(block_bytes);
 
         // Two-stage: validate via proposal mode first
-        match self.template_provider.submit_block(&block_hex, Some(SubmitMode::Proposal)).await {
+        match self
+            .template_provider
+            .submit_block(&block_hex, Some(SubmitMode::Proposal))
+            .await
+        {
             Ok(SubmitBlockResult::Accepted) => {
-                info!("Block proposal accepted for job {}, submitting for real...", share.job_id);
+                info!(
+                    "Block proposal accepted for job {}, submitting for real...",
+                    share.job_id
+                );
             }
             Ok(SubmitBlockResult::Rejected(reason)) => {
-                warn!("Block proposal rejected for job {}: {}", share.job_id, reason);
-                return Err(PoolError::TemplateProvider(format!("block proposal rejected: {}", reason)));
+                warn!(
+                    "Block proposal rejected for job {}: {}",
+                    share.job_id, reason
+                );
+                return Err(PoolError::TemplateProvider(format!(
+                    "block proposal rejected: {}",
+                    reason
+                )));
             }
             Ok(_) => {
-                warn!("Block proposal check inconclusive for job {}, submitting anyway", share.job_id);
+                warn!(
+                    "Block proposal check inconclusive for job {}, submitting anyway",
+                    share.job_id
+                );
             }
             Err(e) => {
-                warn!("Block proposal RPC error for job {}: {}, not submitting", share.job_id, e);
-                return Err(PoolError::TemplateProvider(format!("block proposal RPC error: {}", e)));
+                warn!(
+                    "Block proposal RPC error for job {}: {}, not submitting",
+                    share.job_id, e
+                );
+                return Err(PoolError::TemplateProvider(format!(
+                    "block proposal RPC error: {}",
+                    e
+                )));
             }
         }
 

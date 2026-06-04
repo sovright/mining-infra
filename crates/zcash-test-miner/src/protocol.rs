@@ -1,6 +1,8 @@
 use zcash_mining_protocol::{
-    codec::{decode_new_equihash_job, decode_set_target, decode_submit_shares_response, MessageFrame},
-    messages::{message_types, NewEquihashJob, SetTarget, SubmitSharesResponse},
+    codec::{
+        MessageFrame, decode_new_equihash_job, decode_set_target, decode_submit_shares_response,
+    },
+    messages::{NewEquihashJob, SetTarget, SubmitSharesResponse, message_types},
 };
 
 pub enum ServerMessage {

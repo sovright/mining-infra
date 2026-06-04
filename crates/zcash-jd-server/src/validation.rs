@@ -79,11 +79,7 @@ pub struct TemplateValidator {
 
 impl TemplateValidator {
     /// Create a new validator
-    pub fn new(
-        level: ValidationLevel,
-        pool_payout_script: Vec<u8>,
-        min_pool_payout: u64,
-    ) -> Self {
+    pub fn new(level: ValidationLevel, pool_payout_script: Vec<u8>, min_pool_payout: u64) -> Self {
         Self {
             level,
             pool_payout_script,
@@ -147,9 +143,7 @@ impl TemplateValidator {
     /// Validate a full template job
     pub fn validate(&self, job: &SetFullTemplateJob) -> ValidationResult {
         // Always check pool payout in coinbase
-        if !self.pool_payout_script.is_empty()
-            && !self.validate_pool_payout(&job.coinbase_tx)
-        {
+        if !self.pool_payout_script.is_empty() && !self.validate_pool_payout(&job.coinbase_tx) {
             return ValidationResult::Invalid("Missing or insufficient pool payout".into());
         }
         if let Err(err) = Self::parse_transaction(&job.coinbase_tx) {
@@ -168,7 +162,8 @@ impl TemplateValidator {
         if !self.pool_payout_script.is_empty() && !self.validate_pool_payout(coinbase) {
             return Err("Missing or insufficient pool payout".into());
         }
-        Self::parse_transaction(coinbase).map_err(|err| format!("invalid coinbase transaction: {}", err))
+        Self::parse_transaction(coinbase)
+            .map_err(|err| format!("invalid coinbase transaction: {}", err))
     }
 
     /// Check if pool payout script appears in coinbase
@@ -311,8 +306,7 @@ impl TemplateValidator {
     }
 
     fn read_compact_size(data: &[u8], cursor: &mut usize) -> Result<u64, String> {
-        zcash_pool_common::read_compact_size(data, cursor)
-            .map_err(|e| e.to_string())
+        zcash_pool_common::read_compact_size(data, cursor).map_err(|e| e.to_string())
     }
 
     pub(crate) fn compute_txid(data: &[u8]) -> [u8; 32] {
@@ -346,7 +340,11 @@ impl TemplateValidator {
             let mut i = 0;
             while i < layer.len() {
                 let left = layer[i];
-                let right = if i + 1 < layer.len() { layer[i + 1] } else { left };
+                let right = if i + 1 < layer.len() {
+                    layer[i + 1]
+                } else {
+                    left
+                };
                 let mut data = [0u8; 64];
                 data[..32].copy_from_slice(&left);
                 data[32..].copy_from_slice(&right);
@@ -551,8 +549,7 @@ mod tests {
     #[test]
     fn test_pool_payout_validation() {
         let payout_script = vec![0x76, 0xa9, 0x14, 0xde, 0xad, 0xbe, 0xef];
-        let validator =
-            TemplateValidator::new(ValidationLevel::Minimal, payout_script.clone(), 0);
+        let validator = TemplateValidator::new(ValidationLevel::Minimal, payout_script.clone(), 0);
 
         // Coinbase without payout script
         let mut job = make_test_job();

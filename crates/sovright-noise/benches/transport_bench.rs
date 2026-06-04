@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 
 use sovright_noise::handshake::{NoiseInitiator, NoiseResponder};
 use sovright_noise::keys::Keypair;

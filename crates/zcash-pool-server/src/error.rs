@@ -1,8 +1,8 @@
 //! Pool server error types
 
 use thiserror::Error;
-use zcash_mining_protocol::ProtocolError;
 use zcash_equihash_validator::ValidationError;
+use zcash_mining_protocol::ProtocolError;
 
 #[derive(Error, Debug)]
 pub enum PoolError {

@@ -1,5 +1,5 @@
-use zcash_equihash_validator::vardiff::{VardiffController, VardiffConfig};
 use std::time::Duration;
+use zcash_equihash_validator::vardiff::{VardiffConfig, VardiffController};
 
 #[test]
 fn test_vardiff_creation() {
@@ -36,8 +36,12 @@ fn test_vardiff_adjusts_up_on_fast_shares() {
 
     // Difficulty should increase because shares are coming faster than target
     // 100 shares in 60ms = 100000 shares/min vs target of 6/min
-    assert!(new_diff > initial_diff,
-        "Expected difficulty to increase from {} but got {}", initial_diff, new_diff);
+    assert!(
+        new_diff > initial_diff,
+        "Expected difficulty to increase from {} but got {}",
+        initial_diff,
+        new_diff
+    );
 }
 
 #[test]
@@ -66,8 +70,11 @@ fn test_vardiff_adjusts_down_on_slow_shares() {
 
     // Difficulty should decrease because no shares were submitted
     // 0 shares in 110ms = 0 shares/min vs target of 60/min
-    assert!(new_diff < 100.0,
-        "Expected difficulty to decrease from 100.0 but got {}", new_diff);
+    assert!(
+        new_diff < 100.0,
+        "Expected difficulty to decrease from 100.0 but got {}",
+        new_diff
+    );
 }
 
 #[test]

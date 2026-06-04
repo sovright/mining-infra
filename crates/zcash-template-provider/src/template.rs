@@ -4,10 +4,10 @@ use crate::error::{Error, Result};
 use crate::header::{assemble_header, parse_target};
 use crate::rpc::{self, RpcProvider, ZebraRpc};
 use crate::types::{BlockTemplate, GetBlockTemplateResponse};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
-use tokio::time::{interval, Duration};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{RwLock, broadcast};
+use tokio::time::{Duration, interval};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for the Template Provider
@@ -81,7 +81,11 @@ impl TemplateProvider {
     }
 
     /// Submit a solved block to Zebra
-    pub async fn submit_block(&self, block_hex: &str, mode: Option<rpc::SubmitMode>) -> Result<rpc::SubmitBlockResult> {
+    pub async fn submit_block(
+        &self,
+        block_hex: &str,
+        mode: Option<rpc::SubmitMode>,
+    ) -> Result<rpc::SubmitBlockResult> {
         self.rpc.submit_block(block_hex, mode).await
     }
 
@@ -95,16 +99,23 @@ impl TemplateProvider {
         // Parse coinbase transaction - reject if missing or empty
         let coinbase = if let Some(data) = response.coinbase_txn.get("data") {
             if let Some(hex_str) = data.as_str() {
-                let cb = hex::decode(hex_str).map_err(|e| Error::InvalidTemplate(format!("invalid coinbase hex: {}", e)))?;
+                let cb = hex::decode(hex_str)
+                    .map_err(|e| Error::InvalidTemplate(format!("invalid coinbase hex: {}", e)))?;
                 if cb.is_empty() {
-                    return Err(Error::InvalidTemplate("coinbase transaction is empty".into()));
+                    return Err(Error::InvalidTemplate(
+                        "coinbase transaction is empty".into(),
+                    ));
                 }
                 cb
             } else {
-                return Err(Error::InvalidTemplate("coinbase data field is not a string".into()));
+                return Err(Error::InvalidTemplate(
+                    "coinbase data field is not a string".into(),
+                ));
             }
         } else {
-            return Err(Error::InvalidTemplate("coinbase_txn missing data field".into()));
+            return Err(Error::InvalidTemplate(
+                "coinbase_txn missing data field".into(),
+            ));
         };
 
         Ok(BlockTemplate {

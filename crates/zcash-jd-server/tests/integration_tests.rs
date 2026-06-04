@@ -152,7 +152,11 @@ async fn test_full_mining_flow() {
 
     // Step 1: Allocate token
     let token_response = server
-        .handle_allocate_token(1, "integration-test-miner", JobDeclarationMode::CoinbaseOnly)
+        .handle_allocate_token(
+            1,
+            "integration-test-miner",
+            JobDeclarationMode::CoinbaseOnly,
+        )
         .unwrap();
     assert!(!token_response.mining_job_token.is_empty());
     assert!(token_response.coinbase_output.is_empty());
@@ -187,9 +191,11 @@ async fn test_full_mining_flow() {
     let result = server.handle_push_solution(solution).await;
     assert!(result.is_err());
 
-    assert!(payout
-        .get_stats(&"integration-test-miner".to_string())
-        .is_none());
+    assert!(
+        payout
+            .get_stats(&"integration-test-miner".to_string())
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -233,7 +239,11 @@ async fn test_multiple_miners() {
         };
 
         let result = server.handle_declare_job(job).await;
-        assert!(result.is_ok(), "Miner {} should declare job successfully", i + 1);
+        assert!(
+            result.is_ok(),
+            "Miner {} should declare job successfully",
+            i + 1
+        );
     }
 }
 
@@ -273,7 +283,11 @@ async fn test_job_id_uniqueness() {
 
     // All job IDs should be unique
     let unique_ids: std::collections::HashSet<_> = job_ids.iter().collect();
-    assert_eq!(unique_ids.len(), job_ids.len(), "All job IDs should be unique");
+    assert_eq!(
+        unique_ids.len(),
+        job_ids.len(),
+        "All job IDs should be unique"
+    );
 }
 
 #[test]
@@ -289,7 +303,10 @@ fn test_config_getters() {
         config.coinbase_output_max_additional_size
     );
     assert_eq!(server_config.pool_payout_script, config.pool_payout_script);
-    assert_eq!(server_config.async_mining_allowed, config.async_mining_allowed);
+    assert_eq!(
+        server_config.async_mining_allowed,
+        config.async_mining_allowed
+    );
 
     // Verify token manager access
     let token_manager = server.token_manager();

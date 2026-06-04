@@ -1,10 +1,10 @@
 //! Zebra JSON-RPC client
 
-use async_trait::async_trait;
 use crate::error::{Error, Result};
 use crate::types::GetBlockTemplateResponse;
+use async_trait::async_trait;
 use reqwest::Client;
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -46,7 +46,11 @@ pub trait RpcProvider: Send + Sync {
     /// Get a block template from the node
     async fn get_block_template(&self) -> Result<GetBlockTemplateResponse>;
     /// Submit a solved block to the node
-    async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult>;
+    async fn submit_block(
+        &self,
+        block_hex: &str,
+        mode: Option<SubmitMode>,
+    ) -> Result<SubmitBlockResult>;
     /// Get the best block hash
     async fn get_best_block_hash(&self) -> Result<String>;
 }
@@ -104,9 +108,10 @@ impl ZebraRpc {
         let body: Value = response.json().await?;
 
         if let Some(error) = body.get("error")
-            && !error.is_null() {
-                return Err(Error::Rpc(error.to_string()));
-            }
+            && !error.is_null()
+        {
+            return Err(Error::Rpc(error.to_string()));
+        }
 
         let result = body
             .get("result")
@@ -114,17 +119,21 @@ impl ZebraRpc {
 
         serde_json::from_value(result.clone()).map_err(Error::Json)
     }
-
 }
 
 #[async_trait]
 impl RpcProvider for ZebraRpc {
     async fn get_block_template(&self) -> Result<GetBlockTemplateResponse> {
-        self.request("getblocktemplate", serde_json::json!([])).await
+        self.request("getblocktemplate", serde_json::json!([]))
+            .await
     }
 
     /// Submit a solved block to Zebra
-    async fn submit_block(&self, block_hex: &str, mode: Option<SubmitMode>) -> Result<SubmitBlockResult> {
+    async fn submit_block(
+        &self,
+        block_hex: &str,
+        mode: Option<SubmitMode>,
+    ) -> Result<SubmitBlockResult> {
         let params = match mode {
             Some(m) if !m.as_param().is_empty() => serde_json::json!([block_hex, m.as_param()]),
             _ => serde_json::json!([block_hex]),
@@ -139,7 +148,8 @@ impl RpcProvider for ZebraRpc {
     }
 
     async fn get_best_block_hash(&self) -> Result<String> {
-        self.request("getbestblockhash", serde_json::json!([])).await
+        self.request("getbestblockhash", serde_json::json!([]))
+            .await
     }
 }
 

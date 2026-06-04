@@ -5,11 +5,11 @@
 //! The relay client runs as a background tokio task, sending and receiving
 //! compact blocks over authenticated UDP with Reed-Solomon FEC.
 
-use sovright_relay::{
-    BlockChunker, BlockReceiver, BlockSender, ClientConfig, CompactBlock,
-    PrefilledTx, RelayClient, ShortId, WtxId, AuthDigest, TxId,
-};
 use sha2::{Digest, Sha256};
+use sovright_relay::{
+    AuthDigest, BlockChunker, BlockReceiver, BlockSender, ClientConfig, CompactBlock, PrefilledTx,
+    RelayClient, ShortId, TxId, WtxId,
+};
 use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
@@ -57,31 +57,26 @@ pub(crate) fn build_compact_block(template: &BlockTemplate, nonce: u64) -> Resul
     }];
 
     // Build short IDs for template transactions
-    let short_ids: Vec<ShortId> = template.transactions.iter()
-        .filter_map(|tx| {
-            match hex::decode(&tx.hash) {
-                Ok(hash_bytes) if hash_bytes.len() == 32 => {
-                    let mut txid_bytes = [0u8; 32];
-                    txid_bytes.copy_from_slice(&hash_bytes);
-                    txid_bytes.reverse();
-                    let txid = TxId::from_bytes(txid_bytes);
-                    let wtxid = WtxId::new(txid, AuthDigest::from_bytes([0u8; 32]));
-                    Some(ShortId::compute(&wtxid, &header_hash, nonce))
-                }
-                _ => {
-                    warn!(tx_hash = %tx.hash, "Failed to decode transaction hash, skipping");
-                    None
-                }
+    let short_ids: Vec<ShortId> = template
+        .transactions
+        .iter()
+        .filter_map(|tx| match hex::decode(&tx.hash) {
+            Ok(hash_bytes) if hash_bytes.len() == 32 => {
+                let mut txid_bytes = [0u8; 32];
+                txid_bytes.copy_from_slice(&hash_bytes);
+                txid_bytes.reverse();
+                let txid = TxId::from_bytes(txid_bytes);
+                let wtxid = WtxId::new(txid, AuthDigest::from_bytes([0u8; 32]));
+                Some(ShortId::compute(&wtxid, &header_hash, nonce))
+            }
+            _ => {
+                warn!(tx_hash = %tx.hash, "Failed to decode transaction hash, skipping");
+                None
             }
         })
         .collect();
 
-    Ok(CompactBlock::new(
-        full_header,
-        nonce,
-        short_ids,
-        prefilled,
-    ))
+    Ok(CompactBlock::new(full_header, nonce, short_ids, prefilled))
 }
 
 /// Relay wrapper for the pool server
@@ -109,7 +104,11 @@ impl RelayHandle {
 
         let client_config = ClientConfig::new(relay_peers, auth_key)
             .with_fec(config.relay_data_shards, config.relay_parity_shards)
-            .with_bind_addr(config.relay_bind_addr.unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid address")))
+            .with_bind_addr(
+                config
+                    .relay_bind_addr
+                    .unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid address")),
+            )
             .with_auth_required(true);
 
         let client = RelayClient::new(client_config)
@@ -131,9 +130,12 @@ impl RelayHandle {
     /// Initialize the relay client (bind UDP socket)
     pub async fn init(&self) -> Result<()> {
         let mut guard = self.client.lock().await;
-        let client = guard.as_mut()
+        let client = guard
+            .as_mut()
             .ok_or_else(|| PoolError::Config("relay client already started".into()))?;
-        client.bind().await
+        client
+            .bind()
+            .await
             .map_err(|e| PoolError::Config(format!("relay bind failed: {}", e)))?;
         info!("Relay bound to {:?}", client.local_addr());
         Ok(())
@@ -145,11 +147,12 @@ impl RelayHandle {
     /// Returns a BlockReceiver for incoming compact blocks from the relay network.
     /// Must be called after `init()`.
     pub async fn start(&self) -> Result<BlockReceiver> {
-        let mut client = self.client.lock().await
-            .take()
-            .ok_or_else(|| PoolError::Config("relay client already started or not created".into()))?;
+        let mut client = self.client.lock().await.take().ok_or_else(|| {
+            PoolError::Config("relay client already started or not created".into())
+        })?;
 
-        let (block_receiver, _outgoing_rx) = client.take_receiver()
+        let (block_receiver, _outgoing_rx) = client
+            .take_receiver()
             .ok_or_else(|| PoolError::Config("relay receiver already taken".into()))?;
 
         // Spawn the relay client run loop as a background task.
@@ -168,7 +171,9 @@ impl RelayHandle {
     pub async fn announce_template(&self, template: &BlockTemplate) -> Result<()> {
         let compact = build_compact_block(template, self.nonce)?;
 
-        self.sender.send(compact).await
+        self.sender
+            .send(compact)
+            .await
             .map_err(|e| PoolError::Config(format!("relay send failed: {}", e)))?;
 
         debug!(
@@ -180,7 +185,12 @@ impl RelayHandle {
     }
 
     /// Announce a found block to the relay network
-    pub async fn announce_block(&self, block_header: &[u8], coinbase: &[u8], tx_hashes: &[[u8; 32]]) -> Result<()> {
+    pub async fn announce_block(
+        &self,
+        block_header: &[u8],
+        coinbase: &[u8],
+        tx_hashes: &[[u8; 32]],
+    ) -> Result<()> {
         // Build minimal compact block with just header and coinbase prefilled
         let prefilled = vec![PrefilledTx {
             index: 0,
@@ -189,7 +199,8 @@ impl RelayHandle {
 
         // Build short IDs for non-coinbase transactions
         let header_hash = compute_header_hash(block_header);
-        let short_ids: Vec<ShortId> = tx_hashes.iter()
+        let short_ids: Vec<ShortId> = tx_hashes
+            .iter()
             .map(|hash| {
                 let txid = TxId::from_bytes(*hash);
                 let wtxid = WtxId::new(txid, AuthDigest::from_bytes([0u8; 32]));
@@ -197,14 +208,11 @@ impl RelayHandle {
             })
             .collect();
 
-        let compact = CompactBlock::new(
-            block_header.to_vec(),
-            self.nonce,
-            short_ids,
-            prefilled,
-        );
+        let compact = CompactBlock::new(block_header.to_vec(), self.nonce, short_ids, prefilled);
 
-        self.sender.send(compact).await
+        self.sender
+            .send(compact)
+            .await
             .map_err(|e| PoolError::Config(format!("relay send failed: {}", e)))?;
 
         info!("Announced found block to relay");
@@ -222,9 +230,7 @@ mod tests {
 
     /// Helper: build a BlockTemplate from the TestTemplateFactory output.
     fn make_block_template(txs: Vec<TemplateTransaction>) -> BlockTemplate {
-        let response = TestTemplateFactory::new()
-            .with_transactions(txs)
-            .build();
+        let response = TestTemplateFactory::new().with_transactions(txs).build();
         let header = assemble_header(&response).expect("assemble_header should succeed");
         let coinbase_hex = response.coinbase_txn.get("data").unwrap().as_str().unwrap();
         let coinbase = hex::decode(coinbase_hex).expect("valid coinbase hex");
@@ -302,10 +308,15 @@ mod tests {
         let template = make_block_template(vec![bad_tx]);
 
         // Should succeed -- the invalid tx is skipped via filter_map
-        let compact = build_compact_block(&template, 0).expect("should succeed despite invalid tx hash");
+        let compact =
+            build_compact_block(&template, 0).expect("should succeed despite invalid tx hash");
 
         // The invalid transaction was skipped, so short_ids should be empty
-        assert_eq!(compact.short_ids.len(), 0, "invalid tx hash should be skipped");
+        assert_eq!(
+            compact.short_ids.len(),
+            0,
+            "invalid tx hash should be skipped"
+        );
 
         // Coinbase is still prefilled
         assert_eq!(compact.prefilled_txs.len(), 1);

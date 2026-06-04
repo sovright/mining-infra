@@ -100,10 +100,7 @@ fn test_full_mining_lifecycle() {
         .validate_share_with_job(&share, &job, &detector, &block_target)
         .expect("validate_share_with_job should not return Err");
 
-    assert!(
-        !result.accepted,
-        "Dummy solution should not be accepted"
-    );
+    assert!(!result.accepted, "Dummy solution should not be accepted");
     assert!(
         matches!(
             result.result,
@@ -231,7 +228,12 @@ fn test_full_mining_lifecycle() {
     };
     let stale_detector = InMemoryDuplicateDetector::new();
     let stale_result = processor
-        .validate_share(&stale_share, &channel_with_jobs, &stale_detector, &block_target)
+        .validate_share(
+            &stale_share,
+            &channel_with_jobs,
+            &stale_detector,
+            &block_target,
+        )
         .expect("validate_share should not return Err");
     assert!(!stale_result.accepted);
     assert!(

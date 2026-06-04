@@ -7,20 +7,20 @@
 //! - Handles vardiff adjustments
 
 use crate::error::{PoolError, Result};
+use sovright_noise::NoiseStream;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use zcash_mining_protocol::codec::{
-    encode_new_equihash_job, encode_set_target as codec_encode_set_target,
-    encode_submit_shares_response as codec_encode_submit_shares_response, MessageFrame,
+    MessageFrame, encode_new_equihash_job, encode_set_target as codec_encode_set_target,
+    encode_submit_shares_response as codec_encode_submit_shares_response,
 };
 use zcash_mining_protocol::messages::{
-    message_types, NewEquihashJob, SetTarget, ShareResult, SubmitEquihashShare,
-    SubmitSharesResponse,
+    NewEquihashJob, SetTarget, ShareResult, SubmitEquihashShare, SubmitSharesResponse,
+    message_types,
 };
-use sovright_noise::NoiseStream;
 
 /// Messages sent from session to server
 #[derive(Debug)]
@@ -163,9 +163,7 @@ impl Session {
         // Notify server of disconnection
         let _ = self
             .server_tx
-            .send(SessionMessage::Disconnected {
-                channel_id,
-            })
+            .send(SessionMessage::Disconnected { channel_id })
             .await;
 
         Ok(())
@@ -184,20 +182,18 @@ impl Session {
                 }
                 Ok(Some(msg))
             }
-            Transport::Plain(stream) => {
-                loop {
-                    if let Some(msg) = Self::try_parse_message(read_buf)? {
-                        return Ok(Some(msg));
-                    }
-
-                    let mut temp_buf = [0u8; 1024];
-                    let n = stream.read(&mut temp_buf).await?;
-                    if n == 0 {
-                        return Ok(None);
-                    }
-                    read_buf.extend_from_slice(&temp_buf[..n]);
+            Transport::Plain(stream) => loop {
+                if let Some(msg) = Self::try_parse_message(read_buf)? {
+                    return Ok(Some(msg));
                 }
-            }
+
+                let mut temp_buf = [0u8; 1024];
+                let n = stream.read(&mut temp_buf).await?;
+                if n == 0 {
+                    return Ok(None);
+                }
+                read_buf.extend_from_slice(&temp_buf[..n]);
+            },
         }
     }
 
@@ -217,8 +213,7 @@ impl Session {
         }
 
         // Parse frame header
-        let frame = MessageFrame::decode(read_buf)
-            .map_err(PoolError::Protocol)?;
+        let frame = MessageFrame::decode(read_buf).map_err(PoolError::Protocol)?;
 
         // Validate frame size limit (1MB max per message)
         const MAX_FRAME_SIZE: u32 = 1_048_576;
@@ -303,7 +298,10 @@ impl Session {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => {
                 // Channel was dropped - validation failed
-                warn!("Share validation channel dropped for seq {}", sequence_number);
+                warn!(
+                    "Share validation channel dropped for seq {}",
+                    sequence_number
+                );
                 return Err(PoolError::ChannelSend);
             }
             Err(_) => {
@@ -323,8 +321,7 @@ impl Session {
         job.channel_id = self.channel_id;
 
         // Encode and send
-        let encoded = encode_new_equihash_job(&job)
-            .map_err(PoolError::Protocol)?;
+        let encoded = encode_new_equihash_job(&job).map_err(PoolError::Protocol)?;
 
         self.write_message(&encoded).await?;
 
@@ -379,8 +376,7 @@ impl Session {
 /// Decode a SubmitEquihashShare message
 /// Uses the codec from zcash-mining-protocol
 fn decode_submit_share(data: &[u8]) -> Result<SubmitEquihashShare> {
-    zcash_mining_protocol::codec::decode_submit_share(data)
-        .map_err(PoolError::Protocol)
+    zcash_mining_protocol::codec::decode_submit_share(data).map_err(PoolError::Protocol)
 }
 
 /// Encode a SetTarget message using the canonical codec
@@ -474,6 +470,9 @@ mod tests {
 
         assert_eq!(decoded.channel_id, 42);
         assert_eq!(decoded.sequence_number, 999);
-        assert_eq!(decoded.result, ShareResult::Rejected(RejectReason::Duplicate));
+        assert_eq!(
+            decoded.result,
+            ShareResult::Rejected(RejectReason::Duplicate)
+        );
     }
 }

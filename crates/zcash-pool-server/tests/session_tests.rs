@@ -9,7 +9,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 
 use zcash_mining_protocol::codec::{
-    decode_new_equihash_job, decode_set_target, encode_submit_share, MessageFrame,
+    MessageFrame, decode_new_equihash_job, decode_set_target, encode_submit_share,
 };
 use zcash_mining_protocol::messages::{NewEquihashJob, SubmitEquihashShare};
 use zcash_pool_server::session::{ServerMessage, Session, SessionMessage, Transport};
@@ -99,7 +99,10 @@ async fn test_session_receives_job() {
 
     // Send a job through the server channel
     let job = make_test_job(100);
-    server_tx.send(ServerMessage::NewJob(job.clone())).await.unwrap();
+    server_tx
+        .send(ServerMessage::NewJob(job.clone()))
+        .await
+        .unwrap();
 
     // Read the framed message from the client side
     let msg_bytes = tokio::time::timeout(Duration::from_secs(5), read_framed_message(&mut client))
@@ -108,7 +111,10 @@ async fn test_session_receives_job() {
 
     // Decode and verify
     let decoded = decode_new_equihash_job(&msg_bytes).unwrap();
-    assert_eq!(decoded.channel_id, channel_id, "session should stamp its channel_id");
+    assert_eq!(
+        decoded.channel_id, channel_id,
+        "session should stamp its channel_id"
+    );
     assert_eq!(decoded.job_id, 100);
     assert_eq!(decoded.prev_hash, [0xaa; 32]);
     assert_eq!(decoded.merkle_root, [0xbb; 32]);
@@ -275,11 +281,14 @@ async fn test_session_forwards_share() {
             .await
             .expect("timed out waiting for share response");
 
-    let response = zcash_mining_protocol::codec::decode_submit_shares_response(&response_bytes)
-        .unwrap();
+    let response =
+        zcash_mining_protocol::codec::decode_submit_shares_response(&response_bytes).unwrap();
     assert_eq!(response.channel_id, channel_id);
     assert_eq!(response.sequence_number, 1);
-    assert_eq!(response.result, zcash_mining_protocol::messages::ShareResult::Accepted);
+    assert_eq!(
+        response.result,
+        zcash_mining_protocol::messages::ShareResult::Accepted
+    );
 
     // Shut down
     server_tx.send(ServerMessage::Shutdown).await.unwrap();

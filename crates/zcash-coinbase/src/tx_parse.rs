@@ -303,7 +303,16 @@ mod tests {
 
     #[test]
     fn push_compact_size_roundtrips() {
-        let test_values: Vec<u64> = vec![0, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffff_ffff, 0x1_0000_0000];
+        let test_values: Vec<u64> = vec![
+            0,
+            1,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x10000,
+            0xffff_ffff,
+            0x1_0000_0000,
+        ];
 
         for val in test_values {
             let mut buf = Vec::new();

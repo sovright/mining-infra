@@ -30,8 +30,7 @@ pub fn block_subsidy(height: u64) -> u64 {
     let halvings = if height < BLOSSOM_ACTIVATION_HEIGHT {
         PRE_BLOSSOM_HALVINGS
     } else {
-        PRE_BLOSSOM_HALVINGS
-            + (height - BLOSSOM_ACTIVATION_HEIGHT) / POST_BLOSSOM_HALVING_INTERVAL
+        PRE_BLOSSOM_HALVINGS + (height - BLOSSOM_ACTIVATION_HEIGHT) / POST_BLOSSOM_HALVING_INTERVAL
     };
     if halvings >= 64 {
         return 0;
@@ -65,7 +64,10 @@ mod tests {
     fn first_halving_era_subsidy() {
         // Right at Blossom activation
         assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT), 312_500_000);
-        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 100_000), 312_500_000);
+        assert_eq!(
+            block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 100_000),
+            312_500_000
+        );
     }
 
     #[test]
@@ -89,8 +91,14 @@ mod tests {
 
     #[test]
     fn subsidy_zero_after_many_halvings() {
-        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 64 * POST_BLOSSOM_HALVING_INTERVAL), 0);
-        assert_eq!(block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 100 * POST_BLOSSOM_HALVING_INTERVAL), 0);
+        assert_eq!(
+            block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 64 * POST_BLOSSOM_HALVING_INTERVAL),
+            0
+        );
+        assert_eq!(
+            block_subsidy(BLOSSOM_ACTIVATION_HEIGHT + 100 * POST_BLOSSOM_HALVING_INTERVAL),
+            0
+        );
     }
 
     #[test]

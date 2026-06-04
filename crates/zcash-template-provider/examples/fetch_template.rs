@@ -30,7 +30,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Version: {}", template.header.version);
             println!("Prev Hash: {}", template.header.prev_hash.to_hex());
             println!("Merkle Root: {}", template.header.merkle_root.to_hex());
-            println!("Block Commitments: {}", template.header.hash_block_commitments.to_hex());
+            println!(
+                "Block Commitments: {}",
+                template.header.hash_block_commitments.to_hex()
+            );
             println!("Time: {}", template.header.time);
             println!("Bits: 0x{:08x}", template.header.bits);
             println!("Target: {}", template.target.to_hex());

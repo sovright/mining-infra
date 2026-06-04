@@ -10,9 +10,8 @@ const NOISE_PATTERN: &str = "Noise_NK_25519_ChaChaPoly_BLAKE2s";
 
 /// Fixed server private key (32 bytes) for deterministic tests.
 const SERVER_PRIVATE: [u8; 32] = [
-    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-    0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
-    0x1f, 0x20,
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+    0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
 ];
 
 /// Derive the server public key from the fixed private key using snow's builder.
@@ -70,9 +69,7 @@ fn test_handshake_deterministic_with_fixed_keys() {
     // Encrypt a message from initiator to responder
     let plaintext = b"Hello from the miner!";
     let mut ciphertext = vec![0u8; plaintext.len() + 16]; // plaintext + AEAD tag
-    let ct_len = initiator
-        .write_message(plaintext, &mut ciphertext)
-        .unwrap();
+    let ct_len = initiator.write_message(plaintext, &mut ciphertext).unwrap();
 
     // Ciphertext length should be plaintext + 16-byte AEAD tag
     assert_eq!(
@@ -151,7 +148,9 @@ fn test_handshake_message_lengths() {
     );
 
     let mut payload1 = vec![0u8; 65535];
-    responder.read_message(&msg1[..len1], &mut payload1).unwrap();
+    responder
+        .read_message(&msg1[..len1], &mut payload1)
+        .unwrap();
 
     // Message 2: <- e, ee (32-byte ephemeral public key + 16-byte AEAD tag from ee)
     let mut msg2 = vec![0u8; 65535];

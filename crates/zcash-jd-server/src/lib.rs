@@ -40,8 +40,8 @@ pub use config::JdServerConfig;
 pub use error::{JdServerError, Result};
 pub use messages::*;
 pub use server::{
-    handle_jd_client, handle_jd_client_with_transport, CurrentTemplateContext,
-    FullTemplateJobResponse, JdServer, JdTransport,
+    CurrentTemplateContext, FullTemplateJobResponse, JdServer, JdTransport, handle_jd_client,
+    handle_jd_client_with_transport,
 };
 pub use token::{DeclaredJobInfo, MiningJobToken, TokenManager};
 pub use validation::{TemplateValidator, ValidationLevel, ValidationResult};

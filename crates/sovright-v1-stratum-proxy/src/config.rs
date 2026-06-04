@@ -87,7 +87,9 @@ struct FileLoggingConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            listen: "0.0.0.0:3334".parse().expect("default listen address is valid"),
+            listen: "0.0.0.0:3334"
+                .parse()
+                .expect("default listen address is valid"),
             upstream: "127.0.0.1:3333"
                 .parse()
                 .expect("default upstream address is valid"),
@@ -202,9 +204,12 @@ impl ProxyConfig {
 }
 
 fn parse_socket_addr(field_name: &str, value: &str) -> Result<SocketAddr, ConfigError> {
-    value
-        .parse()
-        .map_err(|error| ConfigError::new(format!("invalid {} value '{}': {}", field_name, value, error)))
+    value.parse().map_err(|error| {
+        ConfigError::new(format!(
+            "invalid {} value '{}': {}",
+            field_name, value, error
+        ))
+    })
 }
 
 #[cfg(test)]
@@ -217,7 +222,10 @@ mod tests {
         assert_eq!(config.listen, "0.0.0.0:3334".parse().unwrap());
         assert_eq!(config.upstream, "127.0.0.1:3333".parse().unwrap());
         assert_eq!(config.timeouts.upstream_connect, Duration::from_secs(10));
-        assert_eq!(config.timeouts.upstream_reconnect_max, Duration::from_secs(60));
+        assert_eq!(
+            config.timeouts.upstream_reconnect_max,
+            Duration::from_secs(60)
+        );
         assert_eq!(config.timeouts.miner_idle, Duration::from_secs(600));
         assert!(!config.metrics.enabled);
     }
@@ -251,7 +259,10 @@ mod tests {
         assert_eq!(merged.listen, "127.0.0.1:4444".parse().unwrap());
         assert_eq!(merged.upstream, "127.0.0.1:5555".parse().unwrap());
         assert_eq!(merged.timeouts.upstream_connect, Duration::from_secs(5));
-        assert_eq!(merged.timeouts.upstream_reconnect_max, Duration::from_secs(30));
+        assert_eq!(
+            merged.timeouts.upstream_reconnect_max,
+            Duration::from_secs(30)
+        );
         assert_eq!(merged.timeouts.miner_idle, Duration::from_secs(120));
         assert!(merged.metrics.enabled);
         assert_eq!(merged.metrics.listen, "127.0.0.1:9000".parse().unwrap());

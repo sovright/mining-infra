@@ -54,7 +54,8 @@ impl PayoutTracker {
         if !difficulty.is_finite() || difficulty <= 0.0 {
             tracing::warn!(
                 "Ignoring share with invalid difficulty {} for miner {}",
-                difficulty, miner_id
+                difficulty,
+                miner_id
             );
             return;
         }
@@ -174,9 +175,7 @@ impl PayoutTracker {
         };
         let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
         let before = miners.len();
-        miners.retain(|_, stats| {
-            stats.last_share.map(|t| t > cutoff).unwrap_or(false)
-        });
+        miners.retain(|_, stats| stats.last_share.map(|t| t > cutoff).unwrap_or(false));
         let removed = before - miners.len();
         if removed > 0 {
             tracing::debug!("Cleaned up {} stale miner entries", removed);
@@ -411,10 +410,7 @@ mod tests {
             "hashrate {} should be <= total_difficulty (1000) since elapsed >= 1s",
             rate
         );
-        assert!(
-            rate > 0.0,
-            "hashrate should be positive"
-        );
+        assert!(rate > 0.0, "hashrate should be positive");
     }
 
     /// Kill mutant: `t > cutoff` vs `t >= cutoff` in active_miner_count
@@ -441,7 +437,10 @@ mod tests {
         // Now: cutoff = now - 50ms. share_time was ~55ms ago.
         // So share_time < cutoff => miner should NOT be active.
         let count = tracker.active_miner_count();
-        assert_eq!(count, 0, "miner whose share is older than window should not be active");
+        assert_eq!(
+            count, 0,
+            "miner whose share is older than window should not be active"
+        );
     }
 
     /// Kill mutant: `t > cutoff` vs `t >= cutoff` in active_miner_count
@@ -472,7 +471,11 @@ mod tests {
         // Correct: 3 - 0 = 3
         // Mutant (+ instead of -): 3 + 0 = 3 (same! need partial removal)
         assert_eq!(removed, 3);
-        assert_eq!(tracker.get_all_stats().len(), 0, "all miners should be removed with zero idle time");
+        assert_eq!(
+            tracker.get_all_stats().len(),
+            0,
+            "all miners should be removed with zero idle time"
+        );
     }
 
     /// Kill mutant: cleanup_stale_miners boundary -- miner exactly at cutoff

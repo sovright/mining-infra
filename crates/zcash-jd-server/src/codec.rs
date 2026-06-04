@@ -8,11 +8,11 @@
 
 use crate::error::{JdServerError, Result};
 use crate::messages::{
-    message_types, AllocateMiningJobToken, AllocateMiningJobTokenSuccess, GetMissingTransactions,
+    AllocateMiningJobToken, AllocateMiningJobTokenSuccess, GetMissingTransactions,
     JobDeclarationMode, ProvideMissingTransactions, PushSolution, SetCustomMiningJob,
     SetCustomMiningJobError, SetCustomMiningJobErrorCode, SetCustomMiningJobSuccess,
     SetFullTemplateJob, SetFullTemplateJobError, SetFullTemplateJobErrorCode,
-    SetFullTemplateJobSuccess,
+    SetFullTemplateJobSuccess, message_types,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -22,8 +22,7 @@ use zcash_mining_protocol::codec::MessageFrame;
 const JD_EXTENSION_TYPE: u16 = 0;
 
 fn frame_payload(data: &[u8], expected_type: u8) -> Result<&[u8]> {
-    let frame = MessageFrame::decode(data)
-        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let frame = MessageFrame::decode(data).map_err(|e| JdServerError::Protocol(e.to_string()))?;
     if frame.msg_type != expected_type {
         return Err(JdServerError::Protocol(format!(
             "Invalid message type: expected 0x{:02x}, got 0x{:02x}",
@@ -68,9 +67,7 @@ fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
 
 /// Helper to write a u16-prefixed string
 fn write_string(payload: &mut Vec<u8>, s: &str) {
-    payload
-        .write_u16::<LittleEndian>(s.len() as u16)
-        .unwrap();
+    payload.write_u16::<LittleEndian>(s.len() as u16).unwrap();
     payload.write_all(s.as_bytes()).unwrap();
 }
 
@@ -135,9 +132,7 @@ fn write_bytes_u32(payload: &mut Vec<u8>, data: &[u8]) {
 pub fn encode_allocate_token(msg: &AllocateMiningJobToken) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
 
-    payload
-        .write_u32::<LittleEndian>(msg.request_id)
-        .unwrap();
+    payload.write_u32::<LittleEndian>(msg.request_id).unwrap();
     write_string(&mut payload, &msg.user_identifier);
     payload.write_u8(msg.requested_mode.as_u8()).unwrap();
 
@@ -179,9 +174,7 @@ pub fn decode_allocate_token(data: &[u8]) -> Result<AllocateMiningJobToken> {
 pub fn encode_allocate_token_success(msg: &AllocateMiningJobTokenSuccess) -> Result<Vec<u8>> {
     let mut payload = Vec::new();
 
-    payload
-        .write_u32::<LittleEndian>(msg.request_id)
-        .unwrap();
+    payload.write_u32::<LittleEndian>(msg.request_id).unwrap();
     write_bytes_u16(&mut payload, &msg.mining_job_token);
     write_bytes_u16(&mut payload, &msg.coinbase_output);
     payload
@@ -391,8 +384,9 @@ pub fn decode_set_custom_job_error(data: &[u8]) -> Result<SetCustomMiningJobErro
     let error_code_byte = cursor
         .read_u8()
         .map_err(|e| JdServerError::Protocol(e.to_string()))?;
-    let error_code = SetCustomMiningJobErrorCode::from_u8(error_code_byte)
-        .ok_or_else(|| JdServerError::Protocol(format!("Unknown error code: 0x{:02x}", error_code_byte)))?;
+    let error_code = SetCustomMiningJobErrorCode::from_u8(error_code_byte).ok_or_else(|| {
+        JdServerError::Protocol(format!("Unknown error code: 0x{:02x}", error_code_byte))
+    })?;
     let error_message = read_string(&mut cursor)?;
 
     Ok(SetCustomMiningJobError {

@@ -1,5 +1,5 @@
-use zcash_equihash_validator::{EquihashValidator, ValidationError};
 use zcash_equihash_validator::difficulty::{compact_to_target, difficulty_to_target};
+use zcash_equihash_validator::{EquihashValidator, ValidationError};
 
 #[test]
 fn test_validator_creation() {
@@ -28,7 +28,10 @@ fn test_wrong_solution_length_rejected() {
     let bad_solution = [0u8; 100]; // Wrong length
 
     let result = validator.verify_solution(&header, &bad_solution);
-    assert!(matches!(result, Err(ValidationError::InvalidSolutionLength(_))));
+    assert!(matches!(
+        result,
+        Err(ValidationError::InvalidSolutionLength(_))
+    ));
 }
 
 #[test]
@@ -46,7 +49,10 @@ fn test_difficulty_to_target() {
     // Difficulty 1 should give max target
     // Zcash max target is 0007ffff... which has high byte at position 28 (little-endian)
     let target = difficulty_to_target(1.0);
-    assert!(target.0[28] > 0, "Expected non-zero byte at position 28 for difficulty 1");
+    assert!(
+        target.0[28] > 0,
+        "Expected non-zero byte at position 28 for difficulty 1"
+    );
 
     // Higher difficulty = lower target
     let harder = difficulty_to_target(2.0);

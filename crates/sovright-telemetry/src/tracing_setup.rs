@@ -3,18 +3,17 @@
 //! Provides configuration and initialization for OpenTelemetry tracing
 //! with OTLP export support for distributed trace collection.
 
-use opentelemetry::global;
 use opentelemetry::KeyValue;
+use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
-    runtime,
+    Resource, runtime,
     trace::{self, RandomIdGenerator, Sampler},
-    Resource,
 };
 use thiserror::Error;
 use tracing::info;
 use tracing_opentelemetry::OpenTelemetryLayer;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Configuration for OpenTelemetry tracing
 #[derive(Debug, Clone)]
@@ -67,8 +66,8 @@ impl TracingConfig {
     /// - `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint URL
     /// - `OTEL_TRACES_SAMPLER_ARG`: Sampling ratio (default: 1.0)
     pub fn from_env() -> Self {
-        let service_name = std::env::var("OTEL_SERVICE_NAME")
-            .unwrap_or_else(|_| "sovright".to_string());
+        let service_name =
+            std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "sovright".to_string());
 
         let otlp_endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok();
 

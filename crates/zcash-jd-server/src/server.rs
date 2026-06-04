@@ -13,24 +13,24 @@ use crate::codec::{
 use crate::config::JdServerConfig;
 use crate::error::{JdServerError, Result};
 use crate::messages::{
-    message_types, AllocateMiningJobTokenSuccess, GetMissingTransactions, JobDeclarationMode,
+    AllocateMiningJobTokenSuccess, GetMissingTransactions, JobDeclarationMode,
     ProvideMissingTransactions, PushSolution, SetCustomMiningJob, SetCustomMiningJobError,
     SetCustomMiningJobErrorCode, SetCustomMiningJobSuccess, SetFullTemplateJob,
-    SetFullTemplateJobError, SetFullTemplateJobErrorCode, SetFullTemplateJobSuccess,
+    SetFullTemplateJobError, SetFullTemplateJobErrorCode, SetFullTemplateJobSuccess, message_types,
 };
 use crate::token::{DeclaredJobInfo, TokenManager};
 use crate::validation::{TemplateValidator, ValidationResult};
+use sovright_noise::NoiseStream;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::{debug, error, info, warn};
-use zcash_equihash_validator::{compact_to_target, target_to_difficulty, EquihashValidator};
+use zcash_equihash_validator::{EquihashValidator, compact_to_target, target_to_difficulty};
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
-use sovright_noise::NoiseStream;
 
 const MAX_JOB_ID: u32 = u32::MAX - 1;
 
@@ -42,11 +42,7 @@ fn next_positive_job_id(counter: &AtomicU32) -> u32 {
         } else {
             current
         };
-        let next = if job_id >= MAX_JOB_ID {
-            1
-        } else {
-            job_id + 1
-        };
+        let next = if job_id >= MAX_JOB_ID { 1 } else { job_id + 1 };
 
         if counter
             .compare_exchange(current, next, Ordering::SeqCst, Ordering::SeqCst)
@@ -420,8 +416,7 @@ impl JdServer {
         }
         drop(current_prev_hash);
 
-        self
-            .validate_custom_job_request(&request, &token_info.client_id)
+        self.validate_custom_job_request(&request, &token_info.client_id)
             .await?;
 
         // 5. Allocate job_id
@@ -489,7 +484,9 @@ impl JdServer {
 
         if !solution.validate_solution_len() {
             warn!(job_id = solution.job_id, "Invalid solution length");
-            return Err(JdServerError::Protocol("Invalid solution length".to_string()));
+            return Err(JdServerError::Protocol(
+                "Invalid solution length".to_string(),
+            ));
         }
 
         let job = self.token_manager.find_job_by_id(solution.job_id)?;
@@ -511,7 +508,9 @@ impl JdServer {
         if solution.time < job.time.saturating_sub(MAX_TIME_BACKWARD)
             || solution.time > job.time.saturating_add(MAX_TIME_FORWARD)
         {
-            return Err(JdServerError::Protocol("solution time out of range".to_string()));
+            return Err(JdServerError::Protocol(
+                "solution time out of range".to_string(),
+            ));
         }
 
         let mut header = [0u8; 140];
@@ -549,18 +548,17 @@ impl JdServer {
     pub async fn handle_set_full_template_job(
         &self,
         request: SetFullTemplateJob,
-    ) -> std::result::Result<
-        SetFullTemplateJobSuccess,
-        FullTemplateJobResponse,
-    > {
+    ) -> std::result::Result<SetFullTemplateJobSuccess, FullTemplateJobResponse> {
         // 1. Validate basic structure
         if let Err(e) = request.validate() {
-            return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                request.channel_id,
-                request.request_id,
-                e,
-                format!("Validation failed: {}", e),
-            )));
+            return Err(FullTemplateJobResponse::Error(
+                SetFullTemplateJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    e,
+                    format!("Validation failed: {}", e),
+                ),
+            ));
         }
 
         // 2. Validate token and check mode
@@ -580,12 +578,14 @@ impl JdServer {
                     request_id = request.request_id,
                     "Full template job rejected: token expired"
                 );
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    SetFullTemplateJobErrorCode::TokenExpired,
-                    "Mining job token has expired",
-                )));
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        SetFullTemplateJobErrorCode::TokenExpired,
+                        "Mining job token has expired",
+                    ),
+                ));
             }
             Err(e) => {
                 error!(
@@ -593,12 +593,14 @@ impl JdServer {
                     error = %e,
                     "Unexpected error validating token"
                 );
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    SetFullTemplateJobErrorCode::Other,
-                    format!("Token validation error: {}", e),
-                )));
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        SetFullTemplateJobErrorCode::Other,
+                        format!("Token validation error: {}", e),
+                    ),
+                ));
             }
         };
 
@@ -634,12 +636,14 @@ impl JdServer {
                     }
                     _ => SetFullTemplateJobErrorCode::Other,
                 };
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    code,
-                    reason,
-                )));
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        code,
+                        reason,
+                    ),
+                ));
             }
         };
 
@@ -655,12 +659,14 @@ impl JdServer {
                         got = ?hex::encode(request.prev_hash),
                         "Full template job rejected: stale prev_hash"
                     );
-                    return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                        request.channel_id,
-                        request.request_id,
-                        SetFullTemplateJobErrorCode::StalePrevHash,
-                        "Previous block hash does not match current chain tip",
-                    )));
+                    return Err(FullTemplateJobResponse::Error(
+                        SetFullTemplateJobError::new(
+                            request.channel_id,
+                            request.request_id,
+                            SetFullTemplateJobErrorCode::StalePrevHash,
+                            "Previous block hash does not match current chain tip",
+                        ),
+                    ));
                 }
             }
             None => {
@@ -668,12 +674,14 @@ impl JdServer {
                     request_id = request.request_id,
                     "Full template job rejected: no template received yet"
                 );
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    SetFullTemplateJobErrorCode::StalePrevHash,
-                    "Server has not received a block template yet",
-                )));
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        SetFullTemplateJobErrorCode::StalePrevHash,
+                        "Server has not received a block template yet",
+                    ),
+                ));
             }
         }
         drop(current_prev_hash);
@@ -681,27 +689,31 @@ impl JdServer {
         // 5. Validate template using the validator
         let validator = self.validator.read().await;
         if let Err(reason) = validator.validate_coinbase(&request.coinbase_tx) {
-            return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                request.channel_id,
-                request.request_id,
-                SetFullTemplateJobErrorCode::CoinbaseConstraintViolation,
-                reason,
-            )));
+            return Err(FullTemplateJobResponse::Error(
+                SetFullTemplateJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetFullTemplateJobErrorCode::CoinbaseConstraintViolation,
+                    reason,
+                ),
+            ));
         }
         if let Some(ref current) = template {
             let max_coinbase_len =
                 current.coinbase_tx_len + self.config.coinbase_output_max_additional_size as usize;
             if request.coinbase_tx.len() > max_coinbase_len {
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    SetFullTemplateJobErrorCode::CoinbaseConstraintViolation,
-                    format!(
-                        "coinbase length {} exceeds maximum {}",
-                        request.coinbase_tx.len(),
-                        max_coinbase_len
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        SetFullTemplateJobErrorCode::CoinbaseConstraintViolation,
+                        format!(
+                            "coinbase length {} exceeds maximum {}",
+                            request.coinbase_tx.len(),
+                            max_coinbase_len
+                        ),
                     ),
-                )));
+                ));
             }
         }
         match validator.validate(&request) {
@@ -714,12 +726,14 @@ impl JdServer {
                     reason = %reason,
                     "Full template job rejected: invalid template"
                 );
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    SetFullTemplateJobErrorCode::InvalidTransactions,
-                    reason,
-                )));
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        SetFullTemplateJobErrorCode::InvalidTransactions,
+                        reason,
+                    ),
+                ));
             }
             ValidationResult::NeedTransactions(missing) => {
                 info!(
@@ -735,11 +749,7 @@ impl JdServer {
                     },
                 );
                 return Err(FullTemplateJobResponse::NeedTransactions(
-                    GetMissingTransactions::new(
-                        request.channel_id,
-                        request.request_id,
-                        missing,
-                    ),
+                    GetMissingTransactions::new(request.channel_id, request.request_id, missing),
                 ));
             }
         }
@@ -759,12 +769,14 @@ impl JdServer {
                     error = %e,
                     "Failed to register full template job"
                 );
-                return Err(FullTemplateJobResponse::Error(SetFullTemplateJobError::new(
-                    request.channel_id,
-                    request.request_id,
-                    SetFullTemplateJobErrorCode::Other,
-                    format!("Failed to register job: {}", e),
-                )));
+                return Err(FullTemplateJobResponse::Error(
+                    SetFullTemplateJobError::new(
+                        request.channel_id,
+                        request.request_id,
+                        SetFullTemplateJobErrorCode::Other,
+                        format!("Failed to register job: {}", e),
+                    ),
+                ));
             }
         };
 
@@ -872,8 +884,7 @@ impl JdServer {
         let mut validator = self.validator.write().await;
 
         for (expected_txid, tx_data) in pending.expected_txids.iter().zip(msg.transactions.iter()) {
-            TemplateValidator::parse_transaction(tx_data)
-                .map_err(JdServerError::Protocol)?;
+            TemplateValidator::parse_transaction(tx_data).map_err(JdServerError::Protocol)?;
             let txid = TemplateValidator::compute_txid(tx_data);
             if &txid != expected_txid {
                 return Err(JdServerError::Protocol(format!(
@@ -938,8 +949,8 @@ impl JdTransport {
                     Err(e) => return Err(JdServerError::Io(e)),
                 }
 
-                let frame =
-                    MessageFrame::decode(&header_buf).map_err(|e| JdServerError::Protocol(e.to_string()))?;
+                let frame = MessageFrame::decode(&header_buf)
+                    .map_err(|e| JdServerError::Protocol(e.to_string()))?;
 
                 // Prevent memory exhaustion attacks - limit frame size to 1MB
                 const MAX_FRAME_SIZE: u32 = 1_048_576;
@@ -959,13 +970,11 @@ impl JdTransport {
                 full_message.extend(payload);
                 Ok(Some(full_message))
             }
-            JdTransport::Noise(stream) => {
-                match stream.read_message().await {
-                    Ok(message) => Ok(Some(message)),
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
-                    Err(e) => Err(JdServerError::Io(e)),
-                }
-            }
+            JdTransport::Noise(stream) => match stream.read_message().await {
+                Ok(message) => Ok(Some(message)),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+                Err(e) => Err(JdServerError::Io(e)),
+            },
         }
     }
 
@@ -1151,11 +1160,7 @@ pub async fn handle_jd_client_with_transport(
             }
 
             _ => {
-                warn!(
-                    client_id,
-                    msg_type = frame.msg_type,
-                    "Unknown message type"
-                );
+                warn!(client_id, msg_type = frame.msg_type, "Unknown message type");
                 // Ignore unknown message types
             }
         }
@@ -1189,11 +1194,8 @@ mod tests {
         let server = JdServer::new(config.clone(), payout_tracker);
 
         // Verify we can allocate a token (default CoinbaseOnly mode)
-        let result = server.handle_allocate_token(
-            1,
-            "test-miner",
-            JobDeclarationMode::CoinbaseOnly,
-        );
+        let result =
+            server.handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -1370,7 +1372,10 @@ mod tests {
         assert!(result.is_err());
 
         let error = result.unwrap_err();
-        assert_eq!(error.error_code, SetCustomMiningJobErrorCode::InvalidCoinbase);
+        assert_eq!(
+            error.error_code,
+            SetCustomMiningJobErrorCode::InvalidCoinbase
+        );
     }
 
     #[tokio::test]
@@ -1380,18 +1385,22 @@ mod tests {
         let server = JdServer::new(config, payout_tracker.clone());
 
         let solution = PushSolution::new(
-            1,              // channel_id
-            42,             // job_id
-            5,              // version
-            1700000000,     // time
-            [0x11; 32],     // nonce
-            [0x22; 1344],   // solution
+            1,            // channel_id
+            42,           // job_id
+            5,            // version
+            1700000000,   // time
+            [0x11; 32],   // nonce
+            [0x22; 1344], // solution
         );
 
         let result = server.handle_push_solution(solution).await;
         assert!(result.is_err());
 
-        assert!(payout_tracker.get_stats(&"jd-miner-1".to_string()).is_none());
+        assert!(
+            payout_tracker
+                .get_stats(&"jd-miner-1".to_string())
+                .is_none()
+        );
     }
 
     #[test]
@@ -1481,11 +1490,8 @@ mod tests {
         let server = JdServer::new(config, payout_tracker);
 
         // Request Full-Template mode
-        let result = server.handle_allocate_token(
-            1,
-            "test-miner",
-            JobDeclarationMode::FullTemplate,
-        );
+        let result =
+            server.handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -1499,11 +1505,8 @@ mod tests {
         let server = JdServer::new(config, payout_tracker);
 
         // Request Full-Template mode, but it's disabled
-        let result = server.handle_allocate_token(
-            1,
-            "test-miner",
-            JobDeclarationMode::FullTemplate,
-        );
+        let result =
+            server.handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate);
         assert!(result.is_ok());
 
         let response = result.unwrap();
@@ -1525,7 +1528,10 @@ mod tests {
         let token_response = server
             .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
             .unwrap();
-        assert_eq!(token_response.granted_mode, JobDeclarationMode::FullTemplate);
+        assert_eq!(
+            token_response.granted_mode,
+            JobDeclarationMode::FullTemplate
+        );
 
         // Declare a full template job
         let coinbase_tx = minimal_tx();
@@ -1564,7 +1570,10 @@ mod tests {
         let token_response = server
             .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
             .unwrap();
-        assert_eq!(token_response.granted_mode, JobDeclarationMode::CoinbaseOnly);
+        assert_eq!(
+            token_response.granted_mode,
+            JobDeclarationMode::CoinbaseOnly
+        );
 
         // Try to declare a full template job with CoinbaseOnly token
         let coinbase_tx = minimal_tx();
@@ -1708,7 +1717,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(error.error_code, SetCustomMiningJobErrorCode::InvalidMerkleRoot);
+        assert_eq!(
+            error.error_code,
+            SetCustomMiningJobErrorCode::InvalidMerkleRoot
+        );
     }
 
     #[tokio::test]
@@ -1751,7 +1763,11 @@ mod tests {
 
         let result = server.handle_push_solution(solution).await;
         assert!(result.is_err());
-        assert!(payout_tracker.get_stats(&"jd-miner-1".to_string()).is_none());
+        assert!(
+            payout_tracker
+                .get_stats(&"jd-miner-1".to_string())
+                .is_none()
+        );
     }
 
     fn merkle_root_for(coinbase: &[u8], txids: &[[u8; 32]]) -> [u8; 32] {
@@ -1779,7 +1795,11 @@ mod tests {
             let mut i = 0;
             while i < layer.len() {
                 let left = layer[i];
-                let right = if i + 1 < layer.len() { layer[i + 1] } else { left };
+                let right = if i + 1 < layer.len() {
+                    layer[i + 1]
+                } else {
+                    left
+                };
                 let mut data = [0u8; 64];
                 data[..32].copy_from_slice(&left);
                 data[32..].copy_from_slice(&right);
@@ -1909,10 +1929,7 @@ mod tests {
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        let tx_data = vec![
-            minimal_tx(),
-            minimal_tx_with_script(&[0x52]),
-        ];
+        let tx_data = vec![minimal_tx(), minimal_tx_with_script(&[0x52])];
         let expected_txids = tx_data
             .iter()
             .map(|tx| TemplateValidator::compute_txid(tx))

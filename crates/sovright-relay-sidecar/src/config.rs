@@ -309,7 +309,9 @@ mod tests {
 
         assert_eq!(
             config.metrics_textfile,
-            Some(PathBuf::from("/var/lib/sovright-relay-sidecar/metrics.prom"))
+            Some(PathBuf::from(
+                "/var/lib/sovright-relay-sidecar/metrics.prom"
+            ))
         );
     }
 

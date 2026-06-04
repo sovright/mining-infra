@@ -10,21 +10,21 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::{pending, pending as future_pending};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::{self, Instant};
 use tracing::{debug, info, warn};
 use zcash_mining_protocol::codec::{
-    decode_new_equihash_job, decode_set_target, decode_submit_shares_response, encode_submit_share,
-    MessageFrame,
+    MessageFrame, decode_new_equihash_job, decode_set_target, decode_submit_shares_response,
+    encode_submit_share,
 };
 use zcash_mining_protocol::messages::{
-    message_types, NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
-    SubmitSharesResponse,
+    NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
+    SubmitSharesResponse, message_types,
 };
 
 #[derive(Debug, Default)]
@@ -336,32 +336,43 @@ impl MinerSession {
             "mining.subscribe" => match Subscribe::try_from(params) {
                 Ok(subscribe) => self.handle_subscribe(request.id, subscribe).await,
                 Err(error) => {
-                    self.send_json(&messages::json_rpc_error_response(request.id, -32602, error))
-                        .await?;
+                    self.send_json(&messages::json_rpc_error_response(
+                        request.id, -32602, error,
+                    ))
+                    .await?;
                     Ok(())
                 }
             },
             "mining.authorize" => match Authorize::try_from(params) {
                 Ok(authorize) => self.handle_authorize(request.id, authorize).await,
                 Err(error) => {
-                    self.send_json(&messages::json_rpc_error_response(request.id, -32602, error))
-                        .await?;
+                    self.send_json(&messages::json_rpc_error_response(
+                        request.id, -32602, error,
+                    ))
+                    .await?;
                     Ok(())
                 }
             },
             "mining.extranonce.subscribe" => match ExtranonceSubscribe::try_from(params) {
-                Ok(subscribe) => self.handle_extranonce_subscribe(request.id, subscribe).await,
+                Ok(subscribe) => {
+                    self.handle_extranonce_subscribe(request.id, subscribe)
+                        .await
+                }
                 Err(error) => {
-                    self.send_json(&messages::json_rpc_error_response(request.id, -32602, error))
-                        .await?;
+                    self.send_json(&messages::json_rpc_error_response(
+                        request.id, -32602, error,
+                    ))
+                    .await?;
                     Ok(())
                 }
             },
             "mining.submit" => match Submit::try_from(params) {
                 Ok(submit) => self.handle_submit(request.id, submit).await,
                 Err(error) => {
-                    self.send_json(&messages::json_rpc_error_response(request.id, -32602, error))
-                        .await?;
+                    self.send_json(&messages::json_rpc_error_response(
+                        request.id, -32602, error,
+                    ))
+                    .await?;
                     Ok(())
                 }
             },
@@ -422,7 +433,8 @@ impl MinerSession {
             .unwrap_or_else(|| "session".to_string());
         let result = serde_json::json!([session_id, translate::bytes_to_hex(&self.nonce_1)]);
 
-        self.send_json(&messages::success_response(request_id, result)).await?;
+        self.send_json(&messages::success_response(request_id, result))
+            .await?;
         self.send_set_extranonce().await?;
         self.flush_work_state(false).await?;
         Ok(())
@@ -441,7 +453,8 @@ impl MinerSession {
         );
         self.worker_name = Some(authorize.worker_name);
         self.recompute_state();
-        self.send_json(&messages::bool_response(request_id, true)).await?;
+        self.send_json(&messages::bool_response(request_id, true))
+            .await?;
         self.flush_work_state(false).await?;
         Ok(())
     }
@@ -452,7 +465,8 @@ impl MinerSession {
         _subscribe: ExtranonceSubscribe,
     ) -> Result<(), SessionError> {
         self.extranonce_subscribed = true;
-        self.send_json(&messages::bool_response(request_id, true)).await?;
+        self.send_json(&messages::bool_response(request_id, true))
+            .await?;
         Ok(())
     }
 
@@ -462,19 +476,20 @@ impl MinerSession {
         submit: Submit,
     ) -> Result<(), SessionError> {
         if let Some(worker_name) = &self.worker_name
-            && submit.worker_name != *worker_name {
-                warn!(
-                    expected = %worker_name,
-                    got = %submit.worker_name,
-                    "Rejecting share: worker name mismatch"
-                );
-                self.send_json(&messages::submit_error_response(
-                    request_id,
-                    "Worker name mismatch",
-                ))
-                .await?;
-                return Ok(());
-            }
+            && submit.worker_name != *worker_name
+        {
+            warn!(
+                expected = %worker_name,
+                got = %submit.worker_name,
+                "Rejecting share: worker name mismatch"
+            );
+            self.send_json(&messages::submit_error_response(
+                request_id,
+                "Worker name mismatch",
+            ))
+            .await?;
+            return Ok(());
+        }
 
         let Some(channel_id) = self.channel_id else {
             self.send_json(&messages::submit_error_response(
@@ -513,8 +528,11 @@ impl MinerSession {
         ) {
             Ok(share) => share,
             Err(error) => {
-                self.send_json(&messages::submit_error_response(request_id, error.to_string()))
-                    .await?;
+                self.send_json(&messages::submit_error_response(
+                    request_id,
+                    error.to_string(),
+                ))
+                .await?;
                 return Ok(());
             }
         };
@@ -532,8 +550,8 @@ impl MinerSession {
     ) -> Result<(), SessionError> {
         match message {
             UpstreamMessage::NewJob(job) => {
-                let nonce_changed =
-                    self.nonce_1 != job.nonce_1 || self.nonce_2_size != Some(job.nonce_2_len as usize);
+                let nonce_changed = self.nonce_1 != job.nonce_1
+                    || self.nonce_2_size != Some(job.nonce_2_len as usize);
                 let target_changed = self.current_target != Some(job.target);
 
                 if job.clean_jobs {
@@ -700,13 +718,16 @@ impl MinerSession {
         self.current_target = None;
         self.job_map.clear();
         self.recompute_state();
-        self.fail_all_pending_shares("Upstream disconnected").await?;
+        self.fail_all_pending_shares("Upstream disconnected")
+            .await?;
         self.schedule_reconnect();
         Ok(())
     }
 
     fn schedule_reconnect(&mut self) {
-        let delay = self.reconnect_delay.min(self.config.timeouts.upstream_reconnect_max);
+        let delay = self
+            .reconnect_delay
+            .min(self.config.timeouts.upstream_reconnect_max);
         self.next_reconnect_at = Some(Instant::now() + delay);
         self.reconnect_delay = self
             .reconnect_delay
@@ -869,9 +890,7 @@ impl UpstreamConnection {
 fn decode_upstream_message(frame: &[u8]) -> Result<Option<UpstreamMessage>, SessionError> {
     let parsed = MessageFrame::decode(frame)?;
     let message = match parsed.msg_type {
-        message_types::NEW_EQUIHASH_JOB => {
-            UpstreamMessage::NewJob(decode_new_equihash_job(frame)?)
-        }
+        message_types::NEW_EQUIHASH_JOB => UpstreamMessage::NewJob(decode_new_equihash_job(frame)?),
         message_types::SET_TARGET => UpstreamMessage::SetTarget(decode_set_target(frame)?),
         message_types::SUBMIT_SHARES_RESPONSE => {
             UpstreamMessage::SubmitResponse(decode_submit_shares_response(frame)?)

@@ -93,7 +93,17 @@ mod tests {
 
     #[test]
     fn test_write_read_roundtrip() {
-        let test_values: &[u64] = &[0, 1, 0xfc, 0xfd, 0xffff, 0x10000, 0xffff_ffff, 0x1_0000_0000, 1344];
+        let test_values: &[u64] = &[
+            0,
+            1,
+            0xfc,
+            0xfd,
+            0xffff,
+            0x10000,
+            0xffff_ffff,
+            0x1_0000_0000,
+            1344,
+        ];
         for &val in test_values {
             let mut buf = Vec::new();
             write_compact_size(val, &mut buf);
@@ -157,7 +167,10 @@ mod tests {
         let data = [0xfd, 0x00];
         let mut cursor = 0;
         let result = read_compact_size(&data, &mut cursor);
-        assert!(result.is_err(), "should fail: only 1 byte after 0xfd prefix, need 2");
+        assert!(
+            result.is_err(),
+            "should fail: only 1 byte after 0xfd prefix, need 2"
+        );
     }
 
     /// Kill mutant: cursor + 2 > data.len() vs cursor + 2 < data.len()
@@ -187,7 +200,10 @@ mod tests {
         let data = [0xfe, 0x00, 0x00, 0x00]; // only 3 payload bytes, need 4
         let mut cursor = 0;
         let result = read_compact_size(&data, &mut cursor);
-        assert!(result.is_err(), "should fail: only 3 bytes after 0xfe prefix, need 4");
+        assert!(
+            result.is_err(),
+            "should fail: only 3 bytes after 0xfe prefix, need 4"
+        );
     }
 
     #[test]

@@ -132,10 +132,11 @@ impl ReconnectManager {
 
         // Check if we should reset backoff
         if let Some(last) = self.last_connected_at
-            && now.duration_since(last) > self.config.reset_after_stable {
-                debug!("Connection was stable, resetting backoff");
-                self.reset();
-            }
+            && now.duration_since(last) > self.config.reset_after_stable
+        {
+            debug!("Connection was stable, resetting backoff");
+            self.reset();
+        }
 
         self.last_connected_at = Some(now);
     }
@@ -170,13 +171,11 @@ impl ReconnectManager {
 
         // Check if we've exceeded max attempts
         if let Some(max) = self.config.max_attempts
-            && self.attempt_count >= max {
-                warn!(
-                    "Maximum reconnection attempts ({}) exceeded",
-                    max
-                );
-                return None;
-            }
+            && self.attempt_count >= max
+        {
+            warn!("Maximum reconnection attempts ({}) exceeded", max);
+            return None;
+        }
 
         // Calculate next delay with exponential backoff
         self.attempt_count += 1;
@@ -386,15 +385,21 @@ mod tests {
         let mut manager = ReconnectManager::new(config);
 
         // First attempt: 1 second
-        let delay1 = manager.on_disconnected(DisconnectReason::NetworkError).unwrap();
+        let delay1 = manager
+            .on_disconnected(DisconnectReason::NetworkError)
+            .unwrap();
         assert_eq!(delay1, Duration::from_secs(1));
 
         // Second attempt: 2 seconds
-        let delay2 = manager.on_disconnected(DisconnectReason::NetworkError).unwrap();
+        let delay2 = manager
+            .on_disconnected(DisconnectReason::NetworkError)
+            .unwrap();
         assert_eq!(delay2, Duration::from_secs(2));
 
         // Third attempt: 4 seconds
-        let delay3 = manager.on_disconnected(DisconnectReason::NetworkError).unwrap();
+        let delay3 = manager
+            .on_disconnected(DisconnectReason::NetworkError)
+            .unwrap();
         assert_eq!(delay3, Duration::from_secs(4));
     }
 
@@ -411,7 +416,9 @@ mod tests {
 
         manager.on_disconnected(DisconnectReason::NetworkError); // 30s
         manager.on_disconnected(DisconnectReason::NetworkError); // 60s (would be 60)
-        let delay = manager.on_disconnected(DisconnectReason::NetworkError).unwrap(); // capped at 60s
+        let delay = manager
+            .on_disconnected(DisconnectReason::NetworkError)
+            .unwrap(); // capped at 60s
         assert_eq!(delay, Duration::from_secs(60));
     }
 
@@ -424,10 +431,26 @@ mod tests {
         };
         let mut manager = ReconnectManager::new(config);
 
-        assert!(manager.on_disconnected(DisconnectReason::NetworkError).is_some());
-        assert!(manager.on_disconnected(DisconnectReason::NetworkError).is_some());
-        assert!(manager.on_disconnected(DisconnectReason::NetworkError).is_some());
-        assert!(manager.on_disconnected(DisconnectReason::NetworkError).is_none());
+        assert!(
+            manager
+                .on_disconnected(DisconnectReason::NetworkError)
+                .is_some()
+        );
+        assert!(
+            manager
+                .on_disconnected(DisconnectReason::NetworkError)
+                .is_some()
+        );
+        assert!(
+            manager
+                .on_disconnected(DisconnectReason::NetworkError)
+                .is_some()
+        );
+        assert!(
+            manager
+                .on_disconnected(DisconnectReason::NetworkError)
+                .is_none()
+        );
         assert!(manager.is_exhausted());
     }
 

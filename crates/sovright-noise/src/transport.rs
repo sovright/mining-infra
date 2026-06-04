@@ -21,10 +21,7 @@ pub struct NoiseStream<S> {
 impl<S> NoiseStream<S> {
     /// Create a new encrypted stream from a completed handshake
     pub fn new(inner: S, transport: TransportState) -> Self {
-        Self {
-            inner,
-            transport,
-        }
+        Self { inner, transport }
     }
 
     /// Get reference to inner stream
@@ -58,7 +55,8 @@ impl NoiseStream<TcpStream> {
 
         // Decrypt
         let mut plaintext = vec![0u8; len];
-        let plaintext_len = self.transport
+        let plaintext_len = self
+            .transport
             .read_message(&ciphertext, &mut plaintext)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
@@ -72,20 +70,29 @@ impl NoiseStream<TcpStream> {
         if plaintext.len() > MAX_MESSAGE_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("Message too large: {} > {}", plaintext.len(), MAX_MESSAGE_SIZE),
+                format!(
+                    "Message too large: {} > {}",
+                    plaintext.len(),
+                    MAX_MESSAGE_SIZE
+                ),
             ));
         }
 
         // Encrypt
         let mut ciphertext = vec![0u8; plaintext.len() + 16]; // AEAD tag
-        let ciphertext_len = self.transport
+        let ciphertext_len = self
+            .transport
             .write_message(plaintext, &mut ciphertext)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         // Write with length prefix
         self.inner.write_u16(ciphertext_len as u16).await?;
         self.inner.write_all(&ciphertext[..ciphertext_len]).await?;
-        trace!("Encrypted message: {} -> {} bytes", plaintext.len(), ciphertext_len);
+        trace!(
+            "Encrypted message: {} -> {} bytes",
+            plaintext.len(),
+            ciphertext_len
+        );
         Ok(())
     }
 
@@ -130,7 +137,10 @@ mod tests {
         let mut client_noise = initiator.connect(client_stream).await.unwrap();
 
         // Send message
-        client_noise.write_message(b"Hello from client!").await.unwrap();
+        client_noise
+            .write_message(b"Hello from client!")
+            .await
+            .unwrap();
 
         // Receive response
         let response = client_noise.read_message().await.unwrap();
@@ -182,7 +192,11 @@ mod tests {
             let mut noise = responder.accept(stream).await.unwrap();
 
             let msg = noise.read_message().await.unwrap();
-            assert!(msg.is_empty(), "Expected empty message, got {} bytes", msg.len());
+            assert!(
+                msg.is_empty(),
+                "Expected empty message, got {} bytes",
+                msg.len()
+            );
         });
 
         let client_stream = TcpStream::connect(addr).await.unwrap();

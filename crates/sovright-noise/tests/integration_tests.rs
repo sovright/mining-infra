@@ -1,7 +1,7 @@
 //! Integration tests for Noise encryption
 
-use tokio::net::{TcpListener, TcpStream};
 use sovright_noise::{Keypair, NoiseInitiator, NoiseResponder, PublicKey};
+use tokio::net::{TcpListener, TcpStream};
 
 #[tokio::test]
 async fn test_multiple_concurrent_connections() {

@@ -56,7 +56,9 @@ impl FullTemplateBuilder {
     ) -> Result<SetFullTemplateJob> {
         // Validate token
         if token.is_empty() {
-            return Err(JdClientError::Protocol("Empty mining job token".to_string()));
+            return Err(JdClientError::Protocol(
+                "Empty mining job token".to_string(),
+            ));
         }
 
         // Validate coinbase
@@ -136,17 +138,17 @@ mod tests {
 
         let job = builder
             .build_job(
-                1,                           // channel_id
-                42,                          // request_id
-                vec![0x01, 0x02, 0x03],      // token
-                5,                           // version
-                [0xaa; 32],                  // prev_hash
-                [0xbb; 32],                  // merkle_root
-                [0xcc; 32],                  // block_commitments
+                1,                            // channel_id
+                42,                           // request_id
+                vec![0x01, 0x02, 0x03],       // token
+                5,                            // version
+                [0xaa; 32],                   // prev_hash
+                [0xbb; 32],                   // merkle_root
+                [0xcc; 32],                   // block_commitments
                 vec![0x01, 0x00, 0x00, 0x00], // coinbase_tx
-                1700000000,                  // time
-                0x1d00ffff,                  // bits
-                vec![],                      // no transactions
+                1700000000,                   // time
+                0x1d00ffff,                   // bits
+                vec![],                       // no transactions
             )
             .unwrap();
 
@@ -203,7 +205,7 @@ mod tests {
         let result = builder.build_job(
             1,
             42,
-            vec![],        // empty token
+            vec![], // empty token
             5,
             [0xaa; 32],
             [0xbb; 32],
@@ -231,7 +233,7 @@ mod tests {
             [0xaa; 32],
             [0xbb; 32],
             [0xcc; 32],
-            vec![],        // empty coinbase
+            vec![], // empty coinbase
             1700000000,
             0x1d00ffff,
             vec![],
@@ -285,10 +287,7 @@ mod tests {
     fn test_select_transactions_by_fee_rate_strategy() {
         let builder = FullTemplateBuilder::new(TxSelectionStrategy::ByFeeRate);
 
-        let transactions = vec![
-            ([0x11; 32], vec![0x01]),
-            ([0x22; 32], vec![0x02]),
-        ];
+        let transactions = vec![([0x11; 32], vec![0x01]), ([0x22; 32], vec![0x02])];
 
         // For MVP, ByFeeRate just returns all transactions
         let selected = builder.select_transactions(transactions.clone());

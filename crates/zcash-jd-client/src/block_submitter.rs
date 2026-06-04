@@ -45,11 +45,12 @@ impl BlockSubmitter {
             .map_err(|e| JdClientError::BlockSubmissionFailed(e.to_string()))?;
 
         if let Some(error) = result.get("error")
-            && !error.is_null() {
-                let error_msg = error.to_string();
-                error!("Block submission failed: {}", error_msg);
-                return Err(JdClientError::BlockSubmissionFailed(error_msg));
-            }
+            && !error.is_null()
+        {
+            let error_msg = error.to_string();
+            error!("Block submission failed: {}", error_msg);
+            return Err(JdClientError::BlockSubmissionFailed(error_msg));
+        }
 
         info!("Block submitted successfully to Zebra");
         Ok(())

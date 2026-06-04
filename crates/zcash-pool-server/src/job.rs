@@ -3,9 +3,9 @@
 //! Converts templates from Phase 1 into jobs for miners.
 
 use crate::channel::Channel;
+use std::sync::atomic::{AtomicU32, Ordering};
 use zcash_mining_protocol::messages::NewEquihashJob;
 use zcash_template_provider::types::BlockTemplate;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Global job ID counter (unique across all channels)
 /// Starts at 1, wraps at u32::MAX - 1 to avoid 0 (reserved for errors)

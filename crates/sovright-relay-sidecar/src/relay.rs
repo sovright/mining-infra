@@ -102,7 +102,8 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "0.0.0.0:0".parse().unwrap();
 
-        let relay = RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO);
+        let relay =
+            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO);
         assert!(relay.is_ok());
     }
 
@@ -112,7 +113,8 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "127.0.0.1:0".parse().unwrap();
         let relay =
-            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO).unwrap();
+            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO)
+                .unwrap();
         relay.init().await.unwrap();
 
         let mut receiver = relay.start_with_receiver().await.unwrap();
@@ -130,7 +132,8 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "127.0.0.1:0".parse().unwrap();
 
-        let relay = RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 255, 2, 0, Duration::ZERO);
+        let relay =
+            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 255, 2, 0, Duration::ZERO);
 
         assert!(relay.is_err());
     }

@@ -212,7 +212,7 @@ async fn serve_metrics(
 async fn shutdown_signal() -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
 
         let mut terminate = signal(SignalKind::terminate())?;
         tokio::select! {
