@@ -18,6 +18,7 @@ proptest! {
             variance_tolerance: variance,
             retarget_interval: Duration::from_millis(retarget_ms),
             initial_difficulty: 1.0,
+            ..Default::default()
         };
         let v = config.validated();
         prop_assert!(v.target_shares_per_minute.is_finite() && v.target_shares_per_minute > 0.0);
