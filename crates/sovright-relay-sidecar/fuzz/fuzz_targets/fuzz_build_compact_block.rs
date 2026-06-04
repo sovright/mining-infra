@@ -1,7 +1,7 @@
 #![no_main]
 use arbitrary::Arbitrary;
-use forge_sidecar::compact::build_compact_block;
-use forge_sidecar::rpc::{BlockTemplate, CoinbaseTxn, DefaultRoots, TemplateTransaction};
+use sovright_relay_sidecar::compact::build_compact_block;
+use sovright_relay_sidecar::rpc::{BlockTemplate, CoinbaseTxn, DefaultRoots, TemplateTransaction};
 use libfuzzer_sys::fuzz_target;
 
 /// Fuzzable block template that generates arbitrary strings for hex fields.

@@ -1,12 +1,12 @@
-# Forge Sidecar Configuration Example
+# Sovright Relay Sidecar Configuration Example
 # Copy to config.toml and modify as needed
 
 # Zebra JSON-RPC URL
 zebra_url = "http://127.0.0.1:8232"
 
-# Forge relay peer addresses (at least one required)
+# Relay peer addresses (at least one required)
 relay_peers = [
-    "forge-relay.example.com:8333",
+    "relay.example.com:8333",
     # "backup-relay.example.com:8333",
 ]
 

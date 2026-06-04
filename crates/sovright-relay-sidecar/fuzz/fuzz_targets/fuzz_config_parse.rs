@@ -1,5 +1,5 @@
 #![no_main]
-use forge_sidecar::config::Config;
+use sovright_relay_sidecar::config::Config;
 use libfuzzer_sys::fuzz_target;
 
 // Fuzz TOML config parsing. Exercises toml deserialization and the

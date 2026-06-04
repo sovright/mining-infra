@@ -1,17 +1,17 @@
-//! Integration tests for forge-sidecar
+//! Integration tests for sovright-relay-sidecar
 
 /// Test that the sidecar binary compiles and shows help
 #[test]
 fn sidecar_help() {
     let output = std::process::Command::new("cargo")
-        .args(["run", "-p", "forge-sidecar", "--", "--help"])
+        .args(["run", "-p", "sovright-relay-sidecar", "--", "--help"])
         .output()
         .expect("failed to run sidecar");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("Forge relay sidecar"),
-        "Expected help text to contain 'Forge relay sidecar', got: {}",
+        stdout.contains("Relay sidecar"),
+        "Expected help text to contain 'Relay sidecar', got: {}",
         stdout
     );
     assert!(

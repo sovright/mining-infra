@@ -1,5 +1,5 @@
 [package]
-name = "forge-sidecar-fuzz"
+name = "sovright-relay-sidecar-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -12,7 +12,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-forge-sidecar = { path = ".." }
+sovright-relay-sidecar = { path = ".." }
 hex = "0.4"
 toml = "0.8"
 

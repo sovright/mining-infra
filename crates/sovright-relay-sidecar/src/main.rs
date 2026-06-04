@@ -1,4 +1,4 @@
-//! Forge sidecar for Stratum V1 mining pools
+//! Relay sidecar for Stratum V1 mining pools
 
 use clap::Parser;
 use std::net::SocketAddr;
@@ -10,15 +10,15 @@ use tracing::{error, info};
 mod poller;
 mod relay;
 
-use forge_sidecar::compact::build_compact_block;
-use forge_sidecar::config;
-use forge_sidecar::rpc::ZebraRpc;
+use sovright_relay_sidecar::compact::build_compact_block;
+use sovright_relay_sidecar::config;
+use sovright_relay_sidecar::rpc::ZebraRpc;
 use poller::{TemplatePoller, TemplateUpdate};
-use relay::ForgeRelay;
+use relay::RelayWrapper;
 
 #[derive(Parser, Debug)]
-#[command(name = "forge-sidecar")]
-#[command(about = "Forge relay sidecar for Stratum V1 mining pools")]
+#[command(name = "relay-sidecar")]
+#[command(about = "Relay sidecar for Stratum V1 mining pools")]
 struct Args {
     /// Configuration file path (TOML)
     #[arg(long, short = 'c')]
@@ -28,7 +28,7 @@ struct Args {
     #[arg(long, default_value = "http://127.0.0.1:8232")]
     zebra_url: String,
 
-    /// Forge relay peer addresses
+    /// Relay peer addresses
     #[arg(long)]
     relay_peer: Vec<String>,
 
@@ -36,7 +36,7 @@ struct Args {
     #[arg(long)]
     auth_key: Option<String>,
 
-    /// Local bind address for forge
+    /// Local bind address for relay
     #[arg(long, default_value = "0.0.0.0:0")]
     bind_addr: String,
 
@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("forge_sidecar=info".parse()?),
+                .add_directive("sovright_relay_sidecar=info".parse()?),
         )
         .init();
 
@@ -102,14 +102,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )
         };
 
-    info!(zebra_url = %zebra_url, "Starting forge sidecar");
+    info!(zebra_url = %zebra_url, "Starting relay sidecar");
 
     // Initialize Zebra RPC client
     let rpc = Arc::new(ZebraRpc::new(&zebra_url).await?);
     info!("Connected to Zebra RPC");
 
-    // Initialize forge relay
-    let relay = ForgeRelay::new(relay_peers.clone(), auth_key, bind_addr)?;
+    // Initialize relay client
+    let relay = RelayWrapper::new(relay_peers.clone(), auth_key, bind_addr)?;
     relay.init().await?;
     relay.start().await?;
     let relay = Arc::new(relay);

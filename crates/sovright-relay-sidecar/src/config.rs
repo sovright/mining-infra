@@ -14,7 +14,7 @@ pub struct Config {
     #[serde(default = "default_zebra_url")]
     pub zebra_url: String,
 
-    /// Forge relay peer addresses
+    /// Relay peer addresses
     pub relay_peers: Vec<String>,
 
     /// Authentication key (hex)

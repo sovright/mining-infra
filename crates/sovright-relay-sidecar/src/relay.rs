@@ -1,4 +1,4 @@
-//! Forge relay client wrapper for sidecar
+//! Relay client wrapper for sidecar
 
 use sovright_relay::{BlockSender, ClientConfig, CompactBlock, RelayClient};
 use std::net::SocketAddr;
@@ -6,14 +6,14 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// Forge relay wrapper
-pub struct ForgeRelay {
+/// Relay client wrapper
+pub struct RelayWrapper {
     client: Arc<RwLock<RelayClient>>,
     sender: BlockSender,
 }
 
-impl ForgeRelay {
-    /// Create a new forge relay
+impl RelayWrapper {
+    /// Create a new relay client
     pub fn new(
         relay_peers: Vec<SocketAddr>,
         auth_key: [u8; 32],
@@ -35,7 +35,7 @@ impl ForgeRelay {
     pub async fn init(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut client = self.client.write().await;
         client.bind().await?;
-        info!(addr = ?client.local_addr(), "Forge relay bound");
+        info!(addr = ?client.local_addr(), "Relay client bound");
         Ok(())
     }
 
@@ -45,7 +45,7 @@ impl ForgeRelay {
         tokio::spawn(async move {
             let mut client = client.write().await;
             if let Err(e) = client.run().await {
-                warn!("Forge relay client exited with error: {}", e);
+                warn!("Relay client exited with error: {}", e);
             }
         });
         Ok(())
@@ -57,7 +57,7 @@ impl ForgeRelay {
         compact: CompactBlock,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.sender.send(compact).await?;
-        debug!("Announced compact block to forge relay");
+        debug!("Announced compact block to relay network");
         Ok(())
     }
 }
@@ -72,7 +72,7 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "0.0.0.0:0".parse().unwrap();
 
-        let relay = ForgeRelay::new(peers, auth_key, bind_addr);
+        let relay = RelayWrapper::new(peers, auth_key, bind_addr);
         assert!(relay.is_ok());
     }
 }

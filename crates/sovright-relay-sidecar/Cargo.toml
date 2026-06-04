@@ -1,16 +1,16 @@
 [package]
-name = "forge-sidecar"
+name = "sovright-relay-sidecar"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "FORGE relay sidecar for Stratum V1 mining pools (part of the Bedrock initiative)"
+description = "Relay sidecar for Stratum V1 mining pools (part of the Sovright network)"
 
 [[bin]]
-name = "forge-sidecar"
+name = "relay-sidecar"
 path = "src/main.rs"
 
 [lib]
-name = "forge_sidecar"
+name = "sovright_relay_sidecar"
 path = "src/lib.rs"
 
 [dependencies]

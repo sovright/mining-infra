@@ -1,19 +1,19 @@
 <p align="center">
-  <img src="../../assets/brand/forge-logo.svg" alt="FORGE" width="180">
+  <img src="../../assets/brand/sovright-relay-sidecar-logo.svg" alt="Sovright Relay Sidecar" width="180">
 </p>
 
-# FORGE Sidecar
+# Sovright Relay Sidecar
 
 > Formerly `fiber-sidecar`.
 
-A standalone sidecar binary that enables Stratum V1 mining pools to use bedrock-forge for low-latency block relay.
+A standalone sidecar binary that enables Stratum V1 mining pools to use sovright-relay for low-latency block relay.
 
 ## Overview
 
-The FORGE sidecar:
+The relay sidecar:
 - Polls Zebra for new block templates
 - Builds compact blocks when templates change
-- Announces compact blocks to the FORGE relay network
+- Announces compact blocks to the Sovright relay network
 
 This allows any V1 pool (NOMP, etc.) to benefit from compact block relay without modification.
 
@@ -22,9 +22,9 @@ This allows any V1 pool (NOMP, etc.) to benefit from compact block relay without
 ### Command Line
 
 ```bash
-forge-sidecar \
+relay-sidecar \
     --zebra-url http://127.0.0.1:8232 \
-    --relay-peer forge-relay.example.com:8333 \
+    --relay-peer relay.example.com:8333 \
     --auth-key 0123456789abcdef... \
     --poll-interval-ms 100
 ```
@@ -32,7 +32,7 @@ forge-sidecar \
 ### Configuration File
 
 ```bash
-forge-sidecar --config config.toml
+relay-sidecar --config config.toml
 ```
 
 See `config.example.toml` for all options.
@@ -47,21 +47,21 @@ STRATUM V1 POOL (unmodified)
         │                             │
         │ poll templates              │ (future: submitblock)
         ▼                             │
-   FORGE SIDECAR ─────────────────────┘
+   RELAY SIDECAR ─────────────────────┘
         │
         ▼ UDP/FEC
-   FORGE RELAY NETWORK
+   SOVRIGHT RELAY NETWORK
 ```
 
 ## Requirements
 
 - Zebra node with JSON-RPC enabled
-- Network connectivity to FORGE relay nodes
+- Network connectivity to Sovright relay nodes
 
 ## Building
 
 ```bash
-cargo build --release -p forge-sidecar
+cargo build --release -p sovright-relay-sidecar
 ```
 
-Binary will be at `target/release/forge-sidecar`.
+Binary will be at `target/release/relay-sidecar`.

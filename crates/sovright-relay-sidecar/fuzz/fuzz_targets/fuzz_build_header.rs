@@ -1,6 +1,6 @@
 #![no_main]
-use forge_sidecar::compact::build_compact_block;
-use forge_sidecar::rpc::{BlockTemplate, CoinbaseTxn, DefaultRoots};
+use sovright_relay_sidecar::compact::build_compact_block;
+use sovright_relay_sidecar::rpc::{BlockTemplate, CoinbaseTxn, DefaultRoots};
 use libfuzzer_sys::fuzz_target;
 
 // Fuzz build_header via build_compact_block using raw bytes as hex field values.
