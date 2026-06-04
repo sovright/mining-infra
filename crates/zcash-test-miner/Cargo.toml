@@ -3,7 +3,7 @@ name = "zcash-test-miner"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CPU Equihash test miner for Bedrock pool testing"
+description = "CPU Equihash test miner for Sovright pool testing"
 
 [[bin]]
 name = "zcash-test-miner"

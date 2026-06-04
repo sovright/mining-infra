@@ -11,7 +11,7 @@ use worker::{run_worker, WorkerConfig};
 
 #[derive(Parser, Debug)]
 #[command(name = "zcash-test-miner")]
-#[command(about = "CPU Equihash test miner for Bedrock pool testing")]
+#[command(about = "CPU Equihash test miner for Sovright pool testing")]
 struct Args {
     /// Pool SV2 endpoint
     #[arg(long, default_value = "127.0.0.1:3333")]

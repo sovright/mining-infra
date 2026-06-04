@@ -131,17 +131,17 @@ mod tests {
     #[test]
     fn inject_tag_into_coinbase_scriptsig() {
         let original = tx_parse::minimal_v4_coinbase();
-        let result = build_coinbase(&original, b"/Bedrock/").unwrap();
+        let result = build_coinbase(&original, b"/Sovright/").unwrap();
         assert!(result
             .tx_bytes
-            .windows(b"/Bedrock/".len())
-            .any(|w| w == b"/Bedrock/"));
+            .windows(b"/Sovright/".len())
+            .any(|w| w == b"/Sovright/"));
     }
 
     #[test]
     fn built_coinbase_has_valid_txid() {
         let original = tx_parse::minimal_v4_coinbase();
-        let result = build_coinbase(&original, b"/Bedrock/").unwrap();
+        let result = build_coinbase(&original, b"/Sovright/").unwrap();
         let expected = auth_digest::compute_v4_txid(&result.tx_bytes);
         assert_eq!(result.txid, expected);
     }

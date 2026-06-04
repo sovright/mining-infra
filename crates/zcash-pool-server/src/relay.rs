@@ -1,4 +1,4 @@
-//! Forge relay integration for low-latency block propagation
+//! Relay integration for low-latency block propagation
 //!
 //! Wraps sovright-relay library for compact block relay over UDP/FEC.
 //!
@@ -84,8 +84,8 @@ pub(crate) fn build_compact_block(template: &BlockTemplate, nonce: u64) -> Resul
     ))
 }
 
-/// Forge relay wrapper for the pool server
-pub struct ForgeRelay {
+/// Relay wrapper for the pool server
+pub struct RelayHandle {
     /// Relay client — Option so we can take ownership when spawning the run loop
     client: Mutex<Option<RelayClient>>,
     /// Block sender handle (cloneable, works after client is moved to run task)
@@ -97,28 +97,28 @@ pub struct ForgeRelay {
     nonce: u64,
 }
 
-impl ForgeRelay {
-    /// Create a new forge relay from pool config
+impl RelayHandle {
+    /// Create a new relay from pool config
     pub fn new(config: &PoolConfig) -> Result<Self> {
-        let relay_peers = config.forge_relay_peers.clone();
+        let relay_peers = config.relay_peers.clone();
         if relay_peers.is_empty() {
-            return Err(PoolError::Config("forge_relay_peers cannot be empty".into()));
+            return Err(PoolError::Config("relay_peers cannot be empty".into()));
         }
 
-        let auth_key = config.forge_auth_key.unwrap_or([0u8; 32]);
+        let auth_key = config.relay_auth_key.unwrap_or([0u8; 32]);
 
         let client_config = ClientConfig::new(relay_peers, auth_key)
-            .with_fec(config.forge_data_shards, config.forge_parity_shards)
-            .with_bind_addr(config.forge_bind_addr.unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid address")))
+            .with_fec(config.relay_data_shards, config.relay_parity_shards)
+            .with_bind_addr(config.relay_bind_addr.unwrap_or_else(|| "0.0.0.0:0".parse().expect("0.0.0.0:0 is a valid address")))
             .with_auth_required(true);
 
         let client = RelayClient::new(client_config)
-            .map_err(|e| PoolError::Config(format!("forge client creation failed: {}", e)))?;
+            .map_err(|e| PoolError::Config(format!("relay client creation failed: {}", e)))?;
 
         let sender = client.sender();
 
-        let chunker = BlockChunker::new(config.forge_data_shards, config.forge_parity_shards)
-            .map_err(|e| PoolError::Config(format!("forge chunker creation failed: {}", e)))?;
+        let chunker = BlockChunker::new(config.relay_data_shards, config.relay_parity_shards)
+            .map_err(|e| PoolError::Config(format!("relay chunker creation failed: {}", e)))?;
 
         Ok(Self {
             client: Mutex::new(Some(client)),
@@ -132,10 +132,10 @@ impl ForgeRelay {
     pub async fn init(&self) -> Result<()> {
         let mut guard = self.client.lock().await;
         let client = guard.as_mut()
-            .ok_or_else(|| PoolError::Config("forge client already started".into()))?;
+            .ok_or_else(|| PoolError::Config("relay client already started".into()))?;
         client.bind().await
-            .map_err(|e| PoolError::Config(format!("forge bind failed: {}", e)))?;
-        info!("Forge relay bound to {:?}", client.local_addr());
+            .map_err(|e| PoolError::Config(format!("relay bind failed: {}", e)))?;
+        info!("Relay bound to {:?}", client.local_addr());
         Ok(())
     }
 
@@ -147,17 +147,17 @@ impl ForgeRelay {
     pub async fn start(&self) -> Result<BlockReceiver> {
         let mut client = self.client.lock().await
             .take()
-            .ok_or_else(|| PoolError::Config("forge client already started or not created".into()))?;
+            .ok_or_else(|| PoolError::Config("relay client already started or not created".into()))?;
 
         let (block_receiver, _outgoing_rx) = client.take_receiver()
-            .ok_or_else(|| PoolError::Config("forge relay receiver already taken".into()))?;
+            .ok_or_else(|| PoolError::Config("relay receiver already taken".into()))?;
 
         // Spawn the relay client run loop as a background task.
         // The run loop handles both sending (via outgoing channel fed by BlockSender)
         // and receiving (incoming UDP packets reassembled via FEC).
         tokio::spawn(async move {
             if let Err(e) = client.run().await {
-                warn!("Forge relay run loop exited: {}", e);
+                warn!("Relay run loop exited: {}", e);
             }
         });
 
@@ -169,12 +169,12 @@ impl ForgeRelay {
         let compact = build_compact_block(template, self.nonce)?;
 
         self.sender.send(compact).await
-            .map_err(|e| PoolError::Config(format!("forge send failed: {}", e)))?;
+            .map_err(|e| PoolError::Config(format!("relay send failed: {}", e)))?;
 
         debug!(
             height = template.height,
             tx_count = template.transactions.len(),
-            "Announced compact block to forge relay"
+            "Announced compact block to relay"
         );
         Ok(())
     }
@@ -205,9 +205,9 @@ impl ForgeRelay {
         );
 
         self.sender.send(compact).await
-            .map_err(|e| PoolError::Config(format!("forge send failed: {}", e)))?;
+            .map_err(|e| PoolError::Config(format!("relay send failed: {}", e)))?;
 
-        info!("Announced found block to forge relay");
+        info!("Announced found block to relay");
         Ok(())
     }
 }
@@ -312,15 +312,15 @@ mod tests {
     }
 
     #[test]
-    fn test_forge_relay_rejects_empty_peers() {
+    fn test_relay_rejects_empty_peers() {
         let config = PoolConfig {
-            forge_relay_enabled: true,
-            forge_relay_peers: vec![],
-            forge_auth_key: Some([0u8; 32]),
+            relay_enabled: true,
+            relay_peers: vec![],
+            relay_auth_key: Some([0u8; 32]),
             ..PoolConfig::default()
         };
 
-        let result = ForgeRelay::new(&config);
+        let result = RelayHandle::new(&config);
         assert!(result.is_err());
         let err_msg = format!("{}", result.err().unwrap());
         assert!(
