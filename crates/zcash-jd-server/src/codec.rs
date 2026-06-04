@@ -8,11 +8,11 @@
 
 use crate::error::{JdServerError, Result};
 use crate::messages::{
-    AllocateMiningJobToken, AllocateMiningJobTokenSuccess, GetMissingTransactions,
+    AllocateMiningJobToken, AllocateMiningJobTokenSuccess, GetMissingTransactions, JdShare,
     JobDeclarationMode, ProvideMissingTransactions, PushSolution, SetCustomMiningJob,
     SetCustomMiningJobError, SetCustomMiningJobErrorCode, SetCustomMiningJobSuccess,
     SetFullTemplateJob, SetFullTemplateJobError, SetFullTemplateJobErrorCode,
-    SetFullTemplateJobSuccess, message_types,
+    SetFullTemplateJobSuccess, SubmitSharesJd, SubmitSharesJdResponse, message_types,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -784,6 +784,164 @@ pub fn decode_provide_missing_transactions(data: &[u8]) -> Result<ProvideMissing
         channel_id,
         request_id,
         transactions,
+    })
+}
+
+// =============================================================================
+// SubmitSharesJd / SubmitSharesJdResponse Codec (0x5B / 0x5C)
+// =============================================================================
+
+/// Maximum number of shares in a single SubmitSharesJd batch
+const MAX_SHARE_COUNT: u16 = 64;
+
+/// Encode a SubmitSharesJd message
+///
+/// Wire layout: channel_id u32 LE, request_id u32 LE, job_id u32 LE,
+/// count u16 LE, then per share: version u32 LE, time u32 LE,
+/// nonce 32 raw bytes (LE), solution 1344 raw bytes.
+pub fn encode_submit_shares_jd(msg: &SubmitSharesJd) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+
+    payload.write_u32::<LittleEndian>(msg.channel_id).unwrap();
+    payload.write_u32::<LittleEndian>(msg.request_id).unwrap();
+    payload.write_u32::<LittleEndian>(msg.job_id).unwrap();
+    payload
+        .write_u16::<LittleEndian>(msg.shares.len() as u16)
+        .unwrap();
+    for share in &msg.shares {
+        payload.write_u32::<LittleEndian>(share.version).unwrap();
+        payload.write_u32::<LittleEndian>(share.time).unwrap();
+        payload.write_all(&share.nonce).unwrap(); // 32 bytes LE
+        payload.write_all(&share.solution).unwrap(); // 1344 bytes
+    }
+
+    let frame = MessageFrame {
+        extension_type: JD_EXTENSION_TYPE,
+        msg_type: message_types::SUBMIT_SHARES_JD,
+        length: payload.len() as u32,
+    };
+
+    let mut result = frame.encode().to_vec();
+    result.extend(payload);
+    Ok(result)
+}
+
+/// Decode a SubmitSharesJd message
+///
+/// Rejects `count == 0` and `count > 64` with `JdServerError::Protocol`.
+/// Never panics on malformed or truncated input.
+pub fn decode_submit_shares_jd(data: &[u8]) -> Result<SubmitSharesJd> {
+    let payload = frame_payload(data, message_types::SUBMIT_SHARES_JD)?;
+    let mut cursor = Cursor::new(payload);
+
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let request_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let job_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let count = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+
+    if count == 0 {
+        return Err(JdServerError::Protocol(
+            "SubmitSharesJd: share count must be at least 1".into(),
+        ));
+    }
+    if count > MAX_SHARE_COUNT {
+        return Err(JdServerError::Protocol(format!(
+            "SubmitSharesJd: share count {} exceeds maximum {}",
+            count, MAX_SHARE_COUNT
+        )));
+    }
+
+    let mut shares = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let version = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+        let time = cursor
+            .read_u32::<LittleEndian>()
+            .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+        let mut nonce = [0u8; 32];
+        cursor
+            .read_exact(&mut nonce)
+            .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+        let mut solution = [0u8; 1344];
+        cursor
+            .read_exact(&mut solution)
+            .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+        shares.push(JdShare {
+            version,
+            time,
+            nonce,
+            solution,
+        });
+    }
+
+    Ok(SubmitSharesJd {
+        channel_id,
+        request_id,
+        job_id,
+        shares,
+    })
+}
+
+/// Encode a SubmitSharesJdResponse message
+///
+/// Wire layout: channel_id u32 LE, request_id u32 LE, accepted u16 LE,
+/// rejected u16 LE, first_error_code u8.
+pub fn encode_submit_shares_jd_response(msg: &SubmitSharesJdResponse) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+
+    payload.write_u32::<LittleEndian>(msg.channel_id).unwrap();
+    payload.write_u32::<LittleEndian>(msg.request_id).unwrap();
+    payload.write_u16::<LittleEndian>(msg.accepted).unwrap();
+    payload.write_u16::<LittleEndian>(msg.rejected).unwrap();
+    payload.write_u8(msg.first_error_code).unwrap();
+
+    let frame = MessageFrame {
+        extension_type: JD_EXTENSION_TYPE,
+        msg_type: message_types::SUBMIT_SHARES_JD_RESPONSE,
+        length: payload.len() as u32,
+    };
+
+    let mut result = frame.encode().to_vec();
+    result.extend(payload);
+    Ok(result)
+}
+
+/// Decode a SubmitSharesJdResponse message
+pub fn decode_submit_shares_jd_response(data: &[u8]) -> Result<SubmitSharesJdResponse> {
+    let payload = frame_payload(data, message_types::SUBMIT_SHARES_JD_RESPONSE)?;
+    let mut cursor = Cursor::new(payload);
+
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let request_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let accepted = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let rejected = cursor
+        .read_u16::<LittleEndian>()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+    let first_error_code = cursor
+        .read_u8()
+        .map_err(|e| JdServerError::Protocol(e.to_string()))?;
+
+    Ok(SubmitSharesJdResponse {
+        channel_id,
+        request_id,
+        accepted,
+        rejected,
+        first_error_code,
     })
 }
 

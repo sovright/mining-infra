@@ -10,11 +10,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use zcash_jd_server::codec::{
     decode_allocate_token, decode_push_solution, decode_set_custom_job_success,
-    encode_allocate_token, encode_push_solution, encode_set_custom_job_success,
+    decode_submit_shares_jd, decode_submit_shares_jd_response, encode_allocate_token,
+    encode_push_solution, encode_set_custom_job_success, encode_submit_shares_jd,
+    encode_submit_shares_jd_response,
 };
 use zcash_jd_server::{
-    AllocateMiningJobToken, JdServer, JdServerConfig, JobDeclarationMode, PushSolution,
-    SetCustomMiningJob, SetCustomMiningJobSuccess, ValidationLevel,
+    AllocateMiningJobToken, JdServer, JdServerConfig, JdShare, JdShareErrorCode,
+    JobDeclarationMode, PushSolution, SetCustomMiningJob, SetCustomMiningJobSuccess,
+    SubmitSharesJd, SubmitSharesJdResponse, ValidationLevel,
 };
 use zcash_pool_common::PayoutTracker;
 
@@ -323,6 +326,200 @@ async fn test_job_id_uniqueness() {
         job_ids.len(),
         "All job IDs should be unique"
     );
+}
+
+// =============================================================================
+// SubmitSharesJd / SubmitSharesJdResponse codec tests
+// =============================================================================
+
+/// Build a JdShare with distinct field patterns for a given index so that
+/// two shares in the same batch are distinguishable from each other.
+fn make_share(idx: u8) -> JdShare {
+    let mut nonce = [0u8; 32];
+    nonce[0] = idx;
+    nonce[31] = idx.wrapping_add(1);
+    let mut solution = [0u8; 1344];
+    solution[0] = idx.wrapping_add(2);
+    solution[1343] = idx.wrapping_add(3);
+    JdShare {
+        version: 5u32.wrapping_add(idx as u32),
+        time: 1_700_000_000u32.wrapping_add(idx as u32 * 60),
+        nonce,
+        solution,
+    }
+}
+
+#[test]
+fn test_submit_shares_jd_1share_roundtrip() {
+    let original = SubmitSharesJd {
+        channel_id: 1,
+        request_id: 100,
+        job_id: 42,
+        shares: vec![make_share(0)],
+    };
+
+    let encoded = encode_submit_shares_jd(&original).unwrap();
+    let decoded = decode_submit_shares_jd(&encoded).unwrap();
+
+    assert_eq!(decoded, original);
+}
+
+#[test]
+fn test_submit_shares_jd_3share_roundtrip() {
+    let original = SubmitSharesJd {
+        channel_id: 7,
+        request_id: 200,
+        job_id: 99,
+        shares: vec![make_share(10), make_share(20), make_share(30)],
+    };
+
+    let encoded = encode_submit_shares_jd(&original).unwrap();
+    let decoded = decode_submit_shares_jd(&encoded).unwrap();
+
+    assert_eq!(decoded, original);
+    assert_eq!(decoded.shares.len(), 3);
+    // Verify each share is distinct
+    assert_ne!(decoded.shares[0].version, decoded.shares[1].version);
+    assert_ne!(decoded.shares[1].version, decoded.shares[2].version);
+    assert_ne!(decoded.shares[0].nonce, decoded.shares[1].nonce);
+}
+
+#[test]
+fn test_submit_shares_jd_response_all_error_codes_roundtrip() {
+    let error_codes = [
+        (0u8, 0u16, 0u16), // none: accepted=1, rejected=0, first_error=0
+        (1u8, 0u16, 1u16), // unknown_job
+        (2u8, 0u16, 1u16), // stale_job
+        (3u8, 0u16, 1u16), // low_difficulty
+        (4u8, 0u16, 1u16), // bad_solution
+        (5u8, 0u16, 1u16), // duplicate
+        (6u8, 0u16, 1u16), // channel_mismatch
+    ];
+
+    for (code, accepted, rejected) in error_codes {
+        let original = SubmitSharesJdResponse {
+            channel_id: 1,
+            request_id: 42,
+            accepted,
+            rejected,
+            first_error_code: code,
+        };
+
+        let encoded = encode_submit_shares_jd_response(&original).unwrap();
+        let decoded = decode_submit_shares_jd_response(&encoded).unwrap();
+
+        assert_eq!(
+            decoded, original,
+            "round-trip failed for error code {}",
+            code
+        );
+    }
+}
+
+#[test]
+fn test_submit_shares_jd_decode_count_zero_rejected() {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use zcash_mining_protocol::codec::MessageFrame;
+
+    // Build a raw payload with count=0 (should be rejected)
+    let mut payload = Vec::new();
+    payload.write_u32::<LittleEndian>(1u32).unwrap(); // channel_id
+    payload.write_u32::<LittleEndian>(2u32).unwrap(); // request_id
+    payload.write_u32::<LittleEndian>(3u32).unwrap(); // job_id
+    payload.write_u16::<LittleEndian>(0u16).unwrap(); // count=0 — invalid
+
+    let frame = MessageFrame {
+        extension_type: 0,
+        msg_type: 0x5B,
+        length: payload.len() as u32,
+    };
+    let mut data = frame.encode().to_vec();
+    data.extend(payload);
+
+    let result = decode_submit_shares_jd(&data);
+    assert!(result.is_err(), "count=0 should be rejected");
+    let err_str = format!("{}", result.unwrap_err());
+    assert!(
+        err_str.contains("Protocol"),
+        "expected Protocol error, got: {}",
+        err_str
+    );
+}
+
+#[test]
+fn test_submit_shares_jd_decode_count_65_rejected() {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use zcash_mining_protocol::codec::MessageFrame;
+
+    // Build a minimal payload with count=65 header only (no actual shares) — too many
+    let mut payload = Vec::new();
+    payload.write_u32::<LittleEndian>(1u32).unwrap(); // channel_id
+    payload.write_u32::<LittleEndian>(2u32).unwrap(); // request_id
+    payload.write_u32::<LittleEndian>(3u32).unwrap(); // job_id
+    payload.write_u16::<LittleEndian>(65u16).unwrap(); // count=65 — exceeds max 64
+    // (no actual share bytes follow — the decoder should reject count before reading shares)
+
+    let frame = MessageFrame {
+        extension_type: 0,
+        msg_type: 0x5B,
+        length: payload.len() as u32,
+    };
+    let mut data = frame.encode().to_vec();
+    data.extend(payload);
+
+    let result = decode_submit_shares_jd(&data);
+    assert!(result.is_err(), "count=65 should be rejected");
+}
+
+#[test]
+fn test_submit_shares_jd_truncated_no_panic() {
+    use byteorder::{LittleEndian, WriteBytesExt};
+    use zcash_mining_protocol::codec::MessageFrame;
+
+    // Write a well-formed header claiming 1 share but with 0 share bytes
+    let mut payload = Vec::new();
+    payload.write_u32::<LittleEndian>(1u32).unwrap(); // channel_id
+    payload.write_u32::<LittleEndian>(2u32).unwrap(); // request_id
+    payload.write_u32::<LittleEndian>(3u32).unwrap(); // job_id
+    payload.write_u16::<LittleEndian>(1u16).unwrap(); // count=1, but no share bytes follow
+
+    let frame = MessageFrame {
+        extension_type: 0,
+        msg_type: 0x5B,
+        length: payload.len() as u32,
+    };
+    let mut data = frame.encode().to_vec();
+    data.extend(payload);
+
+    // Must not panic; must return an error
+    let result = decode_submit_shares_jd(&data);
+    assert!(
+        result.is_err(),
+        "truncated payload must return an error, not panic"
+    );
+}
+
+#[test]
+fn test_jd_share_error_code_roundtrip() {
+    let codes = [
+        JdShareErrorCode::None,
+        JdShareErrorCode::UnknownJob,
+        JdShareErrorCode::StaleJob,
+        JdShareErrorCode::LowDifficulty,
+        JdShareErrorCode::BadSolution,
+        JdShareErrorCode::Duplicate,
+        JdShareErrorCode::ChannelMismatch,
+    ];
+
+    for code in codes {
+        let byte = code.as_u8();
+        let recovered = JdShareErrorCode::from_u8(byte).unwrap();
+        assert_eq!(code, recovered, "round-trip failed for {:?}", code);
+    }
+
+    // Unknown value returns None
+    assert!(JdShareErrorCode::from_u8(7).is_none());
+    assert!(JdShareErrorCode::from_u8(0xFF).is_none());
 }
 
 #[test]

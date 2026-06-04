@@ -31,10 +31,12 @@ pub use codec::{
     decode_provide_missing_transactions, decode_push_solution, decode_set_custom_job,
     decode_set_custom_job_error, decode_set_custom_job_success, decode_set_full_template_job,
     decode_set_full_template_job_error, decode_set_full_template_job_success,
-    encode_allocate_token, encode_allocate_token_success, encode_get_missing_transactions,
+    decode_submit_shares_jd, decode_submit_shares_jd_response, encode_allocate_token,
+    encode_allocate_token_success, encode_get_missing_transactions,
     encode_provide_missing_transactions, encode_push_solution, encode_set_custom_job,
     encode_set_custom_job_error, encode_set_custom_job_success, encode_set_full_template_job,
     encode_set_full_template_job_error, encode_set_full_template_job_success,
+    encode_submit_shares_jd, encode_submit_shares_jd_response,
 };
 pub use config::JdServerConfig;
 pub use error::{JdServerError, Result};
