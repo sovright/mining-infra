@@ -110,27 +110,6 @@ pub fn submit_to_v2(
     })
 }
 
-pub fn parse_hex_u32(input: &str) -> Result<u32, TranslateError> {
-    let trimmed = input.trim();
-    let stripped = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-
-    if stripped.is_empty() {
-        return Err(TranslateError::new("expected non-empty hex u32"));
-    }
-    if stripped.len() > 8 {
-        return Err(TranslateError::new(format!(
-            "hex value '{}' does not fit in u32",
-            input
-        )));
-    }
-
-    u32::from_str_radix(stripped, 16).map_err(|error| {
-        TranslateError::new(format!("invalid u32 hex '{}': {}", input, error))
-    })
-}
 
 /// Parse a little-endian u32 from a 4-byte hex string. ZIP 301 encodes
 /// NTIME/NBITS/VERSION "as in a block header" (little-endian), so a real Zcash
