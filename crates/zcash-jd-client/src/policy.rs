@@ -49,8 +49,29 @@ pub enum PolicyError {
     #[error("policy file must declare [inclusion] mode")]
     MissingMode,
 
-    #[error("inclusion mode '{0}' is not yet supported — refuse to start")]
-    UnsupportedMode(String),
+    #[error("inclusion mode '{mode}' is not yet supported — refuse to start{hint}")]
+    UnsupportedMode {
+        mode: String,
+        /// Pre-formatted hint suffix (already includes a leading separator),
+        /// empty when no close match was detected.
+        hint: String,
+    },
+}
+
+/// Build an `UnsupportedMode` error, appending a "did you mean" hint when the
+/// rejected value is a near-miss for the canonical `"include-all"` (wrong
+/// case, or `_` used instead of `-`).
+fn unsupported_mode_error(mode: &str) -> PolicyError {
+    let normalized = mode.to_ascii_lowercase().replace('_', "-");
+    let hint = if normalized == "include-all" {
+        r#" — did you mean "include-all"?"#.to_string()
+    } else {
+        String::new()
+    };
+    PolicyError::UnsupportedMode {
+        mode: mode.to_owned(),
+        hint,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -144,9 +165,13 @@ pub fn load_policy(path: &Path) -> Result<Policy, PolicyError> {
 
     let mode_str = inclusion.mode.ok_or(PolicyError::MissingMode)?;
 
-    let mode = match mode_str.as_str() {
+    // Trim surrounding whitespace; the bundle emits the canonical
+    // "include-all" but a hand-edited file may carry stray spaces/newlines.
+    // Matching stays case-sensitive: "include-all" is the only accepted value.
+    let trimmed = mode_str.trim();
+    let mode = match trimmed {
         "include-all" => InclusionMode::IncludeAll,
-        other => return Err(PolicyError::UnsupportedMode(other.to_owned())),
+        other => return Err(unsupported_mode_error(other)),
     };
 
     let mut deferred_warnings = Vec::new();
@@ -270,13 +295,62 @@ mod tests {
         writeln!(f, "[inclusion]\nmode = \"exclude-list\"").unwrap();
         let err = load_policy(f.path()).unwrap_err();
         match &err {
-            PolicyError::UnsupportedMode(m) => {
-                assert_eq!(m, "exclude-list");
+            PolicyError::UnsupportedMode { mode, hint } => {
+                assert_eq!(mode, "exclude-list");
+                assert!(hint.is_empty(), "no hint expected for an unrelated mode");
             }
             other => panic!("expected UnsupportedMode, got: {other}"),
         }
         let msg = err.to_string();
         assert!(msg.contains("not yet supported"), "msg: {msg}");
+    }
+
+    #[test]
+    fn load_mode_with_surrounding_whitespace_ok() {
+        let mut f = NamedTempFile::new().unwrap();
+        // Leading/trailing spaces inside the quoted value must be tolerated.
+        writeln!(f, "[inclusion]\nmode = \" include-all \"").unwrap();
+        let policy = load_policy(f.path()).unwrap();
+        assert_eq!(policy.mode, InclusionMode::IncludeAll);
+    }
+
+    #[test]
+    fn load_wrong_case_mode_errors_with_hint() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "[inclusion]\nmode = \"Include-All\"").unwrap();
+        let err = load_policy(f.path()).unwrap_err();
+        match &err {
+            PolicyError::UnsupportedMode { mode, hint } => {
+                assert_eq!(mode, "Include-All");
+                assert!(
+                    hint.contains(r#"did you mean "include-all"?"#),
+                    "expected hint, got: {hint:?}"
+                );
+            }
+            other => panic!("expected UnsupportedMode, got: {other}"),
+        }
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"did you mean "include-all"?"#),
+            "display should carry the hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_underscore_mode_errors_with_hint() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(f, "[inclusion]\nmode = \"include_all\"").unwrap();
+        let err = load_policy(f.path()).unwrap_err();
+        match &err {
+            PolicyError::UnsupportedMode { mode, hint } => {
+                assert_eq!(mode, "include_all");
+                assert!(
+                    hint.contains(r#"did you mean "include-all"?"#),
+                    "expected hint, got: {hint:?}"
+                );
+            }
+            other => panic!("expected UnsupportedMode, got: {other}"),
+        }
     }
 
     // ------------------------------------------------------------------

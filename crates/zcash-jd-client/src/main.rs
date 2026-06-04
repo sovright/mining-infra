@@ -134,3 +134,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the env-var → flag contract the sovereignty bundle relies on.
+    ///
+    /// All assertions live in a single test so the env mutations cannot race
+    /// other tests (cargo runs tests in parallel by default). Env vars are
+    /// restored at the end regardless of assertion outcome.
+    #[test]
+    fn env_vars_drive_config_and_flags_win() {
+        let keys = [
+            "ZEBRA_RPC",
+            "POOL_SV2_ENDPOINT",
+            "ACCOUNT_ID",
+            "JDC_LISTEN",
+            "JDC_POLICY",
+        ];
+
+        // Save originals.
+        let saved: Vec<Option<String>> = keys.iter().map(|k| std::env::var(k).ok()).collect();
+
+        let zebra_env = "http://10.0.0.1:8232";
+        let pool_env = "10.0.0.2:3334";
+        let account_env = "miner-from-env";
+        let listen_env = "127.0.0.1:34255";
+        let policy_env = "/etc/jdc/policy.toml";
+
+        unsafe {
+            std::env::set_var("ZEBRA_RPC", zebra_env);
+            std::env::set_var("POOL_SV2_ENDPOINT", pool_env);
+            std::env::set_var("ACCOUNT_ID", account_env);
+            std::env::set_var("JDC_LISTEN", listen_env);
+            std::env::set_var("JDC_POLICY", policy_env);
+        }
+
+        // No CLI flags — every value comes from the environment.
+        let args = Args::try_parse_from(["zcash-jd-client"]).unwrap();
+        assert_eq!(args.zebra_url, zebra_env, "zebra_url from ZEBRA_RPC");
+        assert_eq!(
+            args.pool_jd_addr, pool_env,
+            "pool_jd_addr from POOL_SV2_ENDPOINT"
+        );
+        assert_eq!(args.user_id, account_env, "user_id from ACCOUNT_ID");
+        assert_eq!(
+            args.jdc_listen,
+            Some(listen_env.parse().unwrap()),
+            "jdc_listen from JDC_LISTEN"
+        );
+        assert_eq!(
+            args.policy.as_deref(),
+            Some(std::path::Path::new(policy_env)),
+            "policy from JDC_POLICY"
+        );
+
+        // CLI flags given AND env set — flags win.
+        let zebra_cli = "http://192.168.1.1:8232";
+        let pool_cli = "192.168.1.2:3334";
+        let account_cli = "miner-from-flag";
+        let listen_cli = "127.0.0.1:44255";
+        let policy_cli = "/tmp/override-policy.toml";
+        let args = Args::try_parse_from([
+            "zcash-jd-client",
+            "--zebra-url",
+            zebra_cli,
+            "--pool-jd-addr",
+            pool_cli,
+            "--user-id",
+            account_cli,
+            "--jdc-listen",
+            listen_cli,
+            "--policy",
+            policy_cli,
+        ])
+        .unwrap();
+        assert_eq!(args.zebra_url, zebra_cli, "--zebra-url beats ZEBRA_RPC");
+        assert_eq!(
+            args.pool_jd_addr, pool_cli,
+            "--pool-jd-addr beats POOL_SV2_ENDPOINT"
+        );
+        assert_eq!(args.user_id, account_cli, "--user-id beats ACCOUNT_ID");
+        assert_eq!(
+            args.jdc_listen,
+            Some(listen_cli.parse().unwrap()),
+            "--jdc-listen beats JDC_LISTEN"
+        );
+        assert_eq!(
+            args.policy.as_deref(),
+            Some(std::path::Path::new(policy_cli)),
+            "--policy beats JDC_POLICY"
+        );
+
+        // Restore originals.
+        unsafe {
+            for (k, v) in keys.iter().zip(saved) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
