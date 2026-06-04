@@ -33,9 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, None) => (None, None),
         _ => {
-            return Err(
-                "JD_LISTEN_ADDR and JD_POOL_PAYOUT_SCRIPT_HEX must be set together".into(),
-            );
+            return Err("JD_LISTEN_ADDR and JD_POOL_PAYOUT_SCRIPT_HEX must be set together".into());
         }
     };
 
