@@ -548,6 +548,16 @@ fn test_config_getters() {
 
 // =============================================================================
 // handle_submit_shares_jd handler tests (Task 4)
+//
+// DELIBERATE COVERAGE GAP: the accept/credit path and the LowDifficulty
+// rejection path are NOT exercised here. Both require a structurally valid
+// Equihash solution — the accept path needs a hash at/under the share target,
+// and LowDifficulty (ValidationError::TargetNotMet) needs a structurally valid
+// solution whose hash is above it. No valid-Equihash-solution fixture exists in
+// this test suite. Both paths are covered by Task 7's full-chain integration
+// test, which mines real solutions with a CPU solver. The tests below cover
+// every rejection path reachable without a valid solution plus the batch
+// counting / first-error / no-credit logic.
 // =============================================================================
 
 /// Job parameters used by the share-handler tests. The miner-controlled share

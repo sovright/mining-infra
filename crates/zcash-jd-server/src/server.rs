@@ -32,7 +32,7 @@ use tokio::net::TcpStream;
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::{debug, error, info, warn};
 use zcash_equihash_validator::{
-    EquihashValidator, Target, compact_to_target, target_to_difficulty,
+    EquihashValidator, Target, ValidationError, compact_to_target, target_to_difficulty,
 };
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
@@ -704,16 +704,20 @@ impl JdServer {
             }
 
             // 5. Expensive: verify Equihash solution meets the share target.
+            //    Distinguish a structurally valid solution that simply misses
+            //    the target (TargetNotMet -> LowDifficulty) from a structurally
+            //    broken solution (everything else -> BadSolution). The
+            //    LowDifficulty branch cannot be exercised here without a valid
+            //    Equihash solution (TargetNotMet requires structural validity);
+            //    it is covered by Task 7's integration test alongside the accept
+            //    path, using a real CPU solver.
             let header = build_header(&job, share.time, &share.nonce);
-            if validator
-                .verify_share(&header, &share.solution, &share_target)
-                .is_err()
-            {
-                reject(
-                    JdShareErrorCode::BadSolution,
-                    &mut rejected,
-                    &mut first_error,
-                );
+            if let Err(e) = validator.verify_share(&header, &share.solution, &share_target) {
+                let code = match e {
+                    ValidationError::TargetNotMet => JdShareErrorCode::LowDifficulty,
+                    _ => JdShareErrorCode::BadSolution,
+                };
+                reject(code, &mut rejected, &mut first_error);
                 continue;
             }
 
