@@ -43,6 +43,11 @@ struct Args {
     /// Transaction selection strategy (all, by-fee-rate)
     #[arg(long, default_value = "all")]
     tx_selection: String,
+
+    /// Bind address for the downstream listener that serves declared jobs to
+    /// the translator proxy (e.g. 127.0.0.1:34255). Omit to disable.
+    #[arg(long)]
+    jdc_listen: Option<std::net::SocketAddr>,
 }
 
 #[tokio::main]
@@ -62,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_template_mode: args.full_template,
         tx_selection: TxSelectionStrategy::parse(&args.tx_selection)
             .unwrap_or(TxSelectionStrategy::All),
-        jdc_listen: None,
+        jdc_listen: args.jdc_listen,
     };
 
     info!("=== Zcash JD Client ===");
@@ -85,6 +90,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         info!("Full-Template mode: disabled (using Coinbase-Only)");
+    }
+    match config.jdc_listen {
+        Some(addr) => info!("Downstream listener: {}", addr),
+        None => info!("Downstream listener: disabled (use --jdc-listen to enable)"),
     }
 
     let client = JdClient::new(config)?;
