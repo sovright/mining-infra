@@ -1,4 +1,4 @@
-//! Stratum V1 client for testing the bedrock-v1-proxy.
+//! Stratum V1 client for testing the sovright-v1-stratum-proxy.
 //!
 //! Connects using JSON-RPC over TCP (newline-delimited), implements:
 //! - mining.subscribe

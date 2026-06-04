@@ -1,4 +1,4 @@
-# Zebra built with internal-miner feature for Bedrock testnet
+# Zebra built with internal-miner feature for Sovright testnet
 FROM rust:1.85-slim as builder
 
 RUN apt-get update && apt-get install -y \

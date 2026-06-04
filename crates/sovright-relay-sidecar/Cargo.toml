@@ -1,0 +1,32 @@
+[package]
+name = "sovright-relay-sidecar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Relay sidecar for Stratum V1 mining pools (part of the Sovright network)"
+
+[[bin]]
+name = "relay-sidecar"
+path = "src/main.rs"
+
+[lib]
+name = "sovright_relay_sidecar"
+path = "src/lib.rs"
+
+[dependencies]
+sovright-relay = { path = "../sovright-relay" }
+tokio = { workspace = true, features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+hex = { workspace = true }
+sha2 = { workspace = true }
+toml = "0.8"
+
+# Zebra RPC client
+jsonrpsee = { version = "0.24", features = ["http-client"] }
+
+[dev-dependencies]
+tempfile = "3"

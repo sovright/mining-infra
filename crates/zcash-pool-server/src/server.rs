@@ -16,8 +16,8 @@ use crate::channel::Channel;
 use crate::config::PoolConfig;
 use crate::duplicate::{DuplicateDetector, InMemoryDuplicateDetector};
 use crate::error::{PoolError, Result};
-#[cfg(feature = "forge")]
-use crate::forge::ForgeRelay;
+#[cfg(feature = "relay")]
+use crate::relay::RelayHandle;
 use crate::job::JobDistributor;
 use crate::payout::{MinerId, PayoutTracker};
 use crate::security::{ConnectionTracker, SequenceCheckResult, SequenceValidator, TimingJitter};
@@ -37,8 +37,8 @@ use zcash_jd_server::{
     JdTransport,
 };
 use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult};
-use bedrock_noise::{Keypair, NoiseResponder};
-use bedrock_strata::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
+use sovright_noise::{Keypair, NoiseResponder};
+use sovright_telemetry::{init_logging, start_metrics_server, LogFormat, PoolMetrics};
 use zcash_template_provider::types::BlockTemplate;
 use zcash_template_provider::{SubmitBlockResult, SubmitMode, TemplateProvider, TemplateProviderConfig};
 use zcash_mining_protocol::messages::SubmitEquihashShare;
@@ -89,9 +89,9 @@ pub struct PoolServer {
     noise_responder: Option<Arc<NoiseResponder>>,
     /// Pool metrics
     metrics: Arc<PoolMetrics>,
-    /// Forge relay for compact block propagation (optional, requires "forge" feature)
-    #[cfg(feature = "forge")]
-    forge_relay: Option<Arc<ForgeRelay>>,
+    /// Relay for compact block propagation (optional, requires "relay" feature)
+    #[cfg(feature = "relay")]
+    relay: Option<Arc<RelayHandle>>,
     /// Sequence validator for replay protection
     sequence_validator: Arc<SequenceValidator>,
     /// Connection tracker for attack detection
@@ -126,26 +126,26 @@ impl PoolServer {
         // Create metrics
         let metrics = Arc::new(PoolMetrics::new());
 
-        // Create forge relay if enabled (requires "forge" feature)
-        #[cfg(feature = "forge")]
-        let forge_relay = if config.forge_relay_enabled {
-            match ForgeRelay::new(&config) {
+        // Create relay if enabled (requires "relay" feature)
+        #[cfg(feature = "relay")]
+        let relay = if config.relay_enabled {
+            match RelayHandle::new(&config) {
                 Ok(relay) => {
-                    info!("Forge relay initialized");
+                    info!("Relay initialized");
                     Some(Arc::new(relay))
                 }
                 Err(e) => {
-                    warn!("Failed to create forge relay: {}. Continuing without relay.", e);
+                    warn!("Failed to create relay: {}. Continuing without relay.", e);
                     None
                 }
             }
         } else {
-            info!("Forge relay disabled");
+            info!("Relay disabled");
             None
         };
-        #[cfg(not(feature = "forge"))]
-        if config.forge_relay_enabled {
-            warn!("Forge relay requested but 'forge' feature is not enabled. Ignoring.");
+        #[cfg(not(feature = "relay"))]
+        if config.relay_enabled {
+            warn!("Relay requested but 'relay' feature is not enabled. Ignoring.");
         }
 
         // Create template provider
@@ -246,8 +246,8 @@ impl PoolServer {
             jd_listen_addr,
             noise_responder,
             metrics,
-            #[cfg(feature = "forge")]
-            forge_relay,
+            #[cfg(feature = "relay")]
+            relay,
             sequence_validator,
             connection_tracker,
             timing_jitter,
@@ -306,13 +306,13 @@ impl PoolServer {
             }
         });
 
-        // Initialize and start forge relay if enabled
-        #[cfg(feature = "forge")]
-        if let Some(ref forge) = self.forge_relay {
-            if let Err(e) = forge.init().await {
-                warn!("Failed to initialize forge relay: {}. Continuing without relay.", e);
+        // Initialize and start relay if enabled
+        #[cfg(feature = "relay")]
+        if let Some(ref relay) = self.relay {
+            if let Err(e) = relay.init().await {
+                warn!("Failed to initialize relay: {}. Continuing without relay.", e);
             } else {
-                match forge.start().await {
+                match relay.start().await {
                     Ok(mut block_receiver) => {
                         // Spawn a task to handle incoming compact blocks from the relay network
                         tokio::spawn(async move {
@@ -320,7 +320,7 @@ impl PoolServer {
                                 info!(
                                     tx_count = block.tx_count(),
                                     header_len = block.header.len(),
-                                    "Received compact block from forge relay"
+                                    "Received compact block from relay"
                                 );
                                 // NOTE(deferred): Compact block reconstruction is intentionally
                                 // deferred for the internal-testnet milestone. The pool currently
@@ -331,12 +331,12 @@ impl PoolServer {
                                 // 3. Update our template if it represents a new chain tip
                                 // Tracked for the mainnet-ready milestone.
                             }
-                            warn!("Forge relay block receiver closed");
+                            warn!("Relay block receiver closed");
                         });
-                        info!("Forge relay started");
+                        info!("Relay started");
                     }
                     Err(e) => {
-                        warn!("Forge relay start error: {}. Continuing without relay.", e);
+                        warn!("Relay start error: {}. Continuing without relay.", e);
                     }
                 }
             }
@@ -786,14 +786,14 @@ impl PoolServer {
             })
             .await;
 
-        // Announce to forge relay network (non-blocking)
-        #[cfg(feature = "forge")]
-        if let Some(ref forge) = self.forge_relay {
-            let forge = Arc::clone(forge);
+        // Announce to relay network (non-blocking)
+        #[cfg(feature = "relay")]
+        if let Some(ref relay) = self.relay {
+            let relay = Arc::clone(relay);
             let template_clone = template.clone();
             tokio::spawn(async move {
-                if let Err(e) = forge.announce_template(&template_clone).await {
-                    warn!("Failed to announce template to forge relay: {}", e);
+                if let Err(e) = relay.announce_template(&template_clone).await {
+                    warn!("Failed to announce template to relay: {}", e);
                 }
             });
         }
@@ -1069,14 +1069,14 @@ impl PoolServer {
                             self.job_distributor.read().await.current_height()
                         );
 
-                        // Announce to forge relay BEFORE submitting to Zebra
+                        // Announce to relay BEFORE submitting to Zebra
                         // This gives the relay network a head start
-                        #[cfg(feature = "forge")]
-                        if let Some(ref forge) = self.forge_relay {
+                        #[cfg(feature = "relay")]
+                        if let Some(ref relay) = self.relay {
                             let header = job.build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
 
                             // Clone all needed data atomically in one lock acquisition
-                            let forge_data = {
+                            let relay_data = {
                                 let distributor = self.job_distributor.read().await;
                                 distributor.current_template().map(|t| {
                                     let tx_hashes: Vec<[u8; 32]> = t.transactions.iter()
@@ -1097,11 +1097,11 @@ impl PoolServer {
                                 })
                             };
 
-                            if let Some((coinbase, tx_hashes)) = forge_data {
-                                let forge = Arc::clone(forge);
+                            if let Some((coinbase, tx_hashes)) = relay_data {
+                                let relay = Arc::clone(relay);
                                 tokio::spawn(async move {
-                                    if let Err(e) = forge.announce_block(&header, &coinbase, &tx_hashes).await {
-                                        warn!("Failed to announce block to forge relay: {}", e);
+                                    if let Err(e) = relay.announce_block(&header, &coinbase, &tx_hashes).await {
+                                        warn!("Failed to announce block to relay: {}", e);
                                     }
                                 });
                             }

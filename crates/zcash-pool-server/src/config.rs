@@ -64,18 +64,18 @@ pub struct PoolConfig {
     /// OTLP endpoint for distributed tracing
     pub otlp_endpoint: Option<String>,
 
-    /// Forge relay configuration (optional - None disables relay)
-    pub forge_relay_enabled: bool,
-    /// UDP bind address for forge relay (default: 0.0.0.0:8336)
-    pub forge_bind_addr: Option<SocketAddr>,
+    /// Relay configuration (optional - None disables relay)
+    pub relay_enabled: bool,
+    /// UDP bind address for relay (default: 0.0.0.0:8336)
+    pub relay_bind_addr: Option<SocketAddr>,
     /// Relay peer addresses to connect to
-    pub forge_relay_peers: Vec<SocketAddr>,
+    pub relay_peers: Vec<SocketAddr>,
     /// Shared authentication key for relay network (32 bytes)
-    pub forge_auth_key: Option<[u8; 32]>,
+    pub relay_auth_key: Option<[u8; 32]>,
     /// FEC data shards (default: 10)
-    pub forge_data_shards: usize,
+    pub relay_data_shards: usize,
     /// FEC parity shards (default: 3)
-    pub forge_parity_shards: usize,
+    pub relay_parity_shards: usize,
 
     // Security settings (attack mitigation)
     /// Enable sequence validation for replay attack protection
@@ -113,8 +113,8 @@ pub enum ConfigError {
     InvalidTemplatePollMs(u64),
     /// Invalid max connections (must be at least 1)
     InvalidMaxConnections(usize),
-    /// Forge relay enabled but no auth key provided
-    ForgeMissingAuthKey,
+    /// Relay enabled but no auth key provided
+    RelayMissingAuthKey,
     /// Invalid FEC shard configuration
     InvalidFecConfig { data: usize, parity: usize },
     /// JD enabled but no pool payout script
@@ -142,8 +142,8 @@ impl std::fmt::Display for ConfigError {
             ConfigError::InvalidMaxConnections(v) => {
                 write!(f, "max_connections {} must be at least 1", v)
             }
-            ConfigError::ForgeMissingAuthKey => {
-                write!(f, "forge_relay_enabled requires forge_auth_key")
+            ConfigError::RelayMissingAuthKey => {
+                write!(f, "relay_enabled requires relay_auth_key")
             }
             ConfigError::InvalidFecConfig { data, parity } => {
                 write!(f, "FEC config invalid: data={}, parity={} (both must be >= 1)", data, parity)
@@ -206,18 +206,18 @@ impl PoolConfig {
             return Err(ConfigError::InvalidMaxConnections(self.max_connections));
         }
 
-        // Forge relay requires auth key
-        if self.forge_relay_enabled && self.forge_auth_key.is_none() {
-            return Err(ConfigError::ForgeMissingAuthKey);
+        // Relay requires auth key
+        if self.relay_enabled && self.relay_auth_key.is_none() {
+            return Err(ConfigError::RelayMissingAuthKey);
         }
 
         // FEC shards must be valid
-        if self.forge_relay_enabled
-            && (self.forge_data_shards == 0 || self.forge_parity_shards == 0)
+        if self.relay_enabled
+            && (self.relay_data_shards == 0 || self.relay_parity_shards == 0)
         {
             return Err(ConfigError::InvalidFecConfig {
-                data: self.forge_data_shards,
-                parity: self.forge_parity_shards,
+                data: self.relay_data_shards,
+                parity: self.relay_parity_shards,
             });
         }
 
@@ -235,8 +235,8 @@ impl PoolConfig {
         }
 
         // FEC shard total must fit in Reed-Solomon's u8 limit
-        if self.forge_relay_enabled {
-            let total = self.forge_data_shards + self.forge_parity_shards;
+        if self.relay_enabled {
+            let total = self.relay_data_shards + self.relay_parity_shards;
             if total > 255 {
                 return Err(ConfigError::InvalidFecShardTotal { total });
             }
@@ -268,12 +268,12 @@ impl Default for PoolConfig {
             metrics_addr: Some(SocketAddr::from(([127, 0, 0, 1], 9090))),
             json_logging: false,
             otlp_endpoint: None,
-            forge_relay_enabled: false,
-            forge_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8336))),
-            forge_relay_peers: Vec::new(),
-            forge_auth_key: None,
-            forge_data_shards: 10,
-            forge_parity_shards: 3,
+            relay_enabled: false,
+            relay_bind_addr: Some(SocketAddr::from(([0, 0, 0, 0], 8336))),
+            relay_peers: Vec::new(),
+            relay_auth_key: None,
+            relay_data_shards: 10,
+            relay_parity_shards: 3,
             // Security defaults - enable protections by default
             sequence_validation_enabled: true,
             sequence_max_gap: 1000,
@@ -418,23 +418,23 @@ mod tests {
         );
     }
 
-    // 7. ForgeMissingAuthKey
+    // 7. RelayMissingAuthKey
     #[test]
-    fn forge_enabled_without_auth_key_rejected() {
+    fn relay_enabled_without_auth_key_rejected() {
         let mut cfg = valid_config();
-        cfg.forge_relay_enabled = true;
-        cfg.forge_auth_key = None;
-        assert_eq!(cfg.validate(), Err(ConfigError::ForgeMissingAuthKey));
+        cfg.relay_enabled = true;
+        cfg.relay_auth_key = None;
+        assert_eq!(cfg.validate(), Err(ConfigError::RelayMissingAuthKey));
     }
 
     // 8. InvalidFecConfig
     #[test]
-    fn forge_zero_data_shards_rejected() {
+    fn relay_zero_data_shards_rejected() {
         let mut cfg = valid_config();
-        cfg.forge_relay_enabled = true;
-        cfg.forge_auth_key = Some([0u8; 32]);
-        cfg.forge_data_shards = 0;
-        cfg.forge_parity_shards = 3;
+        cfg.relay_enabled = true;
+        cfg.relay_auth_key = Some([0u8; 32]);
+        cfg.relay_data_shards = 0;
+        cfg.relay_parity_shards = 3;
         assert_eq!(
             cfg.validate(),
             Err(ConfigError::InvalidFecConfig {
@@ -445,12 +445,12 @@ mod tests {
     }
 
     #[test]
-    fn forge_zero_parity_shards_rejected() {
+    fn relay_zero_parity_shards_rejected() {
         let mut cfg = valid_config();
-        cfg.forge_relay_enabled = true;
-        cfg.forge_auth_key = Some([0u8; 32]);
-        cfg.forge_data_shards = 10;
-        cfg.forge_parity_shards = 0;
+        cfg.relay_enabled = true;
+        cfg.relay_auth_key = Some([0u8; 32]);
+        cfg.relay_data_shards = 10;
+        cfg.relay_parity_shards = 0;
         assert_eq!(
             cfg.validate(),
             Err(ConfigError::InvalidFecConfig {
@@ -462,12 +462,12 @@ mod tests {
 
     // 9. InvalidFecShardTotal
     #[test]
-    fn forge_fec_total_256_rejected() {
+    fn relay_fec_total_256_rejected() {
         let mut cfg = valid_config();
-        cfg.forge_relay_enabled = true;
-        cfg.forge_auth_key = Some([0u8; 32]);
-        cfg.forge_data_shards = 200;
-        cfg.forge_parity_shards = 56;
+        cfg.relay_enabled = true;
+        cfg.relay_auth_key = Some([0u8; 32]);
+        cfg.relay_data_shards = 200;
+        cfg.relay_parity_shards = 56;
         assert_eq!(
             cfg.validate(),
             Err(ConfigError::InvalidFecShardTotal { total: 256 })
@@ -475,12 +475,12 @@ mod tests {
     }
 
     #[test]
-    fn forge_fec_total_255_accepted() {
+    fn relay_fec_total_255_accepted() {
         let mut cfg = valid_config();
-        cfg.forge_relay_enabled = true;
-        cfg.forge_auth_key = Some([0u8; 32]);
-        cfg.forge_data_shards = 200;
-        cfg.forge_parity_shards = 55;
+        cfg.relay_enabled = true;
+        cfg.relay_auth_key = Some([0u8; 32]);
+        cfg.relay_data_shards = 200;
+        cfg.relay_parity_shards = 55;
         assert!(cfg.validate().is_ok());
     }
 
@@ -528,10 +528,10 @@ mod tests {
 
     // 12. Disabled features ignore invalid sub-config
     #[test]
-    fn forge_disabled_ignores_missing_auth_key() {
+    fn relay_disabled_ignores_missing_auth_key() {
         let mut cfg = valid_config();
-        cfg.forge_relay_enabled = false;
-        cfg.forge_auth_key = None;
+        cfg.relay_enabled = false;
+        cfg.relay_auth_key = None;
         assert!(cfg.validate().is_ok());
     }
 

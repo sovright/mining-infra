@@ -1,4 +1,4 @@
-# Bedrock Internal Testnet -- Deployment Status
+# Sovright Internal Testnet -- Deployment Status
 
 For full operational runbooks (SSH, rebuild, troubleshooting), see the
 canonical deployment doc: **[`../deployment.md`](../deployment.md)**.

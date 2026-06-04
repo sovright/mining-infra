@@ -1,0 +1,21 @@
+[package]
+name = "sovright-telemetry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Telemetry: monitoring and analytics layer for Sovright mining infrastructure"
+
+[dependencies]
+prometheus = "0.14"
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+opentelemetry = { version = "0.21", features = ["trace"] }
+opentelemetry_sdk = { version = "0.21", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.14", features = ["tonic"] }
+tracing-opentelemetry = "0.22"
+tokio = { workspace = true }
+hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

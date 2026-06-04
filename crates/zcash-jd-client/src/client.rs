@@ -18,7 +18,7 @@ use tracing::{debug, error, info, warn};
 use zcash_jd_server::codec::*;
 use zcash_jd_server::messages::*;
 use zcash_mining_protocol::codec::MessageFrame;
-use bedrock_noise::{NoiseInitiator, NoiseStream, PublicKey};
+use sovright_noise::{NoiseInitiator, NoiseStream, PublicKey};
 use zcash_template_provider::types::{BlockTemplate, Hash256};
 use zcash_template_provider::{TemplateProvider, TemplateProviderConfig};
 

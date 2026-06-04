@@ -14,24 +14,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
 
-    // Forge relay configuration (optional)
+    // Relay configuration (optional)
     // Enable for low-latency block propagation to relay network.
     // When enabled, the pool will broadcast newly found blocks to relay peers
     // using UDP with forward error correction (FEC) for fast, reliable delivery.
-    config.forge_relay_enabled = false; // Set to true to enable
-    config.forge_relay_peers = vec![
+    config.relay_enabled = false; // Set to true to enable
+    config.relay_peers = vec![
         // Add relay peer addresses here, e.g.:
         // "relay1.example.com:8336".parse().unwrap(),
         // "relay2.example.com:8336".parse().unwrap(),
     ];
     // Optional: bind address for receiving relay messages (default: 0.0.0.0:8336)
-    // config.forge_bind_addr = Some("0.0.0.0:8336".parse().unwrap());
+    // config.relay_bind_addr = Some("0.0.0.0:8336".parse().unwrap());
     // Optional: shared authentication key with relay peers (32 bytes)
-    // config.forge_auth_key = Some([0x42; 32]);
+    // config.relay_auth_key = Some([0x42; 32]);
     // FEC parameters: data_shards + parity_shards = total shards sent
     // More parity shards = better recovery from packet loss, but more bandwidth
-    config.forge_data_shards = 10;
-    config.forge_parity_shards = 3;
+    config.relay_data_shards = 10;
+    config.relay_parity_shards = 3;
 
     println!("=== Zcash Pool Server ===");
     println!("Listening on: {}", config.listen_addr);

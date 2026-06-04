@@ -32,7 +32,7 @@ jobs:
         working-directory: crates/zcash-mining-protocol
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
 
-  fuzz-bedrock-forge:
+  fuzz-sovright-relay:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -46,10 +46,10 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - uses: actions/cache@v4
         with:
-          path: crates/bedrock-forge/fuzz/target
-          key: fuzz-forge-${{ matrix.target }}-${{ hashFiles('crates/bedrock-forge/**/*.rs') }}
+          path: crates/sovright-relay/fuzz/target
+          key: fuzz-relay-${{ matrix.target }}-${{ hashFiles('crates/sovright-relay/**/*.rs') }}
       - name: Run corpus regression
-        working-directory: crates/bedrock-forge
+        working-directory: crates/sovright-relay
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
 
   fuzz-jd-server:
@@ -142,7 +142,7 @@ jobs:
         working-directory: crates/zcash-template-provider
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
 
-  fuzz-forge-sidecar:
+  fuzz-sovright-relay-sidecar:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -156,13 +156,13 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - uses: actions/cache@v4
         with:
-          path: crates/forge-sidecar/fuzz/target
-          key: fuzz-sidecar-${{ matrix.target }}-${{ hashFiles('crates/forge-sidecar/**/*.rs') }}
+          path: crates/sovright-relay-sidecar/fuzz/target
+          key: fuzz-sidecar-${{ matrix.target }}-${{ hashFiles('crates/sovright-relay-sidecar/**/*.rs') }}
       - name: Run corpus regression
-        working-directory: crates/forge-sidecar
+        working-directory: crates/sovright-relay-sidecar
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
 
-  fuzz-bedrock-noise:
+  fuzz-sovright-noise:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -176,10 +176,10 @@ jobs:
       - run: cargo install cargo-fuzz --locked
       - uses: actions/cache@v4
         with:
-          path: crates/bedrock-noise/fuzz/target
-          key: fuzz-noise-${{ matrix.target }}-${{ hashFiles('crates/bedrock-noise/**/*.rs') }}
+          path: crates/sovright-noise/fuzz/target
+          key: fuzz-noise-${{ matrix.target }}-${{ hashFiles('crates/sovright-noise/**/*.rs') }}
       - name: Run corpus regression
-        working-directory: crates/bedrock-noise
+        working-directory: crates/sovright-noise
         run: cargo +nightly fuzz run ${{ matrix.target }} -- -runs=0
 
   fuzz-pool-server:

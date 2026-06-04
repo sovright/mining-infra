@@ -505,6 +505,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -546,6 +547,7 @@ mod tests {
             retarget_interval: Duration::from_nanos(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
         controller.record_share();
@@ -584,6 +586,7 @@ mod tests {
             // Better approach: use a longer interval to reduce timing sensitivity.
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
 
         // Instead, let's test the boundary precisely by manipulating the math.
@@ -651,6 +654,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -684,6 +688,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
         // No shares recorded
@@ -824,6 +829,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
         for _ in 0..100 {
@@ -844,6 +850,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller2 = VardiffController::new(config2);
         // 0 shares -> final = max(current*0.5, min) = max(0.5025, 1.0) = 1.0
@@ -869,6 +876,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -910,6 +918,7 @@ mod tests {
             retarget_interval: Duration::from_secs(3600),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -962,6 +971,7 @@ mod tests {
             // Very high target: 1,000,000 shares/min
             target_shares_per_minute: 1_000_000.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -1011,6 +1021,7 @@ mod tests {
             retarget_interval: Duration::from_millis(1),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
 
         // Scenario A: 10 shares
@@ -1048,6 +1059,7 @@ mod tests {
             retarget_interval: Duration::from_secs(3600),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -1076,6 +1088,7 @@ mod tests {
             retarget_interval: Duration::from_secs(3600), // 1 hour
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut controller = VardiffController::new(config);
 
@@ -1114,6 +1127,7 @@ mod tests {
             target_shares_per_minute: 5.0,
             // Very wide tolerance: ratio must be outside [0.01, 1.99] to trigger
             variance_tolerance: 0.99,
+            ..Default::default()
         };
         // With variance_tolerance=0.99: lower_bound = 0.01, upper_bound = 1.99
         // The validated() method requires tolerance < 1.0, so 0.99 is fine.
@@ -1129,6 +1143,7 @@ mod tests {
             retarget_interval: Duration::from_secs(3600),
             target_shares_per_minute: 5.0,
             variance_tolerance: 0.25,
+            ..Default::default()
         };
         let mut ctrl = VardiffController::new(config2);
         // Even with extreme shares, no retarget before interval

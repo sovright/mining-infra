@@ -30,7 +30,7 @@ let stream = TcpStream::connect("pool.example.com:3333").await?;
 If the pool supports Noise encryption:
 
 ```rust
-use bedrock_noise::{NoiseInitiator, PublicKey};
+use sovright_noise::{NoiseInitiator, PublicKey};
 
 let server_pubkey = PublicKey::from_hex("pool_public_key_hex")?;
 let initiator = NoiseInitiator::new(server_pubkey);

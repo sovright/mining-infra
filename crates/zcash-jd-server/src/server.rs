@@ -30,7 +30,7 @@ use tracing::{debug, error, info, warn};
 use zcash_equihash_validator::{compact_to_target, target_to_difficulty, EquihashValidator};
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
-use bedrock_noise::NoiseStream;
+use sovright_noise::NoiseStream;
 
 #[derive(Debug, Clone)]
 pub struct CurrentTemplateContext {

@@ -160,6 +160,7 @@ fn test_full_mining_lifecycle() {
         retarget_interval: Duration::from_millis(1),
         target_shares_per_minute: 5.0,
         variance_tolerance: 0.25,
+        ..Default::default()
     };
     let mut vardiff = VardiffController::new(vardiff_config);
     assert_eq!(vardiff.current_difficulty(), 100.0);
