@@ -13,6 +13,7 @@ pub mod declared_job;
 pub mod error;
 pub mod full_template;
 pub mod listener;
+pub mod policy;
 pub mod relay;
 pub mod share_path;
 pub mod template_builder;

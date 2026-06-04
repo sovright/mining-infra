@@ -1,7 +1,10 @@
 //! Zcash JD Client binary
 
+use std::path::PathBuf;
+
 use clap::Parser;
-use tracing::info;
+use tracing::{info, warn};
+use zcash_jd_client::policy::{CONVENTIONAL_POLICY_PATH, load_policy, resolve_policy_path};
 use zcash_jd_client::{JdClient, JdClientConfig, config::TxSelectionStrategy};
 
 #[derive(Parser, Debug)]
@@ -9,15 +12,15 @@ use zcash_jd_client::{JdClient, JdClientConfig, config::TxSelectionStrategy};
 #[command(about = "Zcash Job Declaration Client for Stratum V2")]
 struct Args {
     /// Zebra RPC URL
-    #[arg(long, default_value = "http://127.0.0.1:8232")]
+    #[arg(long, default_value = "http://127.0.0.1:8232", env = "ZEBRA_RPC")]
     zebra_url: String,
 
     /// Pool JD Server address
-    #[arg(long, default_value = "127.0.0.1:3334")]
+    #[arg(long, default_value = "127.0.0.1:3334", env = "POOL_SV2_ENDPOINT")]
     pool_jd_addr: String,
 
     /// User identifier for job allocation
-    #[arg(long, default_value = "zcash-jd-client")]
+    #[arg(long, default_value = "zcash-jd-client", env = "ACCOUNT_ID")]
     user_id: String,
 
     /// Template polling interval in milliseconds
@@ -46,8 +49,15 @@ struct Args {
 
     /// Bind address for the downstream listener that serves declared jobs to
     /// the translator proxy (e.g. 127.0.0.1:34255). Omit to disable.
-    #[arg(long)]
+    #[arg(long, env = "JDC_LISTEN")]
     jdc_listen: Option<std::net::SocketAddr>,
+
+    /// Path to the censorship-policy file (TOML).  If omitted, the
+    /// conventional container path /etc/jdc/policy.toml is probed; if that
+    /// also does not exist, the client starts with no policy (unchanged
+    /// behaviour).
+    #[arg(long, env = "JDC_POLICY")]
+    policy: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -55,6 +65,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // Resolve and load censorship policy (refuse-to-start on any error).
+    let conventional = std::path::Path::new(CONVENTIONAL_POLICY_PATH);
+    if let Some(policy_path) = resolve_policy_path(args.policy.as_deref(), conventional) {
+        match load_policy(&policy_path) {
+            Ok(policy) => {
+                info!(
+                    "Censorship policy loaded from {}: mode = include-all",
+                    policy_path.display()
+                );
+                for section in &policy.deferred_warnings {
+                    warn!(
+                        "policy section '{}' present but not yet enforced — deferred",
+                        section
+                    );
+                }
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let config = JdClientConfig {
         zebra_url: args.zebra_url,
