@@ -23,6 +23,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -45,6 +47,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -75,6 +79,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -98,6 +104,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -120,6 +128,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -143,6 +153,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -165,6 +177,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -187,6 +201,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
@@ -208,6 +224,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
