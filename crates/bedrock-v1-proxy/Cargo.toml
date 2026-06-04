@@ -1,0 +1,17 @@
+[package]
+name = "bedrock-v1-proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stratum V1 translation proxy for the Bedrock Zcash mining pool"
+
+[dependencies]
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio-util = { version = "0.7", features = ["codec"] }
+clap = { version = "4.5", features = ["derive"] }
+toml = "0.8"
+zcash-mining-protocol = { path = "../zcash-mining-protocol" }

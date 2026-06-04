@@ -224,16 +224,24 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                                                 "V1 job: id={}, version={:#x}, clean={}",
                                                 job.job_id, job.version, job.clean_jobs
                                             );
+                                            // Only preempt the solver on clean_jobs=true. A clean=false
+                                            // notify means previous work is still valid (Stratum V1 spec);
+                                            // preempting mid-solve on every refresh starves the solver.
+                                            // We still record the job so a later submit can reference it.
+                                            let should_preempt = job.clean_jobs
+                                                || current_job.lock().unwrap().is_none();
                                             if job.clean_jobs {
                                                 job_map.clear();
                                             }
-                                            let jid = hash_job_id(&job.job_id);
-                                            current_job_id.store(jid, Ordering::Relaxed);
-                                            *current_job.lock().unwrap() = Some((
-                                                job.clone(),
-                                                nonce_1.clone(),
-                                                nonce_2_size,
-                                            ));
+                                            if should_preempt {
+                                                let jid = hash_job_id(&job.job_id);
+                                                current_job_id.store(jid, Ordering::Relaxed);
+                                                *current_job.lock().unwrap() = Some((
+                                                    job.clone(),
+                                                    nonce_1.clone(),
+                                                    nonce_2_size,
+                                                ));
+                                            }
                                             job_map.insert(job.job_id.clone(), job);
                                         }
                                         Err(e) => warn!("Bad mining.notify: {}", e),
