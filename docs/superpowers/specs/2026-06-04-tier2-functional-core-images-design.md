@@ -10,10 +10,11 @@ Predecessor: the Tier-2 testnet unblock (product repo spec `2026-06-04-tier2-tes
 The Tier-2 sovereignty bundle's compose references `bedrock/translator-proxy:latest` and `bedrock/job-declarator:latest` — neither exists as an image. Worse, the topology it describes is not implemented:
 
 - `zcash-jd-client` is client-only: it declares jobs to the pool's JD server but has **no downstream listener** — nothing can mine its declared jobs. The bundle expects the proxy to chain through it on `:34265`.
-- The pool's JD server share/solution path is an explicit stub (`server.rs` PushSolution handler: unvalidated difficulty, synthetic `jd-miner-{channel}` ids, "NOT SAFE FOR PRODUCTION").
+- The pool's JD server has **no per-share path for declared jobs**. `PushSolution` (block solutions) is real on this branch — header reconstruction, `EquihashValidator::verify_share` against the block target, payout credit under `job.client_id` (`zcash-jd-server/src/server.rs:~476-532`) — but there is no message for relaying ordinary shares mined against a declared job, so declared templates earn nothing between blocks.
 - The pool's stratum side never serves declared jobs — declared templates are validated, then nothing mines them.
 - Neither binary reads the env vars the bundle sets; the bundle's `policy.toml` (inclusion preferences, guarantees, ed25519 attestation) has no implementation.
-- `bedrock-v1-proxy` (SV1→V2 translator) IS implemented and reviewed on `sovright/main` (`--listen`/`--upstream` CLI), so the Tier-1 image is mostly packaging.
+- `sovright-v1-stratum-proxy` (SV1→V2 translator) IS implemented and reviewed on `sovright/main` (`--listen`/`--upstream` CLI), so the Tier-1 image is mostly packaging.
+- `zcash-mining-protocol` provides the V2 codec/message types both sides use, but no reusable server-side session layer — the pool server hand-rolls its connection loop.
 
 ## Decisions made (with Zaki)
 
@@ -40,7 +41,7 @@ Tier-1 is unchanged: proxy `--upstream` points at the pool directly.
 
 ### 1. JDC downstream listener (`crates/zcash-jd-client`, new `listener` module)
 
-- Speaks the server side of the Bedrock-V2 subset the proxy consumes upstream: `SetupConnection`, channel open, `NewMiningJob` / `SetNewPrevHash`, `SetTarget`, `SubmitShares*`. Reuse `bedrock-strata`'s framing/codec/session machinery as a library — do not fork the protocol code.
+- Speaks the server side of the V2 subset the proxy consumes upstream: `SetupConnection`, channel open, `NewMiningJob` / `SetNewPrevHash`, `SetTarget`, `SubmitShares*`. Reuse `zcash-mining-protocol`'s codec and message types directly — do not fork protocol code. There is no shared session layer to reuse; the listener implements a minimal session loop over that codec, modeled on `zcash-pool-server`'s connection handling (the proxy exercises a narrow message surface).
 - Serves exactly one job stream: the currently-declared job. On each new template from the miner's Zebra, the JDC re-declares to the pool and, on `SetCustomMiningJobSuccess`, broadcasts the new job downstream.
 - Listen address: `JDC_LISTEN` env / `--jdc-listen` flag, default `0.0.0.0:34265`.
 - **Not-ready behavior:** until Zebra is responding and a declaration has been accepted, the listener accepts TCP connections but issues no jobs (miners idle rather than mining a stale/wrong template). The proxy's existing reconnect/idle handling covers this.
@@ -50,7 +51,7 @@ Tier-1 is unchanged: proxy `--upstream` points at the pool directly.
 
 - JDC validates downstream shares against its declared job: target check against the share target the pool granted, duplicate detection, job-id freshness. Invalid → standard V2 error to the proxy.
 - Valid shares relay upstream over the existing JD connection via a new JD-protocol message `SubmitSharesJd { request_id, job_id, account (user_identifier), nonce/ntime/solution fields needed for independent verification }`. Response: success (with credited count) or typed error.
-- **Pool side replaces the stub:** the JD server looks up the stored declared job for `job_id`, reconstructs the header, verifies Equihash and the share target for real, and credits `payout_tracker` under the declaring account's identity. Synthetic miner ids and unvalidated-difficulty crediting are removed. Errors return typed codes (unknown job, stale job, low difficulty, bad solution, duplicate).
+- **Pool side — new handler, existing machinery:** the `SubmitSharesJd` handler looks up the stored declared job for `job_id`, reconstructs the header, verifies Equihash and the share target, and credits `payout_tracker` under the declaring account — reusing the same validation machinery `handle_push_solution` already uses for block solutions (`EquihashValidator`, header reconstruction, `record_share(&job.client_id, difficulty)`). Errors return typed codes (unknown job, stale job, low difficulty, bad solution, duplicate).
 - **Block path:** when a share meets the block target, the JDC assembles the full block (declared template + coinbase + solution) and submits it to the miner's own Zebra via the existing `block_submitter`, and also sends the existing `PushSolution` to the pool. The miner's node broadcasting its own block is the sovereignty story; PushSolution lets the pool account for found blocks.
 - Vardiff: out of scope for v1 — the share target granted at declaration time stands for the session (testnet CPU miners; revisit before mainnet).
 
@@ -64,8 +65,8 @@ Clap `env` attributes (additive; CLI flags keep working):
 | zcash-jd-client | `POOL_SV2_ENDPOINT` | `--pool-jd-addr` |
 | zcash-jd-client | `ACCOUNT_ID` | `--user-id` (→ `user_identifier`) |
 | zcash-jd-client | `JDC_LISTEN` | `--jdc-listen` (new) |
-| bedrock-v1-proxy | `SV1_LISTEN` | `--listen` |
-| bedrock-v1-proxy | `UPSTREAM` | `--upstream` |
+| sovright-v1-stratum-proxy | `SV1_LISTEN` | `--listen` |
+| sovright-v1-stratum-proxy | `UPSTREAM` | `--upstream` |
 
 The bundle's Tier-1 `POOL_SV2_ENDPOINT` and Tier-2 `JDC_ENDPOINT` both map onto the proxy's `UPSTREAM` in the bundle's compose env wiring (product-side change; the proxy itself knows only `UPSTREAM`).
 
@@ -114,7 +115,7 @@ The bundle's Tier-1 `POOL_SV2_ENDPOINT` and Tier-2 `JDC_ENDPOINT` both map onto 
 
 | Risk | Mitigation |
 |---|---|
-| `bedrock-strata` server machinery isn't cleanly reusable as a library | Surfaced in the first implementation task; fallback is a minimal standalone server speaking only the required subset (the proxy exercises a narrow surface) |
-| Pool-side Equihash verification cost per share | Testnet share rates are trivial; benchmark before mainnet, consider sampling then — not now |
+| Hand-rolled listener session loop drifts from the pool server's protocol behavior | Build it on `zcash-mining-protocol` codec/messages, crib structure from `zcash-pool-server`'s connection handling, and cover the proxy's full message surface in the integration test |
+| Pool-side Equihash verification cost per share (`SubmitSharesJd` adds a per-share verify, same cost as the existing per-block verify) | Testnet share rates are trivial; benchmark before mainnet, consider sampling then — not now |
 | Declared-job/share race on template changes (share for job N arrives after job N+1 declared) | Pool keeps a small window of recent declared jobs per account (e.g. last 4) and validates against the matching one; stale beyond window → typed stale error |
 | GHCR org permissions for first publish | One-time manual check that Actions in `mining-infra` may write packages to the `sovright` org |
