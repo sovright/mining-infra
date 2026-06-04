@@ -62,6 +62,13 @@ const JDC_USER_ID: &str = "tier2-jdc-miner";
 
 /// Overall test budget. A CPU solver needs a few seconds per Equihash solution;
 /// 120s leaves ample slack for slow CI while still failing rather than hanging.
+///
+/// This is also the worst-case leak ceiling for the spawned proxy + miner
+/// binaries: the `ChildGuard` `Drop` reaps them on any normal exit (success,
+/// failure, panic-unwind), but `Drop` does NOT run if the test *process* is
+/// hard-killed (SIGKILL / `cargo test` timeout kill). In that case the children
+/// outlive us; bounding the test's own wall-clock at BUDGET keeps that window
+/// small rather than unbounded.
 const BUDGET: Duration = Duration::from_secs(120);
 
 // ---------------------------------------------------------------------------
@@ -160,13 +167,30 @@ impl MockZebra {
             "getblocktemplate" => (*self.template_result).clone(),
             "submitblock" => {
                 // Record the submitted block hex (first param), return null
-                // (Zebra returns null on accept).
+                // (Zebra returns null on accept). We sanity-check the bytes so a
+                // regression that submits garbage is caught instead of being
+                // counted as block-path success: the hex must be non-empty,
+                // valid hex, and at least header(140) + solution(1344) bytes —
+                // a Zcash block is header + compact-size + 1344-byte Equihash
+                // solution + tx count + coinbase, so 1484 bytes (2968 hex chars)
+                // is a safe lower bound. This proves the submit codepath fired
+                // with structurally plausible bytes; it does NOT assert
+                // Zebra-grade block validity (that is Task 10's live E2E).
+                const MIN_BLOCK_HEX_LEN: usize = (140 + 1344) * 2;
                 if let Ok(req) = serde_json::from_str::<serde_json::Value>(body)
                     && let Some(hex) = req
                         .get("params")
                         .and_then(|p| p.get(0))
                         .and_then(|h| h.as_str())
                 {
+                    assert!(
+                        !hex.is_empty()
+                            && hex.len() >= MIN_BLOCK_HEX_LEN
+                            && hex.bytes().all(|b| b.is_ascii_hexdigit()),
+                        "submitblock received implausible block hex (len={}, expected >= {} valid hex chars)",
+                        hex.len(),
+                        MIN_BLOCK_HEX_LEN,
+                    );
                     self.submitted_blocks.lock().unwrap().push(hex.to_string());
                 }
                 serde_json::Value::Null
@@ -246,6 +270,8 @@ impl MockZebra {
 
 /// Find the end of the HTTP headers and the Content-Length. Returns
 /// `(headers_end_offset, content_length)` once the full header block is present.
+///
+/// Content-Length only; reqwest always sets it for these calls.
 fn parse_http_head(buf: &[u8]) -> Option<(usize, usize)> {
     let head_end = find_subslice(buf, b"\r\n\r\n")? + 4;
     let head = String::from_utf8_lossy(&buf[..head_end]);
@@ -460,6 +486,12 @@ async fn tier2_full_chain_declared_job_mining() {
     // keep solving and poll for a submitblock for a generous grace window
     // bounded by the overall budget. This is asserted OPPORTUNISTICALLY — the
     // test never fails if no solution happens to clear the block target.
+    //
+    // What firing PROVES: the JDC's block-submission codepath ran end-to-end
+    // and handed Zebra structurally plausible block bytes (length + hex checked
+    // in the mock's submitblock handler). It does NOT prove the block is
+    // Zebra-grade valid — full consensus validation against a live node is
+    // Task 10's job, not this in-process chain test.
     let mut blocks = zebra.submitted_count();
     if blocks == 0 {
         let block_deadline = (Instant::now() + Duration::from_secs(20)).min(deadline);
