@@ -1,8 +1,8 @@
-# Bedrock test miner — multi-stage build
+# Sovright test miner — multi-stage build
 # Submits dummy shares to the pool for protocol-level testing.
 #
-# Build:  docker build -f testnet/Dockerfile.test-miner -t bedrock-test-miner .
-# Run:    docker run --network host bedrock-test-miner --pool 127.0.0.1:3333 --rate 5
+# Build:  docker build -f testnet/Dockerfile.test-miner -t sovright-test-miner .
+# Run:    docker run --network host sovright-test-miner --pool 127.0.0.1:3333 --rate 5
 
 FROM rust:1.85-slim AS builder
 

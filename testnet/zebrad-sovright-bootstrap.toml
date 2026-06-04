@@ -1,6 +1,6 @@
-# BedrockTestnet genesis bootstrap config.
+# SovrightTestnet genesis bootstrap config.
 # Uses standard testnet magic temporarily so it can peer with the bootstrap
-# node to get the genesis block into bedrocktestnet state.
+# node to get the genesis block into sovrighttestnet state.
 # Run until blocks > 0, then switch to zebrad.toml (custom magic, no peers).
 
 [mining]
@@ -13,7 +13,7 @@ listen_addr = "0.0.0.0:18234"
 initial_testnet_peers = ["172.17.0.2:18233"]
 
 [network.testnet_parameters]
-network_name = "BedrockTestnet"
+network_name = "SovrightTestnet"
 # Standard testnet magic so the handshake with the bootstrap peer succeeds.
 # Switch to [0, 1, 0, 255] after genesis is in state.
 network_magic = [36, 233, 39, 100]
