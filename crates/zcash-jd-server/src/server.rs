@@ -77,6 +77,13 @@ fn build_header(job: &DeclaredJobInfo, time: u32, nonce: &[u8; 32]) -> [u8; 140]
 }
 
 /// Compute the dedup key for a share: `sha256(nonce ‖ time_le ‖ solution[..64])`.
+///
+/// Only the first 64 bytes of the 1344-byte Equihash-(200,9) solution are
+/// hashed: those bytes encode the leading index pairs of the solution, so two
+/// distinct valid solutions colliding on `(nonce, time, solution[..64])` is
+/// astronomically unlikely. The truncation only bounds hashing cost — the full
+/// 1344-byte solution is still verified in its entirety before any credit, so a
+/// collision could at worst suppress a duplicate, never admit an invalid share.
 fn share_dedup_key(share: &JdShare) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -133,8 +140,14 @@ pub struct JdServer {
     /// expensive Equihash verification), so byte-identical replays are rejected
     /// as duplicates regardless of validity. Remembering an invalid share is
     /// harmless and rate-limits resubmission of garbage. Entries for jobs that
-    /// no longer resolve are evicted at the head of each handler call, bounding
-    /// growth by the live job count; each per-job set is additionally capped.
+    /// no longer resolve are evicted at the head of each handler call.
+    ///
+    /// Memory bound: steady-state worst case is
+    /// `live_jobs × MAX_SEEN_SHARES_PER_JOB × 32 bytes` plus `HashSet` overhead
+    /// (~1-2 MB per job at the per-job cap). The eviction sweep alone only
+    /// scopes this to live jobs; the real backstop on `live_jobs` is token
+    /// issuance — `max_tokens_per_client` and `token_lifetime` — since each job
+    /// is pinned to an unexpired token.
     seen_shares: Mutex<HashMap<u32, HashSet<[u8; 32]>>>,
 }
 
@@ -700,6 +713,11 @@ impl JdServer {
                     reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
                     continue;
                 }
+                // INVARIANT: the contains-check and this insert must remain a
+                // single critical section under the Mutex. That atomicity is
+                // what serializes concurrent identical-key submissions and
+                // prevents double-credit. Do not split it with an `.await`, and
+                // do not move `record_share` inside this block.
                 set.insert(key);
             }
 
