@@ -58,6 +58,9 @@ pub struct JdClientConfig {
     pub full_template_mode: bool,
     /// Transaction selection strategy for Full-Template mode
     pub tx_selection: TxSelectionStrategy,
+    /// Address to bind the downstream listener on (serves declared jobs to the
+    /// translator proxy). `None` disables the listener.
+    pub jdc_listen: Option<SocketAddr>,
 }
 
 impl Default for JdClientConfig {
@@ -72,6 +75,7 @@ impl Default for JdClientConfig {
             pool_public_key: None,
             full_template_mode: false,
             tx_selection: TxSelectionStrategy::All,
+            jdc_listen: None,
         }
     }
 }

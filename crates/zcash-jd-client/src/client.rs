@@ -6,21 +6,29 @@
 
 use crate::block_submitter::BlockSubmitter;
 use crate::config::JdClientConfig;
+use crate::declared_job::{CurrentDeclaredJob, DeclaredJobState};
 use crate::error::{JdClientError, Result};
 use crate::full_template::FullTemplateBuilder;
+use crate::listener::{RelayShare, run_listener};
+use crate::relay::{FLUSH_INTERVAL, RelayBatcher};
 use crate::template_builder::TemplateBuilder;
 use sovright_noise::{NoiseInitiator, NoiseStream, PublicKey};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, error, info, warn};
 use zcash_jd_server::codec::*;
 use zcash_jd_server::messages::*;
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_template_provider::types::{BlockTemplate, Hash256};
 use zcash_template_provider::{TemplateProvider, TemplateProviderConfig};
+
+/// JD channel id used when declaring jobs (`SetCustomMiningJob.channel_id`) and
+/// reused for `SubmitSharesJd`. This is the upstream/JD channel — distinct from
+/// the per-connection downstream channel ids the listener mints locally.
+const JD_CHANNEL_ID: u32 = 1;
 
 enum JdClientTransport {
     Plain(TcpStream),
@@ -120,6 +128,11 @@ pub struct JdClient {
     granted_mode: Arc<RwLock<JobDeclarationMode>>,
     /// Transaction data cache for Full-Template mode (txid -> raw tx)
     tx_cache: Arc<RwLock<HashMap<[u8; 32], Vec<u8>>>>,
+    /// Shared current-declared-job state served to the downstream listener.
+    ///
+    /// Populated on every declaration success and cleared when the JD
+    /// connection drops. `None` until `run()` wires the listener.
+    declared_job_state: Arc<DeclaredJobState>,
 }
 
 impl JdClient {
@@ -154,6 +167,7 @@ impl JdClient {
             current_share_target: Arc::new(RwLock::new(None)),
             granted_mode: Arc::new(RwLock::new(JobDeclarationMode::CoinbaseOnly)),
             tx_cache: Arc::new(RwLock::new(HashMap::new())),
+            declared_job_state: DeclaredJobState::new(),
         })
     }
 
@@ -218,10 +232,39 @@ impl JdClient {
             }
         });
 
+        // Wire the downstream listener + share relay if a listen address is set.
+        // `relay_rx` carries every locally-accepted downstream share for batched
+        // relay to the pool; `push_rx` carries block-meeting shares so we also
+        // send a PushSolution. When disabled, the receivers simply never fire.
+        let (relay_tx, mut relay_rx) = mpsc::channel::<RelayShare>(256);
+        let (push_tx, mut push_rx) = mpsc::channel::<RelayShare>(32);
+        let mut batcher = RelayBatcher::new(JD_CHANNEL_ID);
+
+        if let Some(listen_addr) = self.config.jdc_listen {
+            let state = self.declared_job_state.clone();
+            let submitter = Arc::new(BlockSubmitter::new(self.config.zebra_url.clone()));
+            tokio::spawn(async move {
+                if let Err(e) = run_listener(listen_addr, state, relay_tx, push_tx, submitter).await
+                {
+                    error!("Downstream listener error: {}", e);
+                }
+            });
+            info!("Downstream listener enabled on {}", listen_addr);
+        } else {
+            // Drop the senders so the receivers stay quiescent (and the listener
+            // is never spawned).
+            drop(relay_tx);
+            drop(push_tx);
+        }
+
         info!("JD Client running");
 
-        // Main loop - handle template updates
-        loop {
+        // Periodic flush of partially-filled relay batches.
+        let mut flush = tokio::time::interval(FLUSH_INTERVAL);
+        flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Main loop - handle template updates and relay downstream shares.
+        let run_result: Result<()> = loop {
             tokio::select! {
                 template_result = template_rx.recv() => {
                     match template_result {
@@ -235,8 +278,110 @@ impl JdClient {
                         }
                     }
                 }
+                Some(item) = relay_rx.recv() => {
+                    if let Some(batch) = batcher.push(item)
+                        && let Err(e) = self.relay_shares(&mut transport, batch).await {
+                            error!("Share relay error: {}", e);
+                            break Err(e);
+                        }
+                }
+                Some(item) = push_rx.recv() => {
+                    if let Err(e) = self.send_push_solution(&mut transport, item).await {
+                        error!("PushSolution error: {}", e);
+                        break Err(e);
+                    }
+                }
+                _ = flush.tick() => {
+                    if !batcher.is_empty() {
+                        for batch in batcher.flush_all() {
+                            if let Err(e) = self.relay_shares(&mut transport, batch).await {
+                                error!("Share relay flush error: {}", e);
+                                break;
+                            }
+                        }
+                    }
+                }
             }
+        };
+
+        // JD connection is going away: stop serving the stale job downstream.
+        self.declared_job_state.clear().await;
+        run_result
+    }
+
+    /// Relay a batch of locally-accepted shares to the pool and log the result.
+    ///
+    /// DIVERGENCE NOTE: the pool is authoritative for credit. The proxy was
+    /// already told `Accepted` locally, so a pool rejection here cannot be
+    /// propagated downstream — it is logged as a warning only.
+    async fn relay_shares(
+        &self,
+        transport: &mut JdClientTransport,
+        batch: SubmitSharesJd,
+    ) -> Result<()> {
+        let count = batch.shares.len();
+        let request_id = batch.request_id;
+        let job_id = batch.job_id;
+        let encoded = encode_submit_shares_jd(&batch)?;
+        transport.write_full_message(&encoded).await?;
+
+        let full_message = transport
+            .read_full_message()
+            .await?
+            .ok_or_else(|| JdClientError::Protocol("JD server disconnected".to_string()))?;
+        let frame = MessageFrame::decode(&full_message)
+            .map_err(|e| JdClientError::Protocol(e.to_string()))?;
+
+        if frame.msg_type != message_types::SUBMIT_SHARES_JD_RESPONSE {
+            return Err(JdClientError::Protocol(format!(
+                "Unexpected response to SubmitSharesJd: 0x{:02x}",
+                frame.msg_type
+            )));
         }
+
+        let resp = decode_submit_shares_jd_response(&full_message)?;
+        if resp.rejected > 0 {
+            warn!(
+                job_id,
+                request_id,
+                accepted = resp.accepted,
+                rejected = resp.rejected,
+                first_error = %JdShareErrorCode::from_u8(resp.first_error_code)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unknown".to_string()),
+                "Pool rejected some relayed shares (pool is authoritative for credit)"
+            );
+        } else {
+            debug!(
+                job_id,
+                request_id,
+                accepted = resp.accepted,
+                count,
+                "Relayed share batch accepted by pool"
+            );
+        }
+        Ok(())
+    }
+
+    /// Send a `PushSolution` for a downstream share that met the block target.
+    /// One-way message: the server does not respond.
+    async fn send_push_solution(
+        &self,
+        transport: &mut JdClientTransport,
+        item: RelayShare,
+    ) -> Result<()> {
+        let solution = PushSolution::new(
+            JD_CHANNEL_ID,
+            item.job_id,
+            item.share.version,
+            item.share.time,
+            item.share.nonce,
+            item.share.solution,
+        );
+        let encoded = encode_push_solution(&solution)?;
+        transport.write_full_message(&encoded).await?;
+        info!(job_id = item.job_id, "Sent PushSolution to pool");
+        Ok(())
     }
 
     /// Allocate a mining job token from the pool
@@ -355,15 +500,21 @@ impl JdClient {
             coinbase.len()
         );
 
+        // Capture the template's raw non-coinbase transaction bytes BEFORE the
+        // builder/coinbase are moved into the request. The coinbase-only path
+        // otherwise keeps no raw tx bytes; the listener needs them to reassemble
+        // a full block when a downstream share meets the block target.
+        let raw_transactions = decode_template_tx_bytes(&template)?;
+
         let request = SetCustomMiningJob {
-            channel_id: 1,
+            channel_id: JD_CHANNEL_ID,
             request_id: template.height as u32,
             mining_job_token: token,
             version: template.header.version,
             prev_hash: template.header.prev_hash.0,
             merkle_root,
             block_commitments,
-            coinbase_tx: coinbase,
+            coinbase_tx: coinbase.clone(),
             time: template.header.time,
             bits: template.header.bits,
         };
@@ -395,6 +546,24 @@ impl JdClient {
                 // Remember the pool-granted share target for later share relay/validation.
                 let mut share_target = self.current_share_target.write().await;
                 *share_target = Some(response.share_target);
+                drop(share_target);
+
+                // Publish the declared job to the downstream listener so the
+                // proxy can be served this exact template.
+                self.declared_job_state
+                    .set(CurrentDeclaredJob {
+                        job_id: response.job_id,
+                        version: template.header.version,
+                        prev_hash: template.header.prev_hash.0,
+                        merkle_root,
+                        block_commitments,
+                        time: template.header.time,
+                        bits: template.header.bits,
+                        share_target: response.share_target,
+                        coinbase_tx: coinbase,
+                        transactions: raw_transactions,
+                    })
+                    .await;
             }
             message_types::SET_CUSTOM_MINING_JOB_ERROR => {
                 let error = decode_set_custom_job_error(&full_message)?;
@@ -446,7 +615,7 @@ impl JdClient {
         );
 
         let request = full_builder.build_job(
-            1,
+            JD_CHANNEL_ID,
             template.height as u32,
             token.clone(),
             template.header.version,
@@ -519,6 +688,13 @@ impl JdClient {
                 }
             }
         }
+    }
+
+    /// Get the share-relay sender, wiring it on first call.
+    ///
+    /// Used by tests and by `run()` to inject shares as if from the listener.
+    pub fn declared_job_state(&self) -> Arc<DeclaredJobState> {
+        self.declared_job_state.clone()
     }
 
     fn extract_template_transactions(
@@ -669,6 +845,21 @@ impl JdClient {
             transactions,
         }
     }
+}
+
+/// Decode the raw non-coinbase transaction bytes from a template, in order.
+///
+/// `getblocktemplate` returns each transaction as raw consensus hex in
+/// `tx.data`; this decodes them so a full block can be reassembled later.
+fn decode_template_tx_bytes(template: &BlockTemplate) -> Result<Vec<Vec<u8>>> {
+    template
+        .transactions
+        .iter()
+        .map(|tx| {
+            hex::decode(&tx.data)
+                .map_err(|e| JdClientError::Protocol(format!("invalid tx data: {}", e)))
+        })
+        .collect()
 }
 
 #[cfg(test)]

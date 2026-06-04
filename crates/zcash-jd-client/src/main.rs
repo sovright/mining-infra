@@ -62,6 +62,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         full_template_mode: args.full_template,
         tx_selection: TxSelectionStrategy::parse(&args.tx_selection)
             .unwrap_or(TxSelectionStrategy::All),
+        jdc_listen: None,
     };
 
     info!("=== Zcash JD Client ===");
