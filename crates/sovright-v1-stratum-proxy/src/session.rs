@@ -3,7 +3,7 @@ use crate::translate::{self, TranslateError};
 use crate::v1::codec::V1Codec;
 use crate::v1::messages::{
     self, Authorize, ExtranonceSubscribe, JsonRpcRequest, Notification, SetExtranonceParams,
-    Submit, Subscribe, SubscribeResult, Subscription,
+    Submit, Subscribe,
 };
 use serde_json::Value;
 use std::collections::HashMap;
@@ -411,15 +411,16 @@ impl MinerSession {
 
         self.recompute_state();
 
-        let result = serde_json::to_value(SubscribeResult(
-            Subscription(
-                "mining.notify",
-                self.channel_id
-                    .map(|channel_id| channel_id.to_string())
-                    .unwrap_or_else(|| "session".to_string()),
-            ),
-            translate::bytes_to_hex(&self.nonce_1),
-        ))?;
+        // ZIP 301: mining.subscribe result is [SESSION_ID, NONCE_1], where
+        // SESSION_ID is a plain string (for reconnect), NOT a Bitcoin-style
+        // [method, subscription_id] pair. Real Zcash firmware (Bitmain Z15 /
+        // GodMiner) needs this shape; with the pair form it authorizes but
+        // silently drops once work arrives.
+        let session_id = self
+            .channel_id
+            .map(|channel_id| channel_id.to_string())
+            .unwrap_or_else(|| "session".to_string());
+        let result = serde_json::json!([session_id, translate::bytes_to_hex(&self.nonce_1)]);
 
         self.send_json(&messages::success_response(request_id, result)).await?;
         self.send_set_extranonce().await?;
@@ -753,11 +754,13 @@ impl MinerSession {
     }
 
     async fn send_target_update(&mut self, target: [u8; 32]) -> Result<(), SessionError> {
-        let (target_params, difficulty_params) = translate::target_to_v1(&target);
+        let (target_params, _difficulty_params) = translate::target_to_v1(&target);
         let set_target = Notification::new("mining.set_target", target_params);
-        let set_difficulty = Notification::new("mining.set_difficulty", difficulty_params);
-        self.send_typed_json(&set_target).await?;
-        self.send_typed_json(&set_difficulty).await
+        // Zcash V1 miners (e.g. Bitmain Z15 / GodMiner) are target-based and use
+        // mining.set_target exclusively. Emitting a Bitcoin-style
+        // mining.set_difficulty alongside it causes some firmware to reject the
+        // session (observed: Z15 Pro disconnects ~130ms after the work burst).
+        self.send_typed_json(&set_target).await
     }
 
     async fn send_set_extranonce(&mut self) -> Result<(), SessionError> {

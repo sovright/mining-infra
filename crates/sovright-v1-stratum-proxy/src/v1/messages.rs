@@ -83,12 +83,6 @@ where
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct Subscription(pub &'static str, pub String);
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SubscribeResult(pub Subscription, pub String);
-
-#[derive(Debug, Clone, Serialize)]
 pub struct NotifyParams(
     pub String,
     pub String,

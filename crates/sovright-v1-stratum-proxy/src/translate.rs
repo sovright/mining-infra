@@ -64,14 +64,19 @@ pub fn reverse_hash(hash: &[u8; 32]) -> [u8; 32] {
 }
 
 pub fn job_to_notify(job: &NewEquihashJob) -> NotifyParams {
+    // version/ntime/nbits are sent as little-endian header bytes (the order
+    // they appear in the serialized Zcash block header), matching the
+    // real-world Zcash stratum dialect that ASIC firmware (e.g. Bitmain Z15 /
+    // GodMiner) expects. Previously these were big-endian readable hex, which
+    // Bedrock's own test miner tolerated but the Z15 rejected.
     NotifyParams(
         job.job_id.to_string(),
-        format!("{:08x}", job.version),
+        bytes_to_hex(&job.version.to_le_bytes()),
         bytes_to_hex(&reverse_hash(&job.prev_hash)),
         bytes_to_hex(&reverse_hash(&job.merkle_root)),
         bytes_to_hex(&reverse_hash(&job.block_commitments)),
-        format!("{:08x}", job.time),
-        format!("{:08x}", job.bits),
+        bytes_to_hex(&job.time.to_le_bytes()),
+        bytes_to_hex(&job.bits.to_le_bytes()),
         job.clean_jobs,
     )
 }
@@ -91,7 +96,8 @@ pub fn submit_to_v2(
     solution_hex: &str,
 ) -> Result<SubmitEquihashShare, TranslateError> {
     let nonce_2 = hex_to_bytes(nonce_2_hex)?;
-    let time = parse_hex_u32(time_hex)?;
+    // ZIP 301: submit NTIME is little-endian header bytes (same as notify).
+    let time = parse_hex_u32_le(time_hex)?;
     let solution = normalize_solution(solution_hex)?;
 
     Ok(SubmitEquihashShare {
@@ -104,26 +110,21 @@ pub fn submit_to_v2(
     })
 }
 
-pub fn parse_hex_u32(input: &str) -> Result<u32, TranslateError> {
-    let trimmed = input.trim();
-    let stripped = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
 
-    if stripped.is_empty() {
-        return Err(TranslateError::new("expected non-empty hex u32"));
-    }
-    if stripped.len() > 8 {
+/// Parse a little-endian u32 from a 4-byte hex string. ZIP 301 encodes
+/// NTIME/NBITS/VERSION "as in a block header" (little-endian), so a real Zcash
+/// miner's submit carries NTIME in this form.
+pub fn parse_hex_u32_le(input: &str) -> Result<u32, TranslateError> {
+    let bytes = hex_to_bytes(input)?;
+    if bytes.len() != 4 {
         return Err(TranslateError::new(format!(
-            "hex value '{}' does not fit in u32",
+            "expected 4-byte little-endian hex u32, got '{}'",
             input
         )));
     }
-
-    u32::from_str_radix(stripped, 16).map_err(|error| {
-        TranslateError::new(format!("invalid u32 hex '{}': {}", input, error))
-    })
+    let mut buf = [0u8; 4];
+    buf.copy_from_slice(&bytes);
+    Ok(u32::from_le_bytes(buf))
 }
 
 pub fn normalize_solution(solution_hex: &str) -> Result<[u8; 1344], TranslateError> {
