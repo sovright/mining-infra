@@ -25,10 +25,10 @@ struct Args {
     #[arg(long, short = 'c')]
     config: Option<PathBuf>,
 
-    #[arg(long)]
+    #[arg(long, env = "SV1_LISTEN")]
     listen: Option<SocketAddr>,
 
-    #[arg(long)]
+    #[arg(long, env = "UPSTREAM")]
     upstream: Option<SocketAddr>,
 
     #[arg(long)]
@@ -229,4 +229,79 @@ async fn shutdown_signal() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// Test SV1_LISTEN and UPSTREAM env vars.
+    ///
+    /// Both assertions are in a single test function so env mutations cannot
+    /// race other tests (cargo runs tests in parallel by default).
+    /// Env vars are restored at the end regardless of assertion outcome.
+    #[test]
+    fn env_vars_set_listen_and_upstream() {
+        let listen_key = "SV1_LISTEN";
+        let upstream_key = "UPSTREAM";
+        let listen_val = "127.0.0.1:3333";
+        let upstream_val = "127.0.0.1:3334";
+
+        // Save originals.
+        let saved_listen = std::env::var(listen_key).ok();
+        let saved_upstream = std::env::var(upstream_key).ok();
+
+        unsafe {
+            std::env::set_var(listen_key, listen_val);
+            std::env::set_var(upstream_key, upstream_val);
+        }
+
+        // Env set, no CLI flag — values come from env.
+        let args = Args::try_parse_from(["sovright-v1-stratum-proxy"]).unwrap();
+        assert_eq!(
+            args.listen,
+            Some(listen_val.parse().unwrap()),
+            "listen should come from SV1_LISTEN env var"
+        );
+        assert_eq!(
+            args.upstream,
+            Some(upstream_val.parse().unwrap()),
+            "upstream should come from UPSTREAM env var"
+        );
+
+        // Env set AND CLI flag given — CLI flag wins.
+        let cli_listen = "127.0.0.1:4444";
+        let cli_upstream = "127.0.0.1:4445";
+        let args = Args::try_parse_from([
+            "sovright-v1-stratum-proxy",
+            "--listen",
+            cli_listen,
+            "--upstream",
+            cli_upstream,
+        ])
+        .unwrap();
+        assert_eq!(
+            args.listen,
+            Some(cli_listen.parse().unwrap()),
+            "CLI --listen should take precedence over SV1_LISTEN env var"
+        );
+        assert_eq!(
+            args.upstream,
+            Some(cli_upstream.parse().unwrap()),
+            "CLI --upstream should take precedence over UPSTREAM env var"
+        );
+
+        // Restore originals.
+        unsafe {
+            match saved_listen {
+                Some(v) => std::env::set_var(listen_key, v),
+                None => std::env::remove_var(listen_key),
+            }
+            match saved_upstream {
+                Some(v) => std::env::set_var(upstream_key, v),
+                None => std::env::remove_var(upstream_key),
+            }
+        }
+    }
 }
