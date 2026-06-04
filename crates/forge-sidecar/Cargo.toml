@@ -14,7 +14,7 @@ name = "forge_sidecar"
 path = "src/lib.rs"
 
 [dependencies]
-bedrock-forge = { path = "../bedrock-forge" }
+sovright-relay = { path = "../sovright-relay" }
 tokio = { workspace = true, features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }

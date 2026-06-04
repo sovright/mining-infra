@@ -1,11 +1,11 @@
 //! Forge relay integration for low-latency block propagation
 //!
-//! Wraps bedrock-forge library for compact block relay over UDP/FEC.
+//! Wraps sovright-relay library for compact block relay over UDP/FEC.
 //!
 //! The relay client runs as a background tokio task, sending and receiving
 //! compact blocks over authenticated UDP with Reed-Solomon FEC.
 
-use bedrock_forge::{
+use sovright_relay::{
     BlockChunker, BlockReceiver, BlockSender, ClientConfig, CompactBlock,
     PrefilledTx, RelayClient, ShortId, WtxId, AuthDigest, TxId,
 };
@@ -20,7 +20,7 @@ use zcash_template_provider::types::BlockTemplate;
 /// Equihash solution size for Zcash (n=200, k=9)
 const EQUIHASH_SOLUTION_SIZE: usize = 1344;
 
-/// Compute double-SHA256 header hash, matching bedrock-forge library convention.
+/// Compute double-SHA256 header hash, matching sovright-relay library convention.
 ///
 /// This MUST match `CompactBlock::header_hash()`, `CompactBlockBuilder::compute_header_hash()`,
 /// and `RelayClient::compute_block_hash()` so that short IDs are consistent between

@@ -1,6 +1,6 @@
 //! Forge relay client wrapper for sidecar
 
-use bedrock_forge::{BlockSender, ClientConfig, CompactBlock, RelayClient};
+use sovright_relay::{BlockSender, ClientConfig, CompactBlock, RelayClient};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;

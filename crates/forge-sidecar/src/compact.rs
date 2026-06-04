@@ -1,7 +1,7 @@
 //! Build CompactBlock from Zebra block templates
 
 use crate::rpc::BlockTemplate;
-use bedrock_forge::{AuthDigest, CompactBlock, PrefilledTx, ShortId, TxId, WtxId};
+use sovright_relay::{AuthDigest, CompactBlock, PrefilledTx, ShortId, TxId, WtxId};
 use sha2::{Digest, Sha256};
 use tracing::warn;
 

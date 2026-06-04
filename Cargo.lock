@@ -221,29 +221,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "bedrock-forge"
-version = "0.1.0"
-dependencies = [
- "arbitrary",
- "bytes",
- "criterion",
- "equihash",
- "hex",
- "hmac",
- "proptest",
- "rand 0.8.5",
- "reed-solomon-erasure",
- "sha2",
- "siphasher",
- "socket2 0.5.10",
- "subtle",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
 name = "bedrock-v1-proxy"
 version = "0.1.0"
 dependencies = [
@@ -786,13 +763,13 @@ checksum = "00b0228411908ca8685dba7fc2cdd70ec9990a6e753e89b6ac91a84c40fbaf4b"
 name = "forge-sidecar"
 version = "0.1.0"
 dependencies = [
- "bedrock-forge",
  "clap",
  "hex",
  "jsonrpsee",
  "serde",
  "serde_json",
  "sha2",
+ "sovright-relay",
  "tempfile",
  "tokio",
  "toml",
@@ -2681,6 +2658,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovright-relay"
+version = "0.1.0"
+dependencies = [
+ "arbitrary",
+ "bytes",
+ "criterion",
+ "equihash",
+ "hex",
+ "hmac",
+ "proptest",
+ "rand 0.8.5",
+ "reed-solomon-erasure",
+ "sha2",
+ "siphasher",
+ "socket2 0.5.10",
+ "subtle",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "sovright-telemetry"
 version = "0.1.0"
 dependencies = [
@@ -3921,7 +3921,6 @@ dependencies = [
 name = "zcash-pool-server"
 version = "0.1.0"
 dependencies = [
- "bedrock-forge",
  "byteorder",
  "criterion",
  "hex",
@@ -3930,6 +3929,7 @@ dependencies = [
  "serde",
  "sha2",
  "sovright-noise",
+ "sovright-relay",
  "sovright-telemetry",
  "thiserror 1.0.69",
  "tokio",

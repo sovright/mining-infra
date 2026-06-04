@@ -20,7 +20,7 @@ zcash-pool-common = { path = "../zcash-pool-common" }
 zcash-jd-server = { path = "../zcash-jd-server" }
 sovright-noise = { path = "../sovright-noise" }
 sovright-telemetry = { path = "../sovright-telemetry" }
-bedrock-forge = { path = "../bedrock-forge", optional = true }
+sovright-relay = { path = "../sovright-relay", optional = true }
 byteorder.workspace = true
 hex.workspace = true
 rand = "0.8"
@@ -28,7 +28,7 @@ sha2.workspace = true
 
 [features]
 default = ["forge"]
-forge = ["dep:bedrock-forge"]
+forge = ["dep:sovright-relay"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
