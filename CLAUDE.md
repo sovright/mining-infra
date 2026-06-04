@@ -45,7 +45,7 @@ zcash-pool-server (main orchestrator)
 ├── sovright-noise              # Noise_NK encryption
 ├── sovright-telemetry          # Prometheus metrics, tracing
 ├── sovright-relay              # Compact block relay
-└── sovright-relay-sidecar      # Relay sidecar binary (relay-sidecar)
+└── sovright-relay-sidecar      # Relay sidecar (builds binary: relay-sidecar)
 
 zcash-jd-client (standalone binary)
 ├── zcash-template-provider

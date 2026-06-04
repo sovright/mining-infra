@@ -30,7 +30,7 @@ zcash-jd-client (standalone binary)
 |-- zcash-mining-protocol
 `-- local Zebra node
 
-relay-sidecar (standalone binary)
+sovright-relay-sidecar (builds binary: relay-sidecar)
 |-- sovright-relay
 `-- Zebra RPC polling
 ```

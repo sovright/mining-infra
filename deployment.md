@@ -25,6 +25,19 @@ The project was rebranded from Bedrock/Forge to Sovright. The rename touches ope
 
 **Testnet network name** — `BedrockTestnet` → `SovrightTestnet`. Nodes on different network names will not peer; all nodes must be redeployed together so they share the new `network_name`.
 
+**GCP resources** — existing VMs still carry the old `bedrock-testnet` network tag, and the old `bedrock-product-testnet` firewall rule still exists. Re-tag the VMs and remove the stale rule so traffic matches the new `sovright-product-testnet` rule:
+
+```bash
+# Re-tag each VM: add the new tag, drop the old one
+gcloud compute instances add-tags zebra-testnet \
+  --tags sovright-testnet --zone us-central1-a --project mining-pool-491623
+gcloud compute instances remove-tags zebra-testnet \
+  --tags bedrock-testnet --zone us-central1-a --project mining-pool-491623
+
+# Delete the stale firewall rule (after the sovright-product-testnet rule is in place)
+gcloud compute firewall-rules delete bedrock-product-testnet --project mining-pool-491623
+```
+
 ## Infrastructure
 
 | Resource | Details |
@@ -186,7 +199,7 @@ GCP VM: zebra-testnet (34.72.217.47)
 ├── Test Miner (Docker)
 │   └── Connects to pool at 127.0.0.1:3333
 │
-└── Product Stack (see Sovright-product/deployment.md)
+└── Product Stack (see sovright-product/deployment.md)
     ├── TimescaleDB: 127.0.0.1:5433
     ├── Sovright API: 0.0.0.0:8080
     │   ├── Polls pool Prometheus (127.0.0.1:9090)
