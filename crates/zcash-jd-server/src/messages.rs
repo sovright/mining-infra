@@ -199,7 +199,8 @@ pub struct SetCustomMiningJobSuccess {
     pub request_id: u32,
     /// Server-assigned job identifier
     pub job_id: u32,
-    /// Pool-granted share target for this declared job.
+    /// Pool-granted share target for this declared job (little-endian, matching
+    /// `Target::to_le_bytes`).
     ///
     /// The pool (never the client) chooses this so fake-easy shares cannot
     /// inflate payout credit. It is easier than the block target and is used by

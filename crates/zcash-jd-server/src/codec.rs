@@ -316,7 +316,8 @@ pub fn encode_set_custom_job_success(msg: &SetCustomMiningJobSuccess) -> Result<
     payload.write_u32::<LittleEndian>(msg.channel_id).unwrap();
     payload.write_u32::<LittleEndian>(msg.request_id).unwrap();
     payload.write_u32::<LittleEndian>(msg.job_id).unwrap();
-    // Pool-granted share target: 32 raw bytes appended at the END of the payload.
+    // Pool-granted share target: 32 raw bytes appended at the END of the payload
+    // (little-endian, matching Target::to_le_bytes).
     payload.write_all(&msg.share_target).unwrap();
 
     let frame = MessageFrame {
@@ -345,7 +346,8 @@ pub fn decode_set_custom_job_success(data: &[u8]) -> Result<SetCustomMiningJobSu
         .read_u32::<LittleEndian>()
         .map_err(|e| JdServerError::Protocol(e.to_string()))?;
 
-    // Pool-granted share target: 32 raw bytes at the END of the payload.
+    // Pool-granted share target: 32 raw bytes at the END of the payload
+    // (little-endian, matching Target::to_le_bytes).
     let mut share_target = [0u8; 32];
     cursor
         .read_exact(&mut share_target)

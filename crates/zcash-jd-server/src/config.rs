@@ -36,23 +36,34 @@ pub struct JdServerConfig {
     /// Minimum pool payout value (zatoshis) for full templates
     pub min_pool_payout: u64,
 
-    /// Pool-granted share target for declared jobs.
+    /// Pool-granted share target for declared jobs (little-endian, matching
+    /// `Target::to_le_bytes`).
     ///
     /// The pool chooses this (never the client) so fake-easy shares cannot
     /// inflate payout credit. It is granted at declaration time, returned in
     /// `SetCustomMiningJobSuccess`, and stored in the job for share validation.
     ///
-    /// The default mirrors how the stratum side derives its initial share
-    /// target from `initial_difficulty` (testnet example: 0.0001) via
-    /// `zcash_equihash_validator::difficulty::difficulty_to_target`, keeping the
-    /// JD declared-job share target at parity with the stratum share target.
+    /// The default is derived via
+    /// `zcash_equihash_validator::difficulty::difficulty_to_target` from a
+    /// difficulty of 0.0001, which matches the testnet example configs'
+    /// `initial_difficulty`. There is no shared constant linking the JD and
+    /// stratum systems — the stratum DEFAULT `initial_difficulty` is 1.0
+    /// (`zcash-pool-server/src/config.rs`), and 0.0001 appears only in the
+    /// testnet example binaries.
+    ///
+    /// Note: `difficulty_to_target(0.0001)` clamps to all-ones (`[0xff; 32]`)
+    /// because difficulty < 1.0 (see `difficulty.rs`), so the DEFAULT accepts
+    /// any valid Equihash solution. Production configs MUST set a real target.
     pub share_target: [u8; 32],
 }
 
-/// The default initial difficulty used to derive the JD share target.
+/// The default difficulty used to derive the JD share target.
 ///
-/// Kept in parity with the stratum side's `initial_difficulty` (the testnet
-/// example uses 0.0001); see [`JdServerConfig::share_target`].
+/// Matches the testnet example configs' `initial_difficulty` (0.0001); there is
+/// no shared constant linking the JD and stratum systems (the stratum DEFAULT is
+/// 1.0). Because 0.0001 < 1.0, the derived target clamps to all-ones and accepts
+/// any valid Equihash solution — production configs must override it. See
+/// [`JdServerConfig::share_target`].
 const DEFAULT_SHARE_DIFFICULTY: f64 = 0.0001;
 
 impl Default for JdServerConfig {
