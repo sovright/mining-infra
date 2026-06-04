@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use crate::error::{Error, Result};
-use crate::rpc::RpcProvider;
+use crate::rpc::{RpcProvider, SubmitBlockResult, SubmitMode};
 use crate::types::{DefaultRoots, GetBlockTemplateResponse, TemplateTransaction};
 
 // ---------------------------------------------------------------------------
@@ -64,9 +64,9 @@ impl RpcProvider for MockZebraRpc {
             .unwrap_or_else(|| Err(Error::Rpc("no queued templates".into())))
     }
 
-    async fn submit_block(&self, block_hex: &str) -> Result<Option<String>> {
+    async fn submit_block(&self, block_hex: &str, _mode: Option<SubmitMode>) -> Result<SubmitBlockResult> {
         self.submitted.lock().unwrap().push(block_hex.to_string());
-        Ok(None)
+        Ok(SubmitBlockResult::Accepted)
     }
 
     async fn get_best_block_hash(&self) -> Result<String> {
@@ -239,8 +239,8 @@ mod tests {
     async fn mock_rpc_tracks_submitted_blocks() {
         let mock = MockZebraRpc::new();
 
-        mock.submit_block("aabbccdd").await.unwrap();
-        mock.submit_block("11223344").await.unwrap();
+        mock.submit_block("aabbccdd", None).await.unwrap();
+        mock.submit_block("11223344", None).await.unwrap();
 
         let submitted = mock.submitted_blocks();
         assert_eq!(submitted, vec!["aabbccdd", "11223344"]);
