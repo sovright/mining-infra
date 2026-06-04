@@ -6,29 +6,34 @@
 
 use crate::codec::{
     decode_allocate_token, decode_provide_missing_transactions, decode_push_solution,
-    decode_set_custom_job, decode_set_full_template_job, encode_allocate_token_success,
-    encode_get_missing_transactions, encode_set_custom_job_error, encode_set_custom_job_success,
-    encode_set_full_template_job_error, encode_set_full_template_job_success,
+    decode_set_custom_job, decode_set_full_template_job, decode_submit_shares_jd,
+    encode_allocate_token_success, encode_get_missing_transactions, encode_set_custom_job_error,
+    encode_set_custom_job_success, encode_set_full_template_job_error,
+    encode_set_full_template_job_success, encode_submit_shares_jd_response,
 };
 use crate::config::JdServerConfig;
 use crate::error::{JdServerError, Result};
 use crate::messages::{
-    AllocateMiningJobTokenSuccess, GetMissingTransactions, JobDeclarationMode,
-    ProvideMissingTransactions, PushSolution, SetCustomMiningJob, SetCustomMiningJobError,
-    SetCustomMiningJobErrorCode, SetCustomMiningJobSuccess, SetFullTemplateJob,
-    SetFullTemplateJobError, SetFullTemplateJobErrorCode, SetFullTemplateJobSuccess, message_types,
+    AllocateMiningJobTokenSuccess, GetMissingTransactions, JdShare, JdShareErrorCode,
+    JobDeclarationMode, ProvideMissingTransactions, PushSolution, SetCustomMiningJob,
+    SetCustomMiningJobError, SetCustomMiningJobErrorCode, SetCustomMiningJobSuccess,
+    SetFullTemplateJob, SetFullTemplateJobError, SetFullTemplateJobErrorCode,
+    SetFullTemplateJobSuccess, SubmitSharesJd, SubmitSharesJdResponse, message_types,
 };
 use crate::token::{DeclaredJobInfo, TokenManager};
 use crate::validation::{TemplateValidator, ValidationResult};
 use sovright_noise::NoiseStream;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock as TokioRwLock;
 use tracing::{debug, error, info, warn};
-use zcash_equihash_validator::{EquihashValidator, compact_to_target, target_to_difficulty};
+use zcash_equihash_validator::{
+    EquihashValidator, Target, compact_to_target, target_to_difficulty,
+};
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
 
@@ -51,6 +56,34 @@ fn next_positive_job_id(counter: &AtomicU32) -> u32 {
             return job_id;
         }
     }
+}
+
+/// Build the 140-byte block header for a declared job using the miner-supplied
+/// `time` and `nonce`. All other fields come from the stored `DeclaredJobInfo`.
+///
+/// Layout: [0:4]=version LE, [4:36]=prev_hash, [36:68]=merkle_root,
+/// [68:100]=block_commitments, [100:104]=time LE, [104:108]=bits LE,
+/// [108:140]=nonce.
+fn build_header(job: &DeclaredJobInfo, time: u32, nonce: &[u8; 32]) -> [u8; 140] {
+    let mut header = [0u8; 140];
+    header[0..4].copy_from_slice(&job.version.to_le_bytes());
+    header[4..36].copy_from_slice(&job.prev_hash);
+    header[36..68].copy_from_slice(&job.merkle_root);
+    header[68..100].copy_from_slice(&job.block_commitments);
+    header[100..104].copy_from_slice(&time.to_le_bytes());
+    header[104..108].copy_from_slice(&job.bits.to_le_bytes());
+    header[108..140].copy_from_slice(nonce);
+    header
+}
+
+/// Compute the dedup key for a share: `sha256(nonce ‖ time_le ‖ solution[..64])`.
+fn share_dedup_key(share: &JdShare) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(share.nonce);
+    hasher.update(share.time.to_le_bytes());
+    hasher.update(&share.solution[..64]);
+    hasher.finalize().into()
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +126,21 @@ pub struct JdServer {
     current_template: Arc<TokioRwLock<Option<CurrentTemplateContext>>>,
     /// Outstanding missing-transaction requests keyed by (client_id, request_id)
     pending_missing: Arc<TokioRwLock<HashMap<(String, u32), PendingMissingTransactions>>>,
+    /// Per-job dedup sets of seen share keys, keyed by job_id.
+    ///
+    /// A share key is `sha256(nonce ‖ time_le ‖ solution[..64])`. A key is
+    /// registered the moment a share passes the cheap checks (before the
+    /// expensive Equihash verification), so byte-identical replays are rejected
+    /// as duplicates regardless of validity. Remembering an invalid share is
+    /// harmless and rate-limits resubmission of garbage. Entries for jobs that
+    /// no longer resolve are evicted at the head of each handler call, bounding
+    /// growth by the live job count; each per-job set is additionally capped.
+    seen_shares: Mutex<HashMap<u32, HashSet<[u8; 32]>>>,
 }
+
+/// Maximum number of distinct share keys remembered per job before further
+/// distinct shares are treated as duplicates (prevents memory abuse).
+const MAX_SEEN_SHARES_PER_JOB: usize = 10_000;
 
 impl JdServer {
     /// Create a new JD Server
@@ -113,6 +160,7 @@ impl JdServer {
             current_prev_hash: Arc::new(TokioRwLock::new(None)),
             current_template: Arc::new(TokioRwLock::new(None)),
             pending_missing: Arc::new(TokioRwLock::new(HashMap::new())),
+            seen_shares: Mutex::new(HashMap::new()),
         }
     }
 
@@ -516,14 +564,7 @@ impl JdServer {
             ));
         }
 
-        let mut header = [0u8; 140];
-        header[0..4].copy_from_slice(&job.version.to_le_bytes());
-        header[4..36].copy_from_slice(&job.prev_hash);
-        header[36..68].copy_from_slice(&job.merkle_root);
-        header[68..100].copy_from_slice(&job.block_commitments);
-        header[100..104].copy_from_slice(&solution.time.to_le_bytes());
-        header[104..108].copy_from_slice(&job.bits.to_le_bytes());
-        header[108..140].copy_from_slice(&solution.nonce);
+        let header = build_header(&job, solution.time, &solution.nonce);
 
         let target = compact_to_target(job.bits).to_le_bytes();
         let validator = EquihashValidator::new();
@@ -542,6 +583,162 @@ impl JdServer {
         );
 
         Ok(())
+    }
+
+    /// Handle a batch of declared-job shares relayed by a (untrusted) JDC.
+    ///
+    /// The pool fully verifies every share before crediting any payout. This
+    /// method is infallible: every failure is a *counted rejection*, never an
+    /// `Err`. (Protocol-level garbage — bad framing, count out of range — was
+    /// already rejected at decode time.)
+    ///
+    /// Per-share validation order is cheapest-first, which is also the right DoS
+    /// posture: channel match, version match, time window, dedup-register, then
+    /// the expensive Equihash verification against the pool-granted
+    /// `share_target`. Credit is recorded only after a share clears every check.
+    ///
+    /// Version-mismatch decision: a share whose version differs from the
+    /// declared job is rejected as `StaleJob` — a version change implies the job
+    /// rolled / the template changed underneath the miner.
+    ///
+    /// Dedup decision: the share key is registered the moment a share passes the
+    /// cheap checks, *before* Equihash verification. Byte-identical replays are
+    /// therefore `Duplicate` regardless of validity; remembering an invalid
+    /// share is harmless and rate-limits resubmission of garbage.
+    pub async fn handle_submit_shares_jd(&self, msg: SubmitSharesJd) -> SubmitSharesJdResponse {
+        // Evict dedup entries for jobs that no longer resolve (expired/unknown).
+        // Bounded by the number of tracked jobs.
+        {
+            let mut seen = self.seen_shares.lock().unwrap_or_else(|e| e.into_inner());
+            seen.retain(|job_id, _| self.token_manager.find_job_by_id(*job_id).is_ok());
+        }
+
+        let mut accepted: u16 = 0;
+        let mut rejected: u16 = 0;
+        let mut first_error: Option<JdShareErrorCode> = None;
+
+        // Resolve the job once for the whole batch. If it is unknown, every
+        // share in the batch is rejected with UnknownJob.
+        let job = match self.token_manager.find_job_by_id(msg.job_id) {
+            Ok(job) => job,
+            Err(_) => {
+                let n = msg.shares.len() as u16;
+                warn!(
+                    channel_id = msg.channel_id,
+                    job_id = msg.job_id,
+                    count = n,
+                    "SubmitSharesJd for unknown job"
+                );
+                return SubmitSharesJdResponse {
+                    channel_id: msg.channel_id,
+                    request_id: msg.request_id,
+                    accepted: 0,
+                    rejected: n,
+                    first_error_code: JdShareErrorCode::UnknownJob.as_u8(),
+                };
+            }
+        };
+
+        let validator = EquihashValidator::new();
+        let share_target = job.share_target;
+
+        const MAX_TIME_FORWARD: u32 = 7200;
+        const MAX_TIME_BACKWARD: u32 = 60;
+
+        for share in &msg.shares {
+            let reject = |code: JdShareErrorCode,
+                          rejected: &mut u16,
+                          first_error: &mut Option<JdShareErrorCode>| {
+                *rejected += 1;
+                if first_error.is_none() {
+                    *first_error = Some(code);
+                }
+            };
+
+            // 1. Channel must match the declared job's channel.
+            if msg.channel_id != job.channel_id {
+                reject(
+                    JdShareErrorCode::ChannelMismatch,
+                    &mut rejected,
+                    &mut first_error,
+                );
+                continue;
+            }
+
+            // 2. Version must match (a change means the job rolled -> stale).
+            if share.version != job.version {
+                reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
+                continue;
+            }
+
+            // 3. Time must fall within the job's acceptance window.
+            if share.time < job.time.saturating_sub(MAX_TIME_BACKWARD)
+                || share.time > job.time.saturating_add(MAX_TIME_FORWARD)
+            {
+                reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
+                continue;
+            }
+
+            // 4. Dedup: register the key BEFORE the expensive Equihash check so
+            //    byte-identical replays are caught regardless of validity.
+            let key = share_dedup_key(share);
+            {
+                let mut seen = self.seen_shares.lock().unwrap_or_else(|e| e.into_inner());
+                let set = seen.entry(msg.job_id).or_default();
+                if set.contains(&key) {
+                    reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
+                    continue;
+                }
+                if set.len() >= MAX_SEEN_SHARES_PER_JOB {
+                    // Cap reached: treat further distinct shares as duplicates to
+                    // bound memory. Warn so operators can spot abuse.
+                    warn!(
+                        job_id = msg.job_id,
+                        cap = MAX_SEEN_SHARES_PER_JOB,
+                        "Per-job dedup set full; rejecting share as duplicate"
+                    );
+                    reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
+                    continue;
+                }
+                set.insert(key);
+            }
+
+            // 5. Expensive: verify Equihash solution meets the share target.
+            let header = build_header(&job, share.time, &share.nonce);
+            if validator
+                .verify_share(&header, &share.solution, &share_target)
+                .is_err()
+            {
+                reject(
+                    JdShareErrorCode::BadSolution,
+                    &mut rejected,
+                    &mut first_error,
+                );
+                continue;
+            }
+
+            // Share is valid: credit the declaring client at the share target's
+            // difficulty.
+            let difficulty = target_to_difficulty(&Target::from_le_bytes(share_target));
+            self.payout_tracker.record_share(&job.client_id, difficulty);
+            accepted += 1;
+        }
+
+        debug!(
+            channel_id = msg.channel_id,
+            job_id = msg.job_id,
+            accepted,
+            rejected,
+            "Processed SubmitSharesJd batch"
+        );
+
+        SubmitSharesJdResponse {
+            channel_id: msg.channel_id,
+            request_id: msg.request_id,
+            accepted,
+            rejected,
+            first_error_code: first_error.map(|c| c.as_u8()).unwrap_or(0),
+        }
     }
 
     /// Handle a full template job declaration (Full-Template mode)
@@ -1113,6 +1310,23 @@ pub async fn handle_jd_client_with_transport(
                         "Error processing solution"
                     );
                 }
+            }
+
+            message_types::SUBMIT_SHARES_JD => {
+                let msg = decode_submit_shares_jd(&full_message)?;
+                debug!(
+                    client_id,
+                    channel_id = msg.channel_id,
+                    request_id = msg.request_id,
+                    job_id = msg.job_id,
+                    count = msg.shares.len(),
+                    "Received SubmitSharesJd"
+                );
+
+                // SubmitSharesJd always gets a response (unlike PushSolution).
+                let response = jd_server.handle_submit_shares_jd(msg).await;
+                let encoded = encode_submit_shares_jd_response(&response)?;
+                transport.write_full_message(&encoded).await?;
             }
 
             message_types::SET_FULL_TEMPLATE_JOB => {

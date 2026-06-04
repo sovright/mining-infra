@@ -800,6 +800,13 @@ const MAX_SHARE_COUNT: u16 = 64;
 /// count u16 LE, then per share: version u32 LE, time u32 LE,
 /// nonce 32 raw bytes (LE), solution 1344 raw bytes.
 pub fn encode_submit_shares_jd(msg: &SubmitSharesJd) -> Result<Vec<u8>> {
+    debug_assert!(
+        msg.shares.len() <= MAX_SHARE_COUNT as usize && !msg.shares.is_empty(),
+        "SubmitSharesJd batch must contain 1..={} shares, got {}",
+        MAX_SHARE_COUNT,
+        msg.shares.len()
+    );
+
     let mut payload = Vec::new();
 
     payload.write_u32::<LittleEndian>(msg.channel_id).unwrap();
