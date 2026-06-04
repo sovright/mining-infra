@@ -42,17 +42,9 @@ impl CompactBlock {
         }
     }
 
-    /// Get the block header hash for short ID calculation
-    ///
-    /// Note: In production, this would compute double-SHA256 of header.
-    /// For now we require it to be passed in.
+    /// Get the Zcash block header hash for short ID calculation.
     pub fn header_hash(&self) -> BlockHash {
-        use sha2::{Digest, Sha256};
-        let first = Sha256::digest(&self.header);
-        let second = Sha256::digest(first);
-        let mut hash = [0u8; 32];
-        hash.copy_from_slice(&second);
-        BlockHash::from_bytes(hash)
+        BlockHash::from_bytes(crate::zcash_block_hash(&self.header))
     }
 
     /// Total number of transactions in the original block
@@ -83,12 +75,7 @@ mod tests {
             tx_data: vec![0u8; 100], // Coinbase placeholder
         };
 
-        let compact = CompactBlock::new(
-            header,
-            nonce,
-            vec![short_id],
-            vec![prefilled],
-        );
+        let compact = CompactBlock::new(header, nonce, vec![short_id], vec![prefilled]);
 
         assert_eq!(compact.tx_count(), 2); // 1 short_id + 1 prefilled
         assert_eq!(compact.nonce, nonce);
@@ -100,7 +87,10 @@ mod tests {
             vec![0u8; 2189],
             0,
             vec![],
-            vec![PrefilledTx { index: 0, tx_data: vec![1, 2, 3] }],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: vec![1, 2, 3],
+            }],
         );
 
         assert_eq!(compact.prefilled_txs.len(), 1);

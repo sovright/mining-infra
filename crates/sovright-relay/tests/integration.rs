@@ -1,9 +1,8 @@
 //! Integration tests for compact block round-trip
 
 use sovright_relay::{
-    CompactBlockBuilder, CompactBlockReconstructor,
-    ReconstructionResult, TestMempool, WtxId, TxId, AuthDigest,
-    GetBlockTxn, BlockTxn, BlockHash,
+    AuthDigest, BlockHash, BlockTxn, CompactBlockBuilder, CompactBlockReconstructor, GetBlockTxn,
+    ReconstructionResult, TestMempool, TxId, WtxId, zcash_block_hash,
 };
 
 fn make_wtxid(seed: u8) -> WtxId {
@@ -14,12 +13,7 @@ fn make_wtxid(seed: u8) -> WtxId {
 }
 
 fn header_hash_from_header(header: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut h = [0u8; 32];
-    h.copy_from_slice(&second);
-    h
+    zcash_block_hash(header)
 }
 
 /// Full round trip: sender builds compact block, receiver reconstructs
@@ -48,7 +42,11 @@ fn full_round_trip_synchronized_mempools() {
     let compact = builder.build(&sender_view);
 
     // Verify compact block has minimal prefills (just coinbase)
-    assert_eq!(compact.prefilled_txs.len(), 1, "Should only prefill coinbase");
+    assert_eq!(
+        compact.prefilled_txs.len(),
+        1,
+        "Should only prefill coinbase"
+    );
     assert_eq!(compact.short_ids.len(), 10, "Should have 10 short IDs");
 
     // Receiver's mempool matches sender's view
@@ -128,10 +126,15 @@ fn round_trip_with_missing_transactions() {
             unresolved_short_ids,
             ..
         } => {
-            assert_eq!(unresolved_short_ids.len(), 1, "Should have 1 unresolved short ID");
+            assert_eq!(
+                unresolved_short_ids.len(),
+                1,
+                "Should have 1 unresolved short ID"
+            );
 
             // Find which indexes are missing
-            partial.iter()
+            partial
+                .iter()
                 .enumerate()
                 .filter(|(_, tx)| tx.is_none())
                 .map(|(i, _)| i)
@@ -209,5 +212,9 @@ fn bandwidth_savings_measurement() {
     println!("Bandwidth savings: {:.1}%", savings_pct);
 
     // With good mempool sync, should save >80% bandwidth
-    assert!(savings_pct > 80.0, "Expected >80% bandwidth savings, got {:.1}%", savings_pct);
+    assert!(
+        savings_pct > 80.0,
+        "Expected >80% bandwidth savings, got {:.1}%",
+        savings_pct
+    );
 }

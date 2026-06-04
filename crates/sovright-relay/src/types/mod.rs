@@ -6,7 +6,7 @@ mod txid;
 
 pub use block::BlockHash;
 pub use short_id::ShortId;
-pub use txid::{TxId, WtxId, AuthDigest};
+pub use txid::{AuthDigest, TxId, WtxId};
 
 #[cfg(test)]
 mod tests {

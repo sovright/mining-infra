@@ -19,6 +19,11 @@ This crate implements the core compact block protocol for bandwidth-efficient bl
 - **Transaction ID Types**: Support for Zcash v5 transaction identifiers (txid, wtxid per ZIP 244/239)
 - **Protocol Messages**: GetBlockTxn, BlockTxn, and SendCmpct message types
 
+## Binaries
+
+- `sovright-relay-relay`: authenticated UDP relay daemon for the Sovright relay network.
+- `sovright-relay-probe`: synthetic authenticated compact-block sender for private relay smoke tests.
+
 ## Quick Start
 
 ```rust

@@ -192,15 +192,7 @@ mod tests {
 
         let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
 
-        // Use same header hash computation as builder
-        let header_hash = {
-            use sha2::{Digest, Sha256};
-            let first = Sha256::digest(&header);
-            let second = Sha256::digest(first);
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&second);
-            h
-        };
+        let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
         let result = reconstructor.reconstruct(&compact);
@@ -243,20 +235,16 @@ mod tests {
         let receiver_mempool = TestMempool::new();
 
         let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
-        let header_hash = {
-            use sha2::{Digest, Sha256};
-            let first = Sha256::digest(&header);
-            let second = Sha256::digest(first);
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&second);
-            h
-        };
+        let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
         let result = reconstructor.reconstruct(&compact);
 
         match result {
-            ReconstructionResult::Incomplete { unresolved_short_ids, .. } => {
+            ReconstructionResult::Incomplete {
+                unresolved_short_ids,
+                ..
+            } => {
                 assert_eq!(unresolved_short_ids.len(), 1);
             }
             ReconstructionResult::Invalid { reason } => {
@@ -280,7 +268,10 @@ mod tests {
 
         let result = reconstructor.reconstruct(&compact);
         match result {
-            ReconstructionResult::Incomplete { unresolved_short_ids, .. } => {
+            ReconstructionResult::Incomplete {
+                unresolved_short_ids,
+                ..
+            } => {
                 assert_eq!(unresolved_short_ids, vec![short_id]);
             }
             ReconstructionResult::Invalid { reason } => {
@@ -309,14 +300,7 @@ mod tests {
         let receiver_mempool = TestMempool::new();
         let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
 
-        let header_hash = {
-            use sha2::{Digest, Sha256};
-            let first = Sha256::digest(&header);
-            let second = Sha256::digest(first);
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&second);
-            h
-        };
+        let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
         let result = reconstructor.reconstruct(&compact);
@@ -360,14 +344,7 @@ mod tests {
 
         let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
 
-        let header_hash = {
-            use sha2::{Digest, Sha256};
-            let first = Sha256::digest(&header);
-            let second = Sha256::digest(first);
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&second);
-            h
-        };
+        let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
         let result = reconstructor.reconstruct(&compact);
@@ -394,14 +371,7 @@ mod tests {
         let header = vec![0u8; 2189];
         let nonce = 0u64;
 
-        let header_hash = {
-            use sha2::{Digest, Sha256};
-            let first = Sha256::digest(&header);
-            let second = Sha256::digest(first);
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&second);
-            h
-        };
+        let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
         let compact = CompactBlock::new(vec![0u8; 2189], 0, vec![], vec![]);

@@ -4,23 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use sovright_relay::{
+    AuthDigest, BlockChunker, Chunk, ChunkHeader, CompactBlock, RelayConfig, RelayNode, ShortId,
+    StubPowValidator, WtxId,
     fec::{FecDecoder, FecEncoder},
-    AuthDigest, BlockChunker, Chunk, ChunkHeader, CompactBlock, RelayConfig, RelayNode,
-    StubPowValidator, ShortId, WtxId,
 };
 
-// The harness/ and fixtures/ modules are shared test support code loaded by
-// several integration-test binaries via `#[path]`. The duplicate load is
-// intentional and restructuring the test tree is out of scope here.
-#[path = "../harness/mod.rs"]
-#[allow(clippy::duplicate_mod)]
-mod harness;
-use harness::network::{NetworkConditions, PacketFate, SimulatedNetwork};
+use crate::harness::network::{NetworkConditions, PacketFate, SimulatedNetwork};
 
-#[path = "../fixtures/mod.rs"]
-#[allow(clippy::duplicate_mod)]
-mod fixtures;
-use fixtures::blocks::{create_synthetic_block, TestBlock};
+use crate::fixtures::blocks::{TestBlock, create_synthetic_block};
 
 /// Helper to build compact block bytes
 fn build_compact_block(block: &TestBlock) -> CompactBlock {
@@ -93,8 +84,8 @@ async fn stress_fec_recovery_under_loss() {
 /// Test: High throughput chunk processing
 #[tokio::test]
 async fn stress_high_throughput() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
     node.bind().await.unwrap();
     let addr = node.local_addr().unwrap();
@@ -115,7 +106,8 @@ async fn stress_high_throughput() {
     let num_chunks = 10_000;
 
     for i in 0..num_chunks {
-        let header = ChunkHeader::new_block(&block_hash, (i % 100) as u16, 100, chunk_data.len() as u16);
+        let header =
+            ChunkHeader::new_block(&block_hash, (i % 100) as u16, 100, chunk_data.len() as u16);
         let chunk = Chunk::new(header, chunk_data.clone());
         let _ = socket.send_to(&chunk.to_bytes(), addr).await;
     }
@@ -149,8 +141,8 @@ async fn stress_high_throughput() {
 #[tokio::test]
 #[ignore = "UDP loss threshold is environment-sensitive; run with --ignored"]
 async fn stress_concurrent_senders() {
-    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_unauthenticated_peers_allowed(true);
+    let config =
+        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_unauthenticated_peers_allowed(true);
     let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
     node.bind().await.unwrap();
     let addr = node.local_addr().unwrap();
@@ -175,8 +167,12 @@ async fn stress_concurrent_senders() {
             block_hash[0] = sender_id as u8;
 
             for i in 0..chunks_per_sender {
-                let header =
-                    ChunkHeader::new_block(&block_hash, (i % 50) as u16, 50, chunk_data.len() as u16);
+                let header = ChunkHeader::new_block(
+                    &block_hash,
+                    (i % 50) as u16,
+                    50,
+                    chunk_data.len() as u16,
+                );
                 let chunk = Chunk::new(header, chunk_data.clone());
                 let _ = socket.send_to(&chunk.to_bytes(), addr).await;
             }
@@ -236,13 +232,7 @@ async fn stress_large_block() {
     let shard_opts: Vec<Option<Vec<u8>>> = shards
         .iter()
         .enumerate()
-        .map(|(i, s)| {
-            if i % 10 == 0 {
-                None
-            } else {
-                Some(s.clone())
-            }
-        })
+        .map(|(i, s)| if i % 10 == 0 { None } else { Some(s.clone()) })
         .collect();
 
     let received_count = shard_opts.iter().filter(|s| s.is_some()).count();
@@ -352,5 +342,9 @@ async fn stress_rapid_blocks() {
     );
 
     // Should handle at least 10 blocks/sec
-    assert!(rate > 10.0, "Block processing too slow: {:.1} blocks/sec", rate);
+    assert!(
+        rate > 10.0,
+        "Block processing too slow: {:.1} blocks/sec",
+        rate
+    );
 }

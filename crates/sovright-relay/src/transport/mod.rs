@@ -10,14 +10,14 @@ mod pow;
 mod session;
 
 pub use chunk::{
-    Chunk, ChunkHeader, MessageType, CHUNK_MAGIC, HEADER_SIZE_V1, HEADER_SIZE_V2, MAX_PAYLOAD_SIZE,
-    MAX_TOTAL_CHUNKS,
+    CHUNK_MAGIC, Chunk, ChunkHeader, HEADER_SIZE_V1, HEADER_SIZE_V2, MAX_PAYLOAD_SIZE,
+    MAX_TOTAL_CHUNKS, MessageType,
 };
 pub use chunker::BlockChunker;
 pub use config::{ClientConfig, RelayConfig};
 pub use error::TransportError;
 pub use pow::{
-    EquihashPowValidator, PowResult, PowValidator, RejectAllValidator, StubPowValidator,
-    EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+    EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, PowResult, PowValidator,
+    RejectAllValidator, StubPowValidator, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
 };
 pub use session::{BlockAssembly, RelaySession};

@@ -2,7 +2,9 @@
 
 mod fixtures;
 
-use fixtures::blocks::{create_large_block, create_minimal_block, create_synthetic_block, create_testnet_block};
+use fixtures::blocks::{
+    create_large_block, create_minimal_block, create_synthetic_block, create_testnet_block,
+};
 
 #[test]
 fn synthetic_block_creation() {

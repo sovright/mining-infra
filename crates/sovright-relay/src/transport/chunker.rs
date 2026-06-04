@@ -2,6 +2,7 @@
 
 use crate::compact_block::CompactBlock;
 use crate::fec::{FecDecoder, FecEncoder, FecError};
+use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{MAX_PAYLOAD_SIZE, MAX_TOTAL_CHUNKS};
 
 /// Maximum header size (Zcash headers are ~2189 bytes, allow some margin)
@@ -15,7 +16,7 @@ const MAX_TX_COUNT: usize = 100_000;
 /// Maximum size of a single transaction
 const MAX_TX_DATA_SIZE: usize = 2_000_000; // 2MB
 
-use super::chunk::{Chunk, ChunkHeader};
+use super::chunk::{Chunk, ChunkHeader, MessageType};
 
 /// Converts compact blocks to FEC-encoded chunks for transmission
 pub struct BlockChunker {
@@ -101,14 +102,15 @@ impl BlockChunker {
         data
     }
 
-    /// Deserialize compact block from bytes
-    ///
-    /// Reads the content_len prefix to determine the actual payload boundary,
-    /// stripping any FEC padding that may follow.
-    fn deserialize_compact_block(data: &[u8]) -> std::io::Result<CompactBlock> {
-        use crate::compact_block::PrefilledTx;
-        use crate::types::ShortId;
-        use std::io::{self, Cursor, Read};
+    fn wrap_len_prefixed(content: &[u8]) -> Vec<u8> {
+        let mut data = Vec::with_capacity(4 + content.len());
+        data.extend_from_slice(&(content.len() as u32).to_le_bytes());
+        data.extend_from_slice(content);
+        data
+    }
+
+    fn read_len_prefixed(data: &[u8]) -> std::io::Result<&[u8]> {
+        use std::io;
 
         if data.len() < 4 {
             return Err(io::Error::new(
@@ -117,7 +119,6 @@ impl BlockChunker {
             ));
         }
 
-        // Read content length prefix (strips FEC padding)
         let content_len = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as usize;
         if content_len + 4 > data.len() {
             return Err(io::Error::new(
@@ -129,8 +130,21 @@ impl BlockChunker {
                 ),
             ));
         }
+
+        Ok(&data[4..4 + content_len])
+    }
+
+    /// Deserialize compact block from bytes
+    ///
+    /// Reads the content_len prefix to determine the actual payload boundary,
+    /// stripping any FEC padding that may follow.
+    fn deserialize_compact_block(data: &[u8]) -> std::io::Result<CompactBlock> {
+        use crate::compact_block::PrefilledTx;
+        use crate::types::ShortId;
+        use std::io::{self, Cursor, Read};
+
         // Parse only the content portion, ignoring any trailing FEC padding
-        let content = &data[4..4 + content_len];
+        let content = Self::read_len_prefixed(data)?;
 
         let mut cursor = Cursor::new(content);
         let mut buf4 = [0u8; 4];
@@ -225,14 +239,13 @@ impl BlockChunker {
         Ok(CompactBlock::new(header, nonce, short_ids, prefilled_txs))
     }
 
-    /// Convert a compact block into FEC-encoded chunks
-    pub fn compact_block_to_chunks(
+    fn data_to_chunks(
         &self,
-        compact: &CompactBlock,
-        block_hash: &[u8; 32],
+        msg_type: MessageType,
+        object_hash: &[u8; 32],
+        data: &[u8],
     ) -> Result<Vec<Chunk>, FecError> {
-        let data = Self::serialize_compact_block(compact);
-        let shards = self.encoder.encode(&data)?;
+        let shards = self.encoder.encode(data)?;
 
         if shards.len() > MAX_TOTAL_CHUNKS as usize {
             return Err(FecError::EncodingFailed(
@@ -247,25 +260,56 @@ impl BlockChunker {
             .enumerate()
             .map(|(i, shard)| {
                 if shard.len() > self.max_payload {
-                    return Err(FecError::EncodingFailed(
-                        format!(
-                            "shard too large for payload: {} > {}",
-                            shard.len(),
-                            self.max_payload
-                        ),
-                    ));
+                    return Err(FecError::EncodingFailed(format!(
+                        "shard too large for payload: {} > {}",
+                        shard.len(),
+                        self.max_payload
+                    )));
                 }
-                let header = ChunkHeader::new_block(
-                    block_hash,
-                    i as u16,
-                    total_chunks,
-                    shard.len() as u16,
-                );
+                let header = match msg_type {
+                    MessageType::Block => ChunkHeader::new_block(
+                        object_hash,
+                        i as u16,
+                        total_chunks,
+                        shard.len() as u16,
+                    ),
+                    MessageType::RawBlockSegment => ChunkHeader::new_raw_block_segment(
+                        object_hash,
+                        i as u16,
+                        total_chunks,
+                        shard.len() as u16,
+                    ),
+                    MessageType::Keepalive | MessageType::Auth => {
+                        return Err(FecError::EncodingFailed(
+                            "unsupported chunk data message type".into(),
+                        ));
+                    }
+                };
                 Ok(Chunk::new(header, shard))
             })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(chunks)
+    }
+
+    /// Convert a compact block into FEC-encoded chunks
+    pub fn compact_block_to_chunks(
+        &self,
+        compact: &CompactBlock,
+        block_hash: &[u8; 32],
+    ) -> Result<Vec<Chunk>, FecError> {
+        let data = Self::serialize_compact_block(compact);
+        self.data_to_chunks(MessageType::Block, block_hash, &data)
+    }
+
+    /// Convert a raw block segment into FEC-encoded chunks.
+    pub fn raw_block_segment_to_chunks(
+        &self,
+        segment: &RawBlockSegment,
+    ) -> Result<Vec<Chunk>, FecError> {
+        let object_hash = segment_object_hash(segment.block_hash, segment.segment_index);
+        let data = Self::wrap_len_prefixed(&segment.encode());
+        self.data_to_chunks(MessageType::RawBlockSegment, &object_hash, &data)
     }
 
     /// Reconstruct a compact block from received chunks
@@ -279,6 +323,19 @@ impl BlockChunker {
         let data = self.decoder.decode(chunks, original_len)?;
         Self::deserialize_compact_block(&data)
             .map_err(|e| FecError::DecodingFailed(format!("deserialization failed: {}", e)))
+    }
+
+    /// Reconstruct a raw block segment from received chunks.
+    pub fn chunks_to_raw_block_segment(
+        &self,
+        chunks: Vec<Option<Vec<u8>>>,
+        original_len: usize,
+    ) -> Result<RawBlockSegment, FecError> {
+        let data = self.decoder.decode(chunks, original_len)?;
+        let frame = Self::read_len_prefixed(&data)
+            .map_err(|e| FecError::DecodingFailed(format!("segment frame failed: {}", e)))?;
+        RawBlockSegment::decode(frame)
+            .map_err(|e| FecError::DecodingFailed(format!("segment decode failed: {}", e)))
     }
 
     /// Decode raw serialized data from shards (caller handles parsing)
@@ -328,7 +385,9 @@ mod tests {
         let block_hash = [0xcd; 32];
 
         // Serialize to chunks
-        let chunks = chunker.compact_block_to_chunks(&compact, &block_hash).unwrap();
+        let chunks = chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
         assert_eq!(chunks.len(), 13); // 10 data + 3 parity
 
         // Get original data length from serialization
@@ -336,13 +395,13 @@ mod tests {
         let original_len = original_data.len();
 
         // Extract payloads
-        let shard_opts: Vec<Option<Vec<u8>>> = chunks
-            .into_iter()
-            .map(|c| Some(c.payload))
-            .collect();
+        let shard_opts: Vec<Option<Vec<u8>>> =
+            chunks.into_iter().map(|c| Some(c.payload)).collect();
 
         // Reconstruct
-        let recovered = chunker.chunks_to_compact_block(shard_opts, original_len).unwrap();
+        let recovered = chunker
+            .chunks_to_compact_block(shard_opts, original_len)
+            .unwrap();
 
         assert_eq!(recovered.header, compact.header);
         assert_eq!(recovered.nonce, compact.nonce);
@@ -454,21 +513,23 @@ mod tests {
         let compact = make_test_compact_block();
         let block_hash = [0xcd; 32];
 
-        let chunks = chunker.compact_block_to_chunks(&compact, &block_hash).unwrap();
+        let chunks = chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
 
         let original_data = BlockChunker::serialize_compact_block(&compact);
         let original_len = original_data.len();
 
         // Lose 3 chunks (max recoverable)
-        let mut shard_opts: Vec<Option<Vec<u8>>> = chunks
-            .into_iter()
-            .map(|c| Some(c.payload))
-            .collect();
+        let mut shard_opts: Vec<Option<Vec<u8>>> =
+            chunks.into_iter().map(|c| Some(c.payload)).collect();
         shard_opts[1] = None;
         shard_opts[5] = None;
         shard_opts[9] = None;
 
-        let recovered = chunker.chunks_to_compact_block(shard_opts, original_len).unwrap();
+        let recovered = chunker
+            .chunks_to_compact_block(shard_opts, original_len)
+            .unwrap();
         assert_eq!(recovered.nonce, compact.nonce);
     }
 
@@ -487,6 +548,9 @@ mod tests {
         let min_shards = data.len().div_ceil(MAX_PAYLOAD_SIZE);
         let chunker_ok = BlockChunker::new(min_shards, 1).unwrap();
         let ok = chunker_ok.compact_block_to_chunks(&compact, &block_hash);
-        assert!(ok.is_ok(), "expected default max payload to allow shard size under limit");
+        assert!(
+            ok.is_ok(),
+            "expected default max payload to allow shard size under limit"
+        );
     }
 }

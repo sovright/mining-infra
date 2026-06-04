@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-/// Block header hash - 32-byte double-SHA256 of block header
+/// Block header hash - 32-byte raw Zcash block hash bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct BlockHash([u8; 32]);
 

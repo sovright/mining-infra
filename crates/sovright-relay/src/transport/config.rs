@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use crate::transport::{TransportError, MAX_PAYLOAD_SIZE};
+use crate::transport::{MAX_PAYLOAD_SIZE, TransportError};
 
 /// Maximum total shards for Reed-Solomon (8-bit)
 const MAX_TOTAL_SHARDS: usize = 256;
@@ -29,6 +29,11 @@ pub struct RelayConfig {
     pub allow_unauthenticated_peers: bool,
     /// Maximum number of active peer sessions to retain
     pub max_sessions: usize,
+    /// Number of forwarded packets to send before applying `forward_burst_delay`.
+    /// Zero disables relay-side forward pacing.
+    pub forward_burst_packets: usize,
+    /// Optional delay after each forwarded packet burst.
+    pub forward_burst_delay: Duration,
 }
 
 impl Default for RelayConfig {
@@ -43,6 +48,8 @@ impl Default for RelayConfig {
             authorized_keys: Vec::new(),
             allow_unauthenticated_peers: false,
             max_sessions: 4096,
+            forward_burst_packets: 0,
+            forward_burst_delay: Duration::ZERO,
         }
     }
 }
@@ -71,6 +78,13 @@ impl RelayConfig {
     /// Builder method: set max active sessions
     pub fn with_max_sessions(mut self, max_sessions: usize) -> Self {
         self.max_sessions = max_sessions;
+        self
+    }
+
+    /// Builder method: set relay-side outbound packet pacing
+    pub fn with_forward_pacing(mut self, burst_packets: usize, burst_delay: Duration) -> Self {
+        self.forward_burst_packets = burst_packets;
+        self.forward_burst_delay = burst_delay;
         self
     }
 
@@ -139,6 +153,11 @@ impl RelayConfig {
                 "max_sessions must be > 0".into(),
             ));
         }
+        if self.forward_burst_packets == 0 && !self.forward_burst_delay.is_zero() {
+            return Err(TransportError::InvalidChunk(
+                "forward_burst_packets must be > 0 when forward_burst_delay is set".into(),
+            ));
+        }
         if self.authorized_keys.is_empty() && !self.allow_unauthenticated_peers {
             return Err(TransportError::ConnectionRefused(
                 "authorized_keys required unless unauthenticated peers are explicitly allowed"
@@ -166,6 +185,11 @@ pub struct ClientConfig {
     pub recv_timeout: Duration,
     /// Whether authenticated chunks are required for inbound traffic
     pub auth_required: bool,
+    /// Number of outbound packets to send before applying `send_burst_delay`.
+    /// Zero disables client-side send pacing.
+    pub send_burst_packets: usize,
+    /// Optional delay after each outbound packet burst.
+    pub send_burst_delay: Duration,
 }
 
 impl ClientConfig {
@@ -179,6 +203,8 @@ impl ClientConfig {
             bind_addr: "0.0.0.0:0".parse().unwrap(),
             recv_timeout: Duration::from_secs(30),
             auth_required: false,
+            send_burst_packets: 0,
+            send_burst_delay: Duration::ZERO,
         }
     }
 
@@ -198,6 +224,13 @@ impl ClientConfig {
     /// Builder method: set auth requirement for inbound chunks
     pub fn with_auth_required(mut self, required: bool) -> Self {
         self.auth_required = required;
+        self
+    }
+
+    /// Builder method: set client-side outbound packet pacing
+    pub fn with_send_pacing(mut self, burst_packets: usize, burst_delay: Duration) -> Self {
+        self.send_burst_packets = burst_packets;
+        self.send_burst_delay = burst_delay;
         self
     }
 
@@ -230,6 +263,11 @@ impl ClientConfig {
                 "auth_required set but auth_key is all zeros".into(),
             ));
         }
+        if self.send_burst_packets == 0 && !self.send_burst_delay.is_zero() {
+            return Err(TransportError::InvalidChunk(
+                "send_burst_packets must be > 0 when send_burst_delay is set".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -244,6 +282,8 @@ mod tests {
         assert_eq!(config.data_shards, 10);
         assert_eq!(config.parity_shards, 3);
         assert_eq!(config.total_shards(), 13);
+        assert_eq!(config.forward_burst_packets, 0);
+        assert!(config.forward_burst_delay.is_zero());
     }
 
     #[test]
@@ -251,12 +291,15 @@ mod tests {
         let keys = vec![[0x42; 32]];
         let config = RelayConfig::new("127.0.0.1:9000".parse().unwrap())
             .with_authorized_keys(keys.clone())
-            .with_fec(8, 4);
+            .with_fec(8, 4)
+            .with_forward_pacing(32, Duration::from_millis(1));
 
         assert_eq!(config.listen_addr.port(), 9000);
         assert_eq!(config.authorized_keys, keys);
         assert_eq!(config.data_shards, 8);
         assert_eq!(config.parity_shards, 4);
+        assert_eq!(config.forward_burst_packets, 32);
+        assert_eq!(config.forward_burst_delay, Duration::from_millis(1));
     }
 
     #[test]
@@ -264,11 +307,14 @@ mod tests {
         let relays = vec!["127.0.0.1:8333".parse().unwrap()];
         let key = [0xab; 32];
         let config = ClientConfig::new(relays.clone(), key)
-            .with_fec(10, 3);
+            .with_fec(10, 3)
+            .with_send_pacing(32, Duration::from_millis(1));
 
         assert_eq!(config.relay_addrs, relays);
         assert_eq!(config.auth_key, key);
         assert_eq!(config.data_shards, 10);
+        assert_eq!(config.send_burst_packets, 32);
+        assert_eq!(config.send_burst_delay, Duration::from_millis(1));
     }
 
     #[test]
@@ -282,14 +328,14 @@ mod tests {
         // Invalid data shards
         let config = RelayConfig {
             data_shards: 0,
-            ..Default::default()
+            ..RelayConfig::default()
         };
         assert!(config.validate().is_err());
 
         // Invalid parity shards
         let config = RelayConfig {
             parity_shards: 0,
-            ..Default::default()
+            ..RelayConfig::default()
         };
         assert!(config.validate().is_err());
 
@@ -297,9 +343,14 @@ mod tests {
         let config = RelayConfig {
             data_shards: 200,
             parity_shards: 100,
-            ..Default::default()
+            ..RelayConfig::default()
         };
         assert!(config.validate().is_err());
+
+        let invalid_pacing = RelayConfig::default()
+            .with_unauthenticated_peers_allowed(true)
+            .with_forward_pacing(0, Duration::from_millis(1));
+        assert!(invalid_pacing.validate().is_err());
     }
 
     #[test]
@@ -312,6 +363,15 @@ mod tests {
 
         // Empty relay addrs
         assert!(ClientConfig::new(vec![], key).validate().is_err());
-        assert!(ClientConfig::new(relays, [0u8; 32]).with_auth_required(true).validate().is_err());
+        assert!(
+            ClientConfig::new(relays, [0u8; 32])
+                .with_auth_required(true)
+                .validate()
+                .is_err()
+        );
+
+        let invalid_pacing = ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], key)
+            .with_send_pacing(0, Duration::from_millis(1));
+        assert!(invalid_pacing.validate().is_err());
     }
 }

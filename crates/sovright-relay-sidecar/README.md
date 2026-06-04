@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="../../assets/brand/sovright-relay-sidecar-logo.svg" alt="Sovright Relay Sidecar" width="180">
+  <img src="../../assets/brand/forge-logo.svg" alt="FORGE" width="180">
 </p>
 
-# Sovright Relay Sidecar
+# FORGE Sidecar
 
 > Formerly `fiber-sidecar`.
 
@@ -10,10 +10,12 @@ A standalone sidecar binary that enables Stratum V1 mining pools to use sovright
 
 ## Overview
 
-The relay sidecar:
+The FORGE sidecar:
 - Polls Zebra for new block templates
 - Builds compact blocks when templates change
 - Announces compact blocks to the Sovright relay network
+- Optionally receives relay-reconstructed compact blocks in dry-run mode
+- Submits eligible relay-received blocks to Zebra only when explicitly enabled
 
 This allows any V1 pool (NOMP, etc.) to benefit from compact block relay without modification.
 
@@ -22,9 +24,9 @@ This allows any V1 pool (NOMP, etc.) to benefit from compact block relay without
 ### Command Line
 
 ```bash
-relay-sidecar \
+sovright-relay-sidecar \
     --zebra-url http://127.0.0.1:8232 \
-    --relay-peer relay.example.com:8333 \
+    --relay-peer forge-relay.example.com:8333 \
     --auth-key 0123456789abcdef... \
     --poll-interval-ms 100
 ```
@@ -32,10 +34,37 @@ relay-sidecar \
 ### Configuration File
 
 ```bash
-relay-sidecar --config config.toml
+sovright-relay-sidecar --config config.toml
 ```
 
 See `config.example.toml` for all options.
+
+### Relay Receive Safety
+
+Relay receive is disabled by default. To observe relay-received blocks without
+submitting them, enable dry-run receive:
+
+```bash
+sovright-relay-sidecar \
+    --zebra-url http://127.0.0.1:8232 \
+    --relay-peer forge-relay.example.com:8333 \
+    --auth-key 0123456789abcdef... \
+    --receive-relay-blocks \
+    --disable-template-announcements
+```
+
+`--enable-submitblock` requires `--receive-relay-blocks` and should remain off
+until mainnet cutover signoff. The sidecar only submits compact blocks that
+contain all transactions as contiguous prefilled transactions; header-only or
+short-ID-only compact blocks are rejected as non-submit candidates.
+`--disable-template-announcements` is useful while the local Zebra node is not
+at tip because it prevents stale template broadcasts while keeping relay receive
+telemetry alive.
+
+Relay FEC settings must match the relay nodes and any P2P ingress bridge in the
+same canary path. The defaults are `data_shards = 10` and `parity_shards = 3`;
+larger canary profiles can be set in `config.example.toml` or with
+`--data-shards` and `--parity-shards`.
 
 ## Architecture
 
@@ -45,12 +74,12 @@ STRATUM V1 POOL (unmodified)
         ▼ getblocktemplate/submitblock
     ZEBRA NODE ◄──────────────────────┐
         │                             │
-        │ poll templates              │ (future: submitblock)
+        │ poll templates              │ guarded submitblock, disabled by default
         ▼                             │
-   RELAY SIDECAR ─────────────────────┘
+   FORGE SIDECAR ─────────────────────┘
         │
         ▼ UDP/FEC
-   SOVRIGHT RELAY NETWORK
+   FORGE RELAY NETWORK
 ```
 
 ## Requirements
@@ -64,4 +93,4 @@ STRATUM V1 POOL (unmodified)
 cargo build --release -p sovright-relay-sidecar
 ```
 
-Binary will be at `target/release/relay-sidecar`.
+Binary will be at `target/release/sovright-relay-sidecar`.
