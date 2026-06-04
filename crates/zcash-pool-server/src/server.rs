@@ -108,8 +108,30 @@ pub struct PoolServer {
 }
 
 impl PoolServer {
-    /// Create a new pool server
+    /// Create a new pool server (fetches templates from a live Zebra RPC).
     pub fn new(config: PoolConfig) -> Result<Self> {
+        // Build the Zebra-backed template provider, then delegate to the
+        // shared constructor below.
+        let tp_config = TemplateProviderConfig {
+            zebra_url: config.zebra_url.clone(),
+            poll_interval_ms: config.template_poll_ms,
+        };
+        let template_provider = TemplateProvider::new(tp_config)
+            .map_err(|e| PoolError::TemplateProvider(e.to_string()))?;
+        Self::with_template_provider(config, template_provider)
+    }
+
+    /// Create a pool server with a caller-supplied [`TemplateProvider`].
+    ///
+    /// Identical to [`PoolServer::new`] except the template provider is
+    /// injected rather than constructed from `config.zebra_url`. This lets
+    /// tests and bench tooling supply a mock provider (e.g. built via
+    /// `TemplateProvider::with_rpc`) so the pool can run without a live Zebra
+    /// RPC endpoint.
+    pub fn with_template_provider(
+        config: PoolConfig,
+        template_provider: TemplateProvider,
+    ) -> Result<Self> {
         // Validate configuration before proceeding
         config
             .validate()
@@ -149,13 +171,8 @@ impl PoolServer {
             warn!("Relay requested but 'relay' feature is not enabled. Ignoring.");
         }
 
-        // Create template provider
-        let tp_config = TemplateProviderConfig {
-            zebra_url: config.zebra_url.clone(),
-            poll_interval_ms: config.template_poll_ms,
-        };
-        let template_provider = TemplateProvider::new(tp_config)
-            .map_err(|e| PoolError::TemplateProvider(e.to_string()))?;
+        // Template provider is supplied by the caller (see `new` for the
+        // Zebra-backed path).
 
         // Create session channel (buffered to handle bursts)
         let (session_tx, session_rx) = mpsc::channel(10000);
