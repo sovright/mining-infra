@@ -51,12 +51,12 @@ impl ProxyMetrics {
     pub fn render_prometheus(&self) -> String {
         format!(
             concat!(
-                "# TYPE bedrock_v1_proxy_active_sessions gauge\n",
-                "bedrock_v1_proxy_active_sessions {}\n",
-                "# TYPE bedrock_v1_proxy_total_connections counter\n",
-                "bedrock_v1_proxy_total_connections {}\n",
-                "# TYPE bedrock_v1_proxy_total_v2_reconnects counter\n",
-                "bedrock_v1_proxy_total_v2_reconnects {}\n"
+                "# TYPE sovright_v1_stratum_proxy_active_sessions gauge\n",
+                "sovright_v1_stratum_proxy_active_sessions {}\n",
+                "# TYPE sovright_v1_stratum_proxy_total_connections counter\n",
+                "sovright_v1_stratum_proxy_total_connections {}\n",
+                "# TYPE sovright_v1_stratum_proxy_total_v2_reconnects counter\n",
+                "sovright_v1_stratum_proxy_total_v2_reconnects {}\n"
             ),
             self.active_sessions.load(Ordering::Relaxed),
             self.total_connections.load(Ordering::Relaxed),

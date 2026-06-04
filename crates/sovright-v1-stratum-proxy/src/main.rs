@@ -19,8 +19,8 @@ use tracing_subscriber::EnvFilter;
 use v1::codec::V1Codec;
 
 #[derive(Parser, Debug)]
-#[command(name = "bedrock-v1-proxy")]
-#[command(about = "Stratum V1 to Bedrock V2 translation proxy")]
+#[command(name = "sovright-v1-stratum-proxy")]
+#[command(about = "Stratum V1 to Sovright V2 translation proxy")]
 struct Args {
     #[arg(long, short = 'c')]
     config: Option<PathBuf>,

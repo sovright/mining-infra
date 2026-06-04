@@ -1,9 +1,9 @@
 [package]
-name = "bedrock-v1-proxy"
+name = "sovright-v1-stratum-proxy"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Stratum V1 translation proxy for the Bedrock Zcash mining pool"
+description = "Stratum V1 translation proxy for the Sovright Zcash mining pool"
 
 [dependencies]
 tokio.workspace = true
