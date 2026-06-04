@@ -21,3 +21,4 @@ Thumbs.db
 
 # Debug
 *.log
+.claude/scheduled_tasks.lock
