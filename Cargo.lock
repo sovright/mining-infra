@@ -3893,6 +3893,7 @@ dependencies = [
  "zcash-jd-server",
  "zcash-mining-protocol",
  "zcash-pool-common",
+ "zcash-pool-server",
  "zcash-template-provider",
 ]
 

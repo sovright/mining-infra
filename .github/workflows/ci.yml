@@ -32,3 +32,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+  tier2-chain:
+    # Full-chain mining integration test (pool + JDC + proxy + real CPU
+    # Equihash solver). It is #[ignore]d so the main `cargo test --workspace`
+    # job stays fast and deterministic; this job runs it explicitly. It spawns
+    # the proxy and miner binaries, so the workspace must be built first. Marked
+    # non-blocking (continue-on-error) because it depends on a real CPU solver
+    # finding a solution within the time budget — a slow runner should warn, not
+    # block the PR.
+    name: Tier-2 full-chain mining (non-blocking)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace (produces proxy + miner binaries the test spawns)
+        run: cargo build --workspace --all-targets
+      - name: Run tier-2 chain test
+        run: cargo test -p zcash-jd-client --test tier2_chain_test -- --ignored --nocapture

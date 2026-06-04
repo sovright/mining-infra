@@ -282,14 +282,15 @@ mod tests {
     }
 
     // =========================================================================
-    // DELIBERATE COVERAGE GAP: the Accept path (a share whose hash is at/under
-    // the share target) and the LowDifficulty path
-    // (ValidationError::TargetNotMet, which requires a *structurally valid*
-    // Equihash solution whose hash sits above the share target) are NOT
-    // exercised here. No valid-Equihash-solution fixture exists in this suite —
-    // the only way to produce one is a real CPU solver. Both paths (plus the
-    // block-target branch and end-to-end submission) are covered by Task 7's
-    // full-chain integration test. The tests above cover every rejection path
-    // and pure-function recipe reachable without a valid solution.
+    // ACCEPT / LOW-DIFFICULTY / BLOCK-TARGET COVERAGE: the Accept path (a share
+    // whose hash is at/under the share target) and the block-target branch
+    // require a *structurally valid* Equihash solution, which only a real CPU
+    // solver can produce — so they are NOT exercised in this pure-function unit
+    // suite. They are now covered end-to-end by the Tier-2 full-chain
+    // integration test (`crates/zcash-jd-client/tests/tier2_chain_test.rs`,
+    // `tier2_full_chain_declared_job_mining`), which mines real solutions and
+    // drives the accept + relay + block-submission paths through the live
+    // listener. The tests above cover every rejection path and pure-function
+    // recipe reachable without a valid solution.
     // =========================================================================
 }

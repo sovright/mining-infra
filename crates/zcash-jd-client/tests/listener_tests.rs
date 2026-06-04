@@ -347,13 +347,16 @@ async fn unexpected_message_type_ignored() {
 }
 
 // =============================================================================
-// DELIBERATE COVERAGE GAP: the accept/relay path, the LowDifficulty rejection
-// path, and the block-submission path are NOT exercised here. All three require
-// a structurally valid Equihash solution (the accept/relay path needs a hash at
-// or under the share target; LowDifficulty needs a structurally valid solution
-// whose hash sits above the share target; the block path needs a hash under the
-// block target too). No valid-Equihash-solution fixture exists in this suite —
-// the only way to produce one is a real CPU solver. All three are covered by
-// Task 7's full-chain integration test. The tests above cover every rejection
-// and broadcast path reachable without a valid solution.
+// ACCEPT / RELAY / BLOCK-SUBMISSION COVERAGE: the accept/relay path and the
+// block-submission path require a structurally valid Equihash solution (the
+// accept/relay path needs a hash at or under the share target; the block path
+// needs a hash under the block target too), which only a real CPU solver can
+// produce — so they are NOT exercised in this listener unit suite. They are now
+// covered end-to-end by the Tier-2 full-chain integration test
+// (`crates/zcash-jd-client/tests/tier2_chain_test.rs`,
+// `tier2_full_chain_declared_job_mining`): a real V1 miner solves through the
+// proxy into this listener, whose accepted shares are relayed to (and credited
+// by) the in-process pool, with the block path firing opportunistically. The
+// tests above cover every rejection and broadcast path reachable without a
+// valid solution.
 // =============================================================================

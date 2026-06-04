@@ -549,15 +549,16 @@ fn test_config_getters() {
 // =============================================================================
 // handle_submit_shares_jd handler tests (Task 4)
 //
-// DELIBERATE COVERAGE GAP: the accept/credit path and the LowDifficulty
-// rejection path are NOT exercised here. Both require a structurally valid
-// Equihash solution — the accept path needs a hash at/under the share target,
-// and LowDifficulty (ValidationError::TargetNotMet) needs a structurally valid
-// solution whose hash is above it. No valid-Equihash-solution fixture exists in
-// this test suite. Both paths are covered by Task 7's full-chain integration
-// test, which mines real solutions with a CPU solver. The tests below cover
-// every rejection path reachable without a valid solution plus the batch
-// counting / first-error / no-credit logic.
+// ACCEPT / CREDIT COVERAGE: the server-side accept+credit path of
+// handle_submit_shares_jd requires a structurally valid Equihash solution that
+// meets the pool-granted share target — which only a real CPU solver can
+// produce — so it is NOT exercised in this unit suite. It is now covered
+// end-to-end by the Tier-2 full-chain integration test
+// (`crates/zcash-jd-client/tests/tier2_chain_test.rs`,
+// `tier2_full_chain_declared_job_mining`): a real V1 miner's solution is relayed
+// to this server, which re-verifies it and credits the declaring client in the
+// PayoutTracker. The tests below cover every rejection path reachable without a
+// valid solution plus the batch counting / first-error / no-credit logic.
 // =============================================================================
 
 /// Job parameters used by the share-handler tests. The miner-controlled share
