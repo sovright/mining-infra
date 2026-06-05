@@ -367,6 +367,12 @@ pub fn decode_set_worker_identity(data: &[u8]) -> Result<SetWorkerIdentity> {
         actual: payload.len().saturating_sub(1),
     })?;
 
+    if cursor.position() as usize != payload.len() {
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in payload".into(),
+        ));
+    }
+
     let worker_name = String::from_utf8(name_bytes)
         .map_err(|_| ProtocolError::EncodingError("worker name is not UTF-8".into()))?;
     validate_worker_name(&worker_name)?;
@@ -797,6 +803,22 @@ mod tests {
         assert!(validate_worker_name("has space").is_err());
         assert!(validate_worker_name("emoji\u{1F525}").is_err());
         assert!(validate_worker_name("inject\"label").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_payload_trailing_bytes() {
+        // Hand-build a frame with a valid name but extra trailing payload bytes.
+        let mut payload = vec![3u8]; // name_len=3
+        payload.extend_from_slice(b"rig"); // valid name
+        payload.extend_from_slice(&[0u8; 6]); // 6 extra bytes inside the payload
+        let frame = MessageFrame {
+            extension_type: 0,
+            msg_type: message_types::SET_WORKER_IDENTITY,
+            length: payload.len() as u32,
+        };
+        let mut data = frame.encode().to_vec();
+        data.extend_from_slice(&payload);
+        assert!(decode_set_worker_identity(&data).is_err());
     }
 
     #[test]
