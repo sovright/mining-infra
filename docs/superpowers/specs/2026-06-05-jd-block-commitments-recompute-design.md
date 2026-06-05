@@ -26,29 +26,29 @@ Why earlier tests missed it: the in-process integration test (`tier2_chain_test.
 
 1. **Pool validation: recompute & verify.** The pool stores the chain-history root + branch id, recomputes the expected `block_commitments` from the **declared** coinbase + txs, and verifies the JDC's value. Preserves the pool's role (reject invalid templates before miners waste work); reuses the pool-side `zcash-coinbase` crate.
 2. **Consensus branch id source: zebra `getblockchaininfo`.** Zebra's `getblocktemplate` does **not** carry a branch id (verified: response keys lack it). `getblockchaininfo` returns `consensus.nextblock` (the branch id for the block being mined; `c8e71055` on this NU6 chain). This honors the "from zebra, upgrade-safe, no hardcoded activation table" intent.
-3. **Scope: both modes.** Fix the identical bug in coinbase-only (`client.rs:502`) and full-template (`client.rs:613`) paths; pool validation covers both. Full-template's recompute is the same logic with more txs in the auth-data root.
+3. **Scope: coinbase-only now; full-template deferred.** *(Revised during spec review — supersedes the earlier "both modes" intent.)* The coinbase-only path (`client.rs:502`) is the actual live bug and is fully supported by existing primitives. Full-template (`client.rs:613`) shares the copy-bug but its fix requires computing ZIP-244 auth digests for arbitrary **non-coinbase** transactions (potentially shielded Sapling/Orchard) — `zcash-coinbase` only implements the coinbase sentinel case, so this is substantial net-new crypto, not "more txs in the same loop." Full-template is `--full-template`-gated and off in the bundle. This spec fixes coinbase-only and leaves the full-template `block_commitments` copy in place behind its flag, with an explicit deferral note in code so it isn't silently shipped as correct.
 
 ## Architecture
 
-Reuses existing primitives — no new crypto:
+Reuses existing primitives — no new crypto for the coinbase-only fix this spec covers (full-template's general auth-digest computation is the deferred piece, per Scope decision 3):
 
 | Function | Crate | Purpose |
 |---|---|---|
 | `compute_coinbase_auth_digest(script_sigs, branch_id) -> [u8;32]` | `zcash-coinbase/src/auth_digest.rs` | auth digest of the constructed coinbase |
 | `compute_auth_data_root(&[[u8;32]]) -> [u8;32]` | `zcash-coinbase/src/auth_digest.rs` | merkle root over tx auth digests (coinbase-only = the single digest) |
-| `calculate_block_commitments_hash(history_root, auth_data_root) -> Hash256` | `zcash-template-provider/src/commitments.rs` | `hashBlockCommitments` |
+| `calculate_block_commitments_hash(&Hash256, &Hash256) -> Hash256` | `zcash-template-provider/src/commitments.rs` | `hashBlockCommitments` (wrap the `[u8;32]` roots in `Hash256`) |
 
 ### JDC side (`zcash-template-provider`, `zcash-jd-client`)
 
-- **Template provider** threads two zebra-sourced values into `BlockTemplate`:
-  - `chain_history_root: [u8;32]` from `getblocktemplate` `defaultroots.chainhistoryroot`.
-  - `consensus_branch_id: u32` from a new `getblockchaininfo` call (`consensus.nextblock`, hex → u32). The provider already polls zebra; add the one extra RPC per template refresh (or cache, refreshing on height change — branch id only changes at upgrade boundaries).
+- **Template provider** threads two net-new zebra-sourced fields into `BlockTemplate` (neither exists there today):
+  - `chain_history_root: [u8;32]` from `getblocktemplate` `defaultroots.chainhistoryroot` (the field exists in `DefaultRoots`; thread it onto `BlockTemplate`).
+  - `consensus_branch_id: u32` from a new `getblockchaininfo` call (`consensus.nextblock`, hex → u32) via the existing `rpc.rs::request(method, params)` client. Branch id changes only at upgrade boundaries; cache it and refresh on height change.
 - **`template_builder`**: replace `block_commitments(&self, template)` with a recompute that takes the constructed coinbase bytes + the template's other-tx auth digests:
-  - extract the coinbase's transparent `script_sig`(s) from the JDC-built coinbase,
+  - extract the coinbase's transparent `script_sig` from the JDC-built coinbase via `zcash-coinbase/src/tx_parse.rs::parse_transaction()` (`ParsedTx` → `TxIn.script_sig`),
   - `coinbase_digest = compute_coinbase_auth_digest(script_sigs, template.consensus_branch_id)`,
   - `auth_data_root = compute_auth_data_root(&[coinbase_digest, ...other_tx_digests])`,
   - `block_commitments = calculate_block_commitments_hash(template.chain_history_root, auth_data_root)`.
-- **`client.rs`**: both `handle_coinbase_only_job` and `handle_full_template_job` call the recompute instead of reading `template.header.hash_block_commitments`. For full-template, `other_tx_digests` are the selected transactions' auth digests (from the template's per-tx data — provider must expose them; today `getblocktemplate` transactions carry `authdigest`, but the chain had 0 txs in E2E so this path is exercised only by the unit test until txs appear).
+- **`client.rs`**: `handle_coinbase_only_job` calls the recompute instead of reading `template.header.hash_block_commitments`. `handle_full_template_job` keeps copying for now (behind `--full-template`) with a `TODO`/deferral comment naming this spec, because correct full-template recompute needs general non-coinbase auth digests (see Scope decision 3). For coinbase-only, `other_tx_digests` is empty, so `auth_data_root` = the coinbase digest.
 - **Failure handling:** if the chain-history root or branch id is unavailable, the JDC fails the declaration with a clear error and does not declare — never ship a guessed commitment.
 
 ### Pool side (`zcash-jd-server`, reuses `zcash-coinbase`)
@@ -74,7 +74,7 @@ Pool: each template cycle: store chainHistoryRoot + branch_id in CurrentTemplate
 
 ## Testing
 
-- **Unit (JDC, `template_builder`):** recompute for a known coinbase + chainHistoryRoot + branch id matches a fixed expected value; coinbase-only auth_data_root == coinbase digest; a full-template case with ≥2 tx digests. Cross-check the fixture against a value computed independently (e.g. the live bundle zebra's own template for its own coinbase — recompute should reproduce `e2343c…`/`976e89…` from that coinbase, proving the math).
+- **Unit (JDC, `template_builder`):** recompute for a known coinbase + chainHistoryRoot + branch id matches a fixed expected value; coinbase-only `auth_data_root` == coinbase digest. Cross-check the fixture against an independently computed value — ideally reproduce the live bundle zebra's own `authdataroot`/`blockcommitmentshash` (`e2343c…`/`976e89…`) from that zebra's coinbase + branch id, proving the math against real consensus output.
 - **Unit (pool, `validate_header_fields`):** accepts a correctly-declared job; rejects tampered `block_commitments`; rejects a declaration whose coinbase doesn't produce the declared commitments; chainHistoryRoot/branch id stored from the template.
 - **Integration (the regression test that would have caught this):** extend the in-process chain test so the **pool's template provider and the JDC use different coinbase addresses** (the exact scenario that exposed the bug) — assert the declaration is now **accepted** and a share credits under the account. This requires the in-process harness to give the two sides distinct coinbase outputs (today it shares one zebra mock; the test must diverge them).
 - **Live E2E:** re-run the Tier-2 bundle against the live testnet (internal miner quiesced); a declaration is accepted, a CPU-mined share is credited under the account, and a block-target solution is submitted and accepted by zebra.
