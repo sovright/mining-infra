@@ -55,7 +55,7 @@ Reuses existing primitives — no new crypto for the coinbase-only fix this spec
 
 - **`CurrentTemplateContext`** (`server.rs:96`) gains `chain_history_root: [u8;32]` and `consensus_branch_id: u32`, populated each template cycle from the pool's own template provider + `getblockchaininfo`.
 - **`validate_header_fields`**: replace `if block_commitments != template.block_commitments` with recompute-and-verify:
-  - from the **declared** `coinbase_tx` (in `SetCustomMiningJob`) + declared tx set, compute `auth_data_root` (coinbase digest via `compute_coinbase_auth_digest` with the stored branch id, plus declared txs' digests),
+  - from the **declared** `coinbase_tx` (in `SetCustomMiningJob`), compute the coinbase `auth_data_root` (coinbase digest via `compute_coinbase_auth_digest` with the stored branch id). Coinbase-only declarations carry no other txs, so the root is the single coinbase digest. If a declaration ever carries txs (full-template, deferred), validation falls back to the existing behavior for that flagged path — this spec's pool change targets the coinbase-only declarations the bundle produces,
   - `expected = calculate_block_commitments_hash(template.chain_history_root, auth_data_root)`,
   - reject unless `declared block_commitments == expected`. Typed error retained (now: "declared commitments don't verify against declared coinbase + chain tip").
 - **Stored value:** `DeclaredJobInfo.block_commitments` keeps the JDC-declared (now-verified) value, so the existing `handle_push_solution` / `handle_submit_shares_jd` header reconstruction stays correct for the eventual block.
