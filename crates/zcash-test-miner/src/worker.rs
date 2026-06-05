@@ -40,6 +40,32 @@ struct FoundShare {
     solution: [u8; 1344],
 }
 
+/// Cancellation handle for one job's solver threads.
+///
+/// Each job gets its own flag, cleared when the handle is dropped (job
+/// replaced or session ended). This is what makes cancellation stick: with a
+/// single flag shared across jobs, flipping it false-then-true re-arms stale
+/// threads before they ever observe the cancel, so every new job leaks
+/// another `solver_threads` blocking threads — each holding a ~144MB Tromp
+/// solver working set — until tokio's 512-thread blocking pool is full.
+struct SolverCancel(Arc<AtomicBool>);
+
+impl SolverCancel {
+    fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(true)))
+    }
+
+    fn flag(&self) -> Arc<AtomicBool> {
+        self.0.clone()
+    }
+}
+
+impl Drop for SolverCancel {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 /// Session-level statistics.
 struct SessionStats {
     shares_submitted: u64,
@@ -130,8 +156,10 @@ async fn run_worker_session(
     // Channel for solver threads to send found shares back to the session loop.
     let (share_tx, mut share_rx) = mpsc::channel::<(FoundShare, NewEquihashJob)>(64);
 
-    // Cancellation flag for active solvers.
-    let solving = Arc::new(AtomicBool::new(false));
+    // Per-job cancellation for active solvers. Replacing it on a new job (or
+    // dropping it when the session ends, including error paths via `?`)
+    // permanently cancels that job's threads.
+    let mut current_job_cancel: Option<SolverCancel> = None;
 
     loop {
         tokio::select! {
@@ -160,8 +188,13 @@ async fn run_worker_session(
                             continue;
                         }
 
-                        // Cancel any active solvers
-                        solving.store(false, Ordering::Release);
+                        // Replace the previous job's cancellation handle: the
+                        // assignment drops the old handle, permanently
+                        // cancelling its solver threads. The new job's flag is
+                        // independent, so old threads can never be re-armed.
+                        let cancel = SolverCancel::new();
+                        let new_flag = cancel.flag();
+                        current_job_cancel = Some(cancel);
 
                         // Update share target if job carries one, or use SetTarget value
                         let share_target = if let Some(ref t) = current_target {
@@ -171,12 +204,11 @@ async fn run_worker_session(
                         };
 
                         // Start new solver threads
-                        solving.store(true, Ordering::Release);
                         let solver_threads = config.solver_threads;
 
                         for thread_id in 0..solver_threads {
                             let job_clone = job.clone();
-                            let solving_clone = solving.clone();
+                            let solving_clone = new_flag.clone();
                             let share_tx_clone = share_tx.clone();
                             let share_target_copy = share_target;
 
@@ -282,7 +314,8 @@ async fn run_worker_session(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     info!(worker = %config.worker_name, "Shutdown signal received during session");
-                    solving.store(false, Ordering::Release);
+                    // Dropping the handle cancels the current job's solvers.
+                    drop(current_job_cancel);
                     return Ok(stats);
                 }
             }
@@ -499,6 +532,41 @@ fn nbits_to_target(nbits: u32) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn solver_cancel_starts_armed() {
+        let cancel = SolverCancel::new();
+        assert!(cancel.flag().load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dropping_solver_cancel_clears_flag() {
+        let cancel = SolverCancel::new();
+        let flag = cancel.flag();
+        drop(cancel);
+        assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn replacing_job_cancels_old_threads_but_not_new() {
+        // Regression for the solver-thread leak: a single shared flag that is
+        // flipped false-then-true re-arms stale threads before they observe
+        // the cancellation. Per-job guards must keep generations independent.
+        let mut current = Some(SolverCancel::new());
+        let old_flag = current.as_ref().unwrap().flag();
+
+        current = Some(SolverCancel::new()); // new job arrives
+        let new_flag = current.as_ref().unwrap().flag();
+
+        assert!(
+            !old_flag.load(Ordering::Acquire),
+            "old job's solvers must see a permanent cancel"
+        );
+        assert!(
+            new_flag.load(Ordering::Acquire),
+            "new job's solvers must start armed"
+        );
+    }
 
     #[test]
     fn test_hash_le_target_equal() {
