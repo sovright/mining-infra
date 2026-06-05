@@ -45,12 +45,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
 
-    // Validate the prefix early: worker names are "{prefix}-{i}" and the full
-    // name must pass protocol validation. We check a representative name
-    // ("{prefix}-1") which will fail if the prefix itself contains forbidden
-    // characters or is too long.
-    let representative_name = format!("{}-1", args.worker_prefix);
-    if let Err(e) = validate_worker_name(&representative_name) {
+    // Validate the prefix early: worker names are "{prefix}-{i}" for i in
+    // 1..=workers and the full name must pass protocol validation. Check the
+    // LONGEST generated name ("{prefix}-{workers}") so a prefix that only fits
+    // low indices can't pass startup and then reconnect-loop forever on a
+    // higher-index worker (e.g. a 62-byte prefix where "{prefix}-10" is 65
+    // bytes). This also catches forbidden characters in the prefix itself.
+    let longest_name = format!("{}-{}", args.worker_prefix, args.workers);
+    if let Err(e) = validate_worker_name(&longest_name) {
         eprintln!("Invalid --worker-prefix {:?}: {}", args.worker_prefix, e);
         std::process::exit(1);
     }
