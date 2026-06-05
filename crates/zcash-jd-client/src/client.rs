@@ -499,7 +499,7 @@ impl JdClient {
 
         let coinbase = builder.build_coinbase(&template)?;
         let merkle_root = builder.calculate_merkle_root(&template, &coinbase)?;
-        let block_commitments = builder.block_commitments(&template);
+        let block_commitments = builder.block_commitments(&template, &coinbase)?;
 
         debug!(
             "Declaring Coinbase-Only job for height {} with {} byte coinbase",
@@ -610,7 +610,10 @@ impl JdClient {
 
         let coinbase = builder.build_coinbase(&template)?;
         let merkle_root = builder.calculate_merkle_root(&template, &coinbase)?;
-        let block_commitments = builder.block_commitments(&template);
+        // TODO(2026-06-05-jd-block-commitments-recompute-design): full-template
+        // correctness needs general ZIP-244 auth digests for non-coinbase txs.
+        // Keep this gated path copying the template value until that lands.
+        let block_commitments = builder.template_block_commitments(&template);
 
         let transactions = self.extract_template_transactions(&template)?;
         self.cache_transactions(transactions.clone()).await;

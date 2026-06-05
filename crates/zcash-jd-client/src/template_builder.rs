@@ -5,6 +5,9 @@
 
 use crate::error::{JdClientError, Result};
 use sha2::{Digest, Sha256};
+use zcash_coinbase::auth_digest::{compute_auth_data_root, compute_coinbase_auth_digest};
+use zcash_coinbase::tx_parse::parse_transaction;
+use zcash_template_provider::calculate_block_commitments_hash;
 use zcash_template_provider::types::{BlockTemplate, Hash256};
 
 struct TxOut {
@@ -129,8 +132,39 @@ impl TemplateBuilder {
         Ok(merkle_root_from_txids(&txids))
     }
 
-    /// Get the block commitments hash
-    pub fn block_commitments(&self, template: &BlockTemplate) -> [u8; 32] {
+    /// Recompute the block commitments hash for a Coinbase-Only declaration.
+    pub fn block_commitments(&self, template: &BlockTemplate, coinbase: &[u8]) -> Result<[u8; 32]> {
+        let parsed = parse_transaction(coinbase).map_err(|e| {
+            JdClientError::Protocol(format!(
+                "invalid coinbase transaction for block commitments: {}",
+                e
+            ))
+        })?;
+        if parsed.inputs.is_empty() {
+            return Err(JdClientError::Protocol(
+                "coinbase has no transparent inputs for block commitments".to_string(),
+            ));
+        }
+
+        let mut script_sigs = Vec::new();
+        for input in parsed.inputs {
+            script_sigs.extend_from_slice(&input.script_sig);
+        }
+
+        let coinbase_digest =
+            compute_coinbase_auth_digest(&script_sigs, template.consensus_branch_id);
+        let auth_data_root = compute_auth_data_root(&[coinbase_digest]);
+        Ok(
+            calculate_block_commitments_hash(
+                &template.chain_history_root,
+                &Hash256(auth_data_root),
+            )
+            .0,
+        )
+    }
+
+    /// Return the template's copied block commitments hash.
+    pub fn template_block_commitments(&self, template: &BlockTemplate) -> [u8; 32] {
         template.header.hash_block_commitments.0
     }
 
@@ -295,6 +329,61 @@ fn parse_coinbase_outputs(tx: &[u8]) -> Result<CoinbaseOutputs> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_coinbase::auth_digest::{compute_auth_data_root, compute_coinbase_auth_digest};
+    use zcash_coinbase::tx_parse::parse_transaction;
+    use zcash_template_provider::calculate_block_commitments_hash;
+    use zcash_template_provider::types::{BlockTemplate, EquihashHeader};
+
+    fn minimal_coinbase_with_script_sig(script_sig: &[u8]) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&5u32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        write_compact_size(script_sig.len() as u64, &mut tx);
+        tx.extend_from_slice(script_sig);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        tx.push(1);
+        tx.extend_from_slice(&50_0000_0000u64.to_le_bytes());
+        tx.push(1);
+        tx.push(0x51);
+        tx.extend_from_slice(&0u32.to_le_bytes());
+        tx
+    }
+
+    fn template_for_commitment_test(coinbase: Vec<u8>) -> BlockTemplate {
+        BlockTemplate {
+            template_id: 1,
+            height: 2_000_000,
+            header: EquihashHeader {
+                version: 5,
+                prev_hash: Hash256([0xaa; 32]),
+                merkle_root: Hash256([0xbb; 32]),
+                hash_block_commitments: Hash256([0xcc; 32]),
+                time: 1_700_000_000,
+                bits: 0x1d00ffff,
+                nonce: [0; 32],
+            },
+            target: Hash256([0xff; 32]),
+            transactions: vec![],
+            coinbase,
+            chain_history_root: Hash256([0x42; 32]),
+            consensus_branch_id: 0xc8e7_1055,
+            total_fees: 0,
+        }
+    }
+
+    fn expected_commitments_for_coinbase(template: &BlockTemplate, coinbase: &[u8]) -> [u8; 32] {
+        let parsed = parse_transaction(coinbase).unwrap();
+        let mut script_sigs = Vec::new();
+        for input in parsed.inputs {
+            script_sigs.extend_from_slice(&input.script_sig);
+        }
+        let coinbase_digest =
+            compute_coinbase_auth_digest(&script_sigs, template.consensus_branch_id);
+        let auth_root = compute_auth_data_root(&[coinbase_digest]);
+        calculate_block_commitments_hash(&template.chain_history_root, &Hash256(auth_root)).0
+    }
 
     #[test]
     fn test_template_builder_creation() {
@@ -325,5 +414,21 @@ mod tests {
 
         assert_eq!(builder.pool_coinbase_output(), &[0x01, 0x02, 0x03]);
         assert_eq!(builder.max_additional_size(), 512);
+    }
+
+    #[test]
+    fn recomputes_coinbase_only_block_commitments_from_declared_coinbase() {
+        let template = template_for_commitment_test(minimal_coinbase_with_script_sig(&[
+            0x04, 0xff, 0xff, 0x10, 0x1d,
+        ]));
+        let builder = TemplateBuilder::new(vec![0x52], 256, None);
+        let coinbase = builder.build_coinbase(&template).unwrap();
+
+        let expected = expected_commitments_for_coinbase(&template, &coinbase);
+        assert_ne!(expected, template.header.hash_block_commitments.0);
+        assert_eq!(
+            builder.block_commitments(&template, &coinbase).unwrap(),
+            expected
+        );
     }
 }

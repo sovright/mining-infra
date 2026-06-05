@@ -1,7 +1,7 @@
 //! Zebra JSON-RPC client
 
 use crate::error::{Error, Result};
-use crate::types::GetBlockTemplateResponse;
+use crate::types::{GetBlockTemplateResponse, GetBlockchainInfoResponse};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde::{Serialize, de::DeserializeOwned};
@@ -45,6 +45,8 @@ pub enum SubmitBlockResult {
 pub trait RpcProvider: Send + Sync {
     /// Get a block template from the node
     async fn get_block_template(&self) -> Result<GetBlockTemplateResponse>;
+    /// Get blockchain metadata from the node
+    async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse>;
     /// Submit a solved block to the node
     async fn submit_block(
         &self,
@@ -125,6 +127,11 @@ impl ZebraRpc {
 impl RpcProvider for ZebraRpc {
     async fn get_block_template(&self) -> Result<GetBlockTemplateResponse> {
         self.request("getblocktemplate", serde_json::json!([]))
+            .await
+    }
+
+    async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
+        self.request("getblockchaininfo", serde_json::json!([]))
             .await
     }
 

@@ -809,6 +809,8 @@ impl PoolServer {
                 version: template.header.version,
                 prev_hash: template.header.prev_hash.0,
                 block_commitments: template.header.hash_block_commitments.0,
+                chain_history_root: template.chain_history_root.0,
+                consensus_branch_id: template.consensus_branch_id,
                 bits: template.header.bits,
                 time: template.header.time,
                 txids: template_txids,

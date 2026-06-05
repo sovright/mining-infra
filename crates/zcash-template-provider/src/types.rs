@@ -116,6 +116,27 @@ pub struct GetBlockTemplateResponse {
     pub cur_time: u64,
 }
 
+/// Consensus metadata from Zebra `getblockchaininfo`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockchainInfoConsensus {
+    /// Consensus branch ID for the next block, encoded as hex by Zebra.
+    #[serde(rename = "nextblock")]
+    pub next_block: String,
+}
+
+/// Raw getblockchaininfo response subset needed by template processing.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GetBlockchainInfoResponse {
+    pub consensus: BlockchainInfoConsensus,
+}
+
+impl GetBlockchainInfoResponse {
+    /// Parse `consensus.nextblock` as the branch ID for the block being mined.
+    pub fn next_block_branch_id(&self) -> Result<u32, std::num::ParseIntError> {
+        u32::from_str_radix(self.consensus.next_block.trim_start_matches("0x"), 16)
+    }
+}
+
 /// Processed block template ready for mining
 #[derive(Debug, Clone)]
 pub struct BlockTemplate {
@@ -131,6 +152,10 @@ pub struct BlockTemplate {
     pub transactions: Vec<TemplateTransaction>,
     /// Coinbase transaction
     pub coinbase: Vec<u8>,
+    /// Chain history root from Zebra's `defaultroots.chainhistoryroot`.
+    pub chain_history_root: Hash256,
+    /// Consensus branch ID from Zebra's `getblockchaininfo.consensus.nextblock`.
+    pub consensus_branch_id: u32,
     /// Total fees available
     pub total_fees: i64,
 }

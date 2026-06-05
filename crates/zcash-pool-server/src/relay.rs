@@ -243,6 +243,9 @@ mod tests {
             target: Hash256::default(),
             transactions: response.transactions,
             coinbase,
+            chain_history_root: Hash256::from_hex_le(&response.default_roots.chain_history_root)
+                .expect("valid chain history root"),
+            consensus_branch_id: 0xc8e7_1055,
             total_fees,
         }
     }

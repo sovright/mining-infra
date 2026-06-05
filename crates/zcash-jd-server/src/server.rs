@@ -36,6 +36,8 @@ use zcash_equihash_validator::{
 };
 use zcash_mining_protocol::codec::MessageFrame;
 use zcash_pool_common::PayoutTracker;
+use zcash_template_provider::calculate_block_commitments_hash;
+use zcash_template_provider::types::Hash256;
 
 const MAX_JOB_ID: u32 = u32::MAX - 1;
 
@@ -93,11 +95,37 @@ fn share_dedup_key(share: &JdShare) -> [u8; 32] {
     hasher.finalize().into()
 }
 
+fn recompute_coinbase_only_block_commitments(
+    coinbase_tx: &[u8],
+    chain_history_root: [u8; 32],
+    consensus_branch_id: u32,
+) -> std::result::Result<[u8; 32], String> {
+    let parsed = zcash_coinbase::tx_parse::parse_transaction(coinbase_tx)
+        .map_err(|e| format!("declared coinbase cannot be parsed for commitments: {}", e))?;
+    if parsed.inputs.is_empty() {
+        return Err("declared coinbase has no transparent inputs for commitments".to_string());
+    }
+
+    let mut script_sigs = Vec::new();
+    for input in parsed.inputs {
+        script_sigs.extend_from_slice(&input.script_sig);
+    }
+
+    let coinbase_digest = zcash_coinbase::auth_digest::compute_coinbase_auth_digest(
+        &script_sigs,
+        consensus_branch_id,
+    );
+    let auth_data_root = zcash_coinbase::auth_digest::compute_auth_data_root(&[coinbase_digest]);
+    Ok(calculate_block_commitments_hash(&Hash256(chain_history_root), &Hash256(auth_data_root)).0)
+}
+
 #[derive(Debug, Clone)]
 pub struct CurrentTemplateContext {
     pub version: u32,
     pub prev_hash: [u8; 32],
     pub block_commitments: [u8; 32],
+    pub chain_history_root: [u8; 32],
+    pub consensus_branch_id: u32,
     pub bits: u32,
     pub time: u32,
     pub txids: Vec<[u8; 32]>,
@@ -219,7 +247,6 @@ impl JdServer {
     async fn validate_header_fields(
         &self,
         version: u32,
-        block_commitments: [u8; 32],
         time: u32,
         bits: u32,
     ) -> std::result::Result<Option<CurrentTemplateContext>, String> {
@@ -228,9 +255,6 @@ impl JdServer {
         if let Some(ref template) = current {
             if version != template.version {
                 return Err("block version does not match current template".into());
-            }
-            if block_commitments != template.block_commitments {
-                return Err("block commitments do not match current template".into());
             }
             if bits != template.bits {
                 return Err("difficulty bits do not match current template".into());
@@ -254,12 +278,7 @@ impl JdServer {
         token_info_client_id: &str,
     ) -> std::result::Result<(), SetCustomMiningJobError> {
         let template = self
-            .validate_header_fields(
-                request.version,
-                request.block_commitments,
-                request.time,
-                request.bits,
-            )
+            .validate_header_fields(request.version, request.time, request.bits)
             .await
             .map_err(|reason| {
                 SetCustomMiningJobError::new(
@@ -323,6 +342,29 @@ impl JdServer {
                     request.request_id,
                     SetCustomMiningJobErrorCode::InvalidMerkleRoot,
                     "merkle root does not match pool transaction set",
+                ));
+            }
+
+            let expected_block_commitments = recompute_coinbase_only_block_commitments(
+                &request.coinbase_tx,
+                template.chain_history_root,
+                template.consensus_branch_id,
+            )
+            .map_err(|reason| {
+                SetCustomMiningJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetCustomMiningJobErrorCode::Other,
+                    reason,
+                )
+            })?;
+
+            if expected_block_commitments != request.block_commitments {
+                return Err(SetCustomMiningJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetCustomMiningJobErrorCode::Other,
+                    "declared block commitments do not verify against declared coinbase and chain tip",
                 ));
             }
         }
@@ -839,12 +881,7 @@ impl JdServer {
         }
 
         let template = match self
-            .validate_header_fields(
-                request.version,
-                request.block_commitments,
-                request.time,
-                request.bits,
-            )
+            .validate_header_fields(request.version, request.time, request.bits)
             .await
         {
             Ok(template) => template,
@@ -868,6 +905,22 @@ impl JdServer {
                 ));
             }
         };
+
+        if let Some(ref current) = template
+            && request.block_commitments != current.block_commitments
+        {
+            // TODO(2026-06-05-jd-block-commitments-recompute-design): full-template
+            // validation still uses the copied template commitments until general
+            // non-coinbase ZIP-244 auth digests are implemented.
+            return Err(FullTemplateJobResponse::Error(
+                SetFullTemplateJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetFullTemplateJobErrorCode::Other,
+                    "block commitments do not match current template",
+                ),
+            ));
+        }
 
         // 4. Check prev_hash matches current (stale detection)
         //    Fail closed: reject if we haven't received any template yet
@@ -1868,6 +1921,23 @@ mod tests {
         tx
     }
 
+    fn minimal_v5_tx_with_script(script: &[u8]) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&5u32.to_le_bytes()); // version
+        tx.push(0x01); // vin count
+        tx.extend_from_slice(&[0u8; 32]); // prevout hash
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
+        tx.push(0x01); // scriptSig length
+        tx.push(0x00); // scriptSig
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+        tx.push(0x01); // vout count
+        tx.extend_from_slice(&0u64.to_le_bytes()); // value
+        tx.push(script.len() as u8);
+        tx.extend_from_slice(script);
+        tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        tx
+    }
+
     async fn insert_pending_request(
         server: &JdServer,
         client_id: &str,
@@ -1933,6 +2003,8 @@ mod tests {
                 version: 5,
                 prev_hash,
                 block_commitments: [0xcc; 32],
+                chain_history_root: [0x42; 32],
+                consensus_branch_id: 0xc8e7_1055,
                 bits: 0x1d00ffff,
                 time: 1700000000,
                 txids: vec![],
@@ -1964,6 +2036,116 @@ mod tests {
             error.error_code,
             SetCustomMiningJobErrorCode::InvalidMerkleRoot
         );
+    }
+
+    #[tokio::test]
+    async fn test_declare_job_accepts_commitments_recomputed_from_declared_coinbase() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        let prev_hash = [0xaa; 32];
+        let coinbase_tx = minimal_v5_tx_with_script(&[0x51, 0x24]);
+        let chain_history_root = [0x42; 32];
+        let consensus_branch_id = 0xc8e7_1055;
+        let declared_block_commitments = recompute_coinbase_only_block_commitments(
+            &coinbase_tx,
+            chain_history_root,
+            consensus_branch_id,
+        )
+        .unwrap();
+        assert_ne!(declared_block_commitments, [0xcc; 32]);
+
+        server
+            .set_current_template(CurrentTemplateContext {
+                version: 5,
+                prev_hash,
+                block_commitments: [0xcc; 32],
+                bits: 0x1d00ffff,
+                time: 1700000000,
+                txids: vec![],
+                coinbase_tx_len: coinbase_tx.len(),
+                chain_history_root,
+                consensus_branch_id,
+            })
+            .await;
+
+        let token_response = server
+            .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
+            .unwrap();
+
+        let response = server
+            .handle_declare_job(SetCustomMiningJob {
+                channel_id: 1,
+                request_id: 10,
+                mining_job_token: token_response.mining_job_token,
+                version: 5,
+                prev_hash,
+                merkle_root: TemplateValidator::compute_merkle_root(&coinbase_tx, &[]).unwrap(),
+                block_commitments: declared_block_commitments,
+                coinbase_tx,
+                time: 1700000000,
+                bits: 0x1d00ffff,
+            })
+            .await;
+
+        assert!(response.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_declare_job_rejects_tampered_block_commitments() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        let prev_hash = [0xaa; 32];
+        let coinbase_tx = minimal_v5_tx_with_script(&[0x51, 0x24]);
+        let chain_history_root = [0x42; 32];
+        let consensus_branch_id = 0xc8e7_1055;
+        let mut declared_block_commitments = recompute_coinbase_only_block_commitments(
+            &coinbase_tx,
+            chain_history_root,
+            consensus_branch_id,
+        )
+        .unwrap();
+        declared_block_commitments[0] ^= 0x01;
+
+        server
+            .set_current_template(CurrentTemplateContext {
+                version: 5,
+                prev_hash,
+                block_commitments: [0xcc; 32],
+                bits: 0x1d00ffff,
+                time: 1700000000,
+                txids: vec![],
+                coinbase_tx_len: coinbase_tx.len(),
+                chain_history_root,
+                consensus_branch_id,
+            })
+            .await;
+
+        let token_response = server
+            .handle_allocate_token(1, "test-miner", JobDeclarationMode::CoinbaseOnly)
+            .unwrap();
+
+        let error = server
+            .handle_declare_job(SetCustomMiningJob {
+                channel_id: 1,
+                request_id: 11,
+                mining_job_token: token_response.mining_job_token,
+                version: 5,
+                prev_hash,
+                merkle_root: TemplateValidator::compute_merkle_root(&coinbase_tx, &[]).unwrap(),
+                block_commitments: declared_block_commitments,
+                coinbase_tx,
+                time: 1700000000,
+                bits: 0x1d00ffff,
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.error_code, SetCustomMiningJobErrorCode::Other);
+        assert!(error.error_message.contains("do not verify"));
     }
 
     #[tokio::test]

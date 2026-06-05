@@ -41,6 +41,11 @@ fn response_to_template(
         target,
         transactions: response.transactions.clone(),
         coinbase,
+        chain_history_root: zcash_template_provider::types::Hash256::from_hex_le(
+            &response.default_roots.chain_history_root,
+        )
+        .expect("chainhistoryroot should be valid"),
+        consensus_branch_id: 0xc8e7_1055,
         total_fees,
     }
 }
