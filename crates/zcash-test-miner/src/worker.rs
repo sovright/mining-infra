@@ -8,8 +8,10 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use sovright_noise::PublicKey;
-use zcash_mining_protocol::codec::encode_submit_share;
-use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult, SubmitEquihashShare};
+use zcash_mining_protocol::codec::{encode_set_worker_identity, encode_submit_share};
+use zcash_mining_protocol::messages::{
+    NewEquihashJob, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
+};
 
 /// Simple hex encoding (avoids adding `hex` crate dependency).
 fn to_hex(bytes: &[u8]) -> String {
@@ -122,6 +124,15 @@ async fn run_worker_session(
         MinerTransport::connect(&config.pool_addr, config.server_pubkey.as_ref()).await?;
 
     info!(worker = %config.worker_name, "Connected to pool");
+
+    // Declare our worker identity so the pool can attribute shares to a
+    // human-meaningful name instead of channel_N.
+    let identity = SetWorkerIdentity {
+        worker_name: config.worker_name.clone(),
+    };
+    let encoded = encode_set_worker_identity(&identity)?;
+    transport.write_message(&encoded).await?;
+    info!(worker = %config.worker_name, "Sent worker identity");
 
     let mut stats = SessionStats::new();
     let mut next_seq: u32 = 0;
