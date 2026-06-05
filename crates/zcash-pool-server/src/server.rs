@@ -948,6 +948,7 @@ impl PoolServer {
                 info!("Session {} disconnected", channel_id);
                 Ok(())
             }
+            SessionMessage::IdentityDeclared { .. } => Ok(()), // TODO(worker-identity Task 3)
         }
     }
 
