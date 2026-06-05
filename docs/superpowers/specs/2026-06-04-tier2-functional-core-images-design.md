@@ -119,3 +119,11 @@ The bundle's Tier-1 `POOL_SV2_ENDPOINT` and Tier-2 `JDC_ENDPOINT` both map onto 
 | Pool-side Equihash verification cost per share (`SubmitSharesJd` adds a per-share verify, same cost as the existing per-block verify) | Testnet share rates are trivial; benchmark before mainnet, consider sampling then — not now |
 | Declared-job/share race on template changes (share for job N arrives after job N+1 declared) | Pool keeps a small window of recent declared jobs per account (e.g. last 4) and validates against the matching one; stale beyond window → typed stale error |
 | GHCR org permissions for first publish | One-time manual check that Actions in `mining-infra` may write packages to the `sovright` org |
+
+## Amendment (2026-06-04, post-implementation)
+
+Wire-contract details settled during implementation (docs updated to match code):
+
+- The share-target grant rides `SetCustomMiningJobSuccess` as a trailing `share_target: [u8; 32]` (little-endian, matching `Target::to_le_bytes`); `DeclaredJobInfo` stores it for both declaration modes; the default derives from the testnet examples' difficulty 0.0001 (clamps to accept-anything — production must configure a real target).
+- `SubmitSharesJd` (0x5B) / `SubmitSharesJdResponse` (0x5C): batches bounded 1..=64; response carries accepted/rejected counts plus the FIRST rejection's code. Error codes: 0 none, 1 unknown_job, 2 stale_job, 3 low_difficulty, 4 bad_solution, 5 duplicate, 6 channel_mismatch (a superset of the design's original list). Version mismatch maps to stale_job (a version change implies the job rolled).
+- Endpoint split discovered in final review: the pool's stratum/SV2-mining listener and JD listener are distinct ports; the product bundle now wires `POOL_STRATUM_ENDPOINT` (Tier-1 proxy upstream) separately from `POOL_SV2_ENDPOINT` (Tier-2 JDC's JD endpoint). Deploys must set both to the live pool's actual ports (testnet: stratum 3333, JD 34264).
