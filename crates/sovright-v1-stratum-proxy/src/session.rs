@@ -622,8 +622,12 @@ impl MinerSession {
     }
 
     async fn connect_upstream(&mut self) -> Result<Vec<UpstreamMessage>, SessionError> {
+        // Pass the upstream as a host:port string on every (re)connect so
+        // `TcpStream::connect` re-resolves DNS each time. This is why we keep a
+        // string here instead of a cached `SocketAddr`: a compose service like
+        // `jdc` whose container IP changes on restart is dialed correctly.
         let upstream = UpstreamConnection::connect(
-            self.config.upstream,
+            &self.config.upstream,
             self.config.timeouts.upstream_connect,
         )
         .await?;
@@ -839,7 +843,7 @@ impl MinerSession {
 }
 
 impl UpstreamConnection {
-    async fn connect(addr: SocketAddr, timeout: Duration) -> Result<Self, SessionError> {
+    async fn connect(addr: &str, timeout: Duration) -> Result<Self, SessionError> {
         let stream = match time::timeout(timeout, TcpStream::connect(addr)).await {
             Ok(result) => result?,
             Err(_) => {

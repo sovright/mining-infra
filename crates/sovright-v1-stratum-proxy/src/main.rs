@@ -28,8 +28,10 @@ struct Args {
     #[arg(long, env = "SV1_LISTEN")]
     listen: Option<SocketAddr>,
 
+    // A host:port string (not a parsed `SocketAddr`) so compose service names
+    // like `jdc:34265` are accepted; DNS resolution happens at connect time.
     #[arg(long, env = "UPSTREAM")]
-    upstream: Option<SocketAddr>,
+    upstream: Option<String>,
 
     #[arg(long)]
     upstream_connect_timeout_secs: Option<u64>,
@@ -266,7 +268,7 @@ mod tests {
         );
         assert_eq!(
             args.upstream,
-            Some(upstream_val.parse().unwrap()),
+            Some(upstream_val.to_string()),
             "upstream should come from UPSTREAM env var"
         );
 
@@ -288,7 +290,7 @@ mod tests {
         );
         assert_eq!(
             args.upstream,
-            Some(cli_upstream.parse().unwrap()),
+            Some(cli_upstream.to_string()),
             "CLI --upstream should take precedence over UPSTREAM env var"
         );
 
@@ -303,5 +305,23 @@ mod tests {
                 None => std::env::remove_var(upstream_key),
             }
         }
+    }
+
+    /// Regression test for the live E2E bug: `--upstream` must accept a DNS
+    /// hostname (a Docker-compose service name) without a `SocketAddr` parse
+    /// error, while `--listen` is still parsed as a real `SocketAddr`.
+    #[test]
+    fn upstream_accepts_dns_hostname() {
+        let args = Args::try_parse_from([
+            "sovright-v1-stratum-proxy",
+            "--upstream",
+            "jdc:34265",
+            "--listen",
+            "0.0.0.0:3333",
+        ])
+        .expect("a DNS hostname upstream must parse successfully");
+
+        assert_eq!(args.upstream, Some("jdc:34265".to_string()));
+        assert_eq!(args.listen, Some("0.0.0.0:3333".parse().unwrap()));
     }
 }

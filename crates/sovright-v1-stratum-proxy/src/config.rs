@@ -7,7 +7,11 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub listen: SocketAddr,
-    pub upstream: SocketAddr,
+    /// Upstream address as a host:port string (not a parsed `SocketAddr`) so a
+    /// Docker-compose service name like `jdc:34265` can be resolved at connect
+    /// time. DNS resolution happens in `TcpStream::connect`, which re-resolves
+    /// on every (re)connect — handling container IP changes automatically.
+    pub upstream: String,
     pub timeouts: TimeoutsConfig,
     pub metrics: MetricsConfig,
     pub logging: LoggingConfig,
@@ -90,9 +94,7 @@ impl Default for ProxyConfig {
             listen: "0.0.0.0:3334"
                 .parse()
                 .expect("default listen address is valid"),
-            upstream: "127.0.0.1:3333"
-                .parse()
-                .expect("default upstream address is valid"),
+            upstream: "127.0.0.1:3333".to_string(),
             timeouts: TimeoutsConfig {
                 upstream_connect: Duration::from_secs(10),
                 upstream_reconnect_max: Duration::from_secs(60),
@@ -139,7 +141,7 @@ impl ProxyConfig {
     pub fn apply_overrides(
         &mut self,
         listen: Option<SocketAddr>,
-        upstream: Option<SocketAddr>,
+        upstream: Option<String>,
         upstream_connect_secs: Option<u64>,
         upstream_reconnect_max_secs: Option<u64>,
         miner_idle_secs: Option<u64>,
@@ -178,7 +180,9 @@ impl ProxyConfig {
             self.listen = parse_socket_addr("proxy.listen", &listen)?;
         }
         if let Some(upstream) = file.proxy.upstream {
-            self.upstream = parse_socket_addr("proxy.upstream", &upstream)?;
+            // Kept as a string (no `SocketAddr` parse) so hostnames like
+            // `jdc:34265` are accepted and resolved at connect time.
+            self.upstream = upstream;
         }
         if let Some(seconds) = file.proxy.timeouts.upstream_connect {
             self.timeouts.upstream_connect = Duration::from_secs(seconds);
@@ -220,7 +224,7 @@ mod tests {
     fn default_config_matches_spec() {
         let config = ProxyConfig::default();
         assert_eq!(config.listen, "0.0.0.0:3334".parse().unwrap());
-        assert_eq!(config.upstream, "127.0.0.1:3333".parse().unwrap());
+        assert_eq!(config.upstream, "127.0.0.1:3333");
         assert_eq!(config.timeouts.upstream_connect, Duration::from_secs(10));
         assert_eq!(
             config.timeouts.upstream_reconnect_max,
@@ -257,7 +261,7 @@ mod tests {
         merged.apply_file(config).unwrap();
 
         assert_eq!(merged.listen, "127.0.0.1:4444".parse().unwrap());
-        assert_eq!(merged.upstream, "127.0.0.1:5555".parse().unwrap());
+        assert_eq!(merged.upstream, "127.0.0.1:5555");
         assert_eq!(merged.timeouts.upstream_connect, Duration::from_secs(5));
         assert_eq!(
             merged.timeouts.upstream_reconnect_max,
@@ -267,5 +271,23 @@ mod tests {
         assert!(merged.metrics.enabled);
         assert_eq!(merged.metrics.listen, "127.0.0.1:9000".parse().unwrap());
         assert_eq!(merged.logging.level, "debug");
+    }
+
+    #[test]
+    fn upstream_accepts_dns_hostname() {
+        // Regression test: a Docker-compose service name must pass through the
+        // config layer unvalidated (resolution happens at connect time).
+        let config: FileConfig = toml::from_str(
+            r#"
+                [proxy]
+                upstream = "jdc:34265"
+            "#,
+        )
+        .unwrap();
+
+        let mut merged = ProxyConfig::default();
+        merged.apply_file(config).unwrap();
+
+        assert_eq!(merged.upstream, "jdc:34265");
     }
 }
