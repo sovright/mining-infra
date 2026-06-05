@@ -69,7 +69,7 @@ JDC:  getblocktemplate (chainHistoryRoot, per-tx authdigests)
       → recompute block_commitments → SetCustomMiningJob
 
 Pool: each template cycle: store chainHistoryRoot + branch_id in CurrentTemplateContext
-      → on declaration: recompute expected from DECLARED coinbase+txs → verify == declared
+      → on declaration: recompute expected from the DECLARED coinbase (coinbase-only) → verify == declared
 ```
 
 ## Testing
