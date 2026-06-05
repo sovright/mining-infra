@@ -35,6 +35,10 @@ pub mod message_types {
     pub const GET_MISSING_TRANSACTIONS: u8 = 0x59;
     /// ProvideMissingTransactions message type
     pub const PROVIDE_MISSING_TRANSACTIONS: u8 = 0x5A;
+    /// SubmitSharesJd message type
+    pub const SUBMIT_SHARES_JD: u8 = 0x5B;
+    /// SubmitSharesJdResponse message type
+    pub const SUBMIT_SHARES_JD_RESPONSE: u8 = 0x5C;
 }
 
 /// Job declaration mode
@@ -199,15 +203,23 @@ pub struct SetCustomMiningJobSuccess {
     pub request_id: u32,
     /// Server-assigned job identifier
     pub job_id: u32,
+    /// Pool-granted share target for this declared job (little-endian, matching
+    /// `Target::to_le_bytes`).
+    ///
+    /// The pool (never the client) chooses this so fake-easy shares cannot
+    /// inflate payout credit. It is easier than the block target and is used by
+    /// the per-share validation path for declared jobs.
+    pub share_target: [u8; 32],
 }
 
 impl SetCustomMiningJobSuccess {
     /// Create a new success response
-    pub fn new(channel_id: u32, request_id: u32, job_id: u32) -> Self {
+    pub fn new(channel_id: u32, request_id: u32, job_id: u32, share_target: [u8; 32]) -> Self {
         Self {
             channel_id,
             request_id,
             job_id,
+            share_target,
         }
     }
 }
@@ -633,6 +645,134 @@ impl std::fmt::Display for SetFullTemplateJobErrorCode {
             Self::InvalidTransactions => write!(f, "invalid transactions"),
             Self::TooManyTransactions => write!(f, "too many transactions"),
             Self::Other => write!(f, "other error"),
+        }
+    }
+}
+
+// =============================================================================
+// Share Submission Messages (0x5B-0x5C)
+// =============================================================================
+
+/// One share from a declared job.
+///
+/// Contains exactly the fields that `handle_push_solution` consumes from a miner
+/// submission: version, time, nonce (32 bytes LE), and solution (1344 bytes).
+/// The remaining header fields (prev_hash, merkle_root, block_commitments, bits)
+/// are taken from the `DeclaredJobInfo` stored under `job_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JdShare {
+    /// Block version
+    pub version: u32,
+    /// Block timestamp
+    pub time: u32,
+    /// Full 32-byte nonce (little-endian)
+    pub nonce: [u8; 32],
+    /// Equihash (200,9) solution (1344 bytes)
+    pub solution: [u8; 1344],
+}
+
+/// Client -> Server: Batch of shares mined against a declared job, relayed by the JDC.
+///
+/// Wire layout (payload after frame header):
+/// - channel_id  u32 LE
+/// - request_id  u32 LE
+/// - job_id      u32 LE
+/// - count       u16 LE  (must be 1–64 inclusive; decoder rejects 0 and >64)
+/// - per share:
+///   - version   u32 LE
+///   - time      u32 LE
+///   - nonce     32 raw bytes (little-endian)
+///   - solution  1344 raw bytes
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitSharesJd {
+    /// Channel ID this batch belongs to
+    pub channel_id: u32,
+    /// Request identifier for matching the response
+    pub request_id: u32,
+    /// Job ID from `SetCustomMiningJobSuccess`
+    pub job_id: u32,
+    /// Non-empty batch of shares (max 64); decoder enforces 1 ≤ len ≤ 64
+    pub shares: Vec<JdShare>,
+}
+
+/// Server -> Client: Result of a `SubmitSharesJd` batch.
+///
+/// Wire layout (payload after frame header):
+/// - channel_id       u32 LE
+/// - request_id       u32 LE
+/// - accepted         u16 LE  (shares accepted)
+/// - rejected         u16 LE  (shares rejected)
+/// - first_error_code u8      (0 when rejected == 0; see `JdShareErrorCode`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitSharesJdResponse {
+    /// Channel ID matching the request
+    pub channel_id: u32,
+    /// Request identifier matching the request
+    pub request_id: u32,
+    /// Number of accepted shares
+    pub accepted: u16,
+    /// Number of rejected shares
+    pub rejected: u16,
+    /// Error code for the first rejected share when `rejected > 0`; 0 otherwise.
+    ///
+    /// Use `JdShareErrorCode::from_u8` to interpret.
+    pub first_error_code: u8,
+}
+
+/// Error codes for share rejection in `SubmitSharesJdResponse`.
+///
+/// The response struct keeps the raw `u8` on the wire; this enum provides
+/// type-safe helpers mirroring the style of `SetCustomMiningJobErrorCode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum JdShareErrorCode {
+    /// No error (all shares accepted)
+    None = 0,
+    /// Job ID is unknown (not declared or already evicted)
+    UnknownJob = 1,
+    /// Job has become stale (new block arrived)
+    StaleJob = 2,
+    /// Share does not meet the pool-granted share target
+    LowDifficulty = 3,
+    /// Equihash solution is invalid
+    BadSolution = 4,
+    /// Duplicate share already seen
+    Duplicate = 5,
+    /// Channel ID in share does not match the declared job's channel
+    ChannelMismatch = 6,
+}
+
+impl JdShareErrorCode {
+    /// Convert to wire byte
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    /// Try to convert from wire byte; returns `None` for unknown values
+    pub fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            0 => Some(Self::None),
+            1 => Some(Self::UnknownJob),
+            2 => Some(Self::StaleJob),
+            3 => Some(Self::LowDifficulty),
+            4 => Some(Self::BadSolution),
+            5 => Some(Self::Duplicate),
+            6 => Some(Self::ChannelMismatch),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for JdShareErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => write!(f, "none"),
+            Self::UnknownJob => write!(f, "unknown job"),
+            Self::StaleJob => write!(f, "stale job"),
+            Self::LowDifficulty => write!(f, "low difficulty"),
+            Self::BadSolution => write!(f, "bad solution"),
+            Self::Duplicate => write!(f, "duplicate"),
+            Self::ChannelMismatch => write!(f, "channel mismatch"),
         }
     }
 }

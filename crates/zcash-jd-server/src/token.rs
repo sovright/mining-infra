@@ -51,6 +51,9 @@ pub struct DeclaredJobInfo {
     pub time: u32,
     /// Coinbase transaction
     pub coinbase_tx: Vec<u8>,
+    /// Pool-granted share target for this declared job (chosen by the pool;
+    /// little-endian, matching `Target::to_le_bytes`).
+    pub share_target: [u8; 32],
 }
 
 impl MiningJobToken {
@@ -309,6 +312,7 @@ mod tests {
             bits: 0x1d00ffff,
             time: 1_700_000_000,
             coinbase_tx: vec![0x01; 100],
+            share_target: [0xdd; 32],
         };
 
         manager

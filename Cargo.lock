@@ -3883,14 +3883,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "sovright-noise",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "zcash-equihash-validator",
  "zcash-jd-server",
  "zcash-mining-protocol",
  "zcash-pool-common",
+ "zcash-pool-server",
  "zcash-template-provider",
 ]
 

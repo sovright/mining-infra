@@ -38,6 +38,7 @@ fn test_client_config_custom() {
         pool_public_key: Some("abc123".to_string()),
         full_template_mode: true,
         tx_selection: TxSelectionStrategy::ByFeeRate,
+        jdc_listen: None,
     };
 
     assert_eq!(config.zebra_url, "http://192.168.1.100:8232");

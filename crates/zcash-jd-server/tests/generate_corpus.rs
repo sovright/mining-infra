@@ -60,7 +60,7 @@ fn generate_fuzz_corpus() {
     // SetCustomMiningJobSuccess
     let dir = format!("{}/fuzz_decode_set_custom_job_success", corpus_base);
     fs::create_dir_all(&dir).unwrap();
-    let msg = SetCustomMiningJobSuccess::new(1, 1, 42);
+    let msg = SetCustomMiningJobSuccess::new(1, 1, 42, [0u8; 32]);
     fs::write(
         format!("{}/valid", dir),
         encode_set_custom_job_success(&msg).unwrap(),

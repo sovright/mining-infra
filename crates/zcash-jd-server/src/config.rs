@@ -2,6 +2,8 @@
 
 use std::time::Duration;
 
+use zcash_equihash_validator::difficulty::difficulty_to_target;
+
 use crate::validation::ValidationLevel;
 
 /// JD Server configuration
@@ -33,7 +35,36 @@ pub struct JdServerConfig {
 
     /// Minimum pool payout value (zatoshis) for full templates
     pub min_pool_payout: u64,
+
+    /// Pool-granted share target for declared jobs (little-endian, matching
+    /// `Target::to_le_bytes`).
+    ///
+    /// The pool chooses this (never the client) so fake-easy shares cannot
+    /// inflate payout credit. It is granted at declaration time, returned in
+    /// `SetCustomMiningJobSuccess`, and stored in the job for share validation.
+    ///
+    /// The default is derived via
+    /// `zcash_equihash_validator::difficulty::difficulty_to_target` from a
+    /// difficulty of 0.0001, which matches the testnet example configs'
+    /// `initial_difficulty`. There is no shared constant linking the JD and
+    /// stratum systems — the stratum DEFAULT `initial_difficulty` is 1.0
+    /// (`zcash-pool-server/src/config.rs`), and 0.0001 appears only in the
+    /// testnet example binaries.
+    ///
+    /// Note: `difficulty_to_target(0.0001)` clamps to all-ones (`[0xff; 32]`)
+    /// because difficulty < 1.0 (see `difficulty.rs`), so the DEFAULT accepts
+    /// any valid Equihash solution. Production configs MUST set a real target.
+    pub share_target: [u8; 32],
 }
+
+/// The default difficulty used to derive the JD share target.
+///
+/// Matches the testnet example configs' `initial_difficulty` (0.0001); there is
+/// no shared constant linking the JD and stratum systems (the stratum DEFAULT is
+/// 1.0). Because 0.0001 < 1.0, the derived target clamps to all-ones and accepts
+/// any valid Equihash solution — production configs must override it. See
+/// [`JdServerConfig::share_target`].
+const DEFAULT_SHARE_DIFFICULTY: f64 = 0.0001;
 
 impl Default for JdServerConfig {
     fn default() -> Self {
@@ -47,6 +78,7 @@ impl Default for JdServerConfig {
             full_template_enabled: false,
             full_template_validation: ValidationLevel::Standard,
             min_pool_payout: 0,
+            share_target: difficulty_to_target(DEFAULT_SHARE_DIFFICULTY).0,
         }
     }
 }

@@ -16,7 +16,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 byteorder = "1.5"
-clap = { version = "4.4", features = ["derive"] }
+clap = { version = "4.4", features = ["derive", "env"] }
+toml = "0.8"
 hex.workspace = true
 reqwest = { version = "0.12", features = ["json"] }
 serde_json.workspace = true
@@ -32,3 +33,10 @@ zcash-pool-common = { path = "../zcash-pool-common" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+tempfile = "3"
+# Tier-2 full-chain integration test (tests/tier2_chain_test.rs) drives a real
+# in-process pool server alongside the in-process JD client. No dependency
+# cycle: zcash-pool-server does not depend on zcash-jd-client. Relay feature is
+# off (not needed for the chain under test).
+zcash-pool-server = { path = "../zcash-pool-server", default-features = false }
+zcash-template-provider = { path = "../zcash-template-provider", features = ["test-support"] }
