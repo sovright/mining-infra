@@ -170,17 +170,16 @@ attribution chain works without further changes.
 
 ## Compatibility & rollout
 
-- **New pool, old clients:** no `SetWorkerIdentity` arrives; labels fall back to
-  `channel_N`. Identical to today.
-- **Old pool, new clients:** VERIFIED — the current pool routes every inbound frame
-  through `decode_share_message`, errors on any non-`SUBMIT_EQUIHASH_SHARE` type, and
-  the read loop `break`s: an old pool **disconnects** a client that sends 0x24. Since we
-  control all deployments (single testnet), the operational rule is mandatory:
-  **deploy the pool before clients**. The spec does not require clients to survive an
-  old pool.
-- Deploy order on the testnet VM: pool binary first, then the V1 proxy service and the
-  test-miner systemd service; then the API parser PR (parser change is safe in any
-  order — it only adds accepted names).
+There are no third-party clients of this protocol: the test miner and the V1 proxy are
+the only implementations, and we deploy them alongside the pool. No compatibility
+machinery is needed.
+
+- The `channel_N` fallback exists for robustness (shares arriving before the identity
+  message, identity rejected by validation/cap), not for legacy clients.
+- For the record: the pre-change pool disconnects on unknown frame types, so the pool
+  binary should be updated no later than the clients on the testnet VM. In practice all
+  three ship in one deploy.
+- The API parser PR is safe in any order — it only adds accepted metric names.
 
 ## Error handling summary
 
