@@ -58,3 +58,15 @@ doc = false
 name = "fuzz_roundtrip_set_target"
 path = "fuzz_targets/fuzz_roundtrip_set_target.rs"
 doc = false
+
+[[bin]]
+name = "fuzz_decode_set_worker_identity"
+path = "fuzz_targets/fuzz_decode_set_worker_identity.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_roundtrip_set_worker_identity"
+path = "fuzz_targets/fuzz_roundtrip_set_worker_identity.rs"
+test = false
+doc = false

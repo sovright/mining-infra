@@ -7,7 +7,7 @@
 
 use crate::error::{ProtocolError, Result};
 use crate::messages::{
-    NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
+    NewEquihashJob, RejectReason, SetTarget, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
     SubmitSharesResponse, message_types,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
@@ -557,6 +557,86 @@ pub fn decode_set_target(data: &[u8]) -> Result<SetTarget> {
     Ok(SetTarget { channel_id, target })
 }
 
+/// Encode a SetWorkerIdentity message
+pub fn encode_set_worker_identity(msg: &SetWorkerIdentity) -> Result<Vec<u8>> {
+    let name_bytes = msg.worker_name.as_bytes();
+    if name_bytes.is_empty() {
+        return Err(ProtocolError::EncodingError(
+            "worker_name must not be empty".into(),
+        ));
+    }
+    if name_bytes.len() > 255 {
+        return Err(ProtocolError::EncodingError(format!(
+            "worker_name length {} exceeds 255 bytes",
+            name_bytes.len()
+        )));
+    }
+
+    let mut payload = Vec::new();
+    payload.write_u32::<LittleEndian>(msg.channel_id).unwrap();
+    payload.write_u8(name_bytes.len() as u8).unwrap();
+    payload.write_all(name_bytes).unwrap();
+
+    let frame = MessageFrame {
+        extension_type: 0,
+        msg_type: message_types::SET_WORKER_IDENTITY,
+        length: payload.len() as u32,
+    };
+
+    let mut result = frame.encode().to_vec();
+    result.extend(payload);
+    Ok(result)
+}
+
+/// Decode a SetWorkerIdentity message
+pub fn decode_set_worker_identity(data: &[u8]) -> Result<SetWorkerIdentity> {
+    let frame = MessageFrame::decode(data)?;
+    if frame.msg_type != message_types::SET_WORKER_IDENTITY {
+        return Err(ProtocolError::InvalidMessageType(frame.msg_type));
+    }
+
+    let total_len = MessageFrame::HEADER_SIZE + frame.length as usize;
+    if data.len() < total_len {
+        return Err(ProtocolError::MessageTooShort {
+            expected: total_len,
+            actual: data.len(),
+        });
+    }
+    if data.len() > total_len {
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in message".into(),
+        ));
+    }
+
+    let payload = &data[MessageFrame::HEADER_SIZE..total_len];
+    let mut cursor = Cursor::new(payload);
+
+    let channel_id = cursor
+        .read_u32::<LittleEndian>()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+
+    let name_len = cursor
+        .read_u8()
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))? as usize;
+    if name_len == 0 {
+        return Err(ProtocolError::EncodingError(
+            "worker_name must not be empty".into(),
+        ));
+    }
+
+    let mut name_bytes = vec![0u8; name_len];
+    cursor
+        .read_exact(&mut name_bytes)
+        .map_err(|e| ProtocolError::EncodingError(e.to_string()))?;
+    let worker_name = String::from_utf8(name_bytes)
+        .map_err(|e| ProtocolError::EncodingError(format!("worker_name not UTF-8: {e}")))?;
+
+    Ok(SetWorkerIdentity {
+        channel_id,
+        worker_name,
+    })
+}
+
 impl Encodable for SubmitSharesResponse {
     fn encode(&self) -> Result<Vec<u8>> {
         encode_submit_shares_response(self)
@@ -710,5 +790,74 @@ mod tests {
         let decoded = SetTarget::decode(&encoded).unwrap();
 
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_set_worker_identity_roundtrip() {
+        let msg = SetWorkerIdentity {
+            channel_id: 24,
+            worker_name: "zaki-e2e-1".to_string(),
+        };
+
+        let encoded = encode_set_worker_identity(&msg).unwrap();
+        let decoded = decode_set_worker_identity(&encoded).unwrap();
+
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_set_worker_identity_empty_name_rejected() {
+        let msg = SetWorkerIdentity {
+            channel_id: 1,
+            worker_name: String::new(),
+        };
+        assert!(encode_set_worker_identity(&msg).is_err());
+    }
+
+    #[test]
+    fn test_set_worker_identity_max_length_roundtrip() {
+        let msg = SetWorkerIdentity {
+            channel_id: 1,
+            worker_name: "w".repeat(255),
+        };
+        let encoded = encode_set_worker_identity(&msg).unwrap();
+        let decoded = decode_set_worker_identity(&encoded).unwrap();
+        assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn test_set_worker_identity_overlong_name_rejected() {
+        let msg = SetWorkerIdentity {
+            channel_id: 1,
+            worker_name: "w".repeat(256),
+        };
+        assert!(encode_set_worker_identity(&msg).is_err());
+    }
+
+    #[test]
+    fn test_set_worker_identity_invalid_utf8_rejected() {
+        // Hand-craft a frame whose name bytes are invalid UTF-8.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        payload.push(2); // name length
+        payload.extend_from_slice(&[0xff, 0xfe]); // invalid UTF-8
+        let frame = MessageFrame {
+            extension_type: 0,
+            msg_type: message_types::SET_WORKER_IDENTITY,
+            length: payload.len() as u32,
+        };
+        let mut data = frame.encode().to_vec();
+        data.extend(payload);
+        assert!(decode_set_worker_identity(&data).is_err());
+    }
+
+    #[test]
+    fn test_set_worker_identity_truncated_rejected() {
+        let msg = SetWorkerIdentity {
+            channel_id: 9,
+            worker_name: "rig-1".to_string(),
+        };
+        let encoded = encode_set_worker_identity(&msg).unwrap();
+        assert!(decode_set_worker_identity(&encoded[..encoded.len() - 2]).is_err());
     }
 }

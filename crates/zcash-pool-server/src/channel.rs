@@ -34,6 +34,9 @@ pub struct Channel {
     pub last_job_id: u32,
     /// Rate limiter for share submissions
     pub rate_limiter: RateLimiter,
+    /// Miner-declared worker name (via SetWorkerIdentity), sanitized for use
+    /// as a metrics label. None until the miner identifies itself.
+    pub worker_name: Option<String>,
 }
 
 /// Default job TTL (10 minutes)
@@ -98,7 +101,40 @@ impl Channel {
             jobs: HashMap::with_capacity(10),
             last_job_id: 0,
             rate_limiter: RateLimiter::for_shares(),
+            worker_name: None,
         })
+    }
+
+    /// Record the miner-declared worker name, sanitized for safe use as a
+    /// Prometheus label and portal stratum_auth value: printable, no control
+    /// characters, capped at 64 chars; characters outside [A-Za-z0-9._-] are
+    /// replaced with '_'. Returns false (and stores nothing) if nothing
+    /// usable survives sanitization.
+    pub fn set_worker_name(&mut self, raw: &str) -> bool {
+        let sanitized: String = raw
+            .chars()
+            .take(64)
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if sanitized.chars().all(|c| c == '_') {
+            return false;
+        }
+        self.worker_name = Some(sanitized);
+        true
+    }
+
+    /// Label identifying this channel's worker in metrics: the sanitized
+    /// miner-declared name when known, otherwise "channel_<id>".
+    pub fn metrics_label(&self) -> String {
+        self.worker_name
+            .clone()
+            .unwrap_or_else(|| format!("channel_{}", self.id))
     }
 
     /// Create a new channel with the given nonce_1 prefix.
@@ -223,6 +259,54 @@ mod tests {
 
         assert_eq!(channel.nonce_1, nonce_1);
         assert_eq!(channel.nonce_2_len, 28);
+    }
+
+    #[test]
+    fn test_metrics_label_falls_back_to_channel_id() {
+        let channel = Channel::new_with_id(7, vec![0x01], VardiffConfig::default()).unwrap();
+        assert_eq!(channel.metrics_label(), "channel_7");
+    }
+
+    #[test]
+    fn test_set_worker_name_used_as_metrics_label() {
+        let mut channel = Channel::new_with_id(7, vec![0x01], VardiffConfig::default()).unwrap();
+        assert!(channel.set_worker_name("zaki-e2e-1"));
+        assert_eq!(channel.metrics_label(), "zaki-e2e-1");
+    }
+
+    #[test]
+    fn test_set_worker_name_sanitizes_label_unsafe_chars() {
+        let mut channel = Channel::new_with_id(7, vec![0x01], VardiffConfig::default()).unwrap();
+        assert!(channel.set_worker_name("rig 1\"{evil}\n"));
+        let label = channel.metrics_label();
+        assert!(
+            label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')),
+            "label not sanitized: {label}"
+        );
+    }
+
+    #[test]
+    fn test_set_worker_name_caps_length() {
+        let mut channel = Channel::new_with_id(7, vec![0x01], VardiffConfig::default()).unwrap();
+        assert!(channel.set_worker_name(&"w".repeat(255)));
+        assert_eq!(channel.metrics_label().len(), 64);
+    }
+
+    #[test]
+    fn test_set_worker_name_rejects_garbage_only() {
+        let mut channel = Channel::new_with_id(7, vec![0x01], VardiffConfig::default()).unwrap();
+        assert!(!channel.set_worker_name("@@@ !!!"));
+        assert_eq!(channel.metrics_label(), "channel_7");
+    }
+
+    #[test]
+    fn test_latest_worker_name_wins() {
+        let mut channel = Channel::new_with_id(7, vec![0x01], VardiffConfig::default()).unwrap();
+        assert!(channel.set_worker_name("first"));
+        assert!(channel.set_worker_name("second"));
+        assert_eq!(channel.metrics_label(), "second");
     }
 
     #[test]

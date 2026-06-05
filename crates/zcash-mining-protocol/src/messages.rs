@@ -15,6 +15,8 @@ pub mod message_types {
     pub const SUBMIT_SHARES_RESPONSE: u8 = 0x22;
     /// SetTarget message type (difficulty adjustment)
     pub const SET_TARGET: u8 = 0x23;
+    /// SetWorkerIdentity message type (miner self-identification)
+    pub const SET_WORKER_IDENTITY: u8 = 0x24;
 }
 
 /// Pool -> Miner: New mining job
@@ -164,6 +166,21 @@ pub struct SetTarget {
     pub channel_id: u32,
     /// New target (256-bit, little-endian)
     pub target: [u8; 32],
+}
+
+/// Miner -> Pool: self-identify the worker behind a channel.
+///
+/// Sent once after connect (re-sends allowed; the latest value wins). The
+/// pool uses the name to label per-worker metrics and share credit so the
+/// portal's anonymous-mine-then-claim flow can match workers by the name the
+/// miner chose. Without it the pool only knows the channel id and peer IP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
+pub struct SetWorkerIdentity {
+    /// Channel ID this identity applies to
+    pub channel_id: u32,
+    /// Miner-chosen worker name (1-255 bytes, UTF-8)
+    pub worker_name: String,
 }
 
 #[cfg(test)]

@@ -929,6 +929,17 @@ impl PoolServer {
         Ok(())
     }
 
+    /// Metrics label for a channel: the miner-declared worker name when
+    /// known, otherwise "channel_<id>" (also used when the channel is gone).
+    async fn worker_label(&self, channel_id: u32) -> String {
+        self.channels
+            .read()
+            .await
+            .get(&channel_id)
+            .map(|c| c.metrics_label())
+            .unwrap_or_else(|| format!("channel_{channel_id}"))
+    }
+
     /// Handle a message from a session
     async fn handle_session_message(&self, msg: SessionMessage) -> Result<()> {
         match msg {
@@ -939,6 +950,35 @@ impl PoolServer {
             } => {
                 self.handle_share_submission(channel_id, *share, response_tx)
                     .await
+            }
+            SessionMessage::IdentitySet {
+                channel_id,
+                worker_name,
+            } => {
+                let mut channels = self.channels.write().await;
+                match channels.get_mut(&channel_id) {
+                    Some(channel) => {
+                        if channel.set_worker_name(&worker_name) {
+                            info!(
+                                "Channel {} identified as worker {:?}",
+                                channel_id,
+                                channel.worker_name.as_deref().unwrap_or_default()
+                            );
+                        } else {
+                            warn!(
+                                "Channel {} sent unusable worker name; keeping fallback label",
+                                channel_id
+                            );
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "IdentitySet for unknown channel {} (already disconnected?)",
+                            channel_id
+                        );
+                    }
+                }
+                Ok(())
             }
             SessionMessage::Disconnected { channel_id } => {
                 // Cleanup is handled by the spawned session task on exit
@@ -1085,15 +1125,21 @@ impl PoolServer {
                         } else {
                             None
                         };
-                        // Record payout inside same lock scope
+                        // Record payout inside same lock scope. Credit the
+                        // miner-declared worker name when known so portal
+                        // share history matches what miners can claim;
+                        // fall back to peer IP, then channel id.
                         if let Some(diff) = difficulty {
-                            let miner_id: MinerId = self
-                                .connection_times
-                                .read()
-                                .await
-                                .get(&channel_id)
-                                .map(|(_, addr)| addr.ip().to_string())
-                                .unwrap_or_else(|| format!("channel_{}", channel_id));
+                            let miner_id: MinerId = match channel.worker_name.clone() {
+                                Some(name) => name,
+                                None => self
+                                    .connection_times
+                                    .read()
+                                    .await
+                                    .get(&channel_id)
+                                    .map(|(_, addr)| addr.ip().to_string())
+                                    .unwrap_or_else(|| format!("channel_{}", channel_id)),
+                            };
                             self.payout_tracker.record_share(&miner_id, diff);
                         }
                         new_target
@@ -1113,7 +1159,7 @@ impl PoolServer {
         let share_result = match result {
             Ok(validation) => {
                 if validation.accepted && stale_after_validation {
-                    let worker_label = format!("channel_{}", channel_id);
+                    let worker_label = self.worker_label(channel_id).await;
                     self.metrics.record_share_rejected("StaleJob");
                     self.metrics.record_worker_share_rejected(&worker_label);
                     debug!(
@@ -1181,7 +1227,7 @@ impl PoolServer {
                         }
                     }
 
-                    let worker_label = format!("channel_{}", channel_id);
+                    let worker_label = self.worker_label(channel_id).await;
                     self.metrics.record_share_accepted();
                     self.metrics.record_worker_share_accepted(&worker_label);
                     if validation.is_block {
@@ -1193,7 +1239,7 @@ impl PoolServer {
                     );
                     validation.result
                 } else {
-                    let worker_label = format!("channel_{}", channel_id);
+                    let worker_label = self.worker_label(channel_id).await;
                     let reason = match &validation.result {
                         zcash_mining_protocol::messages::ShareResult::Rejected(r) => {
                             format!("{:?}", r)

@@ -8,8 +8,10 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use sovright_noise::PublicKey;
-use zcash_mining_protocol::codec::encode_submit_share;
-use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult, SubmitEquihashShare};
+use zcash_mining_protocol::codec::{encode_set_worker_identity, encode_submit_share};
+use zcash_mining_protocol::messages::{
+    NewEquihashJob, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
+};
 
 /// Simple hex encoding (avoids adding `hex` crate dependency).
 fn to_hex(bytes: &[u8]) -> String {
@@ -156,6 +158,12 @@ async fn run_worker_session(
     // Channel for solver threads to send found shares back to the session loop.
     let (share_tx, mut share_rx) = mpsc::channel::<(FoundShare, NewEquihashJob)>(64);
 
+    // The pool assigns our channel_id with the first job; we introduce
+    // ourselves as soon as we learn it so shares are credited to this
+    // worker's name (claimable on the portal) instead of an anonymous
+    // channel number.
+    let mut identity_sent = false;
+
     // Per-job cancellation for active solvers. Replacing it on a new job (or
     // dropping it when the session ends, including error paths via `?`)
     // permanently cancels that job's threads.
@@ -177,6 +185,34 @@ async fn run_worker_session(
                             nonce_2_len = job.nonce_2_len,
                             "Received new job"
                         );
+
+                        if !identity_sent {
+                            let identity = SetWorkerIdentity {
+                                channel_id: job.channel_id,
+                                worker_name: config.worker_name.clone(),
+                            };
+                            match encode_set_worker_identity(&identity) {
+                                Ok(encoded) => {
+                                    if let Err(e) = transport.write_message(&encoded).await {
+                                        warn!(
+                                            worker = %config.worker_name,
+                                            error = %e,
+                                            "Failed to send worker identity"
+                                        );
+                                    } else {
+                                        identity_sent = true;
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        worker = %config.worker_name,
+                                        error = %e,
+                                        "Failed to encode worker identity"
+                                    );
+                                    identity_sent = true; // don't retry a hopeless encode
+                                }
+                            }
+                        }
 
                         if !job.validate_nonce_len() {
                             warn!(

@@ -16,6 +16,8 @@ jobs:
           - fuzz_decode_submit_share
           - fuzz_decode_submit_response
           - fuzz_decode_set_target
+          - fuzz_decode_set_worker_identity
+          - fuzz_roundtrip_set_worker_identity
           - fuzz_roundtrip_new_job
           - fuzz_roundtrip_submit_share
           - fuzz_roundtrip_submit_response

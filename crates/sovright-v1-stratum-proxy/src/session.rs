@@ -20,10 +20,10 @@ use tokio::time::{self, Instant};
 use tracing::{debug, info, warn};
 use zcash_mining_protocol::codec::{
     MessageFrame, decode_new_equihash_job, decode_set_target, decode_submit_shares_response,
-    encode_submit_share,
+    encode_set_worker_identity, encode_submit_share,
 };
 use zcash_mining_protocol::messages::{
-    NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
+    NewEquihashJob, RejectReason, SetTarget, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
     SubmitSharesResponse, message_types,
 };
 
@@ -543,6 +543,31 @@ impl MinerSession {
         Ok(())
     }
 
+    /// Forward the authorized V1 worker name upstream as a SetWorkerIdentity.
+    /// Best-effort: identity is advisory, so failures only log.
+    async fn send_identity_upstream(&mut self, channel_id: u32) {
+        let Some(worker_name) = self.worker_name.clone() else {
+            return;
+        };
+        let Some(upstream) = self.upstream.as_mut() else {
+            return;
+        };
+        let identity = SetWorkerIdentity {
+            channel_id,
+            worker_name,
+        };
+        match encode_set_worker_identity(&identity) {
+            Ok(encoded) => {
+                if let Err(e) = upstream.write_raw(&encoded).await {
+                    warn!(peer = %self.peer_addr, error = %e, "Failed to send worker identity upstream");
+                }
+            }
+            Err(e) => {
+                warn!(peer = %self.peer_addr, error = %e, "Failed to encode worker identity");
+            }
+        }
+    }
+
     async fn handle_upstream_message(
         &mut self,
         message: UpstreamMessage,
@@ -558,7 +583,15 @@ impl MinerSession {
                     self.job_map.clear();
                 }
 
+                let channel_changed = self.channel_id != Some(job.channel_id);
                 self.channel_id = Some(job.channel_id);
+                // (Re)introduce the authorized V1 worker upstream whenever the
+                // channel is (re)established, so the pool credits shares to
+                // the miner's stratum username rather than an anonymous
+                // channel number.
+                if channel_changed {
+                    self.send_identity_upstream(job.channel_id).await;
+                }
                 self.nonce_1 = job.nonce_1.clone();
                 self.nonce_2_size = Some(job.nonce_2_len as usize);
                 self.current_target = Some(job.target);
@@ -858,6 +891,12 @@ impl UpstreamConnection {
             stream,
             read_buf: Vec::with_capacity(4096),
         })
+    }
+
+    async fn write_raw(&mut self, encoded: &[u8]) -> Result<(), SessionError> {
+        self.stream.write_all(encoded).await?;
+        self.stream.flush().await?;
+        Ok(())
     }
 
     async fn write_share(&mut self, share: &SubmitEquihashShare) -> Result<(), SessionError> {

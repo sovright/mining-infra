@@ -14,7 +14,8 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use zcash_mining_protocol::codec::{
-    MessageFrame, encode_new_equihash_job, encode_set_target as codec_encode_set_target,
+    MessageFrame, decode_set_worker_identity, encode_new_equihash_job,
+    encode_set_target as codec_encode_set_target,
     encode_submit_shares_response as codec_encode_submit_shares_response,
 };
 use zcash_mining_protocol::messages::{
@@ -30,6 +31,11 @@ pub enum SessionMessage {
         channel_id: u32,
         share: Box<SubmitEquihashShare>,
         response_tx: oneshot::Sender<ShareResult>,
+    },
+    /// Miner declared its worker identity
+    IdentitySet {
+        channel_id: u32,
+        worker_name: String,
     },
     /// Session disconnected
     Disconnected { channel_id: u32 },
@@ -96,6 +102,14 @@ impl Session {
                 read_result = read_future => {
                     match read_result {
                         Ok(Some(msg)) => {
+                            // Identity messages are rare control messages;
+                            // everything else on this socket is a share.
+                            if Self::peek_msg_type(&msg) == Some(message_types::SET_WORKER_IDENTITY) {
+                                if let Err(e) = self.handle_identity(&msg).await {
+                                    warn!("Ignoring bad SetWorkerIdentity on channel {}: {}", channel_id, e);
+                                }
+                                continue;
+                            }
                             match self.decode_share_message(&msg) {
                                 Ok(share) => {
                                     if let Err(e) = self.handle_share(share).await {
@@ -234,6 +248,34 @@ impl Session {
         // Extract message bytes
         let msg_data: Vec<u8> = read_buf.drain(..total_len).collect();
         Ok(Some(msg_data))
+    }
+
+    /// Peek the frame's message type without consuming the message.
+    fn peek_msg_type(msg_data: &[u8]) -> Option<u8> {
+        MessageFrame::decode(msg_data).ok().map(|f| f.msg_type)
+    }
+
+    /// Decode and forward a SetWorkerIdentity message to the server.
+    async fn handle_identity(&mut self, msg_data: &[u8]) -> Result<()> {
+        let identity = decode_set_worker_identity(msg_data).map_err(PoolError::Protocol)?;
+        if identity.channel_id != self.channel_id {
+            return Err(PoolError::InvalidMessage(format!(
+                "SetWorkerIdentity channel_id {} does not match session {}",
+                identity.channel_id, self.channel_id
+            )));
+        }
+        debug!(
+            "Worker identity declared: channel={}, name={}",
+            self.channel_id, identity.worker_name
+        );
+        self.server_tx
+            .send(SessionMessage::IdentitySet {
+                channel_id: self.channel_id,
+                worker_name: identity.worker_name,
+            })
+            .await
+            .map_err(|_| PoolError::ChannelSend)?;
+        Ok(())
     }
 
     /// Decode a share submission message
