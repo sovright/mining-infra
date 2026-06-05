@@ -77,6 +77,8 @@ pub struct PoolServer {
     sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
     /// Channel state (channel_id -> Channel)
     channels: Arc<RwLock<HashMap<u32, Channel>>>,
+    /// Accepted worker identities (bounds Prometheus label cardinality).
+    accepted_identities: Arc<RwLock<HashSet<String>>>,
     /// Channel for session messages
     session_tx: mpsc::Sender<SessionMessage>,
     /// Receiver for session messages
@@ -106,6 +108,43 @@ pub struct PoolServer {
     miner_slots: Arc<Semaphore>,
     /// Limits concurrent JD handshakes and sessions.
     jd_slots: Arc<Semaphore>,
+}
+
+/// Cap on distinct accepted worker identities per process. Identities are
+/// attacker-controlled Prometheus label values; both the label and this set
+/// live until process restart, so the cap bounds metric cardinality against
+/// a client cycling names across reconnects.
+const MAX_WORKER_IDENTITIES: usize = 10_000;
+
+#[derive(Debug, PartialEq)]
+enum IdentityDecision {
+    Accept,
+    AlreadySet,
+    CapReached,
+}
+
+/// Pure policy: immutability first, then the cardinality cap (existing names
+/// don't count against it).
+fn apply_identity_policy(
+    accepted: &mut std::collections::HashSet<String>,
+    current: &Option<String>,
+    name: &str,
+    cap: usize,
+) -> IdentityDecision {
+    if current.is_some() {
+        return IdentityDecision::AlreadySet;
+    }
+    if !accepted.contains(name) && accepted.len() >= cap {
+        return IdentityDecision::CapReached;
+    }
+    IdentityDecision::Accept
+}
+
+/// Metrics label for a channel: declared identity, or `channel_N`.
+fn resolve_worker_label(worker_identity: &Option<String>, channel_id: u32) -> String {
+    worker_identity
+        .clone()
+        .unwrap_or_else(|| format!("channel_{channel_id}"))
 }
 
 impl PoolServer {
@@ -259,6 +298,7 @@ impl PoolServer {
             payout_tracker,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
+            accepted_identities: Arc::new(RwLock::new(HashSet::new())),
             session_tx,
             session_rx,
             // Initialize to impossible target (all zeros) so any share validated
@@ -948,7 +988,35 @@ impl PoolServer {
                 info!("Session {} disconnected", channel_id);
                 Ok(())
             }
-            SessionMessage::IdentityDeclared { .. } => Ok(()), // TODO(worker-identity Task 3)
+            SessionMessage::IdentityDeclared { channel_id, worker_name } => {
+                let mut accepted = self.accepted_identities.write().await;
+                let mut channels = self.channels.write().await;
+                let Some(channel) = channels.get_mut(&channel_id) else {
+                    warn!("Identity for unknown channel {}", channel_id);
+                    return Ok(());
+                };
+                match apply_identity_policy(&mut accepted, &channel.worker_identity, &worker_name, MAX_WORKER_IDENTITIES) {
+                    IdentityDecision::Accept => {
+                        accepted.insert(worker_name.clone());
+                        info!("Channel {} identified as worker '{}'", channel_id, worker_name);
+                        channel.worker_identity = Some(worker_name);
+                    }
+                    IdentityDecision::AlreadySet => {
+                        warn!(
+                            "Channel {} attempted to re-declare identity '{}' (already '{}') - ignored",
+                            channel_id, worker_name,
+                            channel.worker_identity.as_deref().unwrap_or("?")
+                        );
+                    }
+                    IdentityDecision::CapReached => {
+                        warn!(
+                            "Worker identity cap ({}) reached; channel {} stays as channel_{}",
+                            MAX_WORKER_IDENTITIES, channel_id, channel_id
+                        );
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1111,10 +1179,19 @@ impl PoolServer {
             None
         };
 
+        // Resolve the worker label once, after all write-lock scopes have closed.
+        // This short read does not overlap any earlier write locks.
+        let worker_label = {
+            let channels = self.channels.read().await;
+            channels
+                .get(&channel_id)
+                .map(|c| resolve_worker_label(&c.worker_identity, channel_id))
+                .unwrap_or_else(|| format!("channel_{channel_id}"))
+        };
+
         let share_result = match result {
             Ok(validation) => {
                 if validation.accepted && stale_after_validation {
-                    let worker_label = format!("channel_{}", channel_id);
                     self.metrics.record_share_rejected("StaleJob");
                     self.metrics.record_worker_share_rejected(&worker_label);
                     debug!(
@@ -1182,7 +1259,6 @@ impl PoolServer {
                         }
                     }
 
-                    let worker_label = format!("channel_{}", channel_id);
                     self.metrics.record_share_accepted();
                     self.metrics.record_worker_share_accepted(&worker_label);
                     if validation.is_block {
@@ -1194,7 +1270,6 @@ impl PoolServer {
                     );
                     validation.result
                 } else {
-                    let worker_label = format!("channel_{}", channel_id);
                     let reason = match &validation.result {
                         zcash_mining_protocol::messages::ShareResult::Rejected(r) => {
                             format!("{:?}", r)
@@ -1426,5 +1501,42 @@ mod tests {
             current_height: None,
         };
         assert_eq!(stats.connected_sessions, 0);
+    }
+
+    #[test]
+    fn identity_policy() {
+        let mut accepted = std::collections::HashSet::new();
+
+        // First identity accepted
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &None, "rig-1", 2),
+            IdentityDecision::Accept
+        );
+        accepted.insert("rig-1".to_string());
+
+        // Immutable: second declaration on same channel ignored
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &Some("rig-1".into()), "rig-2", 2),
+            IdentityDecision::AlreadySet
+        );
+
+        // Same name on another channel is fine (doesn't grow the set)
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &None, "rig-1", 2),
+            IdentityDecision::Accept
+        );
+
+        // Cap reached for a NEW name
+        accepted.insert("rig-9".to_string());
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &None, "rig-3", 2),
+            IdentityDecision::CapReached
+        );
+    }
+
+    #[test]
+    fn worker_label_resolution() {
+        assert_eq!(resolve_worker_label(&Some("rig-1".into()), 5), "rig-1");
+        assert_eq!(resolve_worker_label(&None, 5), "channel_5");
     }
 }
