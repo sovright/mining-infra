@@ -244,6 +244,9 @@ Add to `session.rs`:
 pub enum InboundMessage {
     Share(SubmitEquihashShare),
     Identity(zcash_mining_protocol::messages::SetWorkerIdentity),
+    /// A SET_WORKER_IDENTITY frame that failed decode/validation. The session
+    /// warns and continues (spec: invalid identity never disconnects).
+    InvalidIdentity(String),
 }
 
 /// Decode an inbound frame by type. Unknown types are an error; the session
@@ -254,10 +257,12 @@ pub fn classify_message(msg_data: &[u8]) -> Result<InboundMessage> {
         message_types::SUBMIT_EQUIHASH_SHARE => {
             Ok(InboundMessage::Share(decode_submit_share(msg_data)?))
         }
-        message_types::SET_WORKER_IDENTITY => Ok(InboundMessage::Identity(
-            zcash_mining_protocol::codec::decode_set_worker_identity(msg_data)
-                .map_err(PoolError::Protocol)?,
-        )),
+        message_types::SET_WORKER_IDENTITY => {
+            match zcash_mining_protocol::codec::decode_set_worker_identity(msg_data) {
+                Ok(ident) => Ok(InboundMessage::Identity(ident)),
+                Err(e) => Ok(InboundMessage::InvalidIdentity(e.to_string())),
+            }
+        }
         other => Err(PoolError::InvalidMessage(format!(
             "Unknown message type: 0x{other:02x}"
         ))),
@@ -311,13 +316,7 @@ Move the `share.channel_id != self.channel_id` check out of `decode_share_messag
     IdentityDeclared { channel_id: u32, worker_name: String },
 ```
 
-NOTE: a decode failure of a malformed 0x24 frame currently lands in the `Err` arm and disconnects. The spec says invalid identity should be ignored with a warning, keeping the connection. Distinguish: in `classify_message`, on a SET_WORKER_IDENTITY frame that fails `decode_set_worker_identity`, return a third variant instead of Err:
-
-```rust
-    InvalidIdentity(String), // reason; session warns and continues
-```
-
-with the session arm:
+The `InvalidIdentity` variant (already in the enum above) keeps the spec's rule that a malformed 0x24 frame is ignored with a warning rather than disconnecting. Session arm:
 
 ```rust
     Ok(InboundMessage::InvalidIdentity(reason)) => {
@@ -483,13 +482,19 @@ SessionMessage::IdentityDeclared { channel_id, worker_name } => {
 }
 ```
 
-Metric labels: at the three `worker_label = format!("channel_{}", channel_id)` sites (server.rs ~1116, ~1184), the surrounding code in `handle_share_submission` already has channel access (it calls `channel.record_share()`); capture the label once where the channel is borrowed:
+Metric labels: the three `worker_label = format!("channel_{}", channel_id)` sites (server.rs 1116, 1184, 1196) all live in the `match result` block (~1113-1207) where NO channel lock is held — the earlier `channels.write()` scope ends before it and only runs on the accepted branch. There is no existing borrow spanning all three sites. Add one dedicated short read before the `match result` block:
 
 ```rust
-let worker_label = resolve_worker_label(&channel.worker_identity, channel_id);
+let worker_label = {
+    let channels = self.channels.read().await; // adapt to the actual field/lock
+    channels
+        .get(&channel_id)
+        .map(|c| resolve_worker_label(&c.worker_identity, channel_id))
+        .unwrap_or_else(|| format!("channel_{channel_id}"))
+};
 ```
 
-and use it at all three call sites (stale-reject, accepted, rejected paths). Read the lock scopes carefully — if the channel borrow ends before the metric call, clone the label out of the lock scope (it's a String; cheap).
+then use `worker_label` (cheap String clone where needed) at all three call sites (stale-reject, accepted, rejected paths), deleting the three `format!` lines.
 
 Do NOT add per-worker hashrate export: the pool has no per-channel hashrate estimator and the spec forbids building one for this feature.
 
@@ -620,7 +625,7 @@ In `connect_upstream` (session.rs:624), immediately after `self.upstream = Some(
 
 `write_raw`: read how `UpstreamConnection::write_share` (used at session.rs:540) writes to the stream and add a sibling method that writes pre-encoded bytes the same way (same framing — `write_share` likely encodes then writes; factor or duplicate the raw-write portion). Fix the borrow order if `self.upstream.as_mut()` conflicts with the surrounding code — the snippet runs right after `self.upstream = Some(...)`, so restructure to use that binding directly if cleaner.
 
-Timing note: today the proxy connects upstream lazily; verify whether `connect_upstream` can run BEFORE `mining.authorize` sets `worker_name` (e.g. on subscribe). If it can, also send the identity at the end of `handle_authorize` when an upstream connection already exists — same snippet factored into a `send_worker_identity(&mut self)` helper called from both places. The immutability rule means only the first one the pool sees wins; sending twice with the same name is harmless (second is warned + ignored).
+Timing (VERIFIED): `connect_upstream` is called from `handle_subscribe` (session.rs:405), which in standard SV1 runs BEFORE `mining.authorize` sets `worker_name` (session.rs:454). So on first connect the `connect_upstream` send is a no-op (`worker_name` is None). Therefore: factor the snippet into a `send_worker_identity(&mut self)` helper and call it from BOTH sites — at the end of `handle_authorize` (the REQUIRED primary path: upstream exists, name just arrived) and in `connect_upstream` after the upstream is established (covers reconnects, where the name is already known). Immutability on the pool side makes a duplicate send harmless (warned + ignored).
 
 - [ ] **Step 4: Run tests**
 
