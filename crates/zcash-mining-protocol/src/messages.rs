@@ -15,6 +15,8 @@ pub mod message_types {
     pub const SUBMIT_SHARES_RESPONSE: u8 = 0x22;
     /// SetTarget message type (difficulty adjustment)
     pub const SET_TARGET: u8 = 0x23;
+    /// SetWorkerIdentity message type (client -> server, once per connection)
+    pub const SET_WORKER_IDENTITY: u8 = 0x24;
 }
 
 /// Pool -> Miner: New mining job
@@ -154,6 +156,39 @@ pub enum RejectReason {
     LowDifficulty,
     /// Other error
     Other(String),
+}
+
+/// Declares the worker name for this connection. Sent by the client once,
+/// immediately after the transport handshake, before any shares. The pool
+/// treats it as immutable for the life of the connection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetWorkerIdentity {
+    /// 1-64 bytes, restricted to [A-Za-z0-9._-].
+    pub worker_name: String,
+}
+
+/// Maximum worker name length in bytes.
+pub const MAX_WORKER_NAME_LEN: usize = 64;
+
+/// Validate a worker name: 1-64 bytes of [A-Za-z0-9._-].
+///
+/// Restricted because the name becomes a Prometheus label value, a database
+/// key, and dashboard text downstream.
+pub fn validate_worker_name(name: &str) -> core::result::Result<(), crate::error::ProtocolError> {
+    if name.is_empty() || name.len() > MAX_WORKER_NAME_LEN {
+        return Err(crate::error::ProtocolError::EncodingError(format!(
+            "worker name must be 1-{MAX_WORKER_NAME_LEN} bytes"
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    {
+        return Err(crate::error::ProtocolError::EncodingError(
+            "worker name may only contain [A-Za-z0-9._-]".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Pool -> Miner: Update share difficulty target
