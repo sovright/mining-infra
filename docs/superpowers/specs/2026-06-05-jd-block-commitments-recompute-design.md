@@ -63,7 +63,7 @@ Reuses existing primitives — no new crypto for the coinbase-only fix this spec
 ### Data flow
 
 ```
-JDC:  getblocktemplate (chainHistoryRoot, per-tx authdigests)
+JDC:  getblocktemplate (chainHistoryRoot)
       + getblockchaininfo (consensus.nextblock = branch_id)
       → build coinbase from pool coinbase_output
       → recompute block_commitments → SetCustomMiningJob
