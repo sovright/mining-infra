@@ -640,6 +640,13 @@ impl MinerSession {
         .await?;
         self.upstream = Some(upstream);
 
+        // Forward worker identity immediately on (re)connect, before draining
+        // the initial messages: jobs arrive in that drain, and any shares the
+        // downstream miner produces from them must already be attributable.
+        // On first connect worker_name is None and this is a no-op (the
+        // handle_authorize site covers that path once the name arrives).
+        self.send_worker_identity().await?;
+
         let mut initial_messages = Vec::new();
         loop {
             let Some(upstream) = self.upstream.as_mut() else {
@@ -683,11 +690,6 @@ impl MinerSession {
         } else {
             self.ever_connected_upstream = true;
         }
-
-        // Forward worker identity on (re)connect if already known (covers
-        // reconnects where authorize has already set worker_name). On first
-        // connect the worker_name is None and this is a no-op.
-        self.send_worker_identity().await?;
 
         Ok(initial_messages)
     }
