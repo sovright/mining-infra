@@ -7,8 +7,8 @@
 
 use crate::error::{ProtocolError, Result};
 use crate::messages::{
-    NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
-    SubmitSharesResponse, message_types,
+    NewEquihashJob, RejectReason, SetTarget, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
+    SubmitSharesResponse, message_types, validate_worker_name,
 };
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use std::io::{Cursor, Read, Write};
@@ -316,6 +316,70 @@ pub fn decode_submit_share(data: &[u8]) -> Result<SubmitEquihashShare> {
     })
 }
 
+/// Encode a SetWorkerIdentity message
+pub fn encode_set_worker_identity(msg: &SetWorkerIdentity) -> Result<Vec<u8>> {
+    validate_worker_name(&msg.worker_name)?;
+
+    let mut payload = Vec::with_capacity(1 + msg.worker_name.len());
+    payload.write_u8(msg.worker_name.len() as u8).unwrap();
+    payload.write_all(msg.worker_name.as_bytes()).unwrap();
+
+    let frame = MessageFrame {
+        extension_type: 0,
+        msg_type: message_types::SET_WORKER_IDENTITY,
+        length: payload.len() as u32,
+    };
+
+    let mut result = frame.encode().to_vec();
+    result.extend(payload);
+    Ok(result)
+}
+
+/// Decode a SetWorkerIdentity message
+pub fn decode_set_worker_identity(data: &[u8]) -> Result<SetWorkerIdentity> {
+    let frame = MessageFrame::decode(data)?;
+    if frame.msg_type != message_types::SET_WORKER_IDENTITY {
+        return Err(ProtocolError::InvalidMessageType(frame.msg_type));
+    }
+
+    let total_len = MessageFrame::HEADER_SIZE + frame.length as usize;
+    if data.len() < total_len {
+        return Err(ProtocolError::MessageTooShort {
+            expected: total_len,
+            actual: data.len(),
+        });
+    }
+    if data.len() > total_len {
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in message".into(),
+        ));
+    }
+
+    let payload = &data[MessageFrame::HEADER_SIZE..total_len];
+    let mut cursor = Cursor::new(payload);
+    let name_len = cursor
+        .read_u8()
+        .map_err(|_| ProtocolError::MessageTooShort { expected: 1, actual: 0 })?
+        as usize;
+    let mut name_bytes = vec![0u8; name_len];
+    cursor.read_exact(&mut name_bytes).map_err(|_| ProtocolError::MessageTooShort {
+        expected: name_len,
+        actual: payload.len().saturating_sub(1),
+    })?;
+
+    if cursor.position() as usize != payload.len() {
+        return Err(ProtocolError::EncodingError(
+            "trailing bytes in payload".into(),
+        ));
+    }
+
+    let worker_name = String::from_utf8(name_bytes)
+        .map_err(|_| ProtocolError::EncodingError("worker name is not UTF-8".into()))?;
+    validate_worker_name(&worker_name)?;
+
+    Ok(SetWorkerIdentity { worker_name })
+}
+
 /// Generic encode trait
 pub trait Encodable {
     fn encode(&self) -> Result<Vec<u8>>;
@@ -593,6 +657,7 @@ pub fn decode_message<T: Decodable>(data: &[u8]) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::{SetWorkerIdentity, validate_worker_name};
 
     #[test]
     fn test_frame_roundtrip() {
@@ -710,5 +775,63 @@ mod tests {
         let decoded = SetTarget::decode(&encoded).unwrap();
 
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn set_worker_identity_round_trip() {
+        let msg = SetWorkerIdentity { worker_name: "e2eclaude-1".to_string() };
+        let encoded = encode_set_worker_identity(&msg).unwrap();
+        let decoded = decode_set_worker_identity(&encoded).unwrap();
+        assert_eq!(decoded.worker_name, "e2eclaude-1");
+    }
+
+    #[test]
+    fn set_worker_identity_frame_type_is_0x24() {
+        let msg = SetWorkerIdentity { worker_name: "a".to_string() };
+        let encoded = encode_set_worker_identity(&msg).unwrap();
+        let frame = MessageFrame::decode(&encoded).unwrap();
+        assert_eq!(frame.msg_type, message_types::SET_WORKER_IDENTITY);
+    }
+
+    #[test]
+    fn worker_name_validation() {
+        assert!(validate_worker_name("rig-1").is_ok());
+        assert!(validate_worker_name("addr.worker_2").is_ok());
+        assert!(validate_worker_name("").is_err());
+        assert!(validate_worker_name(&"x".repeat(65)).is_err());
+        assert!(validate_worker_name(&"x".repeat(64)).is_ok());
+        assert!(validate_worker_name("has space").is_err());
+        assert!(validate_worker_name("emoji\u{1F525}").is_err());
+        assert!(validate_worker_name("inject\"label").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_payload_trailing_bytes() {
+        // Hand-build a frame with a valid name but extra trailing payload bytes.
+        let mut payload = vec![3u8]; // name_len=3
+        payload.extend_from_slice(b"rig"); // valid name
+        payload.extend_from_slice(&[0u8; 6]); // 6 extra bytes inside the payload
+        let frame = MessageFrame {
+            extension_type: 0,
+            msg_type: message_types::SET_WORKER_IDENTITY,
+            length: payload.len() as u32,
+        };
+        let mut data = frame.encode().to_vec();
+        data.extend_from_slice(&payload);
+        assert!(decode_set_worker_identity(&data).is_err());
+    }
+
+    #[test]
+    fn decode_rejects_invalid_names() {
+        // Hand-build a frame whose payload contains a forbidden byte.
+        let payload = [1u8, b' ']; // name_len=1, name=" "
+        let frame = MessageFrame {
+            extension_type: 0,
+            msg_type: message_types::SET_WORKER_IDENTITY,
+            length: payload.len() as u32,
+        };
+        let mut data = frame.encode().to_vec();
+        data.extend_from_slice(&payload);
+        assert!(decode_set_worker_identity(&data).is_err());
     }
 }
