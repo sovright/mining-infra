@@ -97,6 +97,13 @@ allowed). Validation is enforced at encode (client refuses to send garbage) and 
 ### 2. Pool (`crates/zcash-pool-server`)
 
 - Channel state gains `worker_identity: Option<String>`.
+- **Dispatch restructure required:** the pool's read loop currently assumes every
+  client frame is a share (`decode_share_message` or error→disconnect). It must branch
+  on `frame.msg_type` first and route 0x21 vs 0x24, keeping the
+  unknown-type→disconnect behavior for everything else.
+- The pool-wide identity cap is shared state across per-session tasks; it lives
+  alongside the existing shared channel map (same `RwLock`/server-state pattern), as a
+  `HashSet<String>` of accepted identities. The plan must pin its locking placement.
 - New handling for `SET_WORKER_IDENTITY` frames:
   - decode + validate; on decode/validation failure: `warn!`, ignore, keep connection.
   - if identity already set for the channel: `warn!`, ignore (immutability).
@@ -165,12 +172,12 @@ attribution chain works without further changes.
 
 - **New pool, old clients:** no `SetWorkerIdentity` arrives; labels fall back to
   `channel_N`. Identical to today.
-- **Old pool, new clients:** the client sends an unknown frame type. Implementation must
-  verify the old pool's behavior on unknown frame types: if it ignores them, nothing to
-  do; if it closes the connection, clients must treat an identity-send failure as
-  non-fatal only where safe — since we control all deployments (single testnet), the
-  operational rule is simply **deploy the pool before clients**, and the spec does not
-  require clients to survive an old pool.
+- **Old pool, new clients:** VERIFIED — the current pool routes every inbound frame
+  through `decode_share_message`, errors on any non-`SUBMIT_EQUIHASH_SHARE` type, and
+  the read loop `break`s: an old pool **disconnects** a client that sends 0x24. Since we
+  control all deployments (single testnet), the operational rule is mandatory:
+  **deploy the pool before clients**. The spec does not require clients to survive an
+  old pool.
 - Deploy order on the testnet VM: pool binary first, then the V1 proxy service and the
   test-miner systemd service; then the API parser PR (parser change is safe in any
   order — it only adds accepted names).
