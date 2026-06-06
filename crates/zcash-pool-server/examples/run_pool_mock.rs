@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = PoolConfig {
         listen_addr: "0.0.0.0:3333".parse()?,
-        initial_difficulty: 0.0001, // floor target: the CPU test-miner's shares clear it so the no-ASIC smoke test exercises the full submit->accept path
+        initial_difficulty: 1e-9, // below the all-ones saturation point: accept every valid solution at cold start so the no-ASIC smoke test exercises the full submit->accept path; vardiff ramps up from there
         target_shares_per_minute: 5.0,
         nonce_1_len: 4,
         noise_enabled: false,
