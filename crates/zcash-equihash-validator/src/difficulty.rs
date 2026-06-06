@@ -137,15 +137,21 @@ pub fn difficulty_to_target_with_max(difficulty: f64, max: &Target) -> Target {
         return *max;
     }
 
-    // When difficulty < 1.0, the target would exceed max_target.
-    // f64_to_target silently overflows at values > 2^256, producing garbage.
-    // Clamp to all-ones (accept any valid Equihash solution).
-    if difficulty < 1.0 {
-        return Target([0xff; 32]);
-    }
-
     let max_val = target_to_f64(max);
     let target_val = max_val / difficulty;
+
+    // Fractional difficulties produce targets above max_target; that is
+    // fine as long as the result still fits in 256 bits. Saturate to
+    // all-ones (accept any valid Equihash solution) only when it does not
+    // -- f64_to_target silently overflows past 2^256, producing garbage.
+    //
+    // Do NOT clamp at difficulty < 1.0: that created a cliff between
+    // "accept everything" and mainnet diff 1 with no expressible target in
+    // between, which broke vardiff for CPU-class workers (sub-unity
+    // adjustments were no-ops, then one step jumped past feasibility).
+    if target_val >= 2f64.powi(256) {
+        return Target([0xff; 32]);
+    }
 
     f64_to_target(target_val)
 }
@@ -260,13 +266,92 @@ mod tests {
         println!("diff=1.0: target={}", hex::encode(t1.to_le_bytes()));
         println!("max_mainnet:     {}", hex::encode(max.to_le_bytes()));
 
-        // At difficulty 0.0001, target should be all-0xff (clamped)
+        // At difficulty 0.0001 (the testnet initial difficulty), the target
+        // is expressible in 256 bits and must roundtrip -- NOT clamp to
+        // all-ones. The old clamp at difficulty < 1.0 made every sub-unity
+        // vardiff adjustment a no-op (see test_fractional_difficulty_is_continuous).
         let t_low = difficulty_to_target(0.0001);
-        assert_eq!(
+        assert_ne!(
             t_low.to_le_bytes(),
             [0xff; 32],
-            "diff=0.0001 should produce all-ones target, got: {}",
-            hex::encode(t_low.to_le_bytes())
+            "diff=0.0001 must be expressible, got all-ones"
+        );
+        let roundtrip = target_to_difficulty(&t_low);
+        assert!(
+            (roundtrip - 0.0001).abs() / 0.0001 < 0.01,
+            "diff=0.0001 roundtripped to {roundtrip}"
+        );
+    }
+
+    #[test]
+    fn test_fractional_difficulty_is_continuous() {
+        // Regression: difficulties in (saturation, 1.0) used to clamp to
+        // all-ones, creating a cliff between "accept everything" and
+        // mainnet diff 1 with no CPU-feasible target in between
+        // (live incident 2026-06-05: vardiff 0.0001 -> 0.0126 was a no-op,
+        // then the next step jumped past feasibility and shares hit zero).
+        for d in [0.5, 0.1, 0.01, 0.001] {
+            let t = difficulty_to_target(d);
+            assert_ne!(
+                t.to_le_bytes(),
+                [0xff; 32],
+                "diff={d} must be expressible, not clamped to all-ones"
+            );
+            let roundtrip = target_to_difficulty(&t);
+            assert!(
+                (roundtrip - d).abs() / d < 0.01,
+                "diff={d} roundtripped to {roundtrip}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_difficulty_monotonic_across_unity() {
+        // Halving difficulty must exactly double the target on both sides
+        // of 1.0 -- no discontinuity at the unity boundary.
+        let pairs = [(0.25, 0.5), (0.5, 1.0), (1.0, 2.0), (2.0, 4.0)];
+        for (easier, harder) in pairs {
+            let t_easier = target_to_f64(&difficulty_to_target(easier));
+            let t_harder = target_to_f64(&difficulty_to_target(harder));
+            assert!(
+                t_easier > t_harder,
+                "target({easier}) must be larger (easier) than target({harder})"
+            );
+            let ratio = t_easier / t_harder;
+            assert!(
+                (ratio - 2.0).abs() < 0.02,
+                "halving difficulty {harder}->{easier} should double target, ratio={ratio}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_saturation_only_below_representable_bound() {
+        let max = Target::max_mainnet();
+        let max_val = target_to_f64(&max);
+        let saturation = max_val / 2f64.powi(256);
+
+        // Far below the bound: all-ones (accept any valid solution).
+        let t_tiny = difficulty_to_target(saturation * 0.5);
+        assert_eq!(t_tiny.to_le_bytes(), [0xff; 32]);
+
+        // Just above the bound: expressible.
+        let t_above = difficulty_to_target(saturation * 2.0);
+        assert_ne!(t_above.to_le_bytes(), [0xff; 32]);
+    }
+
+    #[test]
+    fn test_vardiff_adjustment_takes_effect_sub_unity() {
+        // The live-incident arithmetic: vardiff multiplied 0.0001 by ~126.
+        // Before the fix both values clamped to the same all-ones target,
+        // so the adjustment was a no-op and the controller re-measured the
+        // same flood, compounding past feasibility.
+        let before = difficulty_to_target(0.0001);
+        let after = difficulty_to_target(0.0001 * 126.0);
+        assert_ne!(
+            before.to_le_bytes(),
+            after.to_le_bytes(),
+            "a 126x difficulty increase must change the effective target"
         );
     }
 

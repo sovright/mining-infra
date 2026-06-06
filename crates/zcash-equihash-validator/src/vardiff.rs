@@ -151,6 +151,18 @@ pub enum VardiffPhase {
     SteadyState,
 }
 
+/// True when `new` differs from `current` by more than `tolerance`
+/// relative to `current`. The epsilon must be relative, not absolute:
+/// difficulties span many orders of magnitude (sub-saturation cold starts
+/// sit around 1e-9), and an absolute epsilon froze the controller in
+/// micro-difficulty regimes.
+fn relative_change_exceeds(current: f64, new: f64, tolerance: f64) -> bool {
+    if current <= 0.0 {
+        return new != current;
+    }
+    ((new / current) - 1.0).abs() > tolerance
+}
+
 /// Per-miner vardiff state
 #[derive(Debug)]
 pub struct VardiffController {
@@ -261,9 +273,9 @@ impl VardiffController {
         if self.shares_since_retarget == 0 {
             let new_difficulty = (self.current_difficulty * 0.5)
                 .clamp(self.config.min_difficulty, self.config.max_difficulty);
-            if (new_difficulty - self.current_difficulty).abs() > 0.01 {
+            if relative_change_exceeds(self.current_difficulty, new_difficulty, 0.01) {
                 info!(
-                    "Vardiff adjustment (zero shares): {:.2} -> {:.2}",
+                    "Vardiff adjustment (zero shares): {:.3e} -> {:.3e}",
                     self.current_difficulty, new_difficulty
                 );
                 self.current_difficulty = new_difficulty;
@@ -315,9 +327,9 @@ impl VardiffController {
         let final_difficulty =
             final_difficulty.clamp(self.config.min_difficulty, self.config.max_difficulty);
 
-        if (final_difficulty - self.current_difficulty).abs() > 0.01 {
+        if relative_change_exceeds(self.current_difficulty, final_difficulty, 0.01) {
             info!(
-                "Vardiff adjustment ({:?}): {:.2} -> {:.2} (share rate: {:.2}/min)",
+                "Vardiff adjustment ({:?}): {:.3e} -> {:.3e} (share rate: {:.2}/min)",
                 self.phase, self.current_difficulty, final_difficulty, actual_rate
             );
             self.current_difficulty = final_difficulty;
@@ -455,6 +467,61 @@ mod tests {
         };
         let validated = config.validated();
         assert!(validated.min_difficulty <= validated.max_difficulty);
+    }
+
+    #[test]
+    fn test_micro_difficulty_adjustments_apply() {
+        // Regression: the "did difficulty change" epsilon was absolute
+        // (0.01), so in micro-difficulty regimes (sub-saturation cold
+        // starts around 1e-9) every adjustment computed by the controller
+        // was discarded as "no change" and vardiff could never move off
+        // accept-everything. The epsilon must be relative.
+        let config = VardiffConfig {
+            initial_difficulty: 1e-9,
+            min_difficulty: 1e-10,
+            max_difficulty: 1e12,
+            retarget_interval: Duration::from_millis(10),
+            target_shares_per_minute: 5.0,
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        assert!((controller.current_difficulty() - 1e-9).abs() < 1e-12);
+
+        // Simulate a flood: far more shares than target rate.
+        std::thread::sleep(Duration::from_millis(20));
+        for _ in 0..200 {
+            controller.record_share();
+        }
+        let new = controller
+            .maybe_retarget()
+            .expect("a 200-share flood must raise micro-scale difficulty");
+        assert!(
+            new > 1e-9 * 10.0,
+            "difficulty must rise substantially, got {new}"
+        );
+    }
+
+    #[test]
+    fn test_zero_shares_cut_applies_at_micro_scale() {
+        // Same epsilon bug on the recovery path: halving 2e-9 -> 1e-9 is a
+        // delta of 1e-9 which the absolute 0.01 epsilon discarded, so an
+        // overshot micro-scale channel could never recover either.
+        let config = VardiffConfig {
+            initial_difficulty: 2e-9,
+            min_difficulty: 1e-10,
+            max_difficulty: 1e12,
+            retarget_interval: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let mut controller = VardiffController::new(config);
+        std::thread::sleep(Duration::from_millis(20));
+        let new = controller
+            .maybe_retarget()
+            .expect("zero-share interval must cut micro-scale difficulty");
+        assert!(
+            (new - 1e-9).abs() / 1e-9 < 0.01,
+            "expected 50% cut, got {new}"
+        );
     }
 
     #[test]
