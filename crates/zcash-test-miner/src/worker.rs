@@ -172,6 +172,13 @@ async fn run_worker_session(
     // permanently cancels that job's threads.
     let mut current_job_cancel: Option<SolverCancel> = None;
 
+    // The job currently being mined, retained so a SetTarget can restart
+    // solvers against it immediately. Waiting for the next job to apply a
+    // target is wrong on slow chains: with Zcash's 75s blocks a vardiff
+    // adjustment would be ignored for over a minute while the miner keeps
+    // flooding (or starving) at the stale target.
+    let mut current_job: Option<NewEquihashJob> = None;
+
     loop {
         tokio::select! {
             // Receive a message from the pool
@@ -199,41 +206,23 @@ async fn run_worker_session(
                             continue;
                         }
 
-                        // Replace the previous job's cancellation handle: the
-                        // assignment drops the old handle, permanently
-                        // cancelling its solver threads. The new job's flag is
-                        // independent, so old threads can never be re-armed.
-                        let cancel = SolverCancel::new();
-                        let new_flag = cancel.flag();
-                        current_job_cancel = Some(cancel);
-
-                        // Update share target if job carries one, or use SetTarget value
+                        // Use the SetTarget-pinned target when present,
+                        // otherwise the target the job carries.
                         let share_target = if let Some(ref t) = current_target {
                             *t
                         } else {
                             job.target
                         };
 
-                        // Start new solver threads
-                        let solver_threads = config.solver_threads;
-
-                        for thread_id in 0..solver_threads {
-                            let job_clone = job.clone();
-                            let solving_clone = new_flag.clone();
-                            let share_tx_clone = share_tx.clone();
-                            let share_target_copy = share_target;
-
-                            tokio::task::spawn_blocking(move || {
-                                run_solver_thread(
-                                    thread_id,
-                                    solver_threads,
-                                    &job_clone,
-                                    &share_target_copy,
-                                    &solving_clone,
-                                    &share_tx_clone,
-                                );
-                            });
-                        }
+                        // Replacing the handle drops the old one, permanently
+                        // cancelling the previous generation's threads.
+                        current_job_cancel = Some(spawn_solvers(
+                            &job,
+                            &share_target,
+                            config.solver_threads,
+                            &share_tx,
+                        ));
+                        current_job = Some(job.clone());
                     }
                     Ok(ServerMessage::ShareResponse(resp)) => {
                         match resp.result {
@@ -263,6 +252,20 @@ async fn run_worker_session(
                             "Target updated"
                         );
                         current_target = Some(set_target.target);
+
+                        // Apply the new target immediately: restart solvers
+                        // against the current job rather than waiting for the
+                        // next one. On slow chains the next job can be a
+                        // minute away, during which vardiff's adjustment
+                        // would have no effect.
+                        if let Some(ref job) = current_job {
+                            current_job_cancel = Some(spawn_solvers(
+                                job,
+                                &set_target.target,
+                                config.solver_threads,
+                                &share_tx,
+                            ));
+                        }
                     }
                     Err(e) => {
                         warn!(worker = %config.worker_name, error = %e, "Failed to decode message");
@@ -338,6 +341,37 @@ async fn run_worker_session(
 ///
 /// Each thread works with interleaved nonces: thread 0 uses nonces 0, N, 2N, ...
 /// thread 1 uses nonces 1, N+1, 2N+1, ... where N is the total number of threads.
+/// Spawn a generation of solver threads for `job` filtered at
+/// `share_target`, returning its cancellation handle. Dropping a previous
+/// generation's handle (or the one returned here) cancels those threads.
+fn spawn_solvers(
+    job: &NewEquihashJob,
+    share_target: &[u8; 32],
+    solver_threads: u32,
+    share_tx: &mpsc::Sender<(FoundShare, NewEquihashJob)>,
+) -> SolverCancel {
+    let cancel = SolverCancel::new();
+    let flag = cancel.flag();
+    for thread_id in 0..solver_threads {
+        let job_clone = job.clone();
+        let solving_clone = flag.clone();
+        let share_tx_clone = share_tx.clone();
+        let share_target_copy = *share_target;
+
+        tokio::task::spawn_blocking(move || {
+            run_solver_thread(
+                thread_id,
+                solver_threads,
+                &job_clone,
+                &share_target_copy,
+                &solving_clone,
+                &share_tx_clone,
+            );
+        });
+    }
+    cancel
+}
+
 fn run_solver_thread(
     thread_id: u32,
     total_threads: u32,
