@@ -207,6 +207,14 @@ impl Channel {
         self.vardiff.maybe_retarget()
     }
 
+    /// Share-independent vardiff tick, driven by the server's maintenance
+    /// loop. Without this, a channel whose difficulty overshot the miner's
+    /// reach can never recover: zero shares means zero record_share calls,
+    /// and record_share was the only path into the retarget logic.
+    pub fn idle_retarget(&mut self) -> Option<f64> {
+        self.vardiff.maybe_retarget()
+    }
+
     /// Check if a share submission is allowed by rate limiter
     ///
     /// Returns true if allowed, false if rate limited
@@ -226,6 +234,33 @@ mod tests {
 
         assert_eq!(channel.nonce_1, nonce_1);
         assert_eq!(channel.nonce_2_len, 28);
+    }
+
+    #[test]
+    fn test_idle_retarget_recovers_without_shares() {
+        // Regression for the vardiff recovery deadlock: maybe_retarget was
+        // only ever invoked from record_share, so a channel whose difficulty
+        // overshot past the miner's reach (zero shares -> zero record_share
+        // calls) could never come back down. idle_retarget is the
+        // share-independent path the server's maintenance loop drives.
+        let config = VardiffConfig {
+            initial_difficulty: 1000.0,
+            min_difficulty: 0.0001,
+            max_difficulty: 1e12,
+            retarget_interval: std::time::Duration::from_millis(10),
+            ..Default::default()
+        };
+        let mut channel = Channel::new_with_id(7, vec![0x01], config).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+
+        let new_difficulty = channel
+            .idle_retarget()
+            .expect("idle retarget must cut difficulty after a silent interval");
+        assert!(
+            new_difficulty < 1000.0,
+            "difficulty must come down, got {new_difficulty}"
+        );
     }
 
     #[test]
