@@ -415,6 +415,7 @@ impl PoolServer {
         // Spawn periodic stats logging and stale miner cleanup
         let payout_tracker = Arc::clone(&self.payout_tracker);
         let sessions = Arc::clone(&self.sessions);
+        let channels = Arc::clone(&self.channels);
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -424,6 +425,26 @@ impl PoolServer {
                 // Clean up stale miner entries (idle > 30 minutes)
                 payout_tracker.cleanup_stale_miners(Duration::from_secs(1800));
                 payout_tracker.rotate_window_if_needed();
+
+                // Share-independent vardiff tick: lets overshooting channels
+                // recover. record_share-driven retargeting stops the moment a
+                // miner stops finding shares, which is exactly when difficulty
+                // most needs to come down (zero-share branch cuts 50% per
+                // interval). Collect adjustments under the lock, send after.
+                let mut retargets = Vec::new();
+                {
+                    let mut channels = channels.write().await;
+                    for (channel_id, channel) in channels.iter_mut() {
+                        if channel.idle_retarget().is_some() {
+                            retargets.push((*channel_id, channel.current_target()));
+                        }
+                    }
+                }
+                for (channel_id, target) in retargets {
+                    if let Some(sender) = sessions.read().await.get(&channel_id) {
+                        let _ = sender.send(ServerMessage::SetTarget { target }).await;
+                    }
+                }
 
                 let session_count = sessions.read().await.len();
                 let active_miners = payout_tracker.active_miner_count();
@@ -988,23 +1009,35 @@ impl PoolServer {
                 info!("Session {} disconnected", channel_id);
                 Ok(())
             }
-            SessionMessage::IdentityDeclared { channel_id, worker_name } => {
+            SessionMessage::IdentityDeclared {
+                channel_id,
+                worker_name,
+            } => {
                 let mut accepted = self.accepted_identities.write().await;
                 let mut channels = self.channels.write().await;
                 let Some(channel) = channels.get_mut(&channel_id) else {
                     warn!("Identity for unknown channel {}", channel_id);
                     return Ok(());
                 };
-                match apply_identity_policy(&mut accepted, &channel.worker_identity, &worker_name, MAX_WORKER_IDENTITIES) {
+                match apply_identity_policy(
+                    &mut accepted,
+                    &channel.worker_identity,
+                    &worker_name,
+                    MAX_WORKER_IDENTITIES,
+                ) {
                     IdentityDecision::Accept => {
                         accepted.insert(worker_name.clone());
-                        info!("Channel {} identified as worker '{}'", channel_id, worker_name);
+                        info!(
+                            "Channel {} identified as worker '{}'",
+                            channel_id, worker_name
+                        );
                         channel.worker_identity = Some(worker_name);
                     }
                     IdentityDecision::AlreadySet => {
                         warn!(
                             "Channel {} attempted to re-declare identity '{}' (already '{}') - ignored",
-                            channel_id, worker_name,
+                            channel_id,
+                            worker_name,
                             channel.worker_identity.as_deref().unwrap_or("?")
                         );
                     }
