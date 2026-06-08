@@ -324,6 +324,8 @@ mod tests {
             relay_raw_fallback_with_tx_cache: false,
             relay_raw_segment_send_rounds: 1,
             relay_raw_segment_round_delay_millis: 0,
+            relay_forward_dedup_window: Duration::from_secs(30),
+            relay_forward_dedup_capacity: 64,
         }
     }
 

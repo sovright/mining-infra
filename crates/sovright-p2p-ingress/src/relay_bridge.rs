@@ -16,6 +16,53 @@ use crate::tx_cache::TxCache;
 
 const RELAY_LEN_PREFIX_BYTES: usize = 4;
 
+/// Bounded, time-windowed LRU of recently-forwarded block hashes. Used by
+/// `RelayBridge::forward_block` to implement first-seen-wins dedup so the
+/// same block being delivered by multiple P2P peers (the steady-state case)
+/// is only encoded and broadcast once into the relay mesh.
+#[derive(Debug)]
+struct RecentForwardedHashes {
+    capacity: usize,
+    window: Duration,
+    entries: std::collections::VecDeque<([u8; 32], std::time::Instant)>,
+}
+
+impl RecentForwardedHashes {
+    fn new(capacity: usize, window: Duration) -> Self {
+        Self {
+            capacity,
+            window,
+            entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn contains(&mut self, hash: &[u8; 32], now: std::time::Instant) -> bool {
+        self.evict_expired(now);
+        self.entries.iter().any(|(h, _)| h == hash)
+    }
+
+    fn record(&mut self, hash: [u8; 32], now: std::time::Instant) {
+        self.evict_expired(now);
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((hash, now));
+    }
+
+    fn evict_expired(&mut self, now: std::time::Instant) {
+        while let Some((_, ts)) = self.entries.front() {
+            if now.duration_since(*ts) > self.window {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RelayBridge {
     sender: BlockSender,
@@ -25,6 +72,9 @@ pub struct RelayBridge {
     raw_fallback_with_tx_cache: bool,
     raw_segment_send_rounds: usize,
     raw_segment_round_delay: Duration,
+    /// Shared dedup ring for first-seen-wins forward suppression. Cloned
+    /// bridges share the same state via `Arc`.
+    recent_forwarded: Arc<std::sync::Mutex<RecentForwardedHashes>>,
 }
 
 impl RelayBridge {
@@ -67,6 +117,10 @@ impl RelayBridge {
             raw_segment_round_delay: Duration::from_millis(
                 config.relay_raw_segment_round_delay_millis,
             ),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                config.relay_forward_dedup_capacity,
+                config.relay_forward_dedup_window,
+            ))),
         }))
     }
 
@@ -87,6 +141,10 @@ impl RelayBridge {
             raw_segment_round_delay: Duration::from_millis(
                 config.relay_raw_segment_round_delay_millis,
             ),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                config.relay_forward_dedup_capacity,
+                config.relay_forward_dedup_window,
+            ))),
         })
     }
 
@@ -117,12 +175,36 @@ impl RelayBridge {
             compact_block_from_raw_block(block_payload)?
         };
         let tx_count = compact.tx_count();
+
+        // First-seen-wins dedup. Under steady state multiple Zcash P2P peers
+        // deliver the same block within the same few hundred milliseconds.
+        // Without this check each delivery re-encodes and re-broadcasts the
+        // block into the relay mesh, multiplying mesh traffic for no benefit.
+        // The decision is recorded on successful broadcast so a half-failed
+        // forward can be retried by the next delivery.
+        let header_hash = *compact.header_hash().as_bytes();
+        {
+            let now = std::time::Instant::now();
+            let mut ring = self
+                .recent_forwarded
+                .lock()
+                .expect("recent_forwarded mutex poisoned");
+            if ring.contains(&header_hash, now) {
+                return Ok(ForwardedBlock {
+                    tx_count,
+                    bytes: block_payload.len(),
+                    relay_objects: 0,
+                    mode: ForwardMode::Deduplicated,
+                });
+            }
+        }
         if let Err(error) = self.preflight_chunks(&compact) {
             let text = error.to_string();
             if text.contains("all-prefilled compact block too large") {
                 let segments =
                     self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
                 let relay_objects = self.send_raw_block_segments(&segments).await?;
+                self.record_forwarded(header_hash);
                 return Ok(ForwardedBlock {
                     tx_count,
                     bytes: block_payload.len(),
@@ -143,6 +225,7 @@ impl RelayBridge {
             let segments =
                 self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
             let raw_segment_relay_objects = self.send_raw_block_segments(&segments).await?;
+            self.record_forwarded(header_hash);
             return Ok(ForwardedBlock {
                 tx_count,
                 bytes: block_payload.len(),
@@ -150,12 +233,21 @@ impl RelayBridge {
                 mode: ForwardMode::CompactBlockWithRawFallback,
             });
         }
+        self.record_forwarded(header_hash);
         Ok(ForwardedBlock {
             tx_count,
             bytes: block_payload.len(),
             relay_objects: 1,
             mode: ForwardMode::CompactBlock,
         })
+    }
+
+    /// Record a successfully-forwarded block hash in the dedup ring.
+    fn record_forwarded(&self, header_hash: [u8; 32]) {
+        let now = std::time::Instant::now();
+        if let Ok(mut ring) = self.recent_forwarded.lock() {
+            ring.record(header_hash, now);
+        }
     }
 
     fn with_segment_plan(
@@ -261,6 +353,10 @@ pub enum ForwardMode {
     CompactBlock,
     CompactBlockWithRawFallback,
     RawBlockSegments,
+    /// First-seen-wins dedup: this block hash was already forwarded within
+    /// the dedup window, so the bridge skipped encoding and broadcast.
+    /// `ForwardedBlock.relay_objects` is 0 in this case.
+    Deduplicated,
 }
 
 impl ForwardMode {
@@ -269,6 +365,7 @@ impl ForwardMode {
             ForwardMode::CompactBlock => "compact_block",
             ForwardMode::CompactBlockWithRawFallback => "compact_block_with_raw_fallback",
             ForwardMode::RawBlockSegments => "raw_block_segments",
+            ForwardMode::Deduplicated => "deduplicated",
         }
     }
 }
@@ -306,6 +403,10 @@ mod tests {
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         }
     }
 
@@ -410,6 +511,10 @@ mod tests {
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         };
         let raw_block = large_raw_block();
 
@@ -448,6 +553,10 @@ mod tests {
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 3,
             raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         };
         let raw_block = large_raw_block();
 
@@ -489,6 +598,10 @@ mod tests {
             raw_fallback_with_tx_cache: true,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
@@ -564,6 +677,8 @@ mod tests {
             relay_raw_fallback_with_tx_cache: false,
             relay_raw_segment_send_rounds: 1,
             relay_raw_segment_round_delay_millis: 0,
+            relay_forward_dedup_window: Duration::from_secs(30),
+            relay_forward_dedup_capacity: 64,
         }
     }
 
@@ -599,5 +714,55 @@ mod tests {
 
         assert_eq!(bridge.raw_segment_send_rounds, 3);
         assert_eq!(bridge.raw_segment_round_delay, Duration::from_millis(25));
+    }
+
+    // ----------------------------------------------------------------
+    // Dedup ring tests (the RecentForwardedHashes helper)
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn recent_forwarded_initially_empty() {
+        let mut r = RecentForwardedHashes::new(4, Duration::from_secs(30));
+        let now = std::time::Instant::now();
+        assert!(!r.contains(&[1u8; 32], now));
+    }
+
+    #[test]
+    fn recent_forwarded_records_and_finds() {
+        let mut r = RecentForwardedHashes::new(4, Duration::from_secs(30));
+        let now = std::time::Instant::now();
+        r.record([7u8; 32], now);
+        assert!(r.contains(&[7u8; 32], now));
+        assert!(!r.contains(&[1u8; 32], now));
+    }
+
+    #[test]
+    fn recent_forwarded_evicts_expired() {
+        let mut r = RecentForwardedHashes::new(4, Duration::from_secs(30));
+        let t0 = std::time::Instant::now();
+        r.record([7u8; 32], t0);
+        assert!(!r.contains(&[7u8; 32], t0 + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn recent_forwarded_capacity_evicts_oldest() {
+        let mut r = RecentForwardedHashes::new(2, Duration::from_secs(30));
+        let t0 = std::time::Instant::now();
+        r.record([1u8; 32], t0);
+        r.record([2u8; 32], t0);
+        r.record([3u8; 32], t0);
+        // Oldest entry [1; 32] should be evicted.
+        assert!(!r.contains(&[1u8; 32], t0));
+        assert!(r.contains(&[2u8; 32], t0));
+        assert!(r.contains(&[3u8; 32], t0));
+    }
+
+    #[test]
+    fn recent_forwarded_zero_capacity_is_no_op() {
+        let mut r = RecentForwardedHashes::new(0, Duration::from_secs(30));
+        let t0 = std::time::Instant::now();
+        r.record([7u8; 32], t0);
+        // Zero-capacity ring never retains, never reports a hit.
+        assert!(!r.contains(&[7u8; 32], t0));
     }
 }
