@@ -14,13 +14,43 @@ use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 use zcash_mining_protocol::codec::{
-    MessageFrame, encode_new_equihash_job, encode_set_target as codec_encode_set_target,
+    MessageFrame, decode_set_worker_identity, encode_new_equihash_job,
+    encode_set_target as codec_encode_set_target,
     encode_submit_shares_response as codec_encode_submit_shares_response,
 };
 use zcash_mining_protocol::messages::{
-    NewEquihashJob, SetTarget, ShareResult, SubmitEquihashShare, SubmitSharesResponse,
-    message_types,
+    NewEquihashJob, SetTarget, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
+    SubmitSharesResponse, message_types,
 };
+
+/// A decoded inbound client message.
+pub enum InboundMessage {
+    Share(Box<SubmitEquihashShare>),
+    Identity(SetWorkerIdentity),
+    /// A SET_WORKER_IDENTITY frame that failed decode/validation. The session
+    /// warns and continues (spec: invalid identity never disconnects).
+    InvalidIdentity(String),
+}
+
+/// Decode an inbound frame by type. Unknown types are an error; the session
+/// disconnects on them, same as before SetWorkerIdentity existed.
+pub fn classify_message(msg_data: &[u8]) -> Result<InboundMessage> {
+    let frame = MessageFrame::decode(msg_data).map_err(PoolError::Protocol)?;
+    match frame.msg_type {
+        message_types::SUBMIT_EQUIHASH_SHARE => {
+            Ok(InboundMessage::Share(Box::new(decode_submit_share(msg_data)?)))
+        }
+        message_types::SET_WORKER_IDENTITY => {
+            match decode_set_worker_identity(msg_data) {
+                Ok(ident) => Ok(InboundMessage::Identity(ident)),
+                Err(e) => Ok(InboundMessage::InvalidIdentity(e.to_string())),
+            }
+        }
+        other => Err(PoolError::InvalidMessage(format!(
+            "Unknown message type: 0x{other:02x}"
+        ))),
+    }
+}
 
 /// Messages sent from session to server
 #[derive(Debug)]
@@ -33,6 +63,9 @@ pub enum SessionMessage {
     },
     /// Session disconnected
     Disconnected { channel_id: u32 },
+    /// Miner declared its worker identity (validated at decode; policy is
+    /// enforced by the server, which owns channel state).
+    IdentityDeclared { channel_id: u32, worker_name: String },
 }
 
 /// Messages sent from server to session
@@ -96,9 +129,20 @@ impl Session {
                 read_result = read_future => {
                     match read_result {
                         Ok(Some(msg)) => {
-                            match self.decode_share_message(&msg) {
-                                Ok(share) => {
-                                    if let Err(e) = self.handle_share(share).await {
+                            match classify_message(&msg) {
+                                Ok(InboundMessage::Share(share)) => {
+                                    if share.channel_id != self.channel_id {
+                                        error!(
+                                            "Share channel_id {} does not match session {} - disconnecting",
+                                            share.channel_id, channel_id
+                                        );
+                                        break;
+                                    }
+                                    debug!(
+                                        "Received share: channel={}, job={}, seq={}",
+                                        share.channel_id, share.job_id, share.sequence_number
+                                    );
+                                    if let Err(e) = self.handle_share(*share).await {
                                         match &e {
                                             PoolError::Timeout | PoolError::ChannelSend => {
                                                 error!(
@@ -112,6 +156,28 @@ impl Session {
                                             }
                                         }
                                     }
+                                }
+                                Ok(InboundMessage::Identity(ident)) => {
+                                    if let Err(e) = self
+                                        .server_tx
+                                        .send(SessionMessage::IdentityDeclared {
+                                            channel_id,
+                                            worker_name: ident.worker_name,
+                                        })
+                                        .await
+                                    {
+                                        error!(
+                                            "Failed to forward identity for channel {}: {}",
+                                            channel_id, e
+                                        );
+                                        break;
+                                    }
+                                }
+                                Ok(InboundMessage::InvalidIdentity(reason)) => {
+                                    warn!(
+                                        "Ignoring invalid worker identity on channel {}: {}",
+                                        channel_id, reason
+                                    );
                                 }
                                 Err(e) => {
                                     error!("Parse error for channel {}: {}", channel_id, e);
@@ -234,30 +300,6 @@ impl Session {
         // Extract message bytes
         let msg_data: Vec<u8> = read_buf.drain(..total_len).collect();
         Ok(Some(msg_data))
-    }
-
-    /// Decode a share submission message
-    fn decode_share_message(&self, msg_data: &[u8]) -> Result<SubmitEquihashShare> {
-        let frame = MessageFrame::decode(msg_data).map_err(PoolError::Protocol)?;
-        if frame.msg_type != message_types::SUBMIT_EQUIHASH_SHARE {
-            return Err(PoolError::InvalidMessage(format!(
-                "Unknown message type: 0x{:02x}",
-                frame.msg_type
-            )));
-        }
-
-        let share = decode_submit_share(msg_data)?;
-        if share.channel_id != self.channel_id {
-            return Err(PoolError::InvalidMessage(format!(
-                "Share channel_id {} does not match session {}",
-                share.channel_id, self.channel_id
-            )));
-        }
-        debug!(
-            "Received share: channel={}, job={}, seq={}",
-            share.channel_id, share.job_id, share.sequence_number
-        );
-        Ok(share)
     }
 
     /// Write a message to the transport
@@ -398,6 +440,45 @@ fn encode_submit_shares_response(msg: &SubmitSharesResponse) -> Result<Vec<u8>> 
 mod tests {
     use super::*;
     use zcash_mining_protocol::messages::RejectReason;
+
+    #[test]
+    fn classify_inbound_frames() {
+        use zcash_mining_protocol::codec::{encode_set_worker_identity, encode_submit_share};
+        use zcash_mining_protocol::messages::{SetWorkerIdentity, SubmitEquihashShare};
+
+        let ident =
+            encode_set_worker_identity(&SetWorkerIdentity { worker_name: "rig-1".into() })
+                .unwrap();
+        assert!(
+            matches!(classify_message(&ident), Ok(InboundMessage::Identity(m)) if m.worker_name == "rig-1")
+        );
+
+        let share = SubmitEquihashShare {
+            channel_id: 7,
+            sequence_number: 0,
+            job_id: 1,
+            nonce_2: vec![0; 28],
+            time: 0,
+            solution: [0u8; 1344],
+        };
+        let share_bytes = encode_submit_share(&share).unwrap();
+        assert!(matches!(classify_message(&share_bytes), Ok(InboundMessage::Share(_)))); // Box<_> matches _
+
+        // Unknown type still errors (caller disconnects on it).
+        let mut unknown = ident.clone();
+        unknown[2] = 0x7f;
+        assert!(classify_message(&unknown).is_err());
+
+        // Malformed 0x24 frame yields InvalidIdentity, not Err.
+        let mut malformed = ident.clone();
+        // Corrupt the payload: set name_len byte to 255, making it unreadable.
+        // Header is 6 bytes; payload starts at byte 6.
+        malformed[6] = 255;
+        assert!(matches!(
+            classify_message(&malformed),
+            Ok(InboundMessage::InvalidIdentity(_))
+        ));
+    }
 
     #[test]
     fn test_encode_set_target() {

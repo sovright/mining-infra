@@ -7,6 +7,7 @@ use clap::Parser;
 use tokio::sync::watch;
 
 use sovright_noise::PublicKey;
+use zcash_mining_protocol::messages::validate_worker_name;
 use worker::{WorkerConfig, run_worker};
 
 #[derive(Parser, Debug)]
@@ -43,6 +44,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
 
     let args = Args::parse();
+
+    // Validate the prefix early: worker names are "{prefix}-{i}" for i in
+    // 1..=workers and the full name must pass protocol validation. Check the
+    // LONGEST generated name ("{prefix}-{workers}") so a prefix that only fits
+    // low indices can't pass startup and then reconnect-loop forever on a
+    // higher-index worker (e.g. a 62-byte prefix where "{prefix}-10" is 65
+    // bytes). This also catches forbidden characters in the prefix itself.
+    let longest_name = format!("{}-{}", args.worker_prefix, args.workers);
+    if let Err(e) = validate_worker_name(&longest_name) {
+        eprintln!("Invalid --worker-prefix {:?}: {}", args.worker_prefix, e);
+        std::process::exit(1);
+    }
 
     if args.v1 {
         let worker_name = format!("{}-1", args.worker_prefix);

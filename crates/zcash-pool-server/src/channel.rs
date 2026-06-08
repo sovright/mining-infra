@@ -34,6 +34,8 @@ pub struct Channel {
     pub last_job_id: u32,
     /// Rate limiter for share submissions
     pub rate_limiter: RateLimiter,
+    /// Worker identity declared via SetWorkerIdentity (immutable once set).
+    pub worker_identity: Option<String>,
 }
 
 /// Default job TTL (10 minutes)
@@ -98,6 +100,7 @@ impl Channel {
             jobs: HashMap::with_capacity(10),
             last_job_id: 0,
             rate_limiter: RateLimiter::for_shares(),
+            worker_identity: None,
         })
     }
 

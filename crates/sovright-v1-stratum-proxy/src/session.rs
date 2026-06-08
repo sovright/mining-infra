@@ -20,8 +20,9 @@ use tokio::time::{self, Instant};
 use tracing::{debug, info, warn};
 use zcash_mining_protocol::codec::{
     MessageFrame, decode_new_equihash_job, decode_set_target, decode_submit_shares_response,
-    encode_submit_share,
+    encode_set_worker_identity, encode_submit_share,
 };
+use zcash_mining_protocol::messages::SetWorkerIdentity;
 use zcash_mining_protocol::messages::{
     NewEquihashJob, RejectReason, SetTarget, ShareResult, SubmitEquihashShare,
     SubmitSharesResponse, message_types,
@@ -455,6 +456,12 @@ impl MinerSession {
         self.recompute_state();
         self.send_json(&messages::bool_response(request_id, true))
             .await?;
+        // Forward the SV1 username as our upstream worker identity so the pool
+        // can attribute this connection's shares to it. Only send if upstream
+        // exists; never fail the authorize response over an identity-send error.
+        if self.upstream.is_some() {
+            self.send_worker_identity().await?;
+        }
         self.flush_work_state(false).await?;
         Ok(())
     }
@@ -633,6 +640,13 @@ impl MinerSession {
         .await?;
         self.upstream = Some(upstream);
 
+        // Forward worker identity immediately on (re)connect, before draining
+        // the initial messages: jobs arrive in that drain, and any shares the
+        // downstream miner produces from them must already be attributable.
+        // On first connect worker_name is None and this is a no-op (the
+        // handle_authorize site covers that path once the name arrives).
+        self.send_worker_identity().await?;
+
         let mut initial_messages = Vec::new();
         loop {
             let Some(upstream) = self.upstream.as_mut() else {
@@ -755,6 +769,41 @@ impl MinerSession {
         Ok(())
     }
 
+    /// Send a SetWorkerIdentity message upstream using the current worker_name.
+    ///
+    /// Called from two sites:
+    ///  1. end of `handle_authorize` — the REQUIRED primary path: upstream
+    ///     already exists, worker name just arrived.
+    ///  2. end of `connect_upstream` — covers reconnects where the worker name
+    ///     is already known. On first connect the name is None and this is a
+    ///     no-op; pool immutability means a duplicate after reconnect is ignored.
+    ///
+    /// Never fails the caller: encode failures (post-sanitization: impossible)
+    /// are logged and skipped; upstream write errors propagate like any other
+    /// upstream write error.
+    async fn send_worker_identity(&mut self) -> Result<(), SessionError> {
+        let Some(raw_name) = self.worker_name.as_deref() else {
+            return Ok(());
+        };
+        let Some(name) = sanitize_worker_name(raw_name) else {
+            return Ok(());
+        };
+        let Some(upstream) = self.upstream.as_mut() else {
+            return Ok(());
+        };
+        let msg = SetWorkerIdentity { worker_name: name };
+        match encode_set_worker_identity(&msg) {
+            Ok(encoded) => {
+                upstream.write_raw(&encoded).await?;
+            }
+            Err(e) => {
+                // Post-sanitization this cannot happen; never block mining on a label.
+                warn!(error = %e, "Failed to encode worker identity, continuing anonymous");
+            }
+        }
+        Ok(())
+    }
+
     async fn flush_work_state(&mut self, include_extranonce: bool) -> Result<(), SessionError> {
         if !self.can_send_work_notifications() {
             return Ok(());
@@ -867,6 +916,13 @@ impl UpstreamConnection {
         Ok(())
     }
 
+    /// Write pre-encoded bytes directly to the upstream stream.
+    async fn write_raw(&mut self, data: &[u8]) -> Result<(), SessionError> {
+        self.stream.write_all(data).await?;
+        self.stream.flush().await?;
+        Ok(())
+    }
+
     async fn read_message(&mut self) -> Result<Option<UpstreamMessage>, SessionError> {
         loop {
             if self.read_buf.len() >= MessageFrame::HEADER_SIZE {
@@ -908,6 +964,29 @@ fn decode_upstream_message(frame: &[u8]) -> Result<Option<UpstreamMessage>, Sess
     Ok(Some(message))
 }
 
+/// Sanitize an SV1 username into a protocol-valid worker name: replace any
+/// character outside [A-Za-z0-9._-] with '_', truncate to 64 chars. Returns
+/// None for an empty input (caller skips identity; pool falls back to
+/// channel_N). Sanitize rather than reject: SV1 usernames are arbitrary
+/// ASIC-config strings and the proxy must not refuse service over a label.
+fn sanitize_worker_name(raw: &str) -> Option<String> {
+    if raw.is_empty() {
+        return None;
+    }
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(64)
+        .collect();
+    Some(cleaned)
+}
+
 fn reject_reason_to_string(reason: &RejectReason) -> String {
     match reason {
         RejectReason::StaleJob => "Stale job".to_string(),
@@ -915,5 +994,29 @@ fn reject_reason_to_string(reason: &RejectReason) -> String {
         RejectReason::InvalidSolution => "Invalid solution".to_string(),
         RejectReason::LowDifficulty => "Low difficulty".to_string(),
         RejectReason::Other(message) => message.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_worker_name_cases() {
+        assert_eq!(sanitize_worker_name("rig-1"), Some("rig-1".to_string()));
+        assert_eq!(
+            sanitize_worker_name("addr.worker"),
+            Some("addr.worker".to_string())
+        );
+        assert_eq!(
+            sanitize_worker_name("has space!"),
+            Some("has_space_".to_string())
+        );
+        assert_eq!(
+            sanitize_worker_name(&"x".repeat(80)),
+            Some("x".repeat(64))
+        );
+        assert_eq!(sanitize_worker_name(""), None);
+        assert_eq!(sanitize_worker_name("🔥🔥"), Some("__".to_string()));
     }
 }
