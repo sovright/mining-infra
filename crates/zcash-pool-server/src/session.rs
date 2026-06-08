@@ -37,15 +37,13 @@ pub enum InboundMessage {
 pub fn classify_message(msg_data: &[u8]) -> Result<InboundMessage> {
     let frame = MessageFrame::decode(msg_data).map_err(PoolError::Protocol)?;
     match frame.msg_type {
-        message_types::SUBMIT_EQUIHASH_SHARE => {
-            Ok(InboundMessage::Share(Box::new(decode_submit_share(msg_data)?)))
-        }
-        message_types::SET_WORKER_IDENTITY => {
-            match decode_set_worker_identity(msg_data) {
-                Ok(ident) => Ok(InboundMessage::Identity(ident)),
-                Err(e) => Ok(InboundMessage::InvalidIdentity(e.to_string())),
-            }
-        }
+        message_types::SUBMIT_EQUIHASH_SHARE => Ok(InboundMessage::Share(Box::new(
+            decode_submit_share(msg_data)?,
+        ))),
+        message_types::SET_WORKER_IDENTITY => match decode_set_worker_identity(msg_data) {
+            Ok(ident) => Ok(InboundMessage::Identity(ident)),
+            Err(e) => Ok(InboundMessage::InvalidIdentity(e.to_string())),
+        },
         other => Err(PoolError::InvalidMessage(format!(
             "Unknown message type: 0x{other:02x}"
         ))),
@@ -65,7 +63,10 @@ pub enum SessionMessage {
     Disconnected { channel_id: u32 },
     /// Miner declared its worker identity (validated at decode; policy is
     /// enforced by the server, which owns channel state).
-    IdentityDeclared { channel_id: u32, worker_name: String },
+    IdentityDeclared {
+        channel_id: u32,
+        worker_name: String,
+    },
 }
 
 /// Messages sent from server to session
@@ -446,9 +447,10 @@ mod tests {
         use zcash_mining_protocol::codec::{encode_set_worker_identity, encode_submit_share};
         use zcash_mining_protocol::messages::{SetWorkerIdentity, SubmitEquihashShare};
 
-        let ident =
-            encode_set_worker_identity(&SetWorkerIdentity { worker_name: "rig-1".into() })
-                .unwrap();
+        let ident = encode_set_worker_identity(&SetWorkerIdentity {
+            worker_name: "rig-1".into(),
+        })
+        .unwrap();
         assert!(
             matches!(classify_message(&ident), Ok(InboundMessage::Identity(m)) if m.worker_name == "rig-1")
         );
@@ -462,7 +464,10 @@ mod tests {
             solution: [0u8; 1344],
         };
         let share_bytes = encode_submit_share(&share).unwrap();
-        assert!(matches!(classify_message(&share_bytes), Ok(InboundMessage::Share(_)))); // Box<_> matches _
+        assert!(matches!(
+            classify_message(&share_bytes),
+            Ok(InboundMessage::Share(_))
+        )); // Box<_> matches _
 
         // Unknown type still errors (caller disconnects on it).
         let mut unknown = ident.clone();

@@ -1012,10 +1012,7 @@ mod tests {
             sanitize_worker_name("has space!"),
             Some("has_space_".to_string())
         );
-        assert_eq!(
-            sanitize_worker_name(&"x".repeat(80)),
-            Some("x".repeat(64))
-        );
+        assert_eq!(sanitize_worker_name(&"x".repeat(80)), Some("x".repeat(64)));
         assert_eq!(sanitize_worker_name(""), None);
         assert_eq!(sanitize_worker_name("🔥🔥"), Some("__".to_string()));
     }
