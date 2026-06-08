@@ -117,10 +117,8 @@ impl Config {
         }
         let relay_raw_segment_round_delay_millis =
             env_u64("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_ROUND_DELAY_MILLIS", 0)?;
-        let relay_forward_dedup_window = Duration::from_secs(env_u64(
-            "SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS",
-            30,
-        )?);
+        let relay_forward_dedup_window =
+            Duration::from_secs(env_u64("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS", 30)?);
         let relay_forward_dedup_capacity =
             env_usize("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY", 64)?;
 

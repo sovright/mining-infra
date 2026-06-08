@@ -403,9 +403,10 @@ mod tests {
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
-            recent_forwarded: Arc::new(std::sync::Mutex::new(
-                RecentForwardedHashes::new(64, Duration::from_secs(30)),
-            )),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         }
     }
 
@@ -510,9 +511,10 @@ mod tests {
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
-            recent_forwarded: Arc::new(std::sync::Mutex::new(
-                RecentForwardedHashes::new(64, Duration::from_secs(30)),
-            )),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         };
         let raw_block = large_raw_block();
 
@@ -551,9 +553,10 @@ mod tests {
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 3,
             raw_segment_round_delay: Duration::ZERO,
-            recent_forwarded: Arc::new(std::sync::Mutex::new(
-                RecentForwardedHashes::new(64, Duration::from_secs(30)),
-            )),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         };
         let raw_block = large_raw_block();
 
@@ -595,9 +598,10 @@ mod tests {
             raw_fallback_with_tx_cache: true,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
-            recent_forwarded: Arc::new(std::sync::Mutex::new(
-                RecentForwardedHashes::new(64, Duration::from_secs(30)),
-            )),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
         };
         let (raw_block, _tx0, tx1) = two_tx_raw_block();
         let tx_cache = TxCache::new(TxCacheConfig {
