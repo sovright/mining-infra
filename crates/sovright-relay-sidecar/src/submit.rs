@@ -63,6 +63,12 @@ pub enum SubmissionOutcome {
         candidate: SubmissionCandidate,
         status: SubmitBlockStatus,
     },
+    /// The safety gate rejected the candidate before reaching the submit RPC.
+    /// `reason` attributes the cause so per-cause metrics can be wired up.
+    GateRejected {
+        candidate: SubmissionCandidate,
+        reason: crate::submit_gate::RejectReason,
+    },
 }
 
 /// Classified Zebra `submitblock` result.
@@ -410,6 +416,111 @@ pub async fn handle_relay_raw_block<S: SubmitBlock + Sync>(
     mode: SubmitBlockMode,
 ) -> Result<SubmissionOutcome, RelayBlockError> {
     let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
+    match mode {
+        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+        SubmitBlockMode::Live => {
+            let result = submitter
+                .submit_block(&candidate.block_hex)
+                .await
+                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+            let status = classify_submitblock_result(result)?;
+            Ok(SubmissionOutcome::Submitted { candidate, status })
+        }
+    }
+}
+
+/// Handle one relay compact block, evaluating the safety gate against the
+/// reassembled candidate before any submit_block call.
+///
+/// The gate runs *before* `mode` is inspected, so a gate rejection in DryRun
+/// mode also short-circuits with `GateRejected`. That lets the staging service
+/// exercise the gate's decision logic on every candidate without ever calling
+/// `submit_block`.
+pub async fn handle_relay_compact_block_with_gate<S, V>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    gate: &mut crate::submit_gate::SubmitGate<V>,
+    parent_height: u64,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+{
+    let candidate = build_submission_candidate(compact)?;
+    let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
+        &compact.header,
+        candidate.block_hash.clone(),
+        parent_height,
+    )
+    .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
+        reason: "candidate meta extraction failed: header too short or parent height overflow"
+            .to_owned(),
+    })?;
+
+    match gate.apply_now(&candidate, &meta) {
+        crate::submit_gate::GateDecision::Accept => {}
+        crate::submit_gate::GateDecision::Reject(reason) => {
+            return Ok(SubmissionOutcome::GateRejected { candidate, reason });
+        }
+    }
+
+    match mode {
+        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+        SubmitBlockMode::Live => {
+            let result = submitter
+                .submit_block(&candidate.block_hex)
+                .await
+                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+            let status = classify_submitblock_result(result)?;
+            Ok(SubmissionOutcome::Submitted { candidate, status })
+        }
+    }
+}
+
+/// Handle one relay raw block, evaluating the safety gate against the
+/// reassembled candidate before any submit_block call.
+pub async fn handle_relay_raw_block_with_gate<S, V>(
+    submitter: &S,
+    raw_block: &[u8],
+    expected_block_hash: Option<[u8; 32]>,
+    mode: SubmitBlockMode,
+    gate: &mut crate::submit_gate::SubmitGate<V>,
+    parent_height: u64,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+{
+    let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
+
+    // Raw blocks carry the full header at the start. Extract the prev_hash
+    // from the first ZCASH_FULL_HEADER_SIZE bytes; the gate metadata needs it.
+    let header = raw_block
+        .get(..ZCASH_FULL_HEADER_SIZE)
+        .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
+            reason: format!(
+                "raw block shorter than the {} byte header prefix",
+                ZCASH_FULL_HEADER_SIZE
+            ),
+        })?;
+    let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
+        header,
+        candidate.block_hash.clone(),
+        parent_height,
+    )
+    .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
+        reason: "candidate meta extraction failed: header too short or parent height overflow"
+            .to_owned(),
+    })?;
+
+    match gate.apply_now(&candidate, &meta) {
+        crate::submit_gate::GateDecision::Accept => {}
+        crate::submit_gate::GateDecision::Reject(reason) => {
+            return Ok(SubmissionOutcome::GateRejected { candidate, reason });
+        }
+    }
+
     match mode {
         SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
         SubmitBlockMode::Live => {
