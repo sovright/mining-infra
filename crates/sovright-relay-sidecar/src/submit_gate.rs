@@ -173,7 +173,11 @@ impl<V: ChainView> SubmitGate<V> {
     /// block height, header-bytes for PoW recheck).
     ///
     /// Use `apply_now` in production. `apply_at` is for deterministic tests.
-    pub fn apply_now(&mut self, candidate: &SubmissionCandidate, meta: &CandidateMeta) -> GateDecision {
+    pub fn apply_now(
+        &mut self,
+        candidate: &SubmissionCandidate,
+        meta: &CandidateMeta,
+    ) -> GateDecision {
         self.apply_at(candidate, meta, Instant::now())
     }
 
