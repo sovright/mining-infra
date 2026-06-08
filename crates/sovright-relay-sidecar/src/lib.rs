@@ -1,5 +1,6 @@
 //! Relay sidecar library - exposes modules for fuzzing and testing
 
+pub mod chain_view;
 pub mod compact;
 pub mod config;
 pub mod rpc;
