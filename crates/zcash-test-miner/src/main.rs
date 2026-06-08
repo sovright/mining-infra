@@ -7,8 +7,8 @@ use clap::Parser;
 use tokio::sync::watch;
 
 use sovright_noise::PublicKey;
-use zcash_mining_protocol::messages::validate_worker_name;
 use worker::{WorkerConfig, run_worker};
+use zcash_mining_protocol::messages::validate_worker_name;
 
 #[derive(Parser, Debug)]
 #[command(name = "zcash-test-miner")]
