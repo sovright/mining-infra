@@ -80,6 +80,36 @@ pub struct GetBlockTemplateParams {
     pub mode: String,
 }
 
+/// Subset of `getblockchaininfo` we care about for sidecar safety checks.
+///
+/// Zebra's `getblockchaininfo` returns more fields; we only deserialize the
+/// ones the submit gate and adjacent components need. `serde(default)` on the
+/// rest means future Zebra additions do not break this client.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockchainInfo {
+    /// Best-chain tip height (`blocks` field in Zebra's RPC).
+    pub blocks: u64,
+    /// Best block hash (hex).
+    #[serde(rename = "bestblockhash")]
+    pub best_block_hash: String,
+    /// Number of headers (`headers` field, usually equal to `blocks`).
+    #[serde(default)]
+    pub headers: Option<u64>,
+}
+
+/// Subset of `getblockheader` we use to confirm a block hash exists locally.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BlockHeaderInfo {
+    /// Hex-encoded block hash that was queried.
+    pub hash: String,
+    /// Block height.
+    pub height: u64,
+    /// Parent block hash (hex, big-endian).
+    #[serde(rename = "previousblockhash")]
+    #[serde(default)]
+    pub previous_block_hash: Option<String>,
+}
+
 impl ZebraRpc {
     /// Create a new Zebra RPC client
     pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -123,6 +153,53 @@ impl ZebraRpc {
 
         Ok(result)
     }
+
+    /// Fetch the current chain info (best tip + best hash).
+    ///
+    /// The submit gate uses this to compute the height-window check. Used by
+    /// the staging service to poll tip on a short cadence.
+    pub async fn get_blockchain_info(
+        &self,
+    ) -> Result<BlockchainInfo, Box<dyn std::error::Error + Send + Sync>> {
+        let _id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let info: BlockchainInfo = self
+            .client
+            .request("getblockchaininfo", rpc_params![])
+            .await?;
+        Ok(info)
+    }
+
+    /// Fetch a block header by hash. Returns `Ok(Some(_))` if known, `Ok(None)`
+    /// if Zebra reports the block is unknown, `Err(_)` for transport errors.
+    ///
+    /// The submit gate uses this to validate `parent_known` before allowing a
+    /// relay-received block to reach `submitblock`.
+    pub async fn get_block_header(
+        &self,
+        block_hash_hex: &str,
+    ) -> Result<Option<BlockHeaderInfo>, Box<dyn std::error::Error + Send + Sync>> {
+        let _id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        // Verbosity 1 returns the JSON object form; 0 returns hex.
+        let result: Result<BlockHeaderInfo, _> = self
+            .client
+            .request("getblockheader", rpc_params![block_hash_hex, true])
+            .await;
+        match result {
+            Ok(info) => Ok(Some(info)),
+            Err(jsonrpsee::core::ClientError::Call(call_err)) => {
+                // Zebra returns -5 ("Block not found") for unknown hashes; treat
+                // every -5 / "not found" call error as a negative result rather
+                // than propagating an error.
+                let msg = call_err.message().to_lowercase();
+                if call_err.code() == -5 || msg.contains("not found") {
+                    Ok(None)
+                } else {
+                    Err(Box::new(jsonrpsee::core::ClientError::Call(call_err)))
+                }
+            }
+            Err(other) => Err(Box::new(other)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +222,59 @@ mod tests {
         let template: BlockTemplate = serde_json::from_str(json).unwrap();
         assert_eq!(template.version, 4);
         assert_eq!(template.height, 100);
+    }
+
+    #[test]
+    fn blockchain_info_deserialize() {
+        // Minimal shape: Zebra returns many more fields; we only consume a few.
+        let json = r#"{
+            "blocks": 3370892,
+            "bestblockhash": "00000000000000000000000000000000000000000000000000000000abcd1234",
+            "headers": 3370892
+        }"#;
+        let info: BlockchainInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.blocks, 3370892);
+        assert_eq!(
+            info.best_block_hash,
+            "00000000000000000000000000000000000000000000000000000000abcd1234"
+        );
+        assert_eq!(info.headers, Some(3370892));
+    }
+
+    #[test]
+    fn blockchain_info_tolerates_missing_optional_fields() {
+        // The headers field is optional; the rest are required.
+        let json = r#"{
+            "blocks": 3370892,
+            "bestblockhash": "ff"
+        }"#;
+        let info: BlockchainInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.blocks, 3370892);
+        assert_eq!(info.headers, None);
+    }
+
+    #[test]
+    fn block_header_info_deserialize() {
+        let json = r#"{
+            "hash": "abcd",
+            "height": 100,
+            "previousblockhash": "9999"
+        }"#;
+        let info: BlockHeaderInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.hash, "abcd");
+        assert_eq!(info.height, 100);
+        assert_eq!(info.previous_block_hash, Some("9999".to_string()));
+    }
+
+    #[test]
+    fn block_header_info_tolerates_no_parent() {
+        // Genesis block has no previousblockhash.
+        let json = r#"{
+            "hash": "abcd",
+            "height": 0
+        }"#;
+        let info: BlockHeaderInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.height, 0);
+        assert_eq!(info.previous_block_hash, None);
     }
 }
