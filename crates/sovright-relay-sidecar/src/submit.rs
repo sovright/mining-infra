@@ -496,14 +496,14 @@ where
 
     // Raw blocks carry the full header at the start. Extract the prev_hash
     // from the first ZCASH_FULL_HEADER_SIZE bytes; the gate metadata needs it.
-    let header = raw_block
-        .get(..ZCASH_FULL_HEADER_SIZE)
-        .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
+    let header = raw_block.get(..ZCASH_FULL_HEADER_SIZE).ok_or_else(|| {
+        RelayBlockError::ReconstructionInvalid {
             reason: format!(
                 "raw block shorter than the {} byte header prefix",
                 ZCASH_FULL_HEADER_SIZE
             ),
-        })?;
+        }
+    })?;
     let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
         header,
         candidate.block_hash.clone(),

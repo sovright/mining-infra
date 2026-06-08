@@ -248,9 +248,7 @@ async fn dry_run_raw_block_does_not_submit_to_zebra() {
 use sovright_relay_sidecar::submit::{
     handle_relay_compact_block_with_gate, handle_relay_raw_block_with_gate,
 };
-use sovright_relay_sidecar::submit_gate::{
-    ChainView, GateConfig, RejectReason, SubmitGate,
-};
+use sovright_relay_sidecar::submit_gate::{ChainView, GateConfig, RejectReason, SubmitGate};
 
 struct AlwaysKnownChain {
     tip: u64,
