@@ -48,6 +48,13 @@ pub struct Config {
     pub relay_raw_fallback_with_tx_cache: bool,
     pub relay_raw_segment_send_rounds: usize,
     pub relay_raw_segment_round_delay_millis: u64,
+    /// First-seen-wins window for the relay-bridge forward path. If the same
+    /// block hash is offered to `forward_block` twice inside this window,
+    /// the second call returns `ForwardMode::Deduplicated` without re-encoding
+    /// or re-broadcasting. Default 30 seconds.
+    pub relay_forward_dedup_window: Duration,
+    /// Maximum bounded LRU size for the forward dedup ring. Default 64.
+    pub relay_forward_dedup_capacity: usize,
 }
 
 impl Config {
@@ -110,6 +117,12 @@ impl Config {
         }
         let relay_raw_segment_round_delay_millis =
             env_u64("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_ROUND_DELAY_MILLIS", 0)?;
+        let relay_forward_dedup_window = Duration::from_secs(env_u64(
+            "SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS",
+            30,
+        )?);
+        let relay_forward_dedup_capacity =
+            env_usize("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY", 64)?;
 
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -154,6 +167,8 @@ impl Config {
             relay_raw_fallback_with_tx_cache,
             relay_raw_segment_send_rounds,
             relay_raw_segment_round_delay_millis,
+            relay_forward_dedup_window,
+            relay_forward_dedup_capacity,
         })
     }
 }
