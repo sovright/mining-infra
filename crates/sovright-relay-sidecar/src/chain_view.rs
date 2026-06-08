@@ -156,11 +156,7 @@ impl ZebraChainView {
     ///
     /// Use this on the fast path of the staging service that does not run
     /// inside the sync gate (which requires the sync `ChainView` trait).
-    pub async fn parent_known_async(
-        &self,
-        rpc: &ZebraRpc,
-        hash: &[u8; 32],
-    ) -> RpcResult<bool> {
+    pub async fn parent_known_async(&self, rpc: &ZebraRpc, hash: &[u8; 32]) -> RpcResult<bool> {
         if let Ok(state) = self.state.read()
             && state.contains_parent(hash)
         {
@@ -180,11 +176,7 @@ impl ZebraChainView {
     /// On a successful lookup, the hash is also admitted to the parent-known
     /// cache as a side effect — the height query proves the hash exists, so
     /// the next `parent_known` for the same hash short-circuits.
-    pub async fn height_of(
-        &self,
-        rpc: &ZebraRpc,
-        hash: &[u8; 32],
-    ) -> RpcResult<Option<u64>> {
+    pub async fn height_of(&self, rpc: &ZebraRpc, hash: &[u8; 32]) -> RpcResult<Option<u64>> {
         let hex_hash = hex_encode(hash);
         match rpc.get_block_header(&hex_hash).await? {
             Some(info) => {
@@ -263,7 +255,10 @@ mod tests {
         view.admit_parent([99u8; 32]);
 
         assert!(view.parent_known(&[0u8; 32]), "[0] promoted, must survive");
-        assert!(!view.parent_known(&[1u8; 32]), "[1] is least-recent, must be evicted");
+        assert!(
+            !view.parent_known(&[1u8; 32]),
+            "[1] is least-recent, must be evicted"
+        );
         assert!(view.parent_known(&[2u8; 32]));
         assert!(view.parent_known(&[3u8; 32]));
         assert!(view.parent_known(&[99u8; 32]));
@@ -271,8 +266,10 @@ mod tests {
 
     #[test]
     fn hex_encode_lowercase() {
-        let bytes = [0u8, 0x9a, 0xff, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let bytes = [
+            0u8, 0x9a, 0xff, 0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0,
+        ];
         let out = hex_encode(&bytes);
         assert_eq!(&out[..8], "009aff10");
         assert_eq!(out.len(), 64);

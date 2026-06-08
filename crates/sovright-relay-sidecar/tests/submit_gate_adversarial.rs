@@ -24,8 +24,8 @@ use std::time::Duration;
 
 use sovright_relay::{CompactBlock, PrefilledTx, ShortId};
 use sovright_relay_sidecar::submit::{
-    handle_relay_compact_block_with_gate, SubmissionOutcome, SubmitBlock, SubmitBlockMode,
-    SubmitFuture,
+    SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitFuture,
+    handle_relay_compact_block_with_gate,
 };
 use sovright_relay_sidecar::submit_gate::{
     CandidateMeta, ChainView, GateConfig, RejectReason, SubmitGate,
