@@ -1,0 +1,32 @@
+# Container image for the Sovright Relay daemon (sovright-relay crate, relay-node binary).
+#
+# Mirrors the layout of the other published images in this repo (job-declarator,
+# translator-proxy): rust:1.88-slim builder with a workspace cargo build, then a
+# slim debian runtime with a non-root user. The relay listens on UDP for FEC
+# block chunks and benefits from a small attack surface in the runtime image.
+#
+# Build args:
+#   None. The binary is built from the workspace at the commit being imaged.
+#
+# Runtime configuration is via the systemd unit on the host (peer config,
+# auth secret path, bind address, FEC profile). The container does not embed
+# any of that.
+
+# 1.88 = let-chains stabilization floor; kept in sync with translator-proxy and
+# the rest of the workspace.
+FROM rust:1.88-slim-bookworm AS builder
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    pkg-config \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cargo build --release -p sovright-relay --bin relay-node
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd -r -u 10001 sovright
+USER sovright
+COPY --from=builder /src/target/release/relay-node /usr/local/bin/relay-node
+ENTRYPOINT ["/usr/local/bin/relay-node"]
