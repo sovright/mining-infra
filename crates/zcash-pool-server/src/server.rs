@@ -990,23 +990,35 @@ impl PoolServer {
                 info!("Session {} disconnected", channel_id);
                 Ok(())
             }
-            SessionMessage::IdentityDeclared { channel_id, worker_name } => {
+            SessionMessage::IdentityDeclared {
+                channel_id,
+                worker_name,
+            } => {
                 let mut accepted = self.accepted_identities.write().await;
                 let mut channels = self.channels.write().await;
                 let Some(channel) = channels.get_mut(&channel_id) else {
                     warn!("Identity for unknown channel {}", channel_id);
                     return Ok(());
                 };
-                match apply_identity_policy(&mut accepted, &channel.worker_identity, &worker_name, MAX_WORKER_IDENTITIES) {
+                match apply_identity_policy(
+                    &mut accepted,
+                    &channel.worker_identity,
+                    &worker_name,
+                    MAX_WORKER_IDENTITIES,
+                ) {
                     IdentityDecision::Accept => {
                         accepted.insert(worker_name.clone());
-                        info!("Channel {} identified as worker '{}'", channel_id, worker_name);
+                        info!(
+                            "Channel {} identified as worker '{}'",
+                            channel_id, worker_name
+                        );
                         channel.worker_identity = Some(worker_name);
                     }
                     IdentityDecision::AlreadySet => {
                         warn!(
                             "Channel {} attempted to re-declare identity '{}' (already '{}') - ignored",
-                            channel_id, worker_name,
+                            channel_id,
+                            worker_name,
                             channel.worker_identity.as_deref().unwrap_or("?")
                         );
                     }
