@@ -45,26 +45,23 @@ pub struct JdServerConfig {
     ///
     /// The default is derived via
     /// `zcash_equihash_validator::difficulty::difficulty_to_target` from a
-    /// difficulty of 0.0001, which matches the testnet example configs'
-    /// `initial_difficulty`. There is no shared constant linking the JD and
-    /// stratum systems — the stratum DEFAULT `initial_difficulty` is 1.0
-    /// (`zcash-pool-server/src/config.rs`), and 0.0001 appears only in the
-    /// testnet example binaries.
+    /// difficulty of 1e-9, matching the CPU-test cold-start configs. There is
+    /// no shared constant linking the JD and stratum systems — production
+    /// configs should set a real target explicitly.
     ///
-    /// Note: `difficulty_to_target(0.0001)` clamps to all-ones (`[0xff; 32]`)
-    /// because difficulty < 1.0 (see `difficulty.rs`), so the DEFAULT accepts
-    /// any valid Equihash solution. Production configs MUST set a real target.
+    /// Note: `difficulty_to_target(1e-9)` saturates to all-ones (`[0xff; 32]`)
+    /// because it is below the representable bound, so the DEFAULT accepts any
+    /// valid Equihash solution. Production configs MUST set a real target.
     pub share_target: [u8; 32],
 }
 
 /// The default difficulty used to derive the JD share target.
 ///
-/// Matches the testnet example configs' `initial_difficulty` (0.0001); there is
-/// no shared constant linking the JD and stratum systems (the stratum DEFAULT is
-/// 1.0). Because 0.0001 < 1.0, the derived target clamps to all-ones and accepts
-/// any valid Equihash solution — production configs must override it. See
+/// Matches the CPU-test cold-start configs' `initial_difficulty` (1e-9). This
+/// sits below the all-ones saturation point, so the derived target accepts any
+/// valid Equihash solution — production configs must override it. See
 /// [`JdServerConfig::share_target`].
-const DEFAULT_SHARE_DIFFICULTY: f64 = 0.0001;
+const DEFAULT_SHARE_DIFFICULTY: f64 = 1e-9;
 
 impl Default for JdServerConfig {
     fn default() -> Self {
