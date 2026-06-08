@@ -359,13 +359,17 @@ pub fn decode_set_worker_identity(data: &[u8]) -> Result<SetWorkerIdentity> {
     let mut cursor = Cursor::new(payload);
     let name_len = cursor
         .read_u8()
-        .map_err(|_| ProtocolError::MessageTooShort { expected: 1, actual: 0 })?
-        as usize;
+        .map_err(|_| ProtocolError::MessageTooShort {
+            expected: 1,
+            actual: 0,
+        })? as usize;
     let mut name_bytes = vec![0u8; name_len];
-    cursor.read_exact(&mut name_bytes).map_err(|_| ProtocolError::MessageTooShort {
-        expected: name_len,
-        actual: payload.len().saturating_sub(1),
-    })?;
+    cursor
+        .read_exact(&mut name_bytes)
+        .map_err(|_| ProtocolError::MessageTooShort {
+            expected: name_len,
+            actual: payload.len().saturating_sub(1),
+        })?;
 
     if cursor.position() as usize != payload.len() {
         return Err(ProtocolError::EncodingError(
@@ -779,7 +783,9 @@ mod tests {
 
     #[test]
     fn set_worker_identity_round_trip() {
-        let msg = SetWorkerIdentity { worker_name: "e2eclaude-1".to_string() };
+        let msg = SetWorkerIdentity {
+            worker_name: "e2eclaude-1".to_string(),
+        };
         let encoded = encode_set_worker_identity(&msg).unwrap();
         let decoded = decode_set_worker_identity(&encoded).unwrap();
         assert_eq!(decoded.worker_name, "e2eclaude-1");
@@ -787,7 +793,9 @@ mod tests {
 
     #[test]
     fn set_worker_identity_frame_type_is_0x24() {
-        let msg = SetWorkerIdentity { worker_name: "a".to_string() };
+        let msg = SetWorkerIdentity {
+            worker_name: "a".to_string(),
+        };
         let encoded = encode_set_worker_identity(&msg).unwrap();
         let frame = MessageFrame::decode(&encoded).unwrap();
         assert_eq!(frame.msg_type, message_types::SET_WORKER_IDENTITY);

@@ -1135,7 +1135,9 @@ impl SidecarMetrics {
     /// once per `SubmissionOutcome::GateRejected` in the handler match arm.
     fn inc_submit_gate_rejected(&self, reason: sovright_relay_sidecar::submit_gate::RejectReason) {
         let counter = match reason {
-            sovright_relay_sidecar::submit_gate::RejectReason::PowRecheck => &self.submit_gate_rejected_pow,
+            sovright_relay_sidecar::submit_gate::RejectReason::PowRecheck => {
+                &self.submit_gate_rejected_pow
+            }
             sovright_relay_sidecar::submit_gate::RejectReason::UnknownParent => {
                 &self.submit_gate_rejected_unknown_parent
             }
