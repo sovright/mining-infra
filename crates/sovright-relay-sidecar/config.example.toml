@@ -50,3 +50,18 @@ send_burst_delay_micros = 0
 
 # Optional Prometheus textfile for receive/reassembly/submit metrics.
 # metrics_textfile = "/var/lib/sovright-relay-sidecar/metrics.prom"
+
+# Safety gate that sits in front of submit_block for relay-received blocks.
+# Independent of enable_submitblock so the gate can run "shadow" — exercising
+# the decision logic on every reassembled candidate without enable_submitblock
+# being on. Turn this on during Phase 3 staging; flip enable_submitblock on
+# during Phase 4 once gate metrics have been clean for 48 hr.
+[submit_gate]
+# Master switch. Default false.
+enabled = false
+# Allowed block heights below the local tip. Default 3 = one-deep reorg tolerance.
+allowed_below = 3
+# Dedup window in seconds. Default 300 (5 minutes).
+dedup_window_secs = 300
+# Maximum entries in the dedup ring. Default 256.
+dedup_capacity = 256
