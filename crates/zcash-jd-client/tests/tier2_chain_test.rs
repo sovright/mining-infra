@@ -360,7 +360,7 @@ async fn tier2_full_chain_declared_job_mining() {
     let pool_config = PoolConfig {
         listen_addr: pool_stratum_addr,
         zebra_url: zebra_url.clone(),
-        initial_difficulty: 0.0001, // trivial share difficulty for CPU mining
+        initial_difficulty: 1e-9, // below saturation: accept every valid solution at cold start
         target_shares_per_minute: 5.0,
         nonce_1_len: 4,
         noise_enabled: false,
