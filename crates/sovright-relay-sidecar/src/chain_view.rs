@@ -169,6 +169,23 @@ impl ZebraChainView {
         }
         Ok(known)
     }
+
+    /// Look up the height of a block hash via the local Zebra. Used by the
+    /// gated submit handler to fill `CandidateMeta.height = parent_height + 1`.
+    ///
+    /// On a successful lookup, the hash is also admitted to the parent-known
+    /// cache as a side effect — the height query proves the hash exists, so
+    /// the next `parent_known` for the same hash short-circuits.
+    pub async fn height_of(&self, rpc: &ZebraRpc, hash: &[u8; 32]) -> RpcResult<Option<u64>> {
+        let hex_hash = hex_encode(hash);
+        match rpc.get_block_header(&hex_hash).await? {
+            Some(info) => {
+                self.admit_parent(*hash);
+                Ok(Some(info.height))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 impl ChainView for Arc<ZebraChainView> {

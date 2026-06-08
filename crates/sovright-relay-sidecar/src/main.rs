@@ -916,6 +916,19 @@ fn log_submission_outcome(
                 );
             }
         },
+        Ok(SubmissionOutcome::GateRejected { candidate, reason }) => {
+            // The safety gate rejected the candidate before it reached
+            // submit_block. The staging service drives this path on every
+            // reassembled candidate (shadow mode), and a production-mode
+            // sidecar with gate.enabled = true treats it as a normal skip.
+            info!(
+                block_hash = %candidate.block_hash,
+                tx_count = candidate.tx_count,
+                block_bytes = candidate.block_bytes,
+                gate_reason = reason.as_str(),
+                "Relay block rejected by safety gate before submitblock"
+            );
+        }
         Err(error) => match error {
             RelayBlockError::SubmitRejected(reason) => {
                 metrics.inc_submit_rejections();
@@ -1676,6 +1689,9 @@ mod tests {
                 panic!("complete mempool should not need tx fallback")
             }
             SubmissionOutcome::Submitted { .. } => panic!("dry-run must not submit"),
+            SubmissionOutcome::GateRejected { .. } => {
+                panic!("ungated path must not surface GateRejected")
+            }
         }
         assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
         assert_eq!(
@@ -1739,6 +1755,9 @@ mod tests {
             }
             SubmissionOutcome::DryRun(_) => panic!("missing txs should not produce a candidate"),
             SubmissionOutcome::Submitted { .. } => panic!("dry-run must not submit"),
+            SubmissionOutcome::GateRejected { .. } => {
+                panic!("ungated path must not surface GateRejected")
+            }
         }
 
         assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);

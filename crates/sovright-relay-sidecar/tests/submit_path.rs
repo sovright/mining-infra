@@ -240,3 +240,234 @@ async fn dry_run_raw_block_does_not_submit_to_zebra() {
     assert!(matches!(outcome, SubmissionOutcome::DryRun(_)));
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
 }
+
+// ---------------------------------------------------------------------------
+// Gated wrappers (handle_relay_*_with_gate)
+// ---------------------------------------------------------------------------
+
+use sovright_relay_sidecar::submit::{
+    handle_relay_compact_block_with_gate, handle_relay_raw_block_with_gate,
+};
+use sovright_relay_sidecar::submit_gate::{ChainView, GateConfig, RejectReason, SubmitGate};
+
+struct AlwaysKnownChain {
+    tip: u64,
+}
+
+impl ChainView for AlwaysKnownChain {
+    fn tip_height(&self) -> u64 {
+        self.tip
+    }
+    fn parent_known(&self, _parent_hash: &[u8; 32]) -> bool {
+        true
+    }
+}
+
+struct UnknownParentChain {
+    tip: u64,
+}
+
+impl ChainView for UnknownParentChain {
+    fn tip_height(&self) -> u64 {
+        self.tip
+    }
+    fn parent_known(&self, _parent_hash: &[u8; 32]) -> bool {
+        false
+    }
+}
+
+fn compact_with_prefilled_one() -> CompactBlock {
+    CompactBlock::new(
+        header(),
+        0,
+        vec![],
+        vec![PrefilledTx {
+            index: 0,
+            tx_data: vec![0x01],
+        }],
+    )
+}
+
+fn enabled_gate_config() -> GateConfig {
+    GateConfig {
+        enabled: true,
+        allowed_below: 3,
+        dedup_window: std::time::Duration::from_secs(60),
+        dedup_capacity: 8,
+    }
+}
+
+#[tokio::test]
+async fn gated_compact_dry_run_accepts_when_gate_accepts() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let candidate = build_submission_candidate(&compact).unwrap();
+    // candidate.block_hash is derived from the (all-zero parent) header,
+    // so the gate at tip = candidate_height accepts.
+    let chain = AlwaysKnownChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+    let parent_height = 99;
+
+    let outcome = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::DryRun,
+        &mut gate,
+        parent_height,
+    )
+    .await
+    .unwrap();
+
+    let candidate_hash = candidate.block_hash;
+    assert!(
+        matches!(outcome, SubmissionOutcome::DryRun(ref c) if c.block_hash == candidate_hash),
+        "gate-accepted dry-run must surface a DryRun outcome"
+    );
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gated_compact_rejects_unknown_parent() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let chain = UnknownParentChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+
+    let outcome = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::Live,
+        &mut gate,
+        99,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(
+            outcome,
+            SubmissionOutcome::GateRejected {
+                reason: RejectReason::UnknownParent,
+                ..
+            }
+        ),
+        "unknown parent must surface GateRejected",
+    );
+    assert_eq!(
+        submitter.calls.load(Ordering::SeqCst),
+        0,
+        "gate-rejected blocks must never call submit_block",
+    );
+}
+
+#[tokio::test]
+async fn gated_compact_rejects_out_of_window_height() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    // tip = 1000, allowed_below = 3, so candidate height = parent + 1 = 996
+    // (parent = 995) is below the window of [997, 1001].
+    let chain = AlwaysKnownChain { tip: 1000 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+
+    let outcome = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::Live,
+        &mut gate,
+        995,
+    )
+    .await
+    .unwrap();
+
+    assert!(matches!(
+        outcome,
+        SubmissionOutcome::GateRejected {
+            reason: RejectReason::OutOfHeightWindow,
+            ..
+        }
+    ));
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn gated_compact_dedups_repeat_submissions() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let chain = AlwaysKnownChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+
+    let first = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::DryRun,
+        &mut gate,
+        99,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(first, SubmissionOutcome::DryRun(_)));
+
+    let second = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::DryRun,
+        &mut gate,
+        99,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(
+        second,
+        SubmissionOutcome::GateRejected {
+            reason: RejectReason::DuplicateSubmit,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn gated_compact_disabled_gate_accepts() {
+    let submitter = CountingSubmitter::new();
+    let compact = compact_with_prefilled_one();
+    let chain = UnknownParentChain { tip: 100 }; // would reject if gate enabled
+    let mut gate = SubmitGate::new(
+        GateConfig {
+            enabled: false,
+            ..enabled_gate_config()
+        },
+        chain,
+    );
+
+    let outcome = handle_relay_compact_block_with_gate(
+        &submitter,
+        &compact,
+        SubmitBlockMode::DryRun,
+        &mut gate,
+        99,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SubmissionOutcome::DryRun(_)));
+}
+
+#[tokio::test]
+async fn gated_raw_block_dry_run_accepts_when_gate_accepts() {
+    let submitter = CountingSubmitter::new();
+    let raw = raw_block();
+    let expected_hash = raw_block_hash(&raw);
+    let chain = AlwaysKnownChain { tip: 100 };
+    let mut gate = SubmitGate::new(enabled_gate_config(), chain);
+
+    let outcome = handle_relay_raw_block_with_gate(
+        &submitter,
+        &raw,
+        Some(expected_hash),
+        SubmitBlockMode::DryRun,
+        &mut gate,
+        99,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, SubmissionOutcome::DryRun(_)));
+    assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
