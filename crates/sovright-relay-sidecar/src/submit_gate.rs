@@ -238,6 +238,46 @@ impl CandidateMeta {
     fn header_hash_matches(&self, candidate_hash: &str) -> bool {
         self.block_hash_hex == candidate_hash
     }
+
+    /// Extract the parent hash from a serialized Zcash block header.
+    ///
+    /// Zcash header layout (consensus byte order):
+    ///   - `[0..4]`   version          (u32 LE)
+    ///   - `[4..36]`  prev_hash        (32 bytes, internal byte order)
+    ///   - `[36..68]` merkle_root      (32 bytes)
+    ///   - `[68..100]` hash_block_commitments
+    ///   - `[100..104]` time
+    ///   - `[104..108]` bits
+    ///   - `[108..140]` nonce
+    ///   - `[140..]`  Equihash solution (variable length)
+    ///
+    /// Returns `None` if the header is shorter than the fixed pre-solution
+    /// prefix (140 bytes).
+    pub fn parent_hash_from_header(header: &[u8]) -> Option<[u8; 32]> {
+        if header.len() < 36 {
+            return None;
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&header[4..36]);
+        Some(out)
+    }
+
+    /// Build a `CandidateMeta` from a serialized header plus the candidate
+    /// block hash hex plus the parent's height (resolved by the caller via
+    /// `chain_view.get_block_header(parent_hash)` or pre-cached lookup).
+    pub fn from_header_bytes(
+        header: &[u8],
+        block_hash_hex: String,
+        parent_height: u64,
+    ) -> Option<Self> {
+        let parent_hash = Self::parent_hash_from_header(header)?;
+        Some(Self {
+            // Candidate height is parent height + 1, the standard linkage.
+            height: parent_height.checked_add(1)?,
+            parent_hash,
+            block_hash_hex,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +428,54 @@ mod tests {
         assert_eq!(
             g.apply_at(&c, &m, t0 + Duration::from_secs(31)),
             GateDecision::Accept,
+        );
+    }
+
+    #[test]
+    fn parent_hash_from_header_extracts_offset_4_to_36() {
+        // Build a minimal header with a recognizable prev_hash.
+        let mut header = vec![0u8; 140];
+        // Version
+        header[0..4].copy_from_slice(&4u32.to_le_bytes());
+        // Parent (32 bytes of ascending values 1..=32)
+        for i in 0..32 {
+            header[4 + i] = (i + 1) as u8;
+        }
+        let parent = CandidateMeta::parent_hash_from_header(&header).expect("parent slice");
+        for (i, b) in parent.iter().enumerate() {
+            assert_eq!(*b, (i + 1) as u8);
+        }
+    }
+
+    #[test]
+    fn parent_hash_from_header_handles_short_header() {
+        let header = vec![0u8; 10];
+        assert!(CandidateMeta::parent_hash_from_header(&header).is_none());
+    }
+
+    #[test]
+    fn from_header_bytes_constructs_meta_at_parent_plus_one() {
+        let mut header = vec![0u8; 140];
+        for i in 0..32 {
+            header[4 + i] = (i + 1) as u8;
+        }
+        let meta = CandidateMeta::from_header_bytes(&header, "abc".into(), 100)
+            .expect("well-formed");
+        assert_eq!(meta.height, 101);
+        assert_eq!(meta.parent_hash[0], 1);
+        assert_eq!(meta.parent_hash[31], 32);
+        assert_eq!(meta.block_hash_hex, "abc");
+    }
+
+    #[test]
+    fn from_header_bytes_rejects_parent_height_overflow() {
+        let mut header = vec![0u8; 140];
+        for i in 0..32 {
+            header[4 + i] = (i + 1) as u8;
+        }
+        assert!(
+            CandidateMeta::from_header_bytes(&header, "ff".into(), u64::MAX).is_none(),
+            "u64::MAX parent height has no successor",
         );
     }
 
