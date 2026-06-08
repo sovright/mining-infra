@@ -463,8 +463,8 @@ mod tests {
         for i in 0..32 {
             header[4 + i] = (i + 1) as u8;
         }
-        let meta = CandidateMeta::from_header_bytes(&header, "abc".into(), 100)
-            .expect("well-formed");
+        let meta =
+            CandidateMeta::from_header_bytes(&header, "abc".into(), 100).expect("well-formed");
         assert_eq!(meta.height, 101);
         assert_eq!(meta.parent_hash[0], 1);
         assert_eq!(meta.parent_hash[31], 32);
