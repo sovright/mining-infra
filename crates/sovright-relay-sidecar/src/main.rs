@@ -921,6 +921,7 @@ fn log_submission_outcome(
             // submit_block. The staging service drives this path on every
             // reassembled candidate (shadow mode), and a production-mode
             // sidecar with gate.enabled = true treats it as a normal skip.
+            metrics.inc_submit_gate_rejected(reason);
             info!(
                 block_hash = %candidate.block_hash,
                 tx_count = candidate.tx_count,
@@ -1011,6 +1012,14 @@ struct SidecarMetrics {
     submit_rpc_failures: AtomicU64,
     submit_rejections: AtomicU64,
     not_submit_candidates: AtomicU64,
+    /// Per-cause counters for the submit safety gate. Incremented in
+    /// `handle_relay_*_block_with_gate` so the staging service can attribute
+    /// gate decisions while running in shadow mode (enable_submitblock=false).
+    submit_gate_accepted: AtomicU64,
+    submit_gate_rejected_pow: AtomicU64,
+    submit_gate_rejected_unknown_parent: AtomicU64,
+    submit_gate_rejected_out_of_window: AtomicU64,
+    submit_gate_rejected_duplicate: AtomicU64,
     raw_segment_incomplete_blocks: AtomicUsize,
     raw_segment_payload_bytes: AtomicUsize,
     tx_cache_entries: AtomicUsize,
@@ -1114,6 +1123,34 @@ impl SidecarMetrics {
         self.not_submit_candidates.fetch_add(1, Ordering::Relaxed);
     }
 
+    // Consumed by the upcoming `bedrock-forge-submitblock-staging` service
+    // (separate ticket on the deployment side); the in-process sidecar does
+    // not produce SubmissionOutcome::GateRejected on its own paths today.
+    #[allow(dead_code)]
+    fn inc_submit_gate_accepted(&self) {
+        self.submit_gate_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment the gate-rejection counter that matches `reason`. Called
+    /// once per `SubmissionOutcome::GateRejected` in the handler match arm.
+    fn inc_submit_gate_rejected(&self, reason: sovright_relay_sidecar::submit_gate::RejectReason) {
+        let counter = match reason {
+            sovright_relay_sidecar::submit_gate::RejectReason::PowRecheck => {
+                &self.submit_gate_rejected_pow
+            }
+            sovright_relay_sidecar::submit_gate::RejectReason::UnknownParent => {
+                &self.submit_gate_rejected_unknown_parent
+            }
+            sovright_relay_sidecar::submit_gate::RejectReason::OutOfHeightWindow => {
+                &self.submit_gate_rejected_out_of_window
+            }
+            sovright_relay_sidecar::submit_gate::RejectReason::DuplicateSubmit => {
+                &self.submit_gate_rejected_duplicate
+            }
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn set_raw_segment_buffer_state(&self, incomplete_blocks: usize, payload_bytes: usize) {
         self.raw_segment_incomplete_blocks
             .store(incomplete_blocks, Ordering::Relaxed);
@@ -1193,6 +1230,16 @@ impl SidecarMetrics {
         let submit_rpc_failures = self.submit_rpc_failures.load(Ordering::Relaxed);
         let submit_rejections = self.submit_rejections.load(Ordering::Relaxed);
         let not_submit_candidates = self.not_submit_candidates.load(Ordering::Relaxed);
+        let submit_gate_accepted = self.submit_gate_accepted.load(Ordering::Relaxed);
+        let submit_gate_rejected_pow = self.submit_gate_rejected_pow.load(Ordering::Relaxed);
+        let submit_gate_rejected_unknown_parent = self
+            .submit_gate_rejected_unknown_parent
+            .load(Ordering::Relaxed);
+        let submit_gate_rejected_out_of_window = self
+            .submit_gate_rejected_out_of_window
+            .load(Ordering::Relaxed);
+        let submit_gate_rejected_duplicate =
+            self.submit_gate_rejected_duplicate.load(Ordering::Relaxed);
         let raw_segment_incomplete_blocks =
             self.raw_segment_incomplete_blocks.load(Ordering::Relaxed);
         let raw_segment_payload_bytes = self.raw_segment_payload_bytes.load(Ordering::Relaxed);
@@ -1254,6 +1301,13 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_submit_rejections_total {submit_rejections}\n",
                 "# TYPE sovright_relay_sidecar_relay_not_submit_candidates_total counter\n",
                 "sovright_relay_sidecar_relay_not_submit_candidates_total {not_submit_candidates}\n",
+                "# TYPE sovright_relay_sidecar_submit_gate_accepted_total counter\n",
+                "sovright_relay_sidecar_submit_gate_accepted_total {submit_gate_accepted}\n",
+                "# TYPE sovright_relay_sidecar_submit_gate_rejected_total counter\n",
+                "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"pow_recheck\"}} {submit_gate_rejected_pow}\n",
+                "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"unknown_parent\"}} {submit_gate_rejected_unknown_parent}\n",
+                "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"out_of_height_window\"}} {submit_gate_rejected_out_of_window}\n",
+                "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"duplicate_submit\"}} {submit_gate_rejected_duplicate}\n",
                 "# TYPE sovright_relay_sidecar_raw_segment_incomplete_blocks gauge\n",
                 "sovright_relay_sidecar_raw_segment_incomplete_blocks {raw_segment_incomplete_blocks}\n",
                 "# TYPE sovright_relay_sidecar_raw_segment_payload_bytes gauge\n",
@@ -1322,6 +1376,11 @@ impl SidecarMetrics {
             tx_feed_invalid_lines = tx_feed_invalid_lines,
             tx_feed_cache_disabled = tx_feed_cache_disabled,
             tx_feed_dropped_too_large = tx_feed_dropped_too_large,
+            submit_gate_accepted = submit_gate_accepted,
+            submit_gate_rejected_pow = submit_gate_rejected_pow,
+            submit_gate_rejected_unknown_parent = submit_gate_rejected_unknown_parent,
+            submit_gate_rejected_out_of_window = submit_gate_rejected_out_of_window,
+            submit_gate_rejected_duplicate = submit_gate_rejected_duplicate,
         )
     }
 }
