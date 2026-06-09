@@ -29,6 +29,8 @@ fn make_template(height: u64, prev_hash: [u8; 32]) -> BlockTemplate {
         target: Hash256([0xff; 32]),
         transactions: vec![],
         coinbase: vec![],
+        chain_history_root: Hash256([0x42; 32]),
+        consensus_branch_id: 0xc8e7_1055,
         total_fees: 0,
     }
 }

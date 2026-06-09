@@ -322,6 +322,8 @@ fn test_block_serialization_structure() {
         target: Hash256([0xff; 32]),
         transactions: vec![tx],
         coinbase: coinbase.clone(),
+        chain_history_root: Hash256([0x42; 32]),
+        consensus_branch_id: 0xc8e7_1055,
         total_fees: 1000,
     };
 

@@ -11,7 +11,9 @@ use std::sync::Mutex;
 
 use crate::error::{Error, Result};
 use crate::rpc::{RpcProvider, SubmitBlockResult, SubmitMode};
-use crate::types::{DefaultRoots, GetBlockTemplateResponse, TemplateTransaction};
+use crate::types::{
+    DefaultRoots, GetBlockTemplateResponse, GetBlockchainInfoResponse, TemplateTransaction,
+};
 
 // ---------------------------------------------------------------------------
 // MockZebraRpc
@@ -20,6 +22,7 @@ use crate::types::{DefaultRoots, GetBlockTemplateResponse, TemplateTransaction};
 /// A mock implementation of [`RpcProvider`] that returns pre-queued responses.
 pub struct MockZebraRpc {
     templates: Mutex<VecDeque<Result<GetBlockTemplateResponse>>>,
+    blockchain_infos: Mutex<VecDeque<Result<GetBlockchainInfoResponse>>>,
     submitted: Mutex<Vec<String>>,
 }
 
@@ -28,6 +31,7 @@ impl MockZebraRpc {
     pub fn new() -> Self {
         Self {
             templates: Mutex::new(VecDeque::new()),
+            blockchain_infos: Mutex::new(VecDeque::new()),
             submitted: Mutex::new(Vec::new()),
         }
     }
@@ -40,6 +44,18 @@ impl MockZebraRpc {
     /// Queue an error response.
     pub fn enqueue_error(&self, err: Error) {
         self.templates.lock().unwrap().push_back(Err(err));
+    }
+
+    /// Queue a successful getblockchaininfo response.
+    pub fn enqueue_blockchain_info(&self, next_block: &str) {
+        self.blockchain_infos
+            .lock()
+            .unwrap()
+            .push_back(Ok(GetBlockchainInfoResponse {
+                consensus: crate::types::BlockchainInfoConsensus {
+                    next_block: next_block.to_string(),
+                },
+            }));
     }
 
     /// Return a snapshot of all submitted block hex strings.
@@ -62,6 +78,20 @@ impl RpcProvider for MockZebraRpc {
             .unwrap()
             .pop_front()
             .unwrap_or_else(|| Err(Error::Rpc("no queued templates".into())))
+    }
+
+    async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
+        self.blockchain_infos
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| {
+                Ok(GetBlockchainInfoResponse {
+                    consensus: crate::types::BlockchainInfoConsensus {
+                        next_block: "c8e71055".to_string(),
+                    },
+                })
+            })
     }
 
     async fn submit_block(
@@ -178,6 +208,12 @@ impl TestTemplateFactory {
     /// Set the block commitments hash (64-char hex, display/big-endian order).
     pub fn block_commitments_hash(mut self, h: &str) -> Self {
         self.block_commitments_hash = h.to_string();
+        self
+    }
+
+    /// Set the chain history root (64-char internal-order hex).
+    pub fn chain_history_root(mut self, h: &str) -> Self {
+        self.chain_history_root = h.to_string();
         self
     }
 

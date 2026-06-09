@@ -3889,6 +3889,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zcash-coinbase",
  "zcash-equihash-validator",
  "zcash-jd-server",
  "zcash-mining-protocol",
@@ -3914,6 +3915,7 @@ dependencies = [
  "zcash-equihash-validator",
  "zcash-mining-protocol",
  "zcash-pool-common",
+ "zcash-template-provider",
 ]
 
 [[package]]

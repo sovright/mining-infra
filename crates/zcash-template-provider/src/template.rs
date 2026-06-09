@@ -3,9 +3,9 @@
 use crate::error::{Error, Result};
 use crate::header::{assemble_header, parse_target};
 use crate::rpc::{self, RpcProvider, ZebraRpc};
-use crate::types::{BlockTemplate, GetBlockTemplateResponse};
-use std::sync::Arc;
+use crate::types::{BlockTemplate, GetBlockTemplateResponse, Hash256};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, broadcast};
 use tokio::time::{Duration, interval};
 use tracing::{debug, error, info, warn};
@@ -33,6 +33,7 @@ pub struct TemplateProvider {
     config: TemplateProviderConfig,
     rpc: Box<dyn RpcProvider>,
     template_id: AtomicU64,
+    consensus_branch_cache: Mutex<Option<(u64, u32)>>,
     current_template: Arc<RwLock<Option<BlockTemplate>>>,
     sender: broadcast::Sender<BlockTemplate>,
 }
@@ -47,6 +48,7 @@ impl TemplateProvider {
             config,
             rpc: Box::new(rpc),
             template_id: AtomicU64::new(1),
+            consensus_branch_cache: Mutex::new(None),
             current_template: Arc::new(RwLock::new(None)),
             sender,
         })
@@ -59,6 +61,7 @@ impl TemplateProvider {
             config,
             rpc,
             template_id: AtomicU64::new(1),
+            consensus_branch_cache: Mutex::new(None),
             current_template: Arc::new(RwLock::new(None)),
             sender,
         }
@@ -77,7 +80,8 @@ impl TemplateProvider {
     /// Fetch a new template from Zebra
     pub async fn fetch_template(&self) -> Result<BlockTemplate> {
         let response = self.rpc.get_block_template().await?;
-        self.process_template(response)
+        let consensus_branch_id = self.consensus_branch_id_for_height(response.height).await?;
+        self.process_template(response, consensus_branch_id)
     }
 
     /// Submit a solved block to Zebra
@@ -90,9 +94,35 @@ impl TemplateProvider {
     }
 
     /// Process a getblocktemplate response into a BlockTemplate
-    fn process_template(&self, response: GetBlockTemplateResponse) -> Result<BlockTemplate> {
+    async fn consensus_branch_id_for_height(&self, height: u64) -> Result<u32> {
+        if let Some((cached_height, branch_id)) = *self.consensus_branch_cache.lock().unwrap()
+            && cached_height == height
+        {
+            return Ok(branch_id);
+        }
+
+        let info = self.rpc.get_blockchain_info().await?;
+        let branch_id = info.next_block_branch_id().map_err(|e| {
+            Error::InvalidTemplate(format!(
+                "invalid getblockchaininfo consensus.nextblock branch id: {}",
+                e
+            ))
+        })?;
+
+        *self.consensus_branch_cache.lock().unwrap() = Some((height, branch_id));
+        Ok(branch_id)
+    }
+
+    fn process_template(
+        &self,
+        response: GetBlockTemplateResponse,
+        consensus_branch_id: u32,
+    ) -> Result<BlockTemplate> {
         let header = assemble_header(&response)?;
         let target = parse_target(&response.target)?;
+        let chain_history_root =
+            Hash256::from_hex_le(&response.default_roots.chain_history_root)
+                .map_err(|e| Error::InvalidTemplate(format!("invalid chainhistoryroot: {}", e)))?;
 
         let total_fees: i64 = response.transactions.iter().map(|tx| tx.fee).sum();
 
@@ -125,6 +155,8 @@ impl TemplateProvider {
             target,
             transactions: response.transactions,
             coinbase,
+            chain_history_root,
+            consensus_branch_id,
             total_fees,
         })
     }
@@ -157,7 +189,16 @@ impl TemplateProvider {
                     );
 
                     if last_fingerprint.as_deref() != Some(&fingerprint) {
-                        match self.process_template(response) {
+                        let consensus_branch_id =
+                            match self.consensus_branch_id_for_height(response.height).await {
+                                Ok(branch_id) => branch_id,
+                                Err(e) => {
+                                    error!("Failed to fetch consensus branch id: {}", e);
+                                    continue;
+                                }
+                            };
+
+                        match self.process_template(response, consensus_branch_id) {
                             Ok(template) => {
                                 // Only commit the fingerprint AFTER successful processing.
                                 // Previously, fingerprint was set before process_template(),
@@ -196,6 +237,8 @@ impl TemplateProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{MockZebraRpc, TestTemplateFactory};
+    use crate::types::Hash256;
 
     #[test]
     fn test_config_default() {
@@ -209,5 +252,27 @@ mod tests {
         let config = TemplateProviderConfig::default();
         let provider = TemplateProvider::new(config);
         assert!(provider.is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetch_template_threads_chain_history_root_and_branch_id() {
+        let chain_history_root = "daea4adddaea4adddaea4adddaea4adddaea4adddaea4adddaea4adddaea4add";
+        let rpc = MockZebraRpc::new();
+        rpc.enqueue_template(
+            TestTemplateFactory::new()
+                .chain_history_root(chain_history_root)
+                .height(2_000_000)
+                .build(),
+        );
+        rpc.enqueue_blockchain_info("c8e71055");
+
+        let provider = TemplateProvider::with_rpc(TemplateProviderConfig::default(), Box::new(rpc));
+        let template = provider.fetch_template().await.unwrap();
+
+        assert_eq!(
+            template.chain_history_root,
+            Hash256::from_hex_le(chain_history_root).unwrap()
+        );
+        assert_eq!(template.consensus_branch_id, 0xc8e7_1055);
     }
 }

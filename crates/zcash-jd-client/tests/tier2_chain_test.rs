@@ -10,7 +10,8 @@
 //!   -> sovright-v1-stratum-proxy (spawned binary: --listen P1 --upstream P2)
 //!   -> zcash-jd-client downstream listener on P2 (in-process)
 //!   -> JD connection -> zcash-pool-server's JD server on P3 (in-process pool)
-//!   -> both JDC + pool template providers: a mock Zebra JSON-RPC over HTTP
+//!   -> JDC + pool template providers: separate mock Zebra JSON-RPC servers
+//!      with the same chain tip but different template coinbases
 //! ```
 //!
 //! Assertions:
@@ -53,7 +54,6 @@ use tokio::net::{TcpListener, TcpStream};
 
 use zcash_jd_client::{JdClient, JdClientConfig};
 use zcash_pool_server::{PayoutTracker, PoolConfig, PoolServer};
-use zcash_template_provider::testutil::TestTemplateFactory;
 
 /// The JDC user identifier. The pool credits accepted declared-job shares under
 /// this exact string (it is the AllocateToken `user_identifier` -> token
@@ -92,10 +92,13 @@ impl Drop for ChildGuard {
 // Mock Zebra: a minimal HTTP/1.1 JSON-RPC server.
 //
 // Serves `getblocktemplate` (always the same trivially-easy template),
-// `submitblock` (records the hex, returns null = accepted), and
-// `getbestblockhash`. Implemented over raw tokio TCP so the test adds no HTTP
-// dependency. Both the pool and the JDC point their `zebra_url` here, so they
-// observe the SAME prev_hash and the JDC's declaration is never stale.
+// `getblockchaininfo`, `submitblock` (records the hex, returns null =
+// accepted), and `getbestblockhash`. Implemented over raw tokio TCP so the test
+// adds no HTTP dependency. The pool and JDC use separate mock zebras that share
+// the SAME prev_hash / chainhistoryroot / branch id, so the JDC's declaration is
+// never stale, but their template coinbases and template commitment hashes
+// differ. This catches the old JD bug: copying the JDC template commitment and
+// comparing against the pool template commitment would reject the declaration.
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
@@ -107,7 +110,7 @@ struct MockZebra {
 }
 
 impl MockZebra {
-    fn new() -> Self {
+    fn new(coinbase_output_script: &[u8], block_commitments_byte: u8) -> Self {
         // Trivially-easy template:
         //  * version 4 (ZIP 301 notify VERSION == 4),
         //  * bits 0x2007ffff -> compact_to_target yields a huge (easy) BLOCK
@@ -116,29 +119,22 @@ impl MockZebra {
         //  * target field all-0xff -> the easiest possible 256-bit target for
         //    the pool's own block-target bookkeeping,
         //  * empty transactions -> block assembly = header + solution + coinbase.
-        // Pull a known-good coinbase hex from the factory (it produces a
-        // decodable minimal coinbase the TemplateBuilder/JD validator accept),
-        // then hand-build the getblocktemplate JSON so we control target/bits
-        // exactly. The field names match `GetBlockTemplateResponse`'s serde
-        // (deserialize) contract — that struct is Deserialize-only, so we build
-        // the wire JSON directly rather than serializing it.
-        let factory = TestTemplateFactory::new().version(4).height(1_000_000);
-        let response = factory.build();
-        let coinbase_hex = response
-            .coinbase_txn
-            .get("data")
-            .and_then(|d| d.as_str())
-            .expect("factory coinbase has data")
-            .to_string();
+        // Hand-build the getblocktemplate JSON so we control target/bits and
+        // can deliberately diverge the pool/JDC template coinbases. The field
+        // names match `GetBlockTemplateResponse`'s serde contract.
+        let coinbase_hex = hex::encode(minimal_v5_coinbase_with_output_script(
+            coinbase_output_script,
+        ));
+        let block_commitments_hash = hex::encode([block_commitments_byte; 32]);
 
         let value = serde_json::json!({
             "version": 4,
             "previousblockhash": "0".repeat(64),
             "defaultroots": {
                 "merkleroot": "0".repeat(64),
-                "chainhistoryroot": "0".repeat(64),
+                "chainhistoryroot": "42".repeat(32),
                 "authdataroot": "0".repeat(64),
-                "blockcommitmentshash": "0".repeat(64),
+                "blockcommitmentshash": block_commitments_hash,
             },
             "transactions": [],
             "coinbasetxn": { "data": coinbase_hex },
@@ -196,6 +192,13 @@ impl MockZebra {
                 serde_json::Value::Null
             }
             "getbestblockhash" => serde_json::Value::String("0".repeat(64)),
+            "getblockchaininfo" => serde_json::json!({
+                "chain": "regtest",
+                "blocks": 1_000_000,
+                "headers": 1_000_000,
+                "bestblockhash": "0".repeat(64),
+                "consensus": { "nextblock": "c8e71055" },
+            }),
             _ => serde_json::Value::Null,
         };
         serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": result })
@@ -266,6 +269,23 @@ impl MockZebra {
             buf.drain(..headers_end + content_len);
         }
     }
+}
+
+fn minimal_v5_coinbase_with_output_script(output_script: &[u8]) -> Vec<u8> {
+    let mut tx = Vec::new();
+    tx.extend_from_slice(&5u32.to_le_bytes());
+    tx.push(0x01); // vin count
+    tx.extend_from_slice(&[0u8; 32]); // prevout hash
+    tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
+    tx.push(0x01); // scriptSig length
+    tx.push(0x00); // scriptSig
+    tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
+    tx.push(0x01); // vout count
+    tx.extend_from_slice(&50_0000_0000u64.to_le_bytes()); // value
+    zcash_pool_common::write_compact_size(output_script.len() as u64, &mut tx);
+    tx.extend_from_slice(output_script);
+    tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+    tx
 }
 
 /// Find the end of the HTTP headers and the Content-Length. Returns
@@ -339,10 +359,14 @@ async fn tier2_full_chain_declared_job_mining() {
     // already set. Let the pool own logging; the test reports via eprintln!.
     let deadline = Instant::now() + BUDGET;
 
-    // --- Mock Zebra (shared by pool + JDC) ------------------------------------
-    let zebra = MockZebra::new();
-    let zebra_addr = zebra.clone().serve().await;
-    let zebra_url = format!("http://{zebra_addr}");
+    // --- Mock Zebras (same tip, intentionally different template coinbases) ---
+    let pool_zebra = MockZebra::new(&[0x51], 0xcc);
+    let pool_zebra_addr = pool_zebra.clone().serve().await;
+    let pool_zebra_url = format!("http://{pool_zebra_addr}");
+
+    let jdc_zebra = MockZebra::new(&[0x52], 0xdd);
+    let jdc_zebra_addr = jdc_zebra.clone().serve().await;
+    let jdc_zebra_url = format!("http://{jdc_zebra_addr}");
 
     // --- Ephemeral ports ------------------------------------------------------
     let pool_jd_addr = ephemeral_addr().await; // P3: pool JD server
@@ -359,7 +383,7 @@ async fn tier2_full_chain_declared_job_mining() {
     let pool_payout_script = vec![0x76, 0xa9, 0x14]; // OP_DUP OP_HASH160 push20 (prefix)
     let pool_config = PoolConfig {
         listen_addr: pool_stratum_addr,
-        zebra_url: zebra_url.clone(),
+        zebra_url: pool_zebra_url,
         initial_difficulty: 0.0001, // trivial share difficulty for CPU mining
         target_shares_per_minute: 5.0,
         nonce_1_len: 4,
@@ -383,7 +407,7 @@ async fn tier2_full_chain_declared_job_mining() {
 
     // --- In-process JD client -------------------------------------------------
     let jdc_config = JdClientConfig {
-        zebra_url: zebra_url.clone(),
+        zebra_url: jdc_zebra_url,
         pool_jd_addr,
         user_identifier: JDC_USER_ID.to_string(),
         template_poll_ms: 250,
@@ -492,15 +516,15 @@ async fn tier2_full_chain_declared_job_mining() {
     // in the mock's submitblock handler). It does NOT prove the block is
     // Zebra-grade valid — full consensus validation against a live node is
     // Task 10's job, not this in-process chain test.
-    let mut blocks = zebra.submitted_count();
+    let mut blocks = jdc_zebra.submitted_count();
     if blocks == 0 {
         let block_deadline = (Instant::now() + Duration::from_secs(20)).min(deadline);
         let _ = wait_until(block_deadline, Duration::from_millis(200), || {
-            let zebra = zebra.clone();
-            async move { zebra.submitted_count() > 0 }
+            let jdc_zebra = jdc_zebra.clone();
+            async move { jdc_zebra.submitted_count() > 0 }
         })
         .await;
-        blocks = zebra.submitted_count();
+        blocks = jdc_zebra.submitted_count();
     }
     if blocks > 0 {
         eprintln!("[tier2] BLOCK PATH FIRED: {blocks} submitblock call(s) to mock Zebra");

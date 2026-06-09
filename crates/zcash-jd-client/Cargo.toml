@@ -25,6 +25,7 @@ sha2.workspace = true
 
 # Local dependencies
 zcash-template-provider = { path = "../zcash-template-provider" }
+zcash-coinbase = { path = "../zcash-coinbase" }
 zcash-jd-server = { path = "../zcash-jd-server" }
 zcash-mining-protocol = { path = "../zcash-mining-protocol" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
