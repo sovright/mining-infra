@@ -34,7 +34,7 @@ use tokio::net::TcpListener;
 use tokio::signal;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore, mpsc};
 use tracing::{debug, error, info, warn};
-use zcash_equihash_validator::VardiffConfig;
+use zcash_equihash_validator::{VardiffConfig, difficulty::difficulty_to_target};
 use zcash_jd_server::{
     CurrentTemplateContext, JdServer, JdServerConfig, JdTransport, handle_jd_client_with_transport,
 };
@@ -227,6 +227,7 @@ impl PoolServer {
             full_template_enabled: config.jd_full_template_enabled,
             full_template_validation: config.jd_full_template_validation,
             min_pool_payout: config.jd_min_pool_payout,
+            share_target: difficulty_to_target(config.initial_difficulty).0,
             ..JdServerConfig::default()
         };
         let jd_server = Arc::new(JdServer::new(jd_config, Arc::clone(&payout_tracker)));
@@ -415,6 +416,7 @@ impl PoolServer {
         // Spawn periodic stats logging and stale miner cleanup
         let payout_tracker = Arc::clone(&self.payout_tracker);
         let sessions = Arc::clone(&self.sessions);
+        let channels = Arc::clone(&self.channels);
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
@@ -424,6 +426,26 @@ impl PoolServer {
                 // Clean up stale miner entries (idle > 30 minutes)
                 payout_tracker.cleanup_stale_miners(Duration::from_secs(1800));
                 payout_tracker.rotate_window_if_needed();
+
+                // Share-independent vardiff tick: lets overshooting channels
+                // recover. record_share-driven retargeting stops the moment a
+                // miner stops finding shares, which is exactly when difficulty
+                // most needs to come down (zero-share branch cuts 50% per
+                // interval). Collect adjustments under the lock, send after.
+                let mut retargets = Vec::new();
+                {
+                    let mut channels = channels.write().await;
+                    for (channel_id, channel) in channels.iter_mut() {
+                        if channel.idle_retarget().is_some() {
+                            retargets.push((*channel_id, channel.current_target()));
+                        }
+                    }
+                }
+                for (channel_id, target) in retargets {
+                    if let Some(sender) = sessions.read().await.get(&channel_id) {
+                        let _ = sender.send(ServerMessage::SetTarget { target }).await;
+                    }
+                }
 
                 let session_count = sessions.read().await.len();
                 let active_miners = payout_tracker.active_miner_count();
@@ -1498,12 +1520,37 @@ fn build_block_bytes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_equihash_validator::difficulty::difficulty_to_target;
+    use zcash_template_provider::testutil::MockZebraRpc;
 
     #[test]
     fn test_pool_server_creation() {
         let config = PoolConfig::default();
         let server = PoolServer::new(config);
         assert!(server.is_ok());
+    }
+
+    #[test]
+    fn jd_share_target_follows_pool_initial_difficulty() {
+        let config = PoolConfig {
+            initial_difficulty: 1e-9,
+            ..PoolConfig::default()
+        };
+        let template_provider = TemplateProvider::with_rpc(
+            TemplateProviderConfig {
+                zebra_url: config.zebra_url.clone(),
+                poll_interval_ms: config.template_poll_ms,
+            },
+            Box::new(MockZebraRpc::new()),
+        );
+
+        let server = PoolServer::with_template_provider(config, template_provider)
+            .expect("pool server constructs with mock template provider");
+
+        assert_eq!(
+            server.jd_server.config().share_target,
+            difficulty_to_target(1e-9).0
+        );
     }
 
     #[test]

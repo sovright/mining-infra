@@ -42,13 +42,13 @@ impl FromStr for LogFormat {
 /// Sets up tracing with the specified format and default log level.
 /// The log level can be overridden via the `RUST_LOG` environment variable.
 ///
-/// # Mutual Exclusivity
+/// # Process-global state
 ///
 /// This function and [`init_tracing`](crate::init_tracing) both call
-/// `tracing_subscriber::registry().init()`, which sets the global default
-/// subscriber. **Only one may be called per process.** Calling both will
-/// panic at runtime. Choose `init_logging` for local logging or
-/// `init_tracing` for OpenTelemetry export with logging.
+/// `tracing_subscriber::registry().try_init()`, which sets the global default
+/// subscriber. Only one subscriber may be installed per process. If another
+/// test or application path has already initialized tracing, this function
+/// leaves that subscriber in place.
 ///
 /// # Arguments
 ///
@@ -80,7 +80,8 @@ pub fn init_logging(format: LogFormat, default_level: &str) {
                         .with_thread_ids(false)
                         .with_span_events(FmtSpan::CLOSE),
                 )
-                .init();
+                .try_init()
+                .ok();
         }
         LogFormat::Json => {
             tracing_subscriber::registry()
@@ -91,7 +92,8 @@ pub fn init_logging(format: LogFormat, default_level: &str) {
                         .with_target(true)
                         .with_span_events(FmtSpan::CLOSE),
                 )
-                .init();
+                .try_init()
+                .ok();
         }
     }
 }
@@ -150,5 +152,11 @@ mod tests {
         let format = LogFormat::Json;
         let cloned = format;
         assert_eq!(format, cloned);
+    }
+
+    #[test]
+    fn init_logging_is_idempotent() {
+        init_logging(LogFormat::Pretty, "info");
+        init_logging(LogFormat::Json, "debug");
     }
 }

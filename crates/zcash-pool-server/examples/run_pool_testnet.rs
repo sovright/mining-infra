@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = PoolConfig {
         listen_addr: "0.0.0.0:3333".parse()?,
         zebra_url: "http://127.0.0.1:18232".to_string(),
-        initial_difficulty: 0.0001, // Very low for CPU testnet miner
+        initial_difficulty: 1e-9, // below the all-ones saturation point (max_target/2^256): accept every valid solution at cold start; vardiff ramps up from there
         target_shares_per_minute: 5.0,
         nonce_1_len: 4,
         noise_enabled: false,
