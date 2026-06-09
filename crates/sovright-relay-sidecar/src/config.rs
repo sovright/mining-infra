@@ -96,6 +96,71 @@ pub struct Config {
     /// Optional Prometheus textfile path for sidecar receive metrics.
     #[serde(default)]
     pub metrics_textfile: Option<PathBuf>,
+
+    /// Configuration for the relay-received submit safety gate.
+    ///
+    /// The gate sits in front of `submit_block` once `enable_submitblock` is on.
+    /// It is configured separately from `enable_submitblock` so the
+    /// production cutover can land the gate in `enabled = true` mode while
+    /// `enable_submitblock` is still false, exercising the decision logic on
+    /// every reassembled candidate without forwarding anything upstream.
+    #[serde(default)]
+    pub submit_gate: SubmitGateConfig,
+}
+
+/// Configuration for the safety gate in front of `submit_block`.
+///
+/// All fields default to safe values that match the gate defaults. The
+/// `enabled` flag defaults to false so the gate is explicitly opt-in.
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
+pub struct SubmitGateConfig {
+    /// Master switch. Default false. The gate must be explicitly enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Allowed block heights below the local tip. Default 3.
+    #[serde(default = "default_submit_gate_allowed_below")]
+    pub allowed_below: u64,
+    /// Dedup window in seconds. Default 300 (5 minutes).
+    #[serde(default = "default_submit_gate_dedup_window_secs")]
+    pub dedup_window_secs: u64,
+    /// Maximum entries to retain in the dedup ring. Default 256.
+    #[serde(default = "default_submit_gate_dedup_capacity")]
+    pub dedup_capacity: usize,
+}
+
+impl Default for SubmitGateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_below: default_submit_gate_allowed_below(),
+            dedup_window_secs: default_submit_gate_dedup_window_secs(),
+            dedup_capacity: default_submit_gate_dedup_capacity(),
+        }
+    }
+}
+
+impl SubmitGateConfig {
+    /// Convert to the gate's runtime config struct.
+    pub fn to_gate_config(&self) -> crate::submit_gate::GateConfig {
+        crate::submit_gate::GateConfig {
+            enabled: self.enabled,
+            allowed_below: self.allowed_below,
+            dedup_window: std::time::Duration::from_secs(self.dedup_window_secs),
+            dedup_capacity: self.dedup_capacity,
+        }
+    }
+}
+
+fn default_submit_gate_allowed_below() -> u64 {
+    3
+}
+
+fn default_submit_gate_dedup_window_secs() -> u64 {
+    300
+}
+
+fn default_submit_gate_dedup_capacity() -> usize {
+    256
 }
 
 fn default_zebra_url() -> String {
@@ -234,6 +299,36 @@ mod tests {
         assert_eq!(config.tx_cache_max_entries, 50_000);
         assert_eq!(config.tx_cache_max_bytes, 128 * 1024 * 1024);
         assert_eq!(config.tx_cache_max_tx_bytes, 2 * 1024 * 1024);
+        assert!(!config.submit_gate.enabled);
+        assert_eq!(config.submit_gate.allowed_below, 3);
+        assert_eq!(config.submit_gate.dedup_window_secs, 300);
+        assert_eq!(config.submit_gate.dedup_capacity, 256);
+    }
+
+    #[test]
+    fn config_parses_submit_gate_overrides() {
+        let toml = r#"
+            relay_peers = ["127.0.0.1:8333"]
+
+            [submit_gate]
+            enabled = true
+            allowed_below = 6
+            dedup_window_secs = 600
+            dedup_capacity = 1024
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+
+        assert!(config.submit_gate.enabled);
+        assert_eq!(config.submit_gate.allowed_below, 6);
+        assert_eq!(config.submit_gate.dedup_window_secs, 600);
+        assert_eq!(config.submit_gate.dedup_capacity, 1024);
+
+        let gate = config.submit_gate.to_gate_config();
+        assert!(gate.enabled);
+        assert_eq!(gate.allowed_below, 6);
+        assert_eq!(gate.dedup_window, std::time::Duration::from_secs(600));
+        assert_eq!(gate.dedup_capacity, 1024);
     }
 
     #[test]
