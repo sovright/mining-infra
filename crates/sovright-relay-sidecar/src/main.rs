@@ -26,10 +26,15 @@ use relay::RelayWrapper;
 use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
 use sovright_relay_sidecar::rpc::ZebraRpc;
+use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    handle_relay_compact_block, handle_relay_compact_block_with_mempool, handle_relay_raw_block,
+    handle_relay_compact_block, handle_relay_compact_block_with_gate,
+    handle_relay_compact_block_with_mempool, handle_relay_raw_block,
+    handle_relay_raw_block_with_gate,
 };
+use sovright_relay_sidecar::submit_gate::SubmitGate;
+use tokio::sync::Mutex as TokioMutex;
 
 #[derive(Parser, Debug)]
 #[command(name = "sovright-relay-sidecar")]
@@ -163,6 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         send_burst_packets,
         send_burst_delay_micros,
         metrics_textfile,
+        submit_gate_cfg,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -188,6 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.send_burst_packets,
             cfg.send_burst_delay_micros,
             cfg.metrics_textfile.clone(),
+            Some(cfg.submit_gate.clone()),
         )
     } else {
         // Use CLI args
@@ -238,6 +245,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.send_burst_packets,
             args.send_burst_delay_micros,
             args.metrics_textfile.clone(),
+            None,
         )
     };
 
@@ -302,6 +310,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         } else {
             SubmitBlockMode::DryRun
         };
+        // Build the optional safety gate. The gate is constructed exactly when
+        // submit_gate.enabled = true in the TOML config; on the CLI fallback it
+        // is always None. The ZebraChainView feeds the gate's parent-known
+        // check and is shared so we can also use it for parent-height lookups
+        // on each candidate before invoking the gated handler.
+        let (gate, chain_view) = if let Some(cfg) = submit_gate_cfg.as_ref().filter(|c| c.enabled) {
+            let chain_view = ZebraChainView::new(ZebraChainViewConfig::default());
+            // Spawn the polling task; drop the JoinHandle since the view's
+            // lifetime is bound by the main loop. Dropping the chain_view
+            // Arc on shutdown cancels the poller.
+            let _poller = Arc::clone(&chain_view).start(Arc::clone(&rpc));
+            let gate = Arc::new(TokioMutex::new(SubmitGate::new(
+                cfg.to_gate_config(),
+                Arc::clone(&chain_view),
+            )));
+            info!("Safety gate enabled");
+            (Some(gate), Some(chain_view))
+        } else {
+            (None, None)
+        };
+
         spawn_relay_block_handler(
             receiver,
             Arc::clone(&rpc),
@@ -310,6 +339,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             raw_segment_buffer_config,
             Arc::clone(&metrics),
             Arc::clone(&mempool),
+            gate,
+            chain_view,
         );
     } else {
         relay.start().await?;
@@ -392,6 +423,8 @@ fn spawn_relay_block_handler<M>(
     raw_segment_buffer_config: RawSegmentBufferConfig,
     metrics: Arc<SidecarMetrics>,
     mempool: Arc<M>,
+    gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
+    chain_view: Option<Arc<ZebraChainView>>,
 ) where
     M: MempoolProvider + Send + Sync + 'static,
 {
@@ -410,15 +443,61 @@ fn spawn_relay_block_handler<M>(
                     match payload {
                         RelayPayload::CompactBlock(compact) => {
                             metrics.inc_compact_blocks_received();
-                            let outcome = handle_relay_compact_payload(
-                                rpc.as_ref(),
-                                &compact,
-                                mode,
-                                compact_reconstruction_enabled,
-                                mempool.as_ref(),
-                                metrics.as_ref(),
-                            )
-                            .await;
+                            // Gate the candidate when configured and not in
+                            // mempool-reconstruction mode (the gated handler
+                            // doesn't support short_id reconstruction yet).
+                            let use_gate = gate.is_some()
+                                && !(compact_reconstruction_enabled
+                                    && !compact.short_ids.is_empty());
+                            let outcome = if let (true, Some(gate), Some(chain_view)) =
+                                (use_gate, &gate, &chain_view)
+                            {
+                                let parent_height = if compact.header.len() >= 36 {
+                                    let mut prev_hash = [0u8; 32];
+                                    prev_hash.copy_from_slice(&compact.header[4..36]);
+                                    chain_view
+                                        .height_of(rpc.as_ref(), &prev_hash)
+                                        .await
+                                        .ok()
+                                        .flatten()
+                                        .unwrap_or(0)
+                                } else {
+                                    0
+                                };
+                                let mut gate_guard = gate.lock().await;
+                                handle_relay_compact_block_with_gate(
+                                    rpc.as_ref(),
+                                    &compact,
+                                    mode,
+                                    &mut gate_guard,
+                                    parent_height,
+                                )
+                                .await
+                            } else {
+                                handle_relay_compact_payload(
+                                    rpc.as_ref(),
+                                    &compact,
+                                    mode,
+                                    compact_reconstruction_enabled,
+                                    mempool.as_ref(),
+                                    metrics.as_ref(),
+                                )
+                                .await
+                            };
+                            // Per-cause GateRejected metric is incremented in
+                            // log_submission_outcome; here we tick the
+                            // accepted-by-gate counter for outcomes that
+                            // came through the gated handler and were not
+                            // rejected by the gate.
+                            if use_gate
+                                && matches!(
+                                    outcome,
+                                    Ok(SubmissionOutcome::DryRun(_))
+                                        | Ok(SubmissionOutcome::Submitted { .. })
+                                )
+                            {
+                                metrics.inc_submit_gate_accepted();
+                            }
                             log_submission_outcome(outcome, metrics.as_ref());
                         }
                         RelayPayload::RawBlockSegment(segment) => {
@@ -456,16 +535,50 @@ fn spawn_relay_block_handler<M>(
                                                 raw_block_bytes = raw_block.len(),
                                                 "Relay raw block segments complete"
                                             );
-                                            log_submission_outcome(
+                                            let raw_outcome = if let (Some(gate), Some(chain_view)) =
+                                                (&gate, &chain_view)
+                                            {
+                                                let parent_height = if raw_block.len() >= 36 {
+                                                    let mut prev_hash = [0u8; 32];
+                                                    prev_hash.copy_from_slice(&raw_block[4..36]);
+                                                    chain_view
+                                                        .height_of(rpc.as_ref(), &prev_hash)
+                                                        .await
+                                                        .ok()
+                                                        .flatten()
+                                                        .unwrap_or(0)
+                                                } else {
+                                                    0
+                                                };
+                                                let mut gate_guard = gate.lock().await;
+                                                handle_relay_raw_block_with_gate(
+                                                    rpc.as_ref(),
+                                                    &raw_block,
+                                                    Some(block_hash),
+                                                    mode,
+                                                    &mut gate_guard,
+                                                    parent_height,
+                                                )
+                                                .await
+                                            } else {
                                                 handle_relay_raw_block(
                                                     rpc.as_ref(),
                                                     &raw_block,
                                                     Some(block_hash),
                                                     mode,
                                                 )
-                                                .await,
-                                                metrics.as_ref(),
-                                            );
+                                                .await
+                                            };
+                                            if gate.is_some()
+                                                && matches!(
+                                                    raw_outcome,
+                                                    Ok(SubmissionOutcome::DryRun(_))
+                                                        | Ok(SubmissionOutcome::Submitted { .. })
+                                                )
+                                            {
+                                                metrics.inc_submit_gate_accepted();
+                                            }
+                                            log_submission_outcome(raw_outcome, metrics.as_ref());
                                         }
                                         Err(error) => {
                                             metrics.inc_raw_segment_reassembly_failures();
