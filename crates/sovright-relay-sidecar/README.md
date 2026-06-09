@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="../../assets/brand/forge-logo.svg" alt="FORGE" width="180">
+  <img src="../../assets/brand/sovright-relay-sidecar-logo.svg" alt="Sovright Relay Sidecar" width="180">
 </p>
 
-# FORGE Sidecar
+# Sovright Relay Sidecar
 
 > Formerly `fiber-sidecar`.
 
@@ -10,7 +10,7 @@ A standalone sidecar binary that enables Stratum V1 mining pools to use sovright
 
 ## Overview
 
-The FORGE sidecar:
+The relay sidecar:
 - Polls Zebra for new block templates
 - Builds compact blocks when templates change
 - Announces compact blocks to the Sovright relay network
@@ -26,7 +26,7 @@ This allows any V1 pool (NOMP, etc.) to benefit from compact block relay without
 ```bash
 sovright-relay-sidecar \
     --zebra-url http://127.0.0.1:8232 \
-    --relay-peer forge-relay.example.com:8333 \
+    --relay-peer relay.example.com:8333 \
     --auth-key 0123456789abcdef... \
     --poll-interval-ms 100
 ```
@@ -47,7 +47,7 @@ submitting them, enable dry-run receive:
 ```bash
 sovright-relay-sidecar \
     --zebra-url http://127.0.0.1:8232 \
-    --relay-peer forge-relay.example.com:8333 \
+    --relay-peer relay.example.com:8333 \
     --auth-key 0123456789abcdef... \
     --receive-relay-blocks \
     --disable-template-announcements
@@ -76,10 +76,10 @@ STRATUM V1 POOL (unmodified)
         │                             │
         │ poll templates              │ guarded submitblock, disabled by default
         ▼                             │
-   FORGE SIDECAR ─────────────────────┘
+   RELAY SIDECAR ─────────────────────┘
         │
         ▼ UDP/FEC
-   FORGE RELAY NETWORK
+   SOVRIGHT RELAY NETWORK
 ```
 
 ## Requirements
