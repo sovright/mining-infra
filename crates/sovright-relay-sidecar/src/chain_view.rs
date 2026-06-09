@@ -162,7 +162,7 @@ impl ZebraChainView {
         {
             return Ok(true);
         }
-        let hex_hash = hex_encode(hash);
+        let hex_hash = display_hex_encode(hash);
         let known = rpc.get_block_header(&hex_hash).await?.is_some();
         if known {
             self.admit_parent(*hash);
@@ -177,7 +177,7 @@ impl ZebraChainView {
     /// cache as a side effect — the height query proves the hash exists, so
     /// the next `parent_known` for the same hash short-circuits.
     pub async fn height_of(&self, rpc: &ZebraRpc, hash: &[u8; 32]) -> RpcResult<Option<u64>> {
-        let hex_hash = hex_encode(hash);
+        let hex_hash = display_hex_encode(hash);
         match rpc.get_block_header(&hex_hash).await? {
             Some(info) => {
                 self.admit_parent(*hash);
@@ -202,9 +202,27 @@ impl ChainView for Arc<ZebraChainView> {
 }
 
 /// Lowercase hex encoding without external dependencies.
+#[cfg(test)]
 fn hex_encode(bytes: &[u8; 32]) -> String {
     let mut out = String::with_capacity(64);
     for b in bytes {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
+}
+
+/// Zcash/Bitcoin display-form hex encoding for block hashes.
+///
+/// Block hashes are stored in headers in natural (little-endian) byte order
+/// but the RPC interface displays + accepts them in reversed (big-endian)
+/// hex — e.g. the hash printed by `zcash-cli getblockhash` is the trailing
+/// header bytes first. `getblockheader <hash>` expects this reversed form,
+/// so pass the prev_hash bytes straight from `header[4..36]` through this
+/// function before calling Zebra RPC. The cache stores the raw natural-order
+/// bytes; only the boundary with Zebra needs the display form.
+fn display_hex_encode(bytes: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for b in bytes.iter().rev() {
         out.push_str(&format!("{:02x}", b));
     }
     out
