@@ -44,7 +44,7 @@ gcloud compute firewall-rules delete bedrock-product-testnet --project mining-po
 |----------|---------|
 | GCP Project | `mining-pool-491623` |
 | VM | `zebra-testnet` |
-| IP | `34.72.217.47` |
+| IP | `136.116.78.249` |
 | Zone | `us-central1-a` |
 | Branch | `internal-testnet` |
 
@@ -143,7 +143,7 @@ docker logs -f test-miner
 
 **Run from a dev machine:**
 ```bash
-cargo run --release -p zcash-test-miner -- --pool 34.72.217.47:3333 --rate 5
+cargo run --release -p zcash-test-miner -- --pool 136.116.78.249:3333 --rate 5
 ```
 
 **Options:**
@@ -185,7 +185,7 @@ gcloud compute firewall-rules create sovright-product-testnet \
 ## Full System Architecture
 
 ```
-GCP VM: zebra-testnet (34.72.217.47)
+GCP VM: zebra-testnet (136.116.78.249)
 │
 ├── Zebra Node (Docker)
 │   ├── RPC: 127.0.0.1:18232
