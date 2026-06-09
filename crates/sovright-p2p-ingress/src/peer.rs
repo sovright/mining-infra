@@ -19,9 +19,21 @@ use crate::wire::{
     read_message, write_message,
 };
 
-const PROTOCOL_VERSION: i32 = 170_140;
+// Zcash protocol version sent in our `version` message. NU6.2 activated
+// on mainnet at block 3,370,884 (2026-04). Zebra 5.0.0 ships 170_150 as its
+// current `protocolversion`; remote NU6.2 peers drop connections from nodes
+// reporting older versions. Keep this in sync with the latest mainnet
+// network upgrade as new ones land.
+const PROTOCOL_VERSION: i32 = 170_150;
+
+// Floor for accepting *remote* version messages. We stay permissive here so
+// the ingress can still ingest from slower-to-upgrade peers and from
+// post-NU5/NU6 nodes that haven't moved to NU6.2 yet.
 const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
-const USER_AGENT: &str = "/sovright-p2p-ingress:0.1.0/";
+
+// Sub-version sent in our `version` message. Zcash mainnet currently
+// accepts any non-banned user agent; we keep this short and identifying.
+const USER_AGENT: &str = "/sovright-p2p-ingress:0.2.0/";
 
 pub async fn run_peer(
     peer_addr: SocketAddr,
