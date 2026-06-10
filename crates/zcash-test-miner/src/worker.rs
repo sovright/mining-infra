@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use blake2b_simd::Params as Blake2bParams;
@@ -78,6 +78,27 @@ impl SolverCancel {
 impl Drop for SolverCancel {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Session-lifetime source of unique nonce-2 indices, shared by all solver
+/// threads and across solver generations.
+///
+/// Respawned solvers must continue the sequence rather than reset it: a
+/// SetTarget restarts the solvers against the current job, and a generation
+/// that starts over at index 0 re-searches space it already submitted — the
+/// pool then rejects every re-found share as a duplicate.
+#[derive(Clone)]
+struct NonceCursor(Arc<AtomicU64>);
+
+impl NonceCursor {
+    fn new() -> Self {
+        Self(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// Claim the next unsearched nonce index.
+    fn claim(&self) -> u64 {
+        self.0.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -197,6 +218,10 @@ async fn run_worker_session(
     // Channel for solver threads to send found shares back to the session loop.
     let (share_tx, mut share_rx) = mpsc::channel::<(FoundShare, NewEquihashJob)>(64);
 
+    // Nonce indices are claimed from a session-wide cursor so no two solver
+    // threads — or solver generations — ever search the same nonce.
+    let nonce_cursor = NonceCursor::new();
+
     // Per-job cancellation for active solvers. Replacing it on a new job (or
     // dropping it when the session ends, including error paths via `?`)
     // permanently cancels that job's threads.
@@ -272,6 +297,7 @@ async fn run_worker_session(
                             &job,
                             &share_target,
                             config.solver_threads,
+                            &nonce_cursor,
                             &share_tx,
                             metrics,
                         ));
@@ -318,6 +344,7 @@ async fn run_worker_session(
                                 job,
                                 &set_target.target,
                                 config.solver_threads,
+                                &nonce_cursor,
                                 &share_tx,
                                 metrics,
                             ));
@@ -406,6 +433,7 @@ fn spawn_solvers(
     job: &NewEquihashJob,
     share_target: &[u8; 32],
     solver_threads: u32,
+    nonce_cursor: &NonceCursor,
     share_tx: &mpsc::Sender<(FoundShare, NewEquihashJob)>,
     metrics: &Arc<MinerMetrics>,
 ) -> SolverCancel {
@@ -417,13 +445,14 @@ fn spawn_solvers(
         let share_tx_clone = share_tx.clone();
         let share_target_copy = *share_target;
         let metrics_clone = metrics.clone();
+        let cursor_clone = nonce_cursor.clone();
 
         tokio::task::spawn_blocking(move || {
             run_solver_thread(
                 thread_id,
-                solver_threads,
                 &job_clone,
                 &share_target_copy,
+                &cursor_clone,
                 &solving_clone,
                 &share_tx_clone,
                 &metrics_clone,
@@ -435,15 +464,14 @@ fn spawn_solvers(
 
 fn run_solver_thread(
     thread_id: u32,
-    total_threads: u32,
     job: &NewEquihashJob,
     share_target: &[u8; 32],
+    nonce_cursor: &NonceCursor,
     solving: &AtomicBool,
     share_tx: &mpsc::Sender<(FoundShare, NewEquihashJob)>,
     metrics: &MinerMetrics,
 ) {
     let nonce_1 = &job.nonce_1;
-    let nonce_1_len = nonce_1.len();
     let nonce_2_len = job.nonce_2_len as usize;
 
     debug!(thread_id, job_id = job.job_id, "Solver thread starting");
@@ -458,9 +486,6 @@ fn run_solver_thread(
     input[100..104].copy_from_slice(&job.time.to_le_bytes());
     input[104..108].copy_from_slice(&job.bits.to_le_bytes());
 
-    // Counter for interleaved nonce assignment
-    let mut counter: u64 = thread_id as u64;
-
     loop {
         if !solving.load(Ordering::Acquire) {
             debug!(thread_id, job_id = job.job_id, "Solver cancelled");
@@ -470,7 +495,10 @@ fn run_solver_thread(
         // We run solve_200_9 which loops internally calling next_nonce.
         // We give it a batch of nonces to try before checking cancellation.
         let solving_ref = solving;
-        let mut local_counter = counter;
+
+        // The solver breaks on the first nonce that produces solutions, so
+        // the winning nonce is the last index claimed from the cursor.
+        let mut last_claimed: u64 = 0;
 
         let solutions = equihash::tromp::solve_200_9::<32>(&input, || {
             if !solving_ref.load(Ordering::Acquire) {
@@ -480,30 +508,12 @@ fn run_solver_thread(
             // Each yielded nonce is one Equihash solution attempt.
             metrics.add_attempts(1);
 
-            // Build full 32-byte nonce from nonce_1 + counter
-            let mut nonce = [0u8; 32];
-            nonce[..nonce_1_len].copy_from_slice(nonce_1);
-            let counter_bytes = local_counter.to_le_bytes();
-            let copy_len = 8.min(nonce_2_len);
-            nonce[nonce_1_len..nonce_1_len + copy_len].copy_from_slice(&counter_bytes[..copy_len]);
-            local_counter += total_threads as u64;
-
-            Some(nonce)
+            last_claimed = nonce_cursor.claim();
+            Some(build_nonce(nonce_1, nonce_2_len, last_claimed))
         });
 
-        // The nonce that produced solutions is `local_counter - total_threads`
-        // because local_counter was incremented after the last yield.
-        // But we need to reconstruct the exact nonce that worked.
-        // The solver breaks on the first nonce that produces solutions,
-        // so the winning nonce is `local_counter - total_threads`.
         if !solutions.is_empty() {
-            let winning_counter = local_counter - total_threads as u64;
-            let mut winning_nonce = [0u8; 32];
-            winning_nonce[..nonce_1_len].copy_from_slice(nonce_1);
-            let counter_bytes = winning_counter.to_le_bytes();
-            let copy_len = 8.min(nonce_2_len);
-            winning_nonce[nonce_1_len..nonce_1_len + copy_len]
-                .copy_from_slice(&counter_bytes[..copy_len]);
+            let winning_nonce = build_nonce(nonce_1, nonce_2_len, last_claimed);
 
             for sol_bytes in &solutions {
                 if sol_bytes.len() != 1344 {
@@ -549,13 +559,22 @@ fn run_solver_thread(
             }
         }
 
-        // Update counter for next solve_200_9 call
-        counter = local_counter;
-
         // Small random delay between solve cycles (50-200ms)
         let delay_ms = rand::thread_rng().gen_range(50..=200);
         std::thread::sleep(Duration::from_millis(delay_ms));
     }
+}
+
+/// Build the full 32-byte nonce: the pool-assigned nonce_1 prefix followed by
+/// the claimed index, little-endian and zero-padded, in the miner-controlled
+/// nonce_2 region.
+fn build_nonce(nonce_1: &[u8], nonce_2_len: usize, index: u64) -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    nonce[..nonce_1.len()].copy_from_slice(nonce_1);
+    let copy_len = 8.min(nonce_2_len);
+    nonce[nonce_1.len()..nonce_1.len() + copy_len]
+        .copy_from_slice(&index.to_le_bytes()[..copy_len]);
+    nonce
 }
 
 /// Compute the block hash: BLAKE2b-256 of header(140) || compact_size(1344) || solution(1344)
@@ -655,6 +674,51 @@ mod tests {
         let flag = cancel.flag();
         drop(cancel);
         assert!(!flag.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn respawned_solvers_continue_nonce_sequence() {
+        // Regression: each solver generation used to restart its nonce counter
+        // at thread_id, so a SetTarget-triggered respawn re-searched the same
+        // nonce space on the same job and resubmitted every found share — the
+        // pool rejected the entire burst as Duplicate. The cursor is worker-
+        // session-lifetime: a new generation must continue the sequence.
+        let cursor = NonceCursor::new();
+
+        // First generation claims some indices, then is cancelled (SetTarget).
+        let gen1: Vec<u64> = (0..4).map(|_| cursor.claim()).collect();
+
+        // The respawned generation shares the cursor and continues from where
+        // the previous generation stopped.
+        let gen2: Vec<u64> = (0..4).map(|_| cursor.claim()).collect();
+
+        for idx in &gen2 {
+            assert!(
+                !gen1.contains(idx),
+                "respawned solvers must not re-search nonce index {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn cloned_cursor_shares_the_sequence() {
+        // Solver threads each hold a clone; claims must be unique across them.
+        let cursor = NonceCursor::new();
+        let clone = cursor.clone();
+        assert_eq!(cursor.claim(), 0);
+        assert_eq!(clone.claim(), 1);
+        assert_eq!(cursor.claim(), 2);
+    }
+
+    #[test]
+    fn build_nonce_places_index_after_nonce_1() {
+        let nonce_1 = [0xaa, 0xbb, 0xcc, 0xdd];
+        let nonce = build_nonce(&nonce_1, 28, 0x0102);
+        assert_eq!(&nonce[..4], &nonce_1);
+        // Index is little-endian in the miner-controlled region.
+        assert_eq!(nonce[4], 0x02);
+        assert_eq!(nonce[5], 0x01);
+        assert!(nonce[6..].iter().all(|&b| b == 0));
     }
 
     #[test]

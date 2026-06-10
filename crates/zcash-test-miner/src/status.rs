@@ -107,11 +107,7 @@ pub struct MiningStarted<'a> {
 
 /// Multi-line launch banner.
 pub fn startup_banner(info: &StartupInfo, color: bool) -> String {
-    let title = style(
-        &format!("zcash-test-miner v{}", info.version),
-        BOLD,
-        color,
-    );
+    let title = style(&format!("zcash-test-miner v{}", info.version), BOLD, color);
     let enc = match &info.encryption {
         Some(k) => format!("Noise_NK ({k})"),
         None => "disabled (plaintext)".to_string(),
