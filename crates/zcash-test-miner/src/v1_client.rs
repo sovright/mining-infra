@@ -18,6 +18,18 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+use crate::metrics::MinerMetrics;
+use crate::status::{self, MiningStarted};
+
+/// Decrements the connected-worker gauge when the V1 session ends, on any path.
+struct ConnGuard(Arc<MinerMetrics>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.worker_disconnected();
+    }
+}
+
 /// Parsed V1 job from mining.notify
 #[derive(Debug, Clone)]
 pub struct V1Job {
@@ -32,7 +44,12 @@ pub struct V1Job {
 }
 
 /// Run the test miner in V1 mode.
-pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run_v1(
+    pool_addr: &str,
+    worker: &str,
+    metrics: Arc<MinerMetrics>,
+    color: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     info!("Connecting to pool at {} (V1 mode)", pool_addr);
     let stream = TcpStream::connect(pool_addr).await?;
     info!("Connected to pool (V1)");
@@ -84,6 +101,11 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
     let mut nonce_2_size: usize = 28; // default
     let mut current_target: [u8; 32] = [0xff; 32];
     let mut job_map: HashMap<String, V1Job> = HashMap::new();
+    // Print the "mining started" status once, when the first job lands.
+    let mut first_job = true;
+    // Holds the connected-worker gauge for the session lifetime; set on
+    // successful authorize, dropped (decrementing) when run_v1 returns.
+    let mut conn_guard: Option<ConnGuard> = None;
 
     // Solver channel
     let (solution_tx, mut solution_rx) = mpsc::channel::<(String, Vec<u8>, u32, Vec<u8>)>(32);
@@ -97,6 +119,7 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
     let solver_job = current_job.clone();
     let solver_job_id = current_job_id.clone();
     let solver_tx = solution_tx.clone();
+    let solver_metrics = metrics.clone();
     std::thread::spawn(move || {
         let mut rng = rand::thread_rng();
         use rand::RngCore;
@@ -136,6 +159,8 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                 }
 
                 nonce_counter = nonce_counter.wrapping_add(1);
+                // One Equihash solution attempt per nonce.
+                solver_metrics.add_attempts(1);
 
                 let mut nonce_2 = vec![0u8; nonce_2_len];
                 let counter_bytes = nonce_counter.to_le_bytes();
@@ -216,6 +241,26 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                                                 "V1 job: id={}, version={:#x}, clean={}",
                                                 job.job_id, job.version, job.clean_jobs
                                             );
+                                            // First job with an assigned nonce-1 means mining
+                                            // has truly begun: surface the rich status.
+                                            if first_job && !nonce_1.is_empty() {
+                                                first_job = false;
+                                                println!(
+                                                    "{}",
+                                                    status::mining_started(
+                                                        &MiningStarted {
+                                                            worker,
+                                                            channel_id: None,
+                                                            nonce_1_hex: hex::encode(&nonce_1),
+                                                            nonce_2_len: nonce_2_size,
+                                                            share_target: current_target,
+                                                            bits: job.bits,
+                                                            clean: job.clean_jobs,
+                                                        },
+                                                        color,
+                                                    )
+                                                );
+                                            }
                                             // Only preempt the solver on clean_jobs=true. A clean=false
                                             // notify means previous work is still valid (Stratum V1 spec);
                                             // preempting mid-solve on every refresh starves the solver.
@@ -286,6 +331,9 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                                 let result = msg.get("result").and_then(|v| v.as_bool()).unwrap_or(false);
                                 if result {
                                     info!("Authorized as {}", worker);
+                                    metrics.worker_connected();
+                                    conn_guard = Some(ConnGuard(metrics.clone()));
+                                    println!("{}", status::connected(worker, false, color));
                                 } else {
                                     let err = msg.get("error").cloned().unwrap_or(Value::Null);
                                     error!("Authorization failed: {}", err);
@@ -294,8 +342,10 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                                 // Share response
                                 let result = msg.get("result").and_then(|v| v.as_bool()).unwrap_or(false);
                                 if result {
+                                    metrics.incr_accepted();
                                     info!("Share accepted (id={})", id);
                                 } else {
+                                    metrics.incr_rejected();
                                     let err = msg.get("error").cloned().unwrap_or(Value::Null);
                                     warn!("Share rejected (id={}): {}", id, err);
                                 }
@@ -335,13 +385,16 @@ pub async fn run_v1(pool_addr: &str, worker: &str) -> Result<(), Box<dyn std::er
                 )
                 .await?;
 
+                metrics.incr_submitted();
                 info!("Submitted V1 share: id={}, job_id={}", submit_id, job_id);
             }
         }
     }
 
     info!("V1 test miner shutting down");
-    let _ = current_target; // suppress unused warning
+    // Explicitly drop the connection guard (decrementing the gauge); its sole
+    // purpose is this Drop, so consuming it here also documents the intent.
+    drop(conn_guard);
     Ok(())
 }
 

@@ -23,7 +23,9 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+use crate::metrics::MinerMetrics;
 use crate::protocol::{ServerMessage, decode_server_message};
+use crate::status::{self, MiningStarted};
 use crate::transport::MinerTransport;
 
 /// Configuration for a single worker connection.
@@ -32,6 +34,17 @@ pub struct WorkerConfig {
     pub worker_name: String,
     pub solver_threads: u32,
     pub server_pubkey: Option<PublicKey>,
+    /// Whether to colorize the human-facing status output.
+    pub color: bool,
+}
+
+/// Decrements the connected-worker gauge when a session ends, on any path.
+struct ConnGuard(Arc<MinerMetrics>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.worker_disconnected();
+    }
 }
 
 /// A found share ready for submission.
@@ -88,7 +101,11 @@ impl SessionStats {
 }
 
 /// Top-level worker loop that reconnects on errors with jitter.
-pub async fn run_worker(config: WorkerConfig, mut shutdown: watch::Receiver<bool>) {
+pub async fn run_worker(
+    config: WorkerConfig,
+    metrics: Arc<MinerMetrics>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     loop {
         // Check shutdown before connecting
         if *shutdown.borrow() {
@@ -98,7 +115,7 @@ pub async fn run_worker(config: WorkerConfig, mut shutdown: watch::Receiver<bool
 
         info!(worker = %config.worker_name, pool = %config.pool_addr, "Connecting to pool");
 
-        match run_worker_session(&config, &mut shutdown).await {
+        match run_worker_session(&config, &metrics, &mut shutdown).await {
             Ok(stats) => {
                 info!(
                     worker = %config.worker_name,
@@ -144,6 +161,7 @@ pub async fn run_worker(config: WorkerConfig, mut shutdown: watch::Receiver<bool
 /// Run a single session: connect, receive jobs, solve, submit shares.
 async fn run_worker_session(
     config: &WorkerConfig,
+    metrics: &Arc<MinerMetrics>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<SessionStats, Box<dyn std::error::Error + Send + Sync>> {
     let mut transport =
@@ -160,9 +178,21 @@ async fn run_worker_session(
     transport.write_message(&encoded).await?;
     info!(worker = %config.worker_name, "Sent worker identity");
 
+    // Transport + identity are up: count this worker as connected (the guard
+    // decrements on any exit) and surface a human-facing notice.
+    metrics.worker_connected();
+    let _conn_guard = ConnGuard(metrics.clone());
+    println!(
+        "{}",
+        status::connected(&config.worker_name, transport.is_encrypted(), config.color)
+    );
+
     let mut stats = SessionStats::new();
     let mut next_seq: u32 = 0;
     let mut current_target: Option<[u8; 32]> = None;
+    // Print the "mining started" status once per session, when the first valid
+    // job lands. Resetting per session means it reprints after a reconnect.
+    let mut first_job = true;
 
     // Channel for solver threads to send found shares back to the session loop.
     let (share_tx, mut share_rx) = mpsc::channel::<(FoundShare, NewEquihashJob)>(64);
@@ -214,6 +244,28 @@ async fn run_worker_session(
                             job.target
                         };
 
+                        // Surface a rich "mining started" status the first time
+                        // a session actually has work (carries the assigned
+                        // nonce-1 prefix and share target).
+                        if first_job {
+                            first_job = false;
+                            println!(
+                                "{}",
+                                status::mining_started(
+                                    &MiningStarted {
+                                        worker: &config.worker_name,
+                                        channel_id: Some(job.channel_id),
+                                        nonce_1_hex: to_hex(&job.nonce_1),
+                                        nonce_2_len: job.nonce_2_len as usize,
+                                        share_target,
+                                        bits: job.bits,
+                                        clean: job.clean_jobs,
+                                    },
+                                    config.color,
+                                )
+                            );
+                        }
+
                         // Replacing the handle drops the old one, permanently
                         // cancelling the previous generation's threads.
                         current_job_cancel = Some(spawn_solvers(
@@ -221,6 +273,7 @@ async fn run_worker_session(
                             &share_target,
                             config.solver_threads,
                             &share_tx,
+                            metrics,
                         ));
                         current_job = Some(job.clone());
                     }
@@ -228,6 +281,7 @@ async fn run_worker_session(
                         match resp.result {
                             ShareResult::Accepted => {
                                 stats.shares_accepted += 1;
+                                metrics.incr_accepted();
                                 info!(
                                     worker = %config.worker_name,
                                     seq = resp.sequence_number,
@@ -236,6 +290,7 @@ async fn run_worker_session(
                             }
                             ShareResult::Rejected(ref reason) => {
                                 stats.shares_rejected += 1;
+                                metrics.incr_rejected();
                                 warn!(
                                     worker = %config.worker_name,
                                     seq = resp.sequence_number,
@@ -264,6 +319,7 @@ async fn run_worker_session(
                                 &set_target.target,
                                 config.solver_threads,
                                 &share_tx,
+                                metrics,
                             ));
                         }
                     }
@@ -295,6 +351,7 @@ async fn run_worker_session(
                                 return Err(e.into());
                             }
                             stats.shares_submitted += 1;
+                            metrics.incr_submitted();
                             next_seq += 1;
                             info!(
                                 worker = %config.worker_name,
@@ -309,6 +366,7 @@ async fn run_worker_session(
                             let block_hash = compute_block_hash(&header, &found.solution);
                             if hash_le_target(&block_hash, &network_target) {
                                 stats.blocks_found += 1;
+                                metrics.incr_blocks();
                                 info!(
                                     worker = %config.worker_name,
                                     job_id = job.job_id,
@@ -349,6 +407,7 @@ fn spawn_solvers(
     share_target: &[u8; 32],
     solver_threads: u32,
     share_tx: &mpsc::Sender<(FoundShare, NewEquihashJob)>,
+    metrics: &Arc<MinerMetrics>,
 ) -> SolverCancel {
     let cancel = SolverCancel::new();
     let flag = cancel.flag();
@@ -357,6 +416,7 @@ fn spawn_solvers(
         let solving_clone = flag.clone();
         let share_tx_clone = share_tx.clone();
         let share_target_copy = *share_target;
+        let metrics_clone = metrics.clone();
 
         tokio::task::spawn_blocking(move || {
             run_solver_thread(
@@ -366,6 +426,7 @@ fn spawn_solvers(
                 &share_target_copy,
                 &solving_clone,
                 &share_tx_clone,
+                &metrics_clone,
             );
         });
     }
@@ -379,6 +440,7 @@ fn run_solver_thread(
     share_target: &[u8; 32],
     solving: &AtomicBool,
     share_tx: &mpsc::Sender<(FoundShare, NewEquihashJob)>,
+    metrics: &MinerMetrics,
 ) {
     let nonce_1 = &job.nonce_1;
     let nonce_1_len = nonce_1.len();
@@ -414,6 +476,9 @@ fn run_solver_thread(
             if !solving_ref.load(Ordering::Acquire) {
                 return None;
             }
+
+            // Each yielded nonce is one Equihash solution attempt.
+            metrics.add_attempts(1);
 
             // Build full 32-byte nonce from nonce_1 + counter
             let mut nonce = [0u8; 32];
