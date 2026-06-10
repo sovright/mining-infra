@@ -234,17 +234,21 @@ where
         match op().await {
             Ok(value) => return Ok(value),
             Err(err) => {
-                if !is_transient_transport_error(err.as_ref()) || attempt == BACKOFFS_MS.len() {
-                    last_err = Some(err);
-                    break;
-                }
+                // `get` returns None on the extra final pass: retries exhausted.
+                let backoff_ms = match BACKOFFS_MS.get(attempt) {
+                    Some(&ms) if is_transient_transport_error(err.as_ref()) => ms,
+                    _ => {
+                        last_err = Some(err);
+                        break;
+                    }
+                };
                 tracing::warn!(
                     attempt = attempt + 1,
-                    backoff_ms = BACKOFFS_MS[attempt],
+                    backoff_ms,
                     error = %err,
                     "ZebraChainView: transient RPC error on get_block_header; retrying"
                 );
-                tokio::time::sleep(Duration::from_millis(BACKOFFS_MS[attempt])).await;
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
             }
         }
     }
@@ -463,6 +467,10 @@ mod tests {
         })
         .await;
         assert!(result.is_err());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "logical errors must not be retried");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "logical errors must not be retried"
+        );
     }
 }

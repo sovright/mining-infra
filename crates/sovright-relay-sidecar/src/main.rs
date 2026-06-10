@@ -23,10 +23,10 @@ mod relay;
 
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::RelayWrapper;
+use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
 use sovright_relay_sidecar::rpc::ZebraRpc;
-use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
     handle_relay_compact_block, handle_relay_compact_block_with_gate,
@@ -415,6 +415,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_relay_block_handler<M>(
     mut receiver: BlockReceiver,
     rpc: Arc<ZebraRpc>,
@@ -447,8 +448,8 @@ fn spawn_relay_block_handler<M>(
                             // mempool-reconstruction mode (the gated handler
                             // doesn't support short_id reconstruction yet).
                             let use_gate = gate.is_some()
-                                && !(compact_reconstruction_enabled
-                                    && !compact.short_ids.is_empty());
+                                && (!compact_reconstruction_enabled
+                                    || compact.short_ids.is_empty());
                             let outcome = if let (true, Some(gate), Some(chain_view)) =
                                 (use_gate, &gate, &chain_view)
                             {
