@@ -163,7 +163,10 @@ impl ZebraChainView {
             return Ok(true);
         }
         let hex_hash = display_hex_encode(hash);
-        let known = rpc.get_block_header(&hex_hash).await?.is_some();
+        let known = self
+            .get_block_header_with_retry(rpc, &hex_hash)
+            .await?
+            .is_some();
         if known {
             self.admit_parent(*hash);
         }
@@ -178,7 +181,7 @@ impl ZebraChainView {
     /// the next `parent_known` for the same hash short-circuits.
     pub async fn height_of(&self, rpc: &ZebraRpc, hash: &[u8; 32]) -> RpcResult<Option<u64>> {
         let hex_hash = display_hex_encode(hash);
-        match rpc.get_block_header(&hex_hash).await? {
+        match self.get_block_header_with_retry(rpc, &hex_hash).await? {
             Some(info) => {
                 self.admit_parent(*hash);
                 Ok(Some(info.height))
@@ -186,6 +189,81 @@ impl ZebraChainView {
             None => Ok(None),
         }
     }
+
+    /// Call `rpc.get_block_header(...)` with bounded retry on transient
+    /// transport errors.
+    ///
+    /// Observed in production (relay-us-central1-1 → zebra-us-central1-2,
+    /// 2026-06-09 to 06-10): the local Zebra's RPC port briefly refuses TCP
+    /// connections in 30–60s bursts that align with GCE disk-snapshot
+    /// freezes on the underlying persistent disk. Without retry, every
+    /// reassembled candidate that arrived during a burst was treated as
+    /// having an unknown parent (the gate's cache-only `parent_known` check
+    /// can't distinguish "parent doesn't exist" from "we couldn't ask").
+    /// At 11.6% cumulative rate this produced page-level noise.
+    ///
+    /// The retry budget (~2s total) is sized to mask brief freezes but
+    /// short enough that a genuinely-down Zebra still surfaces quickly to
+    /// the caller — better than blocking the per-candidate gate path for
+    /// many seconds during a real outage.
+    async fn get_block_header_with_retry(
+        &self,
+        rpc: &ZebraRpc,
+        hex_hash: &str,
+    ) -> RpcResult<Option<crate::rpc::BlockHeaderInfo>> {
+        retry_transient(|| async { rpc.get_block_header(hex_hash).await }).await
+    }
+}
+
+/// Bounded-retry wrapper around any async operation that yields a
+/// `RpcResult<T>`. Retries on transient transport errors only — logical RPC
+/// errors that have already been mapped to `Ok(...)` by the caller pass
+/// through on the first attempt.
+///
+/// Extracted as a free function so tests can drive the retry loop without
+/// instantiating a real `ZebraRpc`/HTTP client.
+async fn retry_transient<F, Fut, T>(mut op: F) -> RpcResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = RpcResult<T>>,
+{
+    // First attempt + 3 retries, exponentially spaced (100ms, 500ms, 1500ms).
+    const BACKOFFS_MS: [u64; 3] = [100, 500, 1500];
+    let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+    for attempt in 0..=BACKOFFS_MS.len() {
+        match op().await {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if !is_transient_transport_error(err.as_ref()) || attempt == BACKOFFS_MS.len() {
+                    last_err = Some(err);
+                    break;
+                }
+                tracing::warn!(
+                    attempt = attempt + 1,
+                    backoff_ms = BACKOFFS_MS[attempt],
+                    error = %err,
+                    "ZebraChainView: transient RPC error on get_block_header; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(BACKOFFS_MS[attempt])).await;
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "retry_transient: no error captured".into()))
+}
+
+/// True when an error string matches the patterns that production has been
+/// seeing for transient Zebra RPC outages — primarily ConnectionRefused
+/// during GCE disk-snapshot freezes — so we should retry instead of giving
+/// up after a single attempt.
+fn is_transient_transport_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let text = err.to_string();
+    text.contains("ConnectionRefused")
+        || text.contains("connection refused")
+        || text.contains("Connection reset")
+        || text.contains("timed out")
+        || text.contains("timeout")
+        || text.contains("os error 111") // ECONNREFUSED
+        || text.contains("os error 110") // ETIMEDOUT
 }
 
 impl ChainView for Arc<ZebraChainView> {
@@ -291,5 +369,100 @@ mod tests {
         let out = hex_encode(&bytes);
         assert_eq!(&out[..8], "009aff10");
         assert_eq!(out.len(), 64);
+    }
+
+    #[test]
+    fn classifies_connection_refused_as_transient() {
+        let cases = [
+            "tcp connect error: ConnectionRefused",
+            "Os { code: 111, kind: ConnectionRefused, message: \"Connection refused\" }",
+            "connection refused",
+            "Connection reset by peer",
+            "operation timed out",
+            "request timeout",
+            "io error: os error 111",
+            "os error 110 (timed out)",
+        ];
+        for text in cases {
+            let err: Box<dyn std::error::Error + Send + Sync> = text.into();
+            assert!(
+                is_transient_transport_error(err.as_ref()),
+                "expected transient: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn does_not_classify_logical_errors_as_transient() {
+        let cases = [
+            "Block not found",
+            "Method not allowed",
+            "Bad JSON-RPC response",
+            "unknown method",
+            "Invalid parameter",
+        ];
+        for text in cases {
+            let err: Box<dyn std::error::Error + Send + Sync> = text.into();
+            assert!(
+                !is_transient_transport_error(err.as_ref()),
+                "should not retry on: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_transient_succeeds_after_two_connection_refused() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let result: RpcResult<u32> = retry_transient(|| {
+            let calls = Arc::clone(&calls_clone);
+            async move {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err::<u32, _>("ConnectionRefused: simulated".into())
+                } else {
+                    Ok(42)
+                }
+            }
+        })
+        .await;
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn retry_transient_gives_up_after_four_total_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let result: RpcResult<u32> = retry_transient(|| {
+            let calls = Arc::clone(&calls_clone);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, _>("os error 111 ConnectionRefused".into())
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        // 1 first attempt + 3 retries = 4 total.
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn retry_transient_does_not_retry_on_logical_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let result: RpcResult<u32> = retry_transient(|| {
+            let calls = Arc::clone(&calls_clone);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<u32, _>("Block not found".into())
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "logical errors must not be retried");
     }
 }
