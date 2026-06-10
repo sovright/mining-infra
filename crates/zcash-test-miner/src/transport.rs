@@ -36,6 +36,11 @@ impl MinerTransport {
         }
     }
 
+    /// Whether this transport is Noise-encrypted (vs plaintext TCP).
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self, MinerTransport::Noise(_))
+    }
+
     pub async fn read_message(&mut self) -> io::Result<Vec<u8>> {
         match self {
             MinerTransport::Noise(noise) => {
