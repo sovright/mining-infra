@@ -13,16 +13,6 @@ use zcash_mining_protocol::messages::{
     NewEquihashJob, SetWorkerIdentity, ShareResult, SubmitEquihashShare,
 };
 
-/// Simple hex encoding (avoids adding `hex` crate dependency).
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        write!(s, "{b:02x}").unwrap();
-    }
-    s
-}
-
 use crate::metrics::MinerMetrics;
 use crate::protocol::{ServerMessage, decode_server_message};
 use crate::status::{self, MiningStarted};
@@ -280,7 +270,7 @@ async fn run_worker_session(
                                     &MiningStarted {
                                         worker: &config.worker_name,
                                         channel_id: Some(job.channel_id),
-                                        nonce_1_hex: to_hex(&job.nonce_1),
+                                        nonce_1_hex: status::to_hex(&job.nonce_1),
                                         nonce_2_len: job.nonce_2_len as usize,
                                         share_target,
                                         bits: job.bits,
@@ -397,7 +387,7 @@ async fn run_worker_session(
                                 info!(
                                     worker = %config.worker_name,
                                     job_id = job.job_id,
-                                    hash = to_hex(&block_hash),
+                                    hash = status::to_hex(&block_hash),
                                     "BLOCK FOUND!"
                                 );
                             }
@@ -541,7 +531,7 @@ fn run_solver_thread(
                     info!(
                         thread_id,
                         job_id = job.job_id,
-                        hash = to_hex(&block_hash),
+                        hash = status::to_hex(&block_hash),
                         "Found share meeting target"
                     );
 
