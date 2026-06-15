@@ -71,8 +71,12 @@ pub struct PoolServer {
     share_processor: Arc<ShareProcessor>,
     /// Duplicate share detector
     duplicate_detector: Arc<InMemoryDuplicateDetector>,
-    /// PPS payout tracker
+    /// PPS payout tracker (keyed by miner IP for payout accounting)
     payout_tracker: Arc<PayoutTracker>,
+    /// Windowed difficulty tracker keyed by worker label, used solely to export
+    /// the per-worker `hashrate_sol_s{worker}` gauge consistent with the
+    /// `worker_shares_*` counters.
+    worker_hashrate_tracker: Arc<PayoutTracker>,
     /// Active sessions (channel_id -> sender)
     sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
     /// Channel state (channel_id -> Channel)
@@ -219,6 +223,8 @@ impl PoolServer {
 
         // Create payout tracker (shared with JD server)
         let payout_tracker = Arc::new(PayoutTracker::default());
+        // Separate tracker keyed by worker label for per-worker hashrate metrics.
+        let worker_hashrate_tracker = Arc::new(PayoutTracker::default());
 
         // Create JD Server with shared payout tracker
         let jd_config = JdServerConfig {
@@ -297,6 +303,7 @@ impl PoolServer {
             share_processor: Arc::new(ShareProcessor::new()),
             duplicate_detector: Arc::new(InMemoryDuplicateDetector::new()),
             payout_tracker,
+            worker_hashrate_tracker,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
             accepted_identities: Arc::new(RwLock::new(HashSet::new())),
@@ -415,6 +422,7 @@ impl PoolServer {
 
         // Spawn periodic stats logging and stale miner cleanup
         let payout_tracker = Arc::clone(&self.payout_tracker);
+        let worker_hashrate_tracker = Arc::clone(&self.worker_hashrate_tracker);
         let sessions = Arc::clone(&self.sessions);
         let channels = Arc::clone(&self.channels);
         let metrics = Arc::clone(&self.metrics);
@@ -426,6 +434,8 @@ impl PoolServer {
                 // Clean up stale miner entries (idle > 30 minutes)
                 payout_tracker.cleanup_stale_miners(Duration::from_secs(1800));
                 payout_tracker.rotate_window_if_needed();
+                worker_hashrate_tracker.cleanup_stale_miners(Duration::from_secs(1800));
+                worker_hashrate_tracker.rotate_window_if_needed();
 
                 // Share-independent vardiff tick: lets overshooting channels
                 // recover. record_share-driven retargeting stops the moment a
@@ -454,6 +464,14 @@ impl PoolServer {
                 // Update metrics
                 metrics.set_hashrate(hashrate);
                 metrics.set_pool_aggregates(hashrate, active_miners as i64, session_count as i64);
+
+                // Export per-worker hashrate (difficulty/elapsed over the window),
+                // keyed by the same worker label as the share counters.
+                for (worker_label, worker_hashrate) in
+                    worker_hashrate_tracker.estimate_hashrate_per_miner()
+                {
+                    metrics.set_worker_hashrate(&worker_label, worker_hashrate);
+                }
 
                 info!(
                     "Pool stats: {} connections, {} active miners, {:.2} H/s",
@@ -1297,6 +1315,13 @@ impl PoolServer {
 
                     self.metrics.record_share_accepted();
                     self.metrics.record_worker_share_accepted(&worker_label);
+                    // Accumulate windowed difficulty per worker label for the
+                    // per-worker hashrate gauge (invalid difficulties are ignored
+                    // by record_share).
+                    if let Some(diff) = validation.difficulty {
+                        self.worker_hashrate_tracker
+                            .record_share(&worker_label, diff);
+                    }
                     if validation.is_block {
                         self.metrics.record_worker_block_found(&worker_label);
                     }
