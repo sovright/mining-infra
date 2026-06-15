@@ -1319,7 +1319,8 @@ impl PoolServer {
                     // per-worker hashrate gauge (invalid difficulties are ignored
                     // by record_share).
                     if let Some(diff) = validation.difficulty {
-                        self.worker_hashrate_tracker.record_share(&worker_label, diff);
+                        self.worker_hashrate_tracker
+                            .record_share(&worker_label, diff);
                     }
                     if validation.is_block {
                         self.metrics.record_worker_block_found(&worker_label);
