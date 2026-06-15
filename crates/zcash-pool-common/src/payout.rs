@@ -143,6 +143,30 @@ impl PayoutTracker {
         total_difficulty / elapsed_secs
     }
 
+    /// Per-key hashrate estimate (difficulty accumulated in the window divided
+    /// by elapsed window time), using the same convention as
+    /// [`Self::estimate_pool_hashrate`].
+    ///
+    /// When this tracker is keyed by worker label, this yields per-worker
+    /// hashrate suitable for the `hashrate_sol_s{worker}` gauge. Returns an
+    /// empty map until the window has started (no shares yet).
+    pub fn estimate_hashrate_per_miner(&self) -> HashMap<MinerId, f64> {
+        let elapsed = {
+            let window_start = self.window_start.read().unwrap_or_else(|e| e.into_inner());
+            match *window_start {
+                Some(start) => start.elapsed().min(self.window_duration),
+                None => return HashMap::new(), // No shares yet
+            }
+        };
+        let elapsed_secs = elapsed.as_secs_f64().max(1.0);
+
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        miners
+            .iter()
+            .map(|(id, stats)| (id.clone(), stats.window_difficulty / elapsed_secs))
+            .collect()
+    }
+
     /// Number of active miners (submitted share in window)
     pub fn active_miner_count(&self) -> usize {
         let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
@@ -305,6 +329,29 @@ mod tests {
         tracker.record_share(&"miner2".to_string(), 200.0);
         let rate = tracker.estimate_pool_hashrate();
         assert!(rate > 0.0, "hashrate should be positive after shares");
+    }
+
+    #[test]
+    fn test_estimate_hashrate_per_miner_empty_before_shares() {
+        let tracker = PayoutTracker::default();
+        assert!(tracker.estimate_hashrate_per_miner().is_empty());
+    }
+
+    #[test]
+    fn test_estimate_hashrate_per_miner_splits_by_key() {
+        let tracker = PayoutTracker::new(Duration::from_secs(600));
+        tracker.record_share(&"rig-a".to_string(), 300.0);
+        tracker.record_share(&"rig-b".to_string(), 100.0);
+        std::thread::sleep(Duration::from_millis(1100));
+        let rates = tracker.estimate_hashrate_per_miner();
+        assert_eq!(rates.len(), 2);
+        // Both rates share the same elapsed divisor within one call, so the ratio
+        // reflects the difficulty split exactly (300 : 100 = 3 : 1).
+        let a = rates["rig-a"];
+        let b = rates["rig-b"];
+        assert!((a / b - 3.0).abs() < 1e-9, "ratio {} should be 3", a / b);
+        // Sum should track the pool estimate (separate elapsed reads => loose tol).
+        assert!((a + b - tracker.estimate_pool_hashrate()).abs() < 1.0);
     }
 
     #[test]
