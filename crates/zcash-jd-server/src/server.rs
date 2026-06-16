@@ -2232,11 +2232,17 @@ mod tests {
             .find("pub async fn handle_push_solution")
             .expect("handle_push_solution must exist");
         let rest = &src[start..];
-        // The body ends at the next item's doc comment (`\n    /// `). Inner
-        // comments in the body are `//` at deeper indentation, so this boundary
-        // is unambiguous.
-        let body_end = rest.find("\n    /// ").unwrap_or(rest.len());
-        let body = &rest[..body_end];
+        // The body ends at this `fn`'s own closing brace. rustfmt indents a
+        // 4-space `fn`'s closing brace at exactly 4 spaces (`\n    }`); every
+        // inner block, doc comment, and string-literal brace lives at >= 8
+        // spaces, so the first `\n    }` is unambiguously the function's end.
+        // This is robust against an inner `///` doc comment or a `{`/`}` inside
+        // a `format!` string, which a next-doc-comment heuristic would not be.
+        let body_len = rest
+            .find("\n    }")
+            .map(|i| i + "\n    }".len())
+            .expect("handle_push_solution must have a 4-space-indented closing brace");
+        let body = &rest[..body_len];
 
         // Match a *call* (`record_share(`), not the explanatory prose in the
         // body which mentions `record_share` without parentheses.
