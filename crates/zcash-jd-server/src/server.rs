@@ -163,19 +163,25 @@ pub struct JdServer {
     pending_missing: Arc<TokioRwLock<HashMap<(String, u32), PendingMissingTransactions>>>,
     /// Per-job dedup sets of seen share keys, keyed by job_id.
     ///
-    /// A share key is `sha256(nonce ‖ time_le ‖ solution[..64])`. A key is
-    /// registered the moment a share passes the cheap checks (before the
-    /// expensive Equihash verification), so byte-identical replays are rejected
-    /// as duplicates regardless of validity. Remembering an invalid share is
-    /// harmless and rate-limits resubmission of garbage. Entries for jobs that
-    /// no longer resolve are evicted at the head of each handler call.
+    /// A share key is `sha256(nonce ‖ time_le ‖ solution[..64])`. The dedup
+    /// uses a three-phase pattern to prevent two distinct attacks:
     ///
-    /// Memory bound: steady-state worst case is
-    /// `live_jobs × MAX_SEEN_SHARES_PER_JOB × 32 bytes` plus `HashSet` overhead
-    /// (~1-2 MB per job at the per-job cap). The eviction sweep alone only
-    /// scopes this to live jobs; the real backstop on `live_jobs` is token
-    /// issuance — `max_tokens_per_client` and `token_lifetime` — since each job
-    /// is pinned to an unexpired token.
+    /// 1. **Read-only pre-flight** (before Equihash): if the key is already in
+    ///    the set, reject immediately as `Duplicate` without running the verifier.
+    ///    This prevents valid-share replay DoS (force Equihash on every replay).
+    ///
+    /// 2. **Equihash validation** (structurally invalid → `BadSolution`, NOT
+    ///    recorded in dedup).  Recording invalid shares before validation would
+    ///    let an attacker fill `MAX_SEEN_SHARES_PER_JOB` at zero PoW cost and
+    ///    block all subsequent legitimate shares.
+    ///
+    /// 3. **Authoritative atomic check+insert** (after validation): handles
+    ///    concurrent submissions that raced past the pre-flight.  Only solutions
+    ///    that passed Equihash (`Ok` or `TargetNotMet`) are inserted.
+    ///
+    /// Entries for jobs that no longer resolve are evicted at the head of each
+    /// handler call.  Memory bound: `live_jobs × MAX_SEEN_SHARES_PER_JOB × 32 B`
+    /// plus `HashSet` overhead; backstopped by token issuance limits.
     seen_shares: Mutex<HashMap<u32, HashSet<[u8; 32]>>>,
 }
 
@@ -662,18 +668,17 @@ impl JdServer {
     /// already rejected at decode time.)
     ///
     /// Per-share validation order is cheapest-first, which is also the right DoS
-    /// posture: channel match, version match, time window, dedup-register, then
-    /// the expensive Equihash verification against the pool-granted
-    /// `share_target`. Credit is recorded only after a share clears every check.
+    /// posture: channel match, version match, time window, then the three-phase
+    /// dedup+Equihash sequence, then payout credit.
     ///
     /// Version-mismatch decision: a share whose version differs from the
     /// declared job is rejected as `StaleJob` — a version change implies the job
     /// rolled / the template changed underneath the miner.
     ///
-    /// Dedup decision: the share key is registered the moment a share passes the
-    /// cheap checks, *before* Equihash verification. Byte-identical replays are
-    /// therefore `Duplicate` regardless of validity; remembering an invalid
-    /// share is harmless and rate-limits resubmission of garbage.
+    /// Dedup decision (three-phase, see `seen_shares` doc):
+    ///   1. Read-only pre-flight rejects known replays without running Equihash.
+    ///   2. Equihash validation runs; structurally invalid shares are NOT inserted.
+    ///   3. Authoritative check+insert after validation covers concurrent races.
     pub async fn handle_submit_shares_jd(&self, msg: SubmitSharesJd) -> SubmitSharesJdResponse {
         // Evict dedup entries for jobs that no longer resolve (expired/unknown).
         // Bounded by the number of tracked jobs.

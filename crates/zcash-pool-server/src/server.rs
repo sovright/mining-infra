@@ -931,6 +931,12 @@ impl PoolServer {
                     .collect()
             };
             self.duplicate_detector.prune_inactive(&active_job_ids);
+            // Cross-path solution hashes are only meaningful within one block epoch:
+            // once jobs are stale, per-path dedups already prevent re-submission on
+            // each individual path. Clearing here ties the cross-path window to the
+            // same epoch boundary as the per-job dedups, preventing the LRU-eviction
+            // replay attack (age out a hash, then resubmit via the other path).
+            self.payout_tracker.clear_cross_path_solutions();
             info!("New block detected, pruned inactive jobs from duplicate detector");
         }
 
@@ -1272,9 +1278,23 @@ impl PoolServer {
                         zcash_mining_protocol::messages::RejectReason::StaleJob,
                     )
                 } else if validation.accepted && cross_path_dup {
-                    // Same valid solution already credited via the jd-server path.
-                    // Report as Duplicate so no accepted counters, vardiff, or
-                    // worker hashrate are updated for a share that was not credited.
+                    // Payout was already issued via the jd-server path, so no
+                    // credit, vardiff, or accepted-counter update here. However,
+                    // block propagation must still happen: the JD path does not
+                    // build or submit full blocks, so the pool path must do it even
+                    // when this share is a payout duplicate.
+                    if validation.is_block {
+                        info!(
+                            "BLOCK FOUND (cross-path duplicate) by channel {}! Submitting block.",
+                            channel_id
+                        );
+                        if let Err(e) = self.submit_block(&job, &share).await {
+                            warn!(
+                                "Failed to submit block for cross-path dup job {}: {}",
+                                share.job_id, e
+                            );
+                        }
+                    }
                     self.metrics.record_share_rejected("CrossPathDuplicate");
                     self.metrics.record_worker_share_rejected(&worker_label);
                     debug!(

@@ -63,9 +63,11 @@ pub struct MinerStats {
     pub last_share: Option<Instant>,
 }
 
-/// Maximum solution hashes held in the cross-path dedup set.
-/// 32 bytes/entry × 50k ≈ 1.6 MB cap.
-const MAX_CROSS_PATH_SOLUTIONS: usize = 50_000;
+/// Maximum solution hashes held in the cross-path dedup set per block epoch.
+/// The set is cleared on every new block, so this cap only needs to cover
+/// solutions submitted within one block interval (≈75 s on Zcash mainnet).
+/// 32 bytes/entry × 500k ≈ 16 MB worst-case.
+const MAX_CROSS_PATH_SOLUTIONS: usize = 500_000;
 
 /// PPS payout tracker
 pub struct PayoutTracker {
@@ -266,6 +268,20 @@ impl PayoutTracker {
     pub fn remove_miner(&self, miner_id: &MinerId) {
         let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
         miners.remove(miner_id);
+    }
+
+    /// Clear all cross-path solution hashes.
+    ///
+    /// Call this whenever a new block epoch starts (i.e. `is_new_block` in the
+    /// template handler). Tying the cross-path window to block epochs means an
+    /// evicted hash can never be replayed for double-credit: the job that
+    /// produced it is already stale, so both per-path dedup sets have moved on.
+    pub fn clear_cross_path_solutions(&self) {
+        let mut seen = self
+            .seen_solutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *seen = BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS);
     }
 
     /// Remove miners that haven't submitted a share within the given duration.
