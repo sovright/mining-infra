@@ -627,11 +627,24 @@ impl JdServer {
             .verify_share(&header, &solution.solution, &target)
             .map_err(|e| JdServerError::Protocol(format!("invalid solution: {}", e)))?;
 
-        // Do NOT call payout_tracker.record_share here. The block-finding
-        // solution is also a valid share and was already credited once by the
-        // share path (handle_declared_job_shares). Adding a second credit here
-        // at block difficulty (~1e5× share difficulty) would silently drain the
-        // pool on every found block.
+        // Do NOT call payout_tracker.record_share here (see #51). The
+        // block-finding solution is also a valid share and was already credited
+        // once by the share path (handle_declared_job_shares). Adding a second
+        // credit here at block difficulty (~1e5× share difficulty) would
+        // silently drain the pool on every found block.
+        //
+        // Ordering assumption: crediting the block finder relies entirely on the
+        // share path. This is safe only if the matching SubmitSharesExtended is
+        // processed before (or independently of) this PushSolution. If a JDC
+        // delivers PushSolution first and the share is reordered/dropped in
+        // transit, the finder is credited late or not at all. In practice JDC
+        // sends the share before the solution and both travel the same ordered
+        // connection, so reordering is not expected — but it is an assumption,
+        // not a guarantee.
+        //
+        // TODO(#51): make finder credit independent of share/solution ordering
+        // (e.g. deferred credit keyed by job_id, deduped against the share path)
+        // so a reordered or dropped share cannot cost the finder their credit.
         info!(
             channel_id = solution.channel_id,
             job_id = solution.job_id,
@@ -2193,6 +2206,50 @@ mod tests {
             payout_tracker
                 .get_stats(&"jd-miner-1".to_string())
                 .is_none()
+        );
+    }
+
+    /// Regression guard for #51: `handle_push_solution` must never credit the
+    /// `PayoutTracker`. The block-finding solution is also a valid share and is
+    /// credited exactly once by the share path; a second credit here at block
+    /// difficulty (~1e5× share difficulty) would drain the pool on every block.
+    ///
+    /// We assert this structurally rather than behaviourally. A behavioural test
+    /// would need a PushSolution that passes Equihash verification, but the only
+    /// checked-in valid (200,9) solution validates against a 12-byte input
+    /// (see `zcash-equihash-validator/tests/test_vectors.rs`), whereas the
+    /// production path requires a 108-byte header prefix. Generating a fresh
+    /// solution needs the solver (~144 MB, seconds, flaky in CI). The error
+    /// paths *are* covered behaviourally by `test_push_solution_rejects_*`,
+    /// which assert no credit; this guard covers the success path by ensuring
+    /// the function body contains no `record_share` call at all.
+    #[test]
+    fn push_solution_never_calls_record_share() {
+        // Source of this very file, embedded at compile time.
+        let src = include_str!("server.rs");
+
+        let start = src
+            .find("pub async fn handle_push_solution")
+            .expect("handle_push_solution must exist");
+        let rest = &src[start..];
+        // The body ends at this `fn`'s own closing brace. rustfmt indents a
+        // 4-space `fn`'s closing brace at exactly 4 spaces (`\n    }`); every
+        // inner block, doc comment, and string-literal brace lives at >= 8
+        // spaces, so the first `\n    }` is unambiguously the function's end.
+        // This is robust against an inner `///` doc comment or a `{`/`}` inside
+        // a `format!` string, which a next-doc-comment heuristic would not be.
+        let body_len = rest
+            .find("\n    }")
+            .map(|i| i + "\n    }".len())
+            .expect("handle_push_solution must have a 4-space-indented closing brace");
+        let body = &rest[..body_len];
+
+        // Match a *call* (`record_share(`), not the explanatory prose in the
+        // body which mentions `record_share` without parentheses.
+        assert!(
+            !body.contains("record_share("),
+            "handle_push_solution must not call record_share (regression of #51): \
+             the share path is the sole crediting authority for a found block"
         );
     }
 

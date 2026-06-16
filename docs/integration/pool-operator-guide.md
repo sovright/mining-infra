@@ -504,6 +504,20 @@ cp target/release/zcash-pool-server /usr/local/bin/
 systemctl start zcash-pool
 ```
 
+> **PPS difficulty fix (#50/#51) — one-time migration.** Builds prior to this
+> fix credited shares at the hash-derived difficulty (inflated and
+> high-variance) instead of the job-target difficulty, and credited a found
+> block a second time via `PushSolution`. After deploying a build that includes
+> the fix:
+>
+> - **Restart the pool process** (the rolling restart above is sufficient). The
+>   in-memory `PayoutTracker` carries the inflated balances forward until the
+>   process is restarted; a config reload alone does not clear them.
+> - **Review pre-fix payout DB records before paying out on mainnet.** Any rows
+>   written before the fix reflect inflated per-share credit and a double-counted
+>   block credit. Reconcile or quarantine them before settling real payouts.
+>   Testnet pools can simply restart and discard prior balances.
+
 ### Emergency Procedures
 
 **Zebra disconnected:**
