@@ -3,9 +3,47 @@
 //! Tracks share submissions per miner for payout calculation.
 //! In-memory for Phase 3; can be upgraded to database-backed later.
 
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+
+/// Bounded LRU set for cross-path solution deduplication.
+/// Evicts the oldest entry when capacity is reached so detection never degrades.
+struct BoundedSolutionSet {
+    seen: HashMap<[u8; 32], ()>,
+    order: VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl BoundedSolutionSet {
+    fn new(capacity: usize) -> Self {
+        Self {
+            seen: HashMap::with_capacity(capacity.min(1024)),
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+        }
+    }
+
+    /// Returns `true` if `key` was not previously seen and has been recorded.
+    /// Returns `false` if `key` was already present (cross-path duplicate).
+    fn insert_if_new(&mut self, key: [u8; 32]) -> bool {
+        if self.seen.contains_key(&key) {
+            return false;
+        }
+        if self.seen.len() >= self.capacity {
+            // LRU eviction: `order` and `seen` stay in sync, pop_front is Some here.
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("order non-empty when seen is at capacity");
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(key, ());
+        self.order.push_back(key);
+        true
+    }
+}
 
 /// Unique identifier for a miner (could be pubkey, address, etc.)
 pub type MinerId = String;
@@ -25,6 +63,10 @@ pub struct MinerStats {
     pub last_share: Option<Instant>,
 }
 
+/// Maximum solution hashes held in the cross-path dedup set.
+/// 32 bytes/entry × 50k ≈ 1.6 MB cap.
+const MAX_CROSS_PATH_SOLUTIONS: usize = 50_000;
+
 /// PPS payout tracker
 pub struct PayoutTracker {
     /// Per-miner statistics
@@ -33,6 +75,10 @@ pub struct PayoutTracker {
     window_duration: Duration,
     /// When the current window started (first share in window)
     window_start: RwLock<Option<Instant>>,
+    /// Cross-path solution dedup: prevents double-credit when the same valid
+    /// solution reaches both the pool-server and jd-server submission paths.
+    /// Keyed by SHA-256(solution_bytes); bounded LRU to MAX_CROSS_PATH_SOLUTIONS.
+    seen_solutions: RwLock<BoundedSolutionSet>,
 }
 
 impl PayoutTracker {
@@ -41,6 +87,7 @@ impl PayoutTracker {
             miners: RwLock::new(HashMap::new()),
             window_duration,
             window_start: RwLock::new(None),
+            seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
         }
     }
 
@@ -79,6 +126,40 @@ impl PayoutTracker {
         stats.window_shares += 1;
         stats.window_difficulty += difficulty;
         stats.last_share = Some(now);
+    }
+
+    /// Record a share, deduplicating by solution bytes across all submission paths.
+    ///
+    /// Both the pool-server (SV2 direct) and jd-server (JDC) call into the same
+    /// `Arc<PayoutTracker>`. A miner running both clients could submit the same
+    /// valid solution through both paths; per-path dedup sets would not catch it.
+    /// This method adds a cross-path dedup keyed by SHA-256(solution).
+    ///
+    /// Returns `true` if the share was newly recorded, `false` if it was a
+    /// cross-path duplicate (no credit issued; caller should report as Duplicate).
+    pub fn try_record_share_once(
+        &self,
+        miner_id: &MinerId,
+        difficulty: f64,
+        solution: &[u8],
+    ) -> bool {
+        let key: [u8; 32] = Sha256::digest(solution).into();
+        let is_new = {
+            let mut seen = self
+                .seen_solutions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            seen.insert_if_new(key)
+        };
+        if is_new {
+            self.record_share(miner_id, difficulty);
+        } else {
+            tracing::warn!(
+                miner_id = %miner_id,
+                "Cross-path duplicate share rejected (same solution submitted via pool-server and jd-server)"
+            );
+        }
+        is_new
     }
 
     /// Get statistics for a miner

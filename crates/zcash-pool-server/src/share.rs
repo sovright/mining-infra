@@ -72,9 +72,15 @@ impl ShareProcessor {
         duplicate_detector: &D,
         block_target: &[u8; 32],
     ) -> Result<ShareValidationResult> {
-        // 1. Check for duplicate
-        if duplicate_detector.check_and_record(share.job_id, &share.nonce_2, &share.solution) {
-            debug!("Duplicate share for job {}", share.job_id);
+        // 1. Cheap read-only replay guard: if we've seen this exact share key
+        //    before, reject immediately without running Equihash. This prevents
+        //    an attacker from replaying one valid solution indefinitely and forcing
+        //    a full verifier pass on every replay.
+        //    NOTE: this is a read-only pre-flight. The authoritative check+insert
+        //    happens in step 4 (after validation), which catches concurrent
+        //    submissions that race past this pre-flight.
+        if duplicate_detector.is_seen(share.job_id, &share.nonce_2, &share.solution) {
+            debug!("Duplicate share (pre-validation) for job {}", share.job_id);
             return Ok(ShareValidationResult {
                 accepted: false,
                 result: ShareResult::Rejected(RejectReason::Duplicate),
@@ -121,12 +127,36 @@ impl ShareProcessor {
         // 4. Verify Equihash solution AND check share meets pool target.
         //    verify_share calls verify_solution internally, so we only call it
         //    once to avoid the expensive (~144 MB) duplicate Equihash verification.
+        //
+        //    Dedup insert (step 5) runs AFTER this, not before. Recording in the
+        //    dedup before validation would let an attacker fill the 100k-entry
+        //    per-job set with zero-cost invalid submissions, blocking all legitimate
+        //    shares. Only structurally valid solutions (Ok or TargetNotMet, both
+        //    requiring real Equihash work) are recorded in the dedup.
         let share_target = &job.target;
         match self
             .validator
             .verify_share(&header, &share.solution, share_target)
         {
             Ok(hash) => {
+                // 5. Authoritative atomic check+insert. The pre-flight `is_seen`
+                //    in step 1 fast-paths known replays; this step is the final
+                //    gatekeeper and handles concurrent submissions that raced past
+                //    the pre-flight.
+                if duplicate_detector.check_and_record(
+                    share.job_id,
+                    &share.nonce_2,
+                    &share.solution,
+                ) {
+                    debug!("Duplicate share (post-validation) for job {}", share.job_id);
+                    return Ok(ShareValidationResult {
+                        accepted: false,
+                        result: ShareResult::Rejected(RejectReason::Duplicate),
+                        difficulty: None,
+                        is_block: false,
+                    });
+                }
+
                 // PPS: pay based on the work required (job target), not the
                 // actual hash value. Using the hash would pay miners for luck
                 // (mean payout = ∞) rather than for the fixed unit of work
@@ -149,6 +179,14 @@ impl ShareProcessor {
                 })
             }
             Err(zcash_equihash_validator::ValidationError::TargetNotMet) => {
+                // Valid Equihash solution that misses the pool target. Record in
+                // dedup — it's real work — so re-submission doesn't trigger
+                // another expensive validation pass.
+                let _ = duplicate_detector.check_and_record(
+                    share.job_id,
+                    &share.nonce_2,
+                    &share.solution,
+                );
                 debug!(
                     "Share below target difficulty (target={})",
                     hex::encode(share_target)
@@ -161,6 +199,9 @@ impl ShareProcessor {
                 })
             }
             Err(e) => {
+                // Structurally invalid: do NOT record in dedup. Recording would
+                // let the attacker fill the per-job capacity with invalid
+                // submissions at zero proof-of-work cost.
                 debug!("Invalid solution: {}", e);
                 Ok(ShareValidationResult {
                     accepted: false,
@@ -406,8 +447,13 @@ mod tests {
         }
     }
 
+    /// Invalid solutions must NOT be recorded in the duplicate detector.
+    /// Recording them would let an attacker fill the per-job capacity with
+    /// zero-proof-of-work submissions, blocking legitimate miners.
+    /// Both submissions of the same invalid solution must return InvalidSolution,
+    /// never Duplicate.
     #[test]
-    fn test_validate_share_duplicate_via_channel() {
+    fn test_invalid_shares_do_not_pollute_dedup() {
         use crate::duplicate::InMemoryDuplicateDetector;
 
         let mut channel = make_test_channel(vec![0; 4]);
@@ -427,29 +473,31 @@ mod tests {
             solution: [0; 1344],
         };
 
-        // First submission -- will get InvalidSolution (dummy solution), but not Duplicate
+        // First submission: invalid solution → InvalidSolution, NOT recorded in dedup
         let result1 = processor
             .validate_share(&share, &channel, &detector, &block_target)
             .unwrap();
         assert!(
-            !matches!(
+            matches!(
                 result1.result,
-                ShareResult::Rejected(RejectReason::Duplicate)
+                ShareResult::Rejected(RejectReason::InvalidSolution)
             ),
-            "First submission should not be duplicate, got: {:?}",
+            "First invalid submission must return InvalidSolution, got: {:?}",
             result1.result
         );
 
-        // Second submission of exact same share -- should get Duplicate
+        // Second submission of the same invalid solution: still InvalidSolution, not Duplicate.
+        // If dedup had recorded the first submission an attacker could craft the
+        // is_seen pre-flight into a cheap DoS (force Duplicate without PoW).
         let result2 = processor
             .validate_share(&share, &channel, &detector, &block_target)
             .unwrap();
         assert!(
             matches!(
                 result2.result,
-                ShareResult::Rejected(RejectReason::Duplicate)
+                ShareResult::Rejected(RejectReason::InvalidSolution)
             ),
-            "Second submission should be duplicate, got: {:?}",
+            "Second invalid submission must also return InvalidSolution (not Duplicate), got: {:?}",
             result2.result
         );
     }
@@ -639,6 +687,20 @@ mod tests {
             result.result,
             ShareResult::Accepted,
             "Result must be ShareResult::Accepted"
+        );
+
+        // Re-submit the same valid solution — must be Duplicate, not Accepted.
+        // This proves valid solutions ARE recorded in the dedup.
+        let result2 = processor
+            .validate_share_with_job(&share, &job, &detector, &block_target)
+            .expect("second validate_share_with_job must not error");
+        assert!(
+            matches!(
+                result2.result,
+                ShareResult::Rejected(RejectReason::Duplicate)
+            ),
+            "Re-submission of valid solution must be Duplicate, got: {:?}",
+            result2.result
         );
     }
 

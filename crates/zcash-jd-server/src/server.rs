@@ -748,9 +748,55 @@ impl JdServer {
                 continue;
             }
 
-            // 4. Dedup: register the key BEFORE the expensive Equihash check so
-            //    byte-identical replays are caught regardless of validity.
+            // 4. Cheap read-only replay guard: if this key was already seen,
+            //    reject immediately without running Equihash. Prevents an attacker
+            //    from replaying one valid solution indefinitely and forcing the
+            //    expensive verifier on every replay.
             let key = share_dedup_key(share);
+            {
+                let seen = self.seen_shares.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.get(&msg.job_id).is_some_and(|s| s.contains(&key)) {
+                    reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
+                    continue;
+                }
+            }
+
+            // 5. Expensive: verify Equihash solution meets the share target.
+            //    Distinguish a structurally valid solution that simply misses
+            //    the target (TargetNotMet -> LowDifficulty) from a structurally
+            //    broken solution (everything else -> BadSolution).
+            //
+            //    Dedup insert (step 6) runs AFTER this, not before. Recording in
+            //    the dedup before validation would let an attacker exhaust the
+            //    MAX_SEEN_SHARES_PER_JOB capacity with zero-cost invalid
+            //    submissions, blocking all legitimate shares for that job.
+            //    The LowDifficulty branch cannot be exercised here without a valid
+            //    Equihash solution (TargetNotMet requires structural validity);
+            //    it is covered by Task 7's integration test alongside the accept
+            //    path, using a real CPU solver.
+            let header = build_header(&job, share.time, &share.nonce);
+            let equihash_ok = match validator.verify_share(&header, &share.solution, &share_target)
+            {
+                Ok(_) => true,
+                Err(ValidationError::TargetNotMet) => false,
+                Err(_) => {
+                    // Structurally invalid: do NOT record in dedup. Recording
+                    // would let the attacker fill capacity with no PoW cost.
+                    reject(
+                        JdShareErrorCode::BadSolution,
+                        &mut rejected,
+                        &mut first_error,
+                    );
+                    continue;
+                }
+            };
+
+            // 6. Authoritative atomic check+insert (after validation so only real
+            //    work fills the set). This is the final gatekeeper and handles
+            //    concurrent submissions that raced past the step-4 pre-flight.
+            //    INVARIANT: the contains-check and insert must remain a single
+            //    critical section under the Mutex. Do not split with `.await` and
+            //    do not move `record_share` inside this block.
             {
                 let mut seen = self.seen_shares.lock().unwrap_or_else(|e| e.into_inner());
                 let set = seen.entry(msg.job_id).or_default();
@@ -759,8 +805,6 @@ impl JdServer {
                     continue;
                 }
                 if set.len() >= MAX_SEEN_SHARES_PER_JOB {
-                    // Cap reached: treat further distinct shares as duplicates to
-                    // bound memory. Warn so operators can spot abuse.
                     warn!(
                         job_id = msg.job_id,
                         cap = MAX_SEEN_SHARES_PER_JOB,
@@ -769,37 +813,35 @@ impl JdServer {
                     reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
                     continue;
                 }
-                // INVARIANT: the contains-check and this insert must remain a
-                // single critical section under the Mutex. That atomicity is
-                // what serializes concurrent identical-key submissions and
-                // prevents double-credit. Do not split it with an `.await`, and
-                // do not move `record_share` inside this block.
                 set.insert(key);
             }
 
-            // 5. Expensive: verify Equihash solution meets the share target.
-            //    Distinguish a structurally valid solution that simply misses
-            //    the target (TargetNotMet -> LowDifficulty) from a structurally
-            //    broken solution (everything else -> BadSolution). The
-            //    LowDifficulty branch cannot be exercised here without a valid
-            //    Equihash solution (TargetNotMet requires structural validity);
-            //    it is covered by Task 7's integration test alongside the accept
-            //    path, using a real CPU solver.
-            let header = build_header(&job, share.time, &share.nonce);
-            if let Err(e) = validator.verify_share(&header, &share.solution, &share_target) {
-                let code = match e {
-                    ValidationError::TargetNotMet => JdShareErrorCode::LowDifficulty,
-                    _ => JdShareErrorCode::BadSolution,
-                };
-                reject(code, &mut rejected, &mut first_error);
+            if !equihash_ok {
+                reject(
+                    JdShareErrorCode::LowDifficulty,
+                    &mut rejected,
+                    &mut first_error,
+                );
                 continue;
             }
 
             // Share is valid: credit the declaring client at the share target's
-            // difficulty.
+            // difficulty. Use try_record_share_once to prevent double-credit if
+            // the same solution was already submitted via the pool-server path
+            // (both paths share one Arc<PayoutTracker> but separate per-path dedups).
+            // If it is a cross-path duplicate, report it as Duplicate — not accepted —
+            // so the client sees the correct response and accepted/rejected counters
+            // reflect actual credits issued.
             let difficulty = target_to_difficulty(&Target::from_le_bytes(share_target));
-            self.payout_tracker.record_share(&job.client_id, difficulty);
-            accepted += 1;
+            if self.payout_tracker.try_record_share_once(
+                &job.client_id,
+                difficulty,
+                &share.solution,
+            ) {
+                accepted += 1;
+            } else {
+                reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
+            }
         }
 
         debug!(

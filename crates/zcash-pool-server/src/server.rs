@@ -1184,6 +1184,10 @@ impl PoolServer {
         // Apply vardiff update and record payout atomically under one lock.
         // This prevents the channel from being removed between the two operations.
         let mut stale_after_validation = false;
+        // Set to true when try_record_share_once returns false: same valid solution
+        // already credited via the jd-server path. Treat as Duplicate so vardiff,
+        // accepted counters, and metrics are not updated for a non-credited share.
+        let mut cross_path_dup = false;
         let maybe_new_target = if let Ok(ref validation) = result {
             if validation.accepted {
                 let difficulty = validation.difficulty;
@@ -1203,13 +1207,11 @@ impl PoolServer {
                         stale_after_validation = true;
                         None
                     } else {
-                        let new_target = if channel.record_share().is_some() {
-                            Some(channel.current_target())
-                        } else {
-                            None
-                        };
-                        // Record payout inside same lock scope
-                        if let Some(diff) = difficulty {
+                        // Cross-path dedup check BEFORE updating vardiff: if the
+                        // same valid solution already arrived via the jd-server path,
+                        // skip vardiff and all accepted-share accounting. The
+                        // try_record_share_once call is the authoritative credit gate.
+                        let payout_credited = if let Some(diff) = difficulty {
                             let miner_id: MinerId = self
                                 .connection_times
                                 .read()
@@ -1217,9 +1219,23 @@ impl PoolServer {
                                 .get(&channel_id)
                                 .map(|(_, addr)| addr.ip().to_string())
                                 .unwrap_or_else(|| format!("channel_{}", channel_id));
-                            self.payout_tracker.record_share(&miner_id, diff);
+                            self.payout_tracker.try_record_share_once(
+                                &miner_id,
+                                diff,
+                                &share.solution,
+                            )
+                        } else {
+                            true
+                        };
+
+                        if !payout_credited {
+                            cross_path_dup = true;
+                            None
+                        } else if channel.record_share().is_some() {
+                            Some(channel.current_target())
+                        } else {
+                            None
                         }
-                        new_target
                     }
                 } else {
                     warn!("Channel {} removed during share validation", channel_id);
@@ -1254,6 +1270,19 @@ impl PoolServer {
                     );
                     zcash_mining_protocol::messages::ShareResult::Rejected(
                         zcash_mining_protocol::messages::RejectReason::StaleJob,
+                    )
+                } else if validation.accepted && cross_path_dup {
+                    // Same valid solution already credited via the jd-server path.
+                    // Report as Duplicate so no accepted counters, vardiff, or
+                    // worker hashrate are updated for a share that was not credited.
+                    self.metrics.record_share_rejected("CrossPathDuplicate");
+                    self.metrics.record_worker_share_rejected(&worker_label);
+                    debug!(
+                        "Rejecting share from channel {} as cross-path duplicate (payout already issued via jd-server)",
+                        channel_id
+                    );
+                    zcash_mining_protocol::messages::ShareResult::Rejected(
+                        zcash_mining_protocol::messages::RejectReason::Duplicate,
                     )
                 } else if validation.accepted {
                     // Check for block find
