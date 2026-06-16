@@ -190,37 +190,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn share_difficulty_uses_job_target_not_hash() {
-        // PPS correctness: two shares with different hash values but the same
-        // job target must produce identical difficulty credits.
-        use zcash_equihash_validator::difficulty::target_to_difficulty;
-
-        let target = [0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
-                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-        let expected = target_to_difficulty(&Target::from_le_bytes(target));
-
-        // A "lucky" hash much lower than the target would yield a huge
-        // difficulty via hash_to_difficulty, but must yield the same fixed
-        // value as the target itself.
-        let lucky_hash = [0x00; 32];
-        let lucky_diff = target_to_difficulty(&Target::from_le_bytes(target));
-        assert_eq!(lucky_diff, expected,
-            "lucky hash must not inflate PPS credit beyond job target difficulty");
-
-        // An ordinary hash just below the target.
-        let ordinary_hash = [0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff, 0xff,
-                              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-                              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
-        let _ = ordinary_hash; // only the target matters for PPS
-        let ordinary_diff = target_to_difficulty(&Target::from_le_bytes(target));
-        assert_eq!(ordinary_diff, expected,
-            "ordinary hash must also use job target difficulty");
-    }
-
-    #[test]
     fn test_meets_target() {
         let processor = ShareProcessor::new();
 
@@ -492,8 +461,9 @@ mod tests {
     /// exact 140-byte header that was originally solved. If even one byte is wrong,
     /// every share gets rejected in production despite the validator working in isolation.
     #[test]
-    fn test_real_equihash_solution_full_pipeline() {
+    fn share_difficulty_uses_job_target_not_hash() {
         use crate::duplicate::InMemoryDuplicateDetector;
+        use zcash_equihash_validator::difficulty::target_to_difficulty;
 
         // --- Genesis block header fields ---
         // Full header hex (140 bytes):
@@ -650,9 +620,20 @@ mod tests {
             result.difficulty.is_some(),
             "Accepted share must have a difficulty value"
         );
-        assert!(
-            result.difficulty.unwrap() > 0.0,
-            "Share difficulty must be positive"
+
+        let expected_difficulty = target_to_difficulty(&Target::from_le_bytes(job.target));
+        let accepted_hash = EquihashValidator::new()
+            .verify_share(&built_header, &share.solution, &job.target)
+            .expect("genesis solution must verify against the share target");
+        let hash_derived_difficulty = target_to_difficulty(&Target::from_le_bytes(accepted_hash));
+        assert_ne!(
+            hash_derived_difficulty, expected_difficulty,
+            "test vector must distinguish hash-derived from target-derived PPS credit"
+        );
+        assert_eq!(
+            result.difficulty,
+            Some(expected_difficulty),
+            "PPS credit must use the job target, not the accepted share hash"
         );
         assert_eq!(
             result.result,
