@@ -627,13 +627,14 @@ impl JdServer {
             .verify_share(&header, &solution.solution, &target)
             .map_err(|e| JdServerError::Protocol(format!("invalid solution: {}", e)))?;
 
-        let difficulty = target_to_difficulty(&compact_to_target(job.bits));
-        self.payout_tracker.record_share(&job.client_id, difficulty);
-
+        // Do NOT call payout_tracker.record_share here. The block-finding
+        // solution is also a valid share and was already credited once by the
+        // share path (handle_declared_job_shares). Adding a second credit here
+        // at block difficulty (~1e5× share difficulty) would silently drain the
+        // pool on every found block.
         info!(
             channel_id = solution.channel_id,
             job_id = solution.job_id,
-            difficulty,
             "Validated block solution"
         );
 
