@@ -1219,6 +1219,168 @@ module SystemCompositionTest {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// MODULE 8B: PPS Accounting Regression Models
+// ═══════════════════════════════════════════════════════════════
+// Models the two PPS accounting regressions fixed after review:
+//
+//   1. Accepted shares must credit the declared job target difficulty,
+//      not the realized hash-derived difficulty.
+//   2. PushSolution must submit a candidate block only. It must not create
+//      a second PPS accounting event and must stay harmless if replayed.
+
+module PpsTargetAccounting {
+  import miningSpells.*
+
+  const MINERS: Set[int]
+
+  var payTotShares: int -> int
+  var payTotDiff: int -> int
+  var expectedTotDiff: int -> int
+  var gHashDerivedCredits: int
+  var gAcceptedShares: int
+
+  action init = all {
+    payTotShares' = MINERS.mapBy(_ => 0),
+    payTotDiff' = MINERS.mapBy(_ => 0),
+    expectedTotDiff' = MINERS.mapBy(_ => 0),
+    gHashDerivedCredits' = 0,
+    gAcceptedShares' = 0,
+  }
+
+  action recordAcceptedShareByTarget(miner: int, jobTarget: int, hashDifficulty: int): bool = {
+    val reqDiff = target_to_difficulty(jobTarget)
+    all {
+      MINERS.contains(miner),
+      jobTarget > 0,
+      hashDifficulty >= reqDiff,
+      payTotShares' = payTotShares.setBy(miner, s => s + 1),
+      payTotDiff' = payTotDiff.setBy(miner, d => d + reqDiff),
+      expectedTotDiff' = expectedTotDiff.setBy(miner, d => d + reqDiff),
+      gHashDerivedCredits' = gHashDerivedCredits,
+      gAcceptedShares' = gAcceptedShares + 1,
+    }
+  }
+
+  action recordAcceptedShareByHash(miner: int, jobTarget: int, hashDifficulty: int): bool = {
+    val reqDiff = target_to_difficulty(jobTarget)
+    all {
+      MINERS.contains(miner),
+      jobTarget > 0,
+      hashDifficulty >= reqDiff,
+      payTotShares' = payTotShares.setBy(miner, s => s + 1),
+      payTotDiff' = payTotDiff.setBy(miner, d => d + hashDifficulty),
+      expectedTotDiff' = expectedTotDiff.setBy(miner, d => d + reqDiff),
+      gHashDerivedCredits' =
+        if (hashDifficulty == reqDiff) gHashDerivedCredits else gHashDerivedCredits + 1,
+      gAcceptedShares' = gAcceptedShares + 1,
+    }
+  }
+
+  val ppsCreditsUseJobTarget =
+    gHashDerivedCredits == 0 and
+    MINERS.forall(m => payTotDiff.get(m) == expectedTotDiff.get(m))
+}
+
+module PpsTargetAccountingTest {
+  import miningSpells.*
+  import PpsTargetAccounting(MINERS = Set(1, 2)).*
+
+  // POW_LIMIT=1000000, so target=10000 maps to reqDiff=100.
+  // The hash-derived witness uses 250 to prove the two code paths diverge.
+  run targetDifficultyCredit = init
+    .then(recordAcceptedShareByTarget(1, 10000, 250))
+    .expect(target_to_difficulty(10000) == 100)
+    .expect(payTotShares.get(1) == 1)
+    .expect(payTotDiff.get(1) == target_to_difficulty(10000))
+    .expect(ppsCreditsUseJobTarget)
+
+  run hashDerivedCreditWitness = init
+    .then(recordAcceptedShareByHash(1, 10000, 250))
+    .expect(target_to_difficulty(10000) == 100)
+    .expect(250 > target_to_difficulty(10000))
+    .expect(payTotShares.get(1) == 1)
+    .expect(expectedTotDiff.get(1) == target_to_difficulty(10000))
+    .expect(payTotDiff.get(1) == 250)
+    .expect(gHashDerivedCredits == 1)
+    .expect(not(ppsCreditsUseJobTarget))
+}
+
+module PushSolutionPayout {
+  const MINERS: Set[int]
+
+  var payTotShares: int -> int
+  var payTotDiff: int -> int
+  var pushedSolutions: Set[(int, int)]
+  var pushSolutionCredits: int -> int
+  var gPushSolutionCredits: int
+
+  action init = all {
+    payTotShares' = MINERS.mapBy(_ => 0),
+    payTotDiff' = MINERS.mapBy(_ => 0),
+    pushedSolutions' = Set(),
+    pushSolutionCredits' = MINERS.mapBy(_ => 0),
+    gPushSolutionCredits' = 0,
+  }
+
+  action submitSharesPayout(miner: int, diff: int): bool = all {
+    MINERS.contains(miner),
+    diff > 0,
+    payTotShares' = payTotShares.setBy(miner, s => s + 1),
+    payTotDiff' = payTotDiff.setBy(miner, d => d + diff),
+    pushedSolutions' = pushedSolutions,
+    pushSolutionCredits' = pushSolutionCredits,
+    gPushSolutionCredits' = gPushSolutionCredits,
+  }
+
+  action pushSolution(miner: int, solutionId: int, blockDifficulty: int): bool = all {
+    MINERS.contains(miner),
+    solutionId > 0,
+    blockDifficulty > 0,
+    pushedSolutions' = pushedSolutions.union(Set((miner, solutionId))),
+    payTotShares' = payTotShares,
+    payTotDiff' = payTotDiff,
+    pushSolutionCredits' = pushSolutionCredits,
+    gPushSolutionCredits' = gPushSolutionCredits,
+  }
+
+  action recordPushSolutionPayout(miner: int, solutionId: int, blockDifficulty: int): bool = all {
+    MINERS.contains(miner),
+    solutionId > 0,
+    blockDifficulty > 0,
+    pushedSolutions' = pushedSolutions.union(Set((miner, solutionId))),
+    payTotShares' = payTotShares.setBy(miner, s => s + 1),
+    payTotDiff' = payTotDiff.setBy(miner, d => d + blockDifficulty),
+    pushSolutionCredits' = pushSolutionCredits.setBy(miner, c => c + 1),
+    gPushSolutionCredits' = gPushSolutionCredits + 1,
+  }
+
+  val pushSolutionDoesNotCreditPps =
+    gPushSolutionCredits == 0 and
+    MINERS.forall(m => pushSolutionCredits.get(m) == 0)
+}
+
+module PushSolutionPayoutTest {
+  import PushSolutionPayout(MINERS = Set(1, 2)).*
+
+  run pushSolutionReplayHasNoPayoutEffect = init
+    .then(submitSharesPayout(1, 100))
+    .then(pushSolution(1, 42, 1000))
+    .then(pushSolution(1, 42, 1000))
+    .expect(payTotShares.get(1) == 1)
+    .expect(payTotDiff.get(1) == 100)
+    .expect(pushSolutionDoesNotCreditPps)
+
+  run pushSolutionPayoutReplayWitness = init
+    .then(submitSharesPayout(1, 100))
+    .then(recordPushSolutionPayout(1, 42, 1000))
+    .then(recordPushSolutionPayout(1, 42, 1000))
+    .expect(payTotShares.get(1) == 3)
+    .expect(payTotDiff.get(1) == 2100)
+    .expect(pushSolutionCredits.get(1) == 2)
+    .expect(not(pushSolutionDoesNotCreditPps))
+}
+
+// ═══════════════════════════════════════════════════════════════
 // MODULE 9: Duplicate Detector Wraparound Bug
 // ═══════════════════════════════════════════════════════════════
 

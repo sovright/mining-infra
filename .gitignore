@@ -1,5 +1,6 @@
 # Build artifacts
 /target/
+node_modules/
 
 # Cargo lock for libraries (optional - uncomment if this is a library)
 # Cargo.lock

@@ -1,0 +1,11 @@
+{
+  "name": "mining-infra-quint-specs",
+  "private": true,
+  "scripts": {
+    "quint:test": "npm run quint:test:pps",
+    "quint:test:pps": "quint test --main PpsTargetAccountingTest spec/quint/zcash_mining.qnt && quint test --main PushSolutionPayoutTest spec/quint/zcash_mining.qnt"
+  },
+  "devDependencies": {
+    "@informalsystems/quint": "0.32.0"
+  }
+}
