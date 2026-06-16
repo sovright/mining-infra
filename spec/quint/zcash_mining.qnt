@@ -1285,14 +1285,19 @@ module PpsTargetAccountingTest {
   import miningSpells.*
   import PpsTargetAccounting(MINERS = Set(1, 2)).*
 
+  // POW_LIMIT=1000000, so target=10000 maps to reqDiff=100.
+  // The hash-derived witness uses 250 to prove the two code paths diverge.
   run targetDifficultyCredit = init
     .then(recordAcceptedShareByTarget(1, 10000, 250))
+    .expect(target_to_difficulty(10000) == 100)
     .expect(payTotShares.get(1) == 1)
     .expect(payTotDiff.get(1) == target_to_difficulty(10000))
     .expect(ppsCreditsUseJobTarget)
 
   run hashDerivedCreditWitness = init
     .then(recordAcceptedShareByHash(1, 10000, 250))
+    .expect(target_to_difficulty(10000) == 100)
+    .expect(250 > target_to_difficulty(10000))
     .expect(payTotShares.get(1) == 1)
     .expect(expectedTotDiff.get(1) == target_to_difficulty(10000))
     .expect(payTotDiff.get(1) == 250)
