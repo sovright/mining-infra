@@ -685,9 +685,11 @@ impl JdServer {
     /// rolled / the template changed underneath the miner.
     ///
     /// Dedup decision (three-phase, see `seen_shares` doc):
-    ///   1. Read-only pre-flight rejects known replays without running Equihash.
-    ///   2. Equihash validation runs; structurally invalid shares are NOT inserted.
-    ///   3. Authoritative check+insert after validation covers concurrent races.
+    ///   1. Prev-hash staleness rejects shares for old declared jobs (closes
+    ///      the epoch-clear double-credit window in the cross-path dedup).
+    ///   2. Read-only pre-flight rejects known replays without running Equihash.
+    ///   3. Equihash validation runs; structurally invalid shares are NOT inserted.
+    ///   4. Authoritative check+insert after validation covers concurrent races.
     pub async fn handle_submit_shares_jd(&self, msg: SubmitSharesJd) -> SubmitSharesJdResponse {
         // Evict dedup entries for jobs that no longer resolve (expired/unknown).
         // Bounded by the number of tracked jobs.
@@ -728,6 +730,13 @@ impl JdServer {
         const MAX_TIME_FORWARD: u32 = 7200;
         const MAX_TIME_BACKWARD: u32 = 60;
 
+        // Read current_prev_hash once for the whole batch so we hold the lock
+        // only briefly and don't re-acquire it on every share.
+        let current_prev_hash: Option<[u8; 32]> = {
+            let guard = self.current_prev_hash.read().await;
+            *guard
+        };
+
         for share in &msg.shares {
             let reject = |code: JdShareErrorCode,
                           rejected: &mut u16,
@@ -762,18 +771,20 @@ impl JdServer {
                 continue;
             }
 
-            // TODO(stale-prev-hash): unlike SetCustomJob/SetFullTemplateJob, this
-            // handler does not check `current_prev_hash`. If a new block arrives
-            // with the same block version (common), a miner with a valid token for
-            // the old job can keep submitting shares for that job and receive
-            // credits — while pool-server rejects the same shares as StaleJob.
-            // This does not cause double-credit (pool-server's is_job_active check
-            // fires before try_record_share_once), but jd-path miners get credits
-            // pool-path miners don't for the same old-block work.
-            // Fix: check job.prev_hash against current_prev_hash here and reject
-            // as StaleJob if they differ. Tracked as a separate PR.
+            // 4. Prev-hash staleness: if the pool has moved to a new tip, reject
+            //    shares for old declared jobs. Without this check, a miner whose
+            //    token has not yet expired can keep submitting shares for an old job
+            //    after the cross-path solution set is cleared on the new block and
+            //    receive a second PPS credit for a solution already credited on the
+            //    pool-server path (epoch-clear double-credit attack).
+            if let Some(expected_prev_hash) = current_prev_hash
+                && job.prev_hash != expected_prev_hash
+            {
+                reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
+                continue;
+            }
 
-            // 4. Cheap read-only replay guard: if this key was already seen,
+            // 6. Cheap read-only replay guard: if this key was already seen,
             //    reject immediately without running Equihash. Prevents an attacker
             //    from replaying one valid solution indefinitely and forcing the
             //    expensive verifier on every replay.
@@ -786,7 +797,7 @@ impl JdServer {
                 }
             }
 
-            // 5. Expensive: verify Equihash solution meets the share target.
+            // 7. Expensive: verify Equihash solution meets the share target.
             //    Distinguish a structurally valid solution that simply misses
             //    the target (TargetNotMet -> LowDifficulty) from a structurally
             //    broken solution (everything else -> BadSolution).
@@ -816,7 +827,7 @@ impl JdServer {
                 }
             };
 
-            // 6. Authoritative atomic check+insert (after validation so only real
+            // 8. Authoritative atomic check+insert (after validation so only real
             //    work fills the set). This is the final gatekeeper and handles
             //    concurrent submissions that raced past the step-4 pre-flight.
             //    INVARIANT: the contains-check and insert must remain a single

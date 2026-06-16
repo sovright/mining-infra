@@ -34,7 +34,7 @@ impl BoundedSolutionSet {
             return false;
         }
         if self.seen.len() >= self.capacity {
-            // LRU eviction: `order` and `seen` stay in sync, pop_front is Some here.
+            // FIFO eviction: `order` and `seen` stay in sync, pop_front is Some here.
             let oldest = self
                 .order
                 .pop_front()

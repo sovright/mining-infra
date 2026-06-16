@@ -1294,6 +1294,51 @@ impl PoolServer {
                             "BLOCK FOUND (cross-path duplicate) by channel {}! Submitting block.",
                             channel_id
                         );
+
+                        // Relay announce mirrors the normal block-found path so
+                        // fast propagation fires regardless of which path saw the
+                        // block-valid share first.
+                        #[cfg(feature = "relay")]
+                        if let Some(ref relay) = self.relay {
+                            let header = job
+                                .build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
+                            let relay_data = {
+                                let distributor = self.job_distributor.read().await;
+                                distributor.current_template().map(|t| {
+                                    let tx_hashes: Vec<[u8; 32]> = t
+                                        .transactions
+                                        .iter()
+                                        .filter_map(|tx| {
+                                            let bytes = hex::decode(&tx.hash).ok()?;
+                                            if bytes.len() == 32 {
+                                                let mut arr = [0u8; 32];
+                                                arr.copy_from_slice(&bytes);
+                                                arr.reverse();
+                                                Some(arr)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let coinbase = t.coinbase.clone();
+                                    (coinbase, tx_hashes)
+                                })
+                            };
+                            if let Some((coinbase, tx_hashes)) = relay_data {
+                                let relay = Arc::clone(relay);
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        relay.announce_block(&header, &coinbase, &tx_hashes).await
+                                    {
+                                        warn!(
+                                            "Failed to announce cross-path dup block to relay: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            }
+                        }
+
                         if let Err(e) = self.submit_block(&job, &share).await {
                             warn!(
                                 "Failed to submit block for cross-path dup job {}: {}",
