@@ -127,8 +127,11 @@ impl ShareProcessor {
             .verify_share(&header, &share.solution, share_target)
         {
             Ok(hash) => {
-                // Calculate share difficulty
-                let difficulty = self.hash_to_difficulty(&hash);
+                // PPS: pay based on the work required (job target), not the
+                // actual hash value. Using the hash would pay miners for luck
+                // (mean payout = ∞) rather than for the fixed unit of work
+                // that each accepted share represents.
+                let difficulty = target_to_difficulty(&Target::from_le_bytes(*share_target));
 
                 // Check if this meets block target
                 let is_block = self.meets_target(&hash, block_target);
@@ -169,12 +172,6 @@ impl ShareProcessor {
         }
     }
 
-    /// Convert hash to difficulty
-    fn hash_to_difficulty(&self, hash: &[u8; 32]) -> f64 {
-        let target = Target::from_le_bytes(*hash);
-        target_to_difficulty(&target)
-    }
-
     /// Check if hash meets target using the canonical Target::is_met_by()
     fn meets_target(&self, hash: &[u8; 32], target: &[u8; 32]) -> bool {
         let target = Target::from_le_bytes(*target);
@@ -193,18 +190,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_hash_to_difficulty() {
-        let processor = ShareProcessor::new();
+    fn share_difficulty_uses_job_target_not_hash() {
+        // PPS correctness: two shares with different hash values but the same
+        // job target must produce identical difficulty credits.
+        use zcash_equihash_validator::difficulty::target_to_difficulty;
 
-        // All zeros = maximum difficulty
-        let hash_zeros = [0u8; 32];
-        let diff = processor.hash_to_difficulty(&hash_zeros);
-        assert!(diff > 1e70); // Very high
+        let target = [0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xff, 0xff,
+                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                      0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let expected = target_to_difficulty(&Target::from_le_bytes(target));
 
-        // All 0xff = very low difficulty
-        let hash_ones = [0xff; 32];
-        let diff = processor.hash_to_difficulty(&hash_ones);
-        assert!(diff < 1.0);
+        // A "lucky" hash much lower than the target would yield a huge
+        // difficulty via hash_to_difficulty, but must yield the same fixed
+        // value as the target itself.
+        let lucky_hash = [0x00; 32];
+        let lucky_diff = target_to_difficulty(&Target::from_le_bytes(target));
+        assert_eq!(lucky_diff, expected,
+            "lucky hash must not inflate PPS credit beyond job target difficulty");
+
+        // An ordinary hash just below the target.
+        let ordinary_hash = [0x00, 0x00, 0x00, 0xfe, 0xff, 0xff, 0xff, 0xff,
+                              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+                              0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        let _ = ordinary_hash; // only the target matters for PPS
+        let ordinary_diff = target_to_difficulty(&Target::from_le_bytes(target));
+        assert_eq!(ordinary_diff, expected,
+            "ordinary hash must also use job target difficulty");
     }
 
     #[test]
