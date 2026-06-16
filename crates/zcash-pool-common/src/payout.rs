@@ -8,8 +8,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-/// Bounded LRU set for cross-path solution deduplication.
-/// Evicts the oldest entry when capacity is reached so detection never degrades.
+/// Bounded FIFO set for cross-path solution deduplication.
+/// Evicts the oldest-inserted entry when capacity is reached. The set is
+/// cleared on every new block epoch, so FIFO eviction order is sufficient —
+/// within one epoch the insertion order does not affect correctness.
 struct BoundedSolutionSet {
     seen: HashMap<[u8; 32], ()>,
     order: VecDeque<[u8; 32]>,
@@ -79,7 +81,7 @@ pub struct PayoutTracker {
     window_start: RwLock<Option<Instant>>,
     /// Cross-path solution dedup: prevents double-credit when the same valid
     /// solution reaches both the pool-server and jd-server submission paths.
-    /// Keyed by SHA-256(solution_bytes); bounded LRU to MAX_CROSS_PATH_SOLUTIONS.
+    /// Keyed by SHA-256(solution_bytes); bounded FIFO, cleared on each new block.
     seen_solutions: RwLock<BoundedSolutionSet>,
 }
 
@@ -648,6 +650,41 @@ mod tests {
             tracker.get_stats(&"miner_new".to_string()).is_some(),
             "new miner should be preserved"
         );
+    }
+
+    /// clear_cross_path_solutions resets the epoch boundary: a solution that was
+    /// previously seen must be accepted again after the clear (simulating a new
+    /// block epoch where old-job solutions are irrelevant).
+    #[test]
+    fn test_clear_cross_path_solutions_resets_dedup() {
+        let tracker = PayoutTracker::default();
+        let miner = "miner1".to_string();
+        let solution = b"fake_solution_bytes_32_chars_long".to_vec();
+
+        // First submission: credited
+        assert!(
+            tracker.try_record_share_once(&miner, 1.0, &solution),
+            "first submission must be credited"
+        );
+
+        // Second submission same epoch: cross-path dup, rejected
+        assert!(
+            !tracker.try_record_share_once(&miner, 1.0, &solution),
+            "duplicate within epoch must be rejected"
+        );
+
+        // New block epoch: clear cross-path solutions
+        tracker.clear_cross_path_solutions();
+
+        // Same solution bytes after clear: accepted again (new epoch, new job)
+        assert!(
+            tracker.try_record_share_once(&miner, 1.0, &solution),
+            "same solution must be accepted after epoch clear"
+        );
+
+        // Stats: 2 credits (first + post-clear), 1 rejected
+        let stats = tracker.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 2);
     }
 
     /// Kill mutants on lines 180-181:

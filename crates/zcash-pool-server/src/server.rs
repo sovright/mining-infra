@@ -1283,6 +1283,12 @@ impl PoolServer {
                     // block propagation must still happen: the JD path does not
                     // build or submit full blocks, so the pool path must do it even
                     // when this share is a payout duplicate.
+                    //
+                    // NOTE(test-gap): this branch (cross_path_dup && is_block) has
+                    // no automated test. handle_share_submission is not unit-testable
+                    // without mocking submit_block; an integration test would need
+                    // two concurrent connections (JDC + SV2 direct) submitting the
+                    // same block solution. Tracked for the integration-test milestone.
                     if validation.is_block {
                         info!(
                             "BLOCK FOUND (cross-path duplicate) by channel {}! Submitting block.",

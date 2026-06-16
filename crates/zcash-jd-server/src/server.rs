@@ -651,6 +651,15 @@ impl JdServer {
         // TODO(#51): make finder credit independent of share/solution ordering
         // (e.g. deferred credit keyed by job_id, deduped against the share path)
         // so a reordered or dropped share cannot cost the finder their credit.
+        //
+        // TODO(block-submission): this handler validates the block solution but
+        // never submits it to Zebra. JdServer has no access to the Zebra RPC;
+        // the pool-server's submit_block logic fills the gap only when the same
+        // miner ALSO connects via SV2 direct (cross_path_dup branch). A miner
+        // connected solely via JDC will have their block find silently dropped.
+        // Fix: inject a block-submission callback (Arc<dyn Fn(block_hex) ->
+        // Future<()> + Send + Sync>) into JdServer at construction and call it
+        // here after Equihash validation passes. Tracked as a separate PR.
         info!(
             channel_id = solution.channel_id,
             job_id = solution.job_id,
@@ -752,6 +761,17 @@ impl JdServer {
                 reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
                 continue;
             }
+
+            // TODO(stale-prev-hash): unlike SetCustomJob/SetFullTemplateJob, this
+            // handler does not check `current_prev_hash`. If a new block arrives
+            // with the same block version (common), a miner with a valid token for
+            // the old job can keep submitting shares for that job and receive
+            // credits — while pool-server rejects the same shares as StaleJob.
+            // This does not cause double-credit (pool-server's is_job_active check
+            // fires before try_record_share_once), but jd-path miners get credits
+            // pool-path miners don't for the same old-block work.
+            // Fix: check job.prev_hash against current_prev_hash here and reject
+            // as StaleJob if they differ. Tracked as a separate PR.
 
             // 4. Cheap read-only replay guard: if this key was already seen,
             //    reject immediately without running Equihash. Prevents an attacker
