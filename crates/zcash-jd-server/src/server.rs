@@ -861,6 +861,23 @@ impl JdServer {
                 continue;
             }
 
+            // Re-check prev_hash immediately before the authoritative credit gate.
+            // The cross-path solution set is cleared on new-block events in pool-server.
+            // If a new block arrived while Equihash was running, the cross-path set is
+            // now empty and an old-job share could be credited a second time. Checking
+            // prev_hash here closes that TOCTOU window: the window shrinks from
+            // Equihash-verification-time (ms) to the gap between this read and the
+            // try_record_share_once call (ns), which is an acceptable residual.
+            {
+                let guard = self.current_prev_hash.read().await;
+                if let Some(expected) = *guard
+                    && job.prev_hash != expected
+                {
+                    reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
+                    continue;
+                }
+            }
+
             // Share is valid: credit the declaring client at the share target's
             // difficulty. Use try_record_share_once to prevent double-credit if
             // the same solution was already submitted via the pool-server path
