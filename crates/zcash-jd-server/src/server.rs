@@ -784,7 +784,7 @@ impl JdServer {
                 continue;
             }
 
-            // 6. Cheap read-only replay guard: if this key was already seen,
+            // 5. Cheap read-only replay guard: if this key was already seen,
             //    reject immediately without running Equihash. Prevents an attacker
             //    from replaying one valid solution indefinitely and forcing the
             //    expensive verifier on every replay.
@@ -797,12 +797,12 @@ impl JdServer {
                 }
             }
 
-            // 7. Expensive: verify Equihash solution meets the share target.
+            // 6. Expensive: verify Equihash solution meets the share target.
             //    Distinguish a structurally valid solution that simply misses
             //    the target (TargetNotMet -> LowDifficulty) from a structurally
             //    broken solution (everything else -> BadSolution).
             //
-            //    Dedup insert (step 6) runs AFTER this, not before. Recording in
+            //    Dedup insert (step 7) runs AFTER this, not before. Recording in
             //    the dedup before validation would let an attacker exhaust the
             //    MAX_SEEN_SHARES_PER_JOB capacity with zero-cost invalid
             //    submissions, blocking all legitimate shares for that job.
@@ -827,9 +827,9 @@ impl JdServer {
                 }
             };
 
-            // 8. Authoritative atomic check+insert (after validation so only real
+            // 7. Authoritative atomic check+insert (after validation so only real
             //    work fills the set). This is the final gatekeeper and handles
-            //    concurrent submissions that raced past the step-4 pre-flight.
+            //    concurrent submissions that raced past the step-5 pre-flight.
             //    INVARIANT: the contains-check and insert must remain a single
             //    critical section under the Mutex. Do not split with `.await` and
             //    do not move `record_share` inside this block.

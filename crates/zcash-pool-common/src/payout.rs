@@ -20,6 +20,9 @@ struct BoundedSolutionSet {
 
 impl BoundedSolutionSet {
     fn new(capacity: usize) -> Self {
+        // A zero capacity would make insert_if_new pop from an empty deque and
+        // panic; clamp to at least one so the set is always well-formed.
+        let capacity = capacity.max(1);
         Self {
             seen: HashMap::with_capacity(capacity.min(1024)),
             order: VecDeque::with_capacity(capacity.min(1024)),
@@ -147,6 +150,20 @@ impl PayoutTracker {
         difficulty: f64,
         solution: &[u8],
     ) -> bool {
+        // Mirror record_share's validity guard up front. An invalid-difficulty
+        // share is never credited; recording its key here would consume a dedup
+        // slot and return `true` (caller counts it accepted) while no credit was
+        // issued, and would then falsely dedup a later honest resubmission of the
+        // same solution at a valid difficulty. Reject without touching the set.
+        if !difficulty.is_finite() || difficulty <= 0.0 {
+            tracing::warn!(
+                "Ignoring cross-path share with invalid difficulty {} for miner {}",
+                difficulty,
+                miner_id
+            );
+            return false;
+        }
+
         let key: [u8; 32] = Sha256::digest(solution).into();
         let is_new = {
             let mut seen = self
@@ -685,6 +702,40 @@ mod tests {
         // Stats: 2 credits (first + post-clear), 1 rejected
         let stats = tracker.get_stats(&miner).unwrap();
         assert_eq!(stats.total_shares, 2);
+    }
+
+    /// An invalid-difficulty share must NOT consume a cross-path dedup slot and
+    /// must NOT be reported as recorded. Otherwise the solution's hash would be
+    /// stuck in the set with no credit issued, falsely deduping a later honest
+    /// resubmission of the same solution at a valid difficulty.
+    #[test]
+    fn test_invalid_difficulty_does_not_poison_cross_path_dedup() {
+        let tracker = PayoutTracker::default();
+        let miner = "miner1".to_string();
+        let solution = b"fake_solution_bytes_32_chars_long".to_vec();
+
+        // Invalid difficulty: not recorded, returns false, set untouched.
+        assert!(
+            !tracker.try_record_share_once(&miner, 0.0, &solution),
+            "invalid difficulty must not be credited"
+        );
+        assert!(
+            !tracker.try_record_share_once(&miner, f64::NAN, &solution),
+            "NaN difficulty must not be credited"
+        );
+        assert!(
+            tracker.get_stats(&miner).is_none(),
+            "no credit should exist"
+        );
+
+        // A later honest submission of the SAME solution at a valid difficulty
+        // must be credited — proving the earlier invalid attempts did not poison
+        // the dedup set.
+        assert!(
+            tracker.try_record_share_once(&miner, 1.0, &solution),
+            "valid resubmission of the same solution must be credited"
+        );
+        assert_eq!(tracker.get_stats(&miner).unwrap().total_shares, 1);
     }
 
     /// Kill mutants on lines 180-181:

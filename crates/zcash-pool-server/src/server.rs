@@ -51,7 +51,7 @@ struct ConnectionCtx {
     job_distributor: Arc<RwLock<JobDistributor>>,
     sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
     channels: Arc<RwLock<HashMap<u32, Channel>>>,
-    accepted_identities: Arc<RwLock<HashSet<String>>>,
+    accepted_identities: Arc<RwLock<HashMap<String, usize>>>,
     session_tx: mpsc::Sender<SessionMessage>,
     duplicate_detector: Arc<InMemoryDuplicateDetector>,
     metrics: Arc<PoolMetrics>,
@@ -82,8 +82,12 @@ pub struct PoolServer {
     sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
     /// Channel state (channel_id -> Channel)
     channels: Arc<RwLock<HashMap<u32, Channel>>>,
-    /// Accepted worker identities (bounds Prometheus label cardinality).
-    accepted_identities: Arc<RwLock<HashSet<String>>>,
+    /// Accepted worker identities, reference-counted by the number of live
+    /// channels currently declaring each name (bounds Prometheus label
+    /// cardinality). The count lets a name be released only when its LAST
+    /// channel disconnects, so two channels sharing a worker name don't cause
+    /// the first disconnect to free a slot the second is still using.
+    accepted_identities: Arc<RwLock<HashMap<String, usize>>>,
     /// Channel for session messages
     session_tx: mpsc::Sender<SessionMessage>,
     /// Receiver for session messages
@@ -129,9 +133,9 @@ enum IdentityDecision {
 }
 
 /// Pure policy: immutability first, then the cardinality cap (existing names
-/// don't count against it).
+/// don't count against it, since they already occupy a slot).
 fn apply_identity_policy(
-    accepted: &mut std::collections::HashSet<String>,
+    accepted: &mut HashMap<String, usize>,
     current: &Option<String>,
     name: &str,
     cap: usize,
@@ -139,10 +143,22 @@ fn apply_identity_policy(
     if current.is_some() {
         return IdentityDecision::AlreadySet;
     }
-    if !accepted.contains(name) && accepted.len() >= cap {
+    if !accepted.contains_key(name) && accepted.len() >= cap {
         return IdentityDecision::CapReached;
     }
     IdentityDecision::Accept
+}
+
+/// Release one channel's hold on a worker identity. The name's reference count
+/// is decremented and the entry removed only when the last holder disconnects,
+/// so a shared name isn't freed while another live channel still uses it.
+fn release_identity(accepted: &mut HashMap<String, usize>, name: &str) {
+    if let Some(count) = accepted.get_mut(name) {
+        *count -= 1;
+        if *count == 0 {
+            accepted.remove(name);
+        }
+    }
 }
 
 /// Metrics label for a channel: declared identity, or `channel_N`.
@@ -307,7 +323,7 @@ impl PoolServer {
             worker_hashrate_tracker,
             sessions: Arc::new(RwLock::new(HashMap::new())),
             channels: Arc::new(RwLock::new(HashMap::new())),
-            accepted_identities: Arc::new(RwLock::new(HashSet::new())),
+            accepted_identities: Arc::new(RwLock::new(HashMap::new())),
             session_tx,
             session_rx,
             // Initialize to impossible target (all zeros) so any share validated
@@ -843,7 +859,7 @@ impl PoolServer {
                     .and_then(|c| c.worker_identity)
             };
             if let Some(identity) = worker_identity {
-                accepted_identities.write().await.remove(&identity);
+                release_identity(&mut *accepted_identities.write().await, &identity);
             }
 
             // Track connection duration and detect attack patterns
@@ -1030,7 +1046,7 @@ impl PoolServer {
             if !freed_identities.is_empty() {
                 let mut accepted = self.accepted_identities.write().await;
                 for identity in freed_identities {
-                    accepted.remove(&identity);
+                    release_identity(&mut accepted, &identity);
                 }
             }
         }
@@ -1078,7 +1094,10 @@ impl PoolServer {
                     MAX_WORKER_IDENTITIES,
                 ) {
                     IdentityDecision::Accept => {
-                        accepted.insert(worker_name.clone());
+                        // Refcount this declaration: a fresh name starts at 1,
+                        // an already-present name (shared across live channels)
+                        // is incremented so it isn't freed until all holders go.
+                        *accepted.entry(worker_name.clone()).or_insert(0) += 1;
                         info!(
                             "Channel {} identified as worker '{}'",
                             channel_id, worker_name
@@ -1374,6 +1393,13 @@ impl PoolServer {
                                 share.job_id, e
                             );
                         }
+
+                        // A block was found and submitted by this branch; record
+                        // the block-found metric even though the share is a payout
+                        // duplicate, so cross-path blocks are not dropped from
+                        // per-worker block-found stats (the normal accepted path
+                        // records this too).
+                        self.metrics.record_worker_block_found(&worker_label);
                     }
                     self.metrics.record_share_rejected("CrossPathDuplicate");
                     self.metrics.record_worker_share_rejected(&worker_label);
@@ -1720,14 +1746,14 @@ mod tests {
 
     #[test]
     fn identity_policy() {
-        let mut accepted = std::collections::HashSet::new();
+        let mut accepted: HashMap<String, usize> = HashMap::new();
 
         // First identity accepted
         assert_eq!(
             apply_identity_policy(&mut accepted, &None, "rig-1", 2),
             IdentityDecision::Accept
         );
-        accepted.insert("rig-1".to_string());
+        *accepted.entry("rig-1".to_string()).or_insert(0) += 1;
 
         // Immutable: second declaration on same channel ignored
         assert_eq!(
@@ -1742,11 +1768,44 @@ mod tests {
         );
 
         // Cap reached for a NEW name
-        accepted.insert("rig-9".to_string());
+        *accepted.entry("rig-9".to_string()).or_insert(0) += 1;
         assert_eq!(
             apply_identity_policy(&mut accepted, &None, "rig-3", 2),
             IdentityDecision::CapReached
         );
+    }
+
+    /// Reference counting: two live channels sharing a worker name occupy one
+    /// slot held with count 2. The first disconnect must NOT free the slot (the
+    /// second channel still uses it); only the last disconnect releases it.
+    #[test]
+    fn identity_refcount_release() {
+        let mut accepted: HashMap<String, usize> = HashMap::new();
+
+        // Channel A and channel B both declare "rig-1".
+        *accepted.entry("rig-1".to_string()).or_insert(0) += 1;
+        *accepted.entry("rig-1".to_string()).or_insert(0) += 1;
+        assert_eq!(accepted.get("rig-1"), Some(&2));
+
+        // Channel A disconnects: count drops to 1, slot is NOT freed.
+        release_identity(&mut accepted, "rig-1");
+        assert_eq!(
+            accepted.get("rig-1"),
+            Some(&1),
+            "slot must remain while channel B still holds it"
+        );
+
+        // Channel B disconnects: last holder gone, slot freed.
+        release_identity(&mut accepted, "rig-1");
+        assert!(
+            !accepted.contains_key("rig-1"),
+            "slot must be freed once the last holder disconnects"
+        );
+
+        // Releasing an unknown / already-freed name is a no-op (no underflow panic).
+        release_identity(&mut accepted, "rig-1");
+        release_identity(&mut accepted, "never-seen");
+        assert!(accepted.is_empty());
     }
 
     #[test]
