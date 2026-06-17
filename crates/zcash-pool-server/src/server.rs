@@ -51,6 +51,7 @@ struct ConnectionCtx {
     job_distributor: Arc<RwLock<JobDistributor>>,
     sessions: Arc<RwLock<HashMap<u32, mpsc::Sender<ServerMessage>>>>,
     channels: Arc<RwLock<HashMap<u32, Channel>>>,
+    accepted_identities: Arc<RwLock<HashSet<String>>>,
     session_tx: mpsc::Sender<SessionMessage>,
     duplicate_detector: Arc<InMemoryDuplicateDetector>,
     metrics: Arc<PoolMetrics>,
@@ -334,6 +335,7 @@ impl PoolServer {
             job_distributor: Arc::clone(&self.job_distributor),
             sessions: Arc::clone(&self.sessions),
             channels: Arc::clone(&self.channels),
+            accepted_identities: Arc::clone(&self.accepted_identities),
             session_tx: self.session_tx.clone(),
             duplicate_detector: Arc::clone(&self.duplicate_detector),
             metrics: Arc::clone(&self.metrics),
@@ -804,6 +806,7 @@ impl PoolServer {
         // Spawn session task
         let sessions = Arc::clone(&ctx.sessions);
         let channels = Arc::clone(&ctx.channels);
+        let accepted_identities = Arc::clone(&ctx.accepted_identities);
         let metrics = Arc::clone(&ctx.metrics);
         let connection_tracker = Arc::clone(&ctx.connection_tracker);
         let sequence_validator = Arc::clone(&ctx.sequence_validator);
@@ -827,12 +830,20 @@ impl PoolServer {
 
             // Clean up session and channel atomically on exit
             // Note: We take both locks before modifying either to prevent race conditions
-            // where share validation could access a channel that's partially cleaned up
-            {
+            // where share validation could access a channel that's partially cleaned up.
+            // Extract the declared worker identity BEFORE removing the channel entry so
+            // we can free its slot in accepted_identities — without this, the cap would
+            // fill permanently as miners cycle through connections.
+            let worker_identity = {
                 let mut sessions_guard = sessions.write().await;
                 let mut channels_guard = channels.write().await;
                 sessions_guard.remove(&channel_id);
-                channels_guard.remove(&channel_id);
+                channels_guard
+                    .remove(&channel_id)
+                    .and_then(|c| c.worker_identity)
+            };
+            if let Some(identity) = worker_identity {
+                accepted_identities.write().await.remove(&identity);
             }
 
             // Track connection duration and detect attack patterns
@@ -998,15 +1009,29 @@ impl PoolServer {
         }
 
         if !slow_or_closed.is_empty() {
-            let mut sessions = self.sessions.write().await;
-            let mut channels = self.channels.write().await;
-            for channel_id in slow_or_closed {
-                warn!(
-                    "Dropping slow or closed session {} during job broadcast",
-                    channel_id
-                );
-                sessions.remove(&channel_id);
-                channels.remove(&channel_id);
+            // Collect freed identities so we can release the channels lock before
+            // touching accepted_identities (the IdentityDeclared handler acquires
+            // accepted_identities THEN channels, so the reverse order here would invert).
+            let freed_identities: Vec<String> = {
+                let mut sessions = self.sessions.write().await;
+                let mut channels = self.channels.write().await;
+                slow_or_closed
+                    .into_iter()
+                    .filter_map(|channel_id| {
+                        warn!(
+                            "Dropping slow or closed session {} during job broadcast",
+                            channel_id
+                        );
+                        sessions.remove(&channel_id);
+                        channels.remove(&channel_id).and_then(|c| c.worker_identity)
+                    })
+                    .collect()
+            };
+            if !freed_identities.is_empty() {
+                let mut accepted = self.accepted_identities.write().await;
+                for identity in freed_identities {
+                    accepted.remove(&identity);
+                }
             }
         }
 
