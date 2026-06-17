@@ -1194,6 +1194,17 @@ impl PoolServer {
         // already credited via the jd-server path. Treat as Duplicate so vardiff,
         // accepted counters, and metrics are not updated for a non-credited share.
         let mut cross_path_dup = false;
+        // Compute miner_id before acquiring channels.write() to avoid lock-order
+        // inversion: the cleanup task in handle_new_connection acquires
+        // connection_times.write() then channels.write(), so we must not hold
+        // channels.write() while awaiting connection_times.read().
+        let miner_id: MinerId = self
+            .connection_times
+            .read()
+            .await
+            .get(&channel_id)
+            .map(|(_, addr)| addr.ip().to_string())
+            .unwrap_or_else(|| format!("channel_{}", channel_id));
         let maybe_new_target = if let Ok(ref validation) = result {
             if validation.accepted {
                 let difficulty = validation.difficulty;
@@ -1218,13 +1229,6 @@ impl PoolServer {
                         // skip vardiff and all accepted-share accounting. The
                         // try_record_share_once call is the authoritative credit gate.
                         let payout_credited = if let Some(diff) = difficulty {
-                            let miner_id: MinerId = self
-                                .connection_times
-                                .read()
-                                .await
-                                .get(&channel_id)
-                                .map(|(_, addr)| addr.ip().to_string())
-                                .unwrap_or_else(|| format!("channel_{}", channel_id));
                             self.payout_tracker.try_record_share_once(
                                 &miner_id,
                                 diff,
