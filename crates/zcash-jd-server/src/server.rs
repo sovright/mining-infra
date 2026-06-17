@@ -861,39 +861,42 @@ impl JdServer {
                 continue;
             }
 
-            // Re-check prev_hash immediately before the authoritative credit gate.
-            // The cross-path solution set is cleared on new-block events in pool-server.
-            // If a new block arrived while Equihash was running, the cross-path set is
-            // now empty and an old-job share could be credited a second time. Checking
-            // prev_hash here closes that TOCTOU window: the window shrinks from
-            // Equihash-verification-time (ms) to the gap between this read and the
-            // try_record_share_once call (ns), which is an acceptable residual.
-            {
-                let guard = self.current_prev_hash.read().await;
-                if let Some(expected) = *guard
-                    && job.prev_hash != expected
-                {
-                    reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
-                    continue;
-                }
-            }
-
-            // Share is valid: credit the declaring client at the share target's
-            // difficulty. Use try_record_share_once to prevent double-credit if
-            // the same solution was already submitted via the pool-server path
-            // (both paths share one Arc<PayoutTracker> but separate per-path dedups).
-            // If it is a cross-path duplicate, report it as Duplicate — not accepted —
-            // so the client sees the correct response and accepted/rejected counters
-            // reflect actual credits issued.
+            // Authoritative staleness re-check + credit, performed while HOLDING the
+            // current_prev_hash read guard so the two are atomic w.r.t. a new block.
+            //
+            // The cross-path solution set is cleared on new-block events in pool-server
+            // (handle_new_template), which FIRST calls set_current_prev_hash — taking
+            // the current_prev_hash write lock — and only LATER calls
+            // clear_cross_path_solutions. By holding this read guard across the
+            // (synchronous, no-await) try_record_share_once call, we block that write,
+            // and therefore the subsequent clear, until the credit completes. Without
+            // it, a new block could update prev_hash and clear the set in the gap
+            // between the check and the credit, letting an old-job share be credited a
+            // second time after the pool-path record was wiped (epoch-clear double
+            // credit). try_record_share_once does not await, so the guard is brief and
+            // cannot deadlock (no other lock is held while awaiting it).
             let difficulty = target_to_difficulty(&Target::from_le_bytes(share_target));
-            if self.payout_tracker.try_record_share_once(
-                &job.client_id,
-                difficulty,
-                &share.solution,
-            ) {
-                accepted += 1;
-            } else {
-                reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
+            let credit = {
+                let guard = self.current_prev_hash.read().await;
+                match *guard {
+                    Some(expected) if job.prev_hash != expected => None,
+                    _ => Some(self.payout_tracker.try_record_share_once(
+                        &job.client_id,
+                        difficulty,
+                        &share.solution,
+                    )),
+                }
+            };
+            match credit {
+                // Stale: a new tip landed before we could credit. Reject so the old-job
+                // share is never paid (it may already be credited on the pool path).
+                None => reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error),
+                // Newly credited.
+                Some(true) => accepted += 1,
+                // Cross-path duplicate: same solution already credited via the
+                // pool-server path. Report Duplicate so accepted/rejected counters
+                // reflect actual credits issued.
+                Some(false) => reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error),
             }
         }
 
