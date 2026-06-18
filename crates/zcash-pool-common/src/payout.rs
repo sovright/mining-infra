@@ -4,7 +4,7 @@
 //! In-memory for Phase 3; can be upgraded to database-backed later.
 
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 /// cleared on every new block epoch, so FIFO eviction order is sufficient —
 /// within one epoch the insertion order does not affect correctness.
 struct BoundedSolutionSet {
-    seen: HashMap<[u8; 32], ()>,
+    seen: HashSet<[u8; 32]>,
     order: VecDeque<[u8; 32]>,
     capacity: usize,
 }
@@ -24,7 +24,7 @@ impl BoundedSolutionSet {
         // panic; clamp to at least one so the set is always well-formed.
         let capacity = capacity.max(1);
         Self {
-            seen: HashMap::with_capacity(capacity.min(1024)),
+            seen: HashSet::with_capacity(capacity.min(1024)),
             order: VecDeque::with_capacity(capacity.min(1024)),
             capacity,
         }
@@ -33,7 +33,7 @@ impl BoundedSolutionSet {
     /// Returns `true` if `key` was not previously seen and has been recorded.
     /// Returns `false` if `key` was already present (cross-path duplicate).
     fn insert_if_new(&mut self, key: [u8; 32]) -> bool {
-        if self.seen.contains_key(&key) {
+        if self.seen.contains(&key) {
             return false;
         }
         if self.seen.len() >= self.capacity {
@@ -44,7 +44,7 @@ impl BoundedSolutionSet {
                 .expect("order non-empty when seen is at capacity");
             self.seen.remove(&oldest);
         }
-        self.seen.insert(key, ());
+        self.seen.insert(key);
         self.order.push_back(key);
         true
     }
@@ -71,7 +71,13 @@ pub struct MinerStats {
 /// Maximum solution hashes held in the cross-path dedup set per block epoch.
 /// The set is cleared on every new block, so this cap only needs to cover
 /// solutions submitted within one block interval (≈75 s on Zcash mainnet).
-/// 32 bytes/entry × 500k ≈ 16 MB worst-case.
+///
+/// Each key is stored twice (in `seen` and in `order`), so worst-case key
+/// storage is 2 × 32 B × 500k ≈ 32 MB, plus hashbrown/VecDeque overhead
+/// (~34–36 MB total). This cap is a memory backstop, NOT a within-epoch
+/// security boundary: filling it requires 500k *valid* Equihash solutions in
+/// one block interval, which is computationally infeasible, so FIFO eviction
+/// cannot be reached by an attacker before the next block clears the set.
 const MAX_CROSS_PATH_SOLUTIONS: usize = 500_000;
 
 /// PPS payout tracker
