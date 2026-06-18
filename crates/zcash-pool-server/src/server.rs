@@ -229,7 +229,14 @@ impl PoolServer {
         let (session_tx, session_rx) = mpsc::channel(10000);
 
         // Create payout tracker (shared with JD server)
-        let payout_tracker = Arc::new(PayoutTracker::default());
+        let payout_tracker = Arc::new(if let Some(ref path) = config.payout_state_path {
+            info!(path = %path.display(), "Payout state persistence enabled");
+            PayoutTracker::with_persistence(Duration::from_secs(600), path.clone())
+                .map_err(|e| PoolError::Config(format!("Failed to load payout state: {}", e)))?
+        } else {
+            warn!("Payout state persistence disabled");
+            PayoutTracker::default()
+        });
         // Separate tracker keyed by worker label for per-worker hashrate metrics.
         let worker_hashrate_tracker = Arc::new(PayoutTracker::default());
 

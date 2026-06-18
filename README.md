@@ -125,6 +125,7 @@ Pool server configuration (see `crates/zcash-pool-server/src/config.rs`):
 | `nonce_1_len` | 4 | Pool nonce prefix length (bytes) |
 | `initial_difficulty` | 1.0 | Starting share difficulty |
 | `target_shares_per_minute` | 5.0 | Vardiff target rate |
+| `payout_state_path` | `payout-state.json` | Durable PPS payout state file |
 | `noise_enabled` | false | Enable Noise_NK encryption |
 | `jd_listen_addr` | None | Job Declaration port (e.g. `0.0.0.0:3334`) |
 | `relay_enabled` | false | Enable compact block relay |

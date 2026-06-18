@@ -1,12 +1,15 @@
 //! Simple PPS (Pay Per Share) tracking
 //!
 //! Tracks share submissions per miner for payout calculation.
-//! In-memory for Phase 3; can be upgraded to database-backed later.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+use tracing::error;
 
 /// Bounded FIFO set for cross-path solution deduplication.
 /// Evicts the oldest-inserted entry when capacity is reached. The set is
@@ -80,6 +83,25 @@ pub struct MinerStats {
 /// cannot be reached by an attacker before the next block clears the set.
 const MAX_CROSS_PATH_SOLUTIONS: usize = 500_000;
 
+#[derive(Debug, Clone)]
+struct PayoutPersistence {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedPayoutState {
+    version: u32,
+    miners: BTreeMap<MinerId, PersistedMinerStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedMinerStats {
+    total_shares: u64,
+    total_difficulty: f64,
+}
+
+const PAYOUT_STATE_VERSION: u32 = 1;
+
 /// PPS payout tracker
 pub struct PayoutTracker {
     /// Per-miner statistics
@@ -92,6 +114,8 @@ pub struct PayoutTracker {
     /// solution reaches both the pool-server and jd-server submission paths.
     /// Keyed by SHA-256(solution_bytes); bounded FIFO, cleared on each new block.
     seen_solutions: RwLock<BoundedSolutionSet>,
+    /// Optional durable state path for payout totals.
+    persistence: Option<PayoutPersistence>,
 }
 
 impl PayoutTracker {
@@ -101,7 +125,29 @@ impl PayoutTracker {
             window_duration,
             window_start: RwLock::new(None),
             seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
+            persistence: None,
         }
+    }
+
+    /// Create a payout tracker that persists payout totals to disk.
+    ///
+    /// Only payout totals are restored after restart. Rolling-window counters
+    /// and active-miner timestamps restart empty because they describe current
+    /// process activity, not durable payout credit.
+    pub fn with_persistence<P>(window_duration: Duration, path: P) -> io::Result<Self>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        let miners = load_persisted_miners(&path)?;
+
+        Ok(Self {
+            miners: RwLock::new(miners),
+            window_duration,
+            window_start: RwLock::new(None),
+            seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
+            persistence: Some(PayoutPersistence { path }),
+        })
     }
 
     /// Record a share for a miner
@@ -110,6 +156,19 @@ impl PayoutTracker {
     /// Ignores shares with invalid difficulty (NaN, Infinity, negative, zero)
     /// to prevent poisoning payout calculations.
     pub fn record_share(&self, miner_id: &MinerId, difficulty: f64) {
+        if let Err(err) = self.try_record_share(miner_id, difficulty) {
+            error!(
+                "Failed to persist payout share for miner {}: {}",
+                miner_id, err
+            );
+        }
+    }
+
+    /// Record a share and report persistence failures to the caller.
+    ///
+    /// Returns `Ok(false)` when the share was rejected because the difficulty
+    /// was invalid, and `Ok(true)` when it was recorded.
+    pub fn try_record_share(&self, miner_id: &MinerId, difficulty: f64) -> io::Result<bool> {
         // Guard against NaN, Infinity, negative, and zero difficulty
         if !difficulty.is_finite() || difficulty <= 0.0 {
             tracing::warn!(
@@ -117,7 +176,7 @@ impl PayoutTracker {
                 difficulty,
                 miner_id
             );
-            return;
+            return Ok(false);
         }
 
         let now = Instant::now();
@@ -139,6 +198,9 @@ impl PayoutTracker {
         stats.window_shares += 1;
         stats.window_difficulty += difficulty;
         stats.last_share = Some(now);
+
+        self.persist_locked(&miners)?;
+        Ok(true)
     }
 
     /// Record a share, deduplicating by solution bytes across all submission paths.
@@ -293,6 +355,12 @@ impl PayoutTracker {
     pub fn remove_miner(&self, miner_id: &MinerId) {
         let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
         miners.remove(miner_id);
+        if let Err(err) = self.persist_locked(&miners) {
+            error!(
+                "Failed to persist payout state after removing miner {}: {}",
+                miner_id, err
+            );
+        }
     }
 
     /// Clear all cross-path solution hashes.
@@ -320,6 +388,32 @@ impl PayoutTracker {
             None => return 0, // All miners are within window, nothing to clean
         };
         let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
+
+        if self.persistence.is_some() {
+            let mut stale = 0;
+            for stats in miners.values_mut() {
+                if stats.last_share.map(|t| t <= cutoff).unwrap_or(false) {
+                    stats.window_shares = 0;
+                    stats.window_difficulty = 0.0;
+                    stats.last_share = None;
+                    stale += 1;
+                }
+            }
+            if stale > 0 {
+                tracing::debug!(
+                    "Marked {} stale miner entries inactive while preserving payout totals",
+                    stale
+                );
+                if let Err(err) = self.persist_locked(&miners) {
+                    error!(
+                        "Failed to persist payout state after stale cleanup: {}",
+                        err
+                    );
+                }
+            }
+            return stale;
+        }
+
         let before = miners.len();
         miners.retain(|_, stats| stats.last_share.map(|t| t > cutoff).unwrap_or(false));
         let removed = before - miners.len();
@@ -328,6 +422,118 @@ impl PayoutTracker {
         }
         removed
     }
+
+    fn persist_locked(&self, miners: &HashMap<MinerId, MinerStats>) -> io::Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+
+        let persisted = PersistedPayoutState {
+            version: PAYOUT_STATE_VERSION,
+            miners: miners
+                .iter()
+                .map(|(miner_id, stats)| {
+                    (
+                        miner_id.clone(),
+                        PersistedMinerStats {
+                            total_shares: stats.total_shares,
+                            total_difficulty: stats.total_difficulty,
+                        },
+                    )
+                })
+                .collect(),
+        };
+
+        let json = serde_json::to_vec_pretty(&persisted).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("serialize payout state: {}", err),
+            )
+        })?;
+
+        atomic_write(&persistence.path, &json)
+    }
+}
+
+fn load_persisted_miners(path: &Path) -> io::Result<HashMap<MinerId, MinerStats>> {
+    if !path.exists() {
+        return Ok(HashMap::new());
+    }
+
+    let json = std::fs::read_to_string(path)?;
+    if json.trim().is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let persisted: PersistedPayoutState = serde_json::from_str(&json).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse payout state {}: {}", path.display(), err),
+        )
+    })?;
+
+    if persisted.version != PAYOUT_STATE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported payout state version {} in {}",
+                persisted.version,
+                path.display()
+            ),
+        ));
+    }
+
+    persisted
+        .miners
+        .into_iter()
+        .map(|(miner_id, stats)| {
+            if !stats.total_difficulty.is_finite() || stats.total_difficulty < 0.0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "invalid payout difficulty {} for miner {}",
+                        stats.total_difficulty, miner_id
+                    ),
+                ));
+            }
+
+            Ok((
+                miner_id,
+                MinerStats {
+                    total_shares: stats.total_shares,
+                    total_difficulty: stats.total_difficulty,
+                    window_shares: 0,
+                    window_difficulty: 0.0,
+                    last_share: None,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("payout state path {} has no file name", path.display()),
+        )
+    })?;
+    let tmp_path = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    std::fs::write(&tmp_path, bytes)?;
+    std::fs::rename(&tmp_path, path)?;
+    Ok(())
 }
 
 impl Default for PayoutTracker {
@@ -339,6 +545,19 @@ impl Default for PayoutTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_payout_state_path(test_name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bedrock-{test_name}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn test_record_share() {
@@ -436,6 +655,65 @@ mod tests {
         let removed = tracker.cleanup_stale_miners(Duration::ZERO);
         assert_eq!(removed, 2, "should have removed exactly 2 miners");
         assert_eq!(tracker.get_all_stats().len(), 0);
+    }
+
+    #[test]
+    fn test_persistent_tracker_restores_totals_after_restart() {
+        let state_path = unique_payout_state_path("restart");
+        let miner = "miner1".to_string();
+
+        {
+            let tracker =
+                PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone())
+                    .unwrap();
+            tracker.record_share(&miner, 100.0);
+            tracker.record_share(&miner, 50.0);
+        }
+
+        let restarted =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let stats = restarted.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 2);
+        assert_eq!(stats.total_difficulty, 150.0);
+        assert_eq!(stats.window_shares, 0);
+        assert_eq!(stats.window_difficulty, 0.0);
+        assert_eq!(restarted.active_miner_count(), 0);
+
+        restarted.record_share(&miner, 25.0);
+        let restarted_again =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let stats = restarted_again.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 3);
+        assert_eq!(stats.total_difficulty, 175.0);
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_persistent_cleanup_preserves_payout_totals() {
+        let state_path = unique_payout_state_path("cleanup");
+        let miner = "miner1".to_string();
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        tracker.record_share(&miner, 100.0);
+        let removed = tracker.cleanup_stale_miners(Duration::ZERO);
+
+        assert_eq!(removed, 1);
+        let stats = tracker.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 1);
+        assert_eq!(stats.total_difficulty, 100.0);
+        assert_eq!(stats.window_shares, 0);
+        assert_eq!(stats.window_difficulty, 0.0);
+        assert_eq!(stats.last_share, None);
+
+        let restarted =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let stats = restarted.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 1);
+        assert_eq!(stats.total_difficulty, 100.0);
+
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]

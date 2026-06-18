@@ -37,6 +37,9 @@ pub struct PoolConfig {
     /// Pool's payout script for coinbase (used by JD Server)
     pub pool_payout_script: Option<Vec<u8>>,
 
+    /// Path to durable PPS payout state.
+    pub payout_state_path: Option<PathBuf>,
+
     /// Enable Noise encryption for miner connections
     pub noise_enabled: bool,
 
@@ -123,6 +126,8 @@ pub enum ConfigError {
     InvalidTimingJitter { min_ms: u64, max_ms: u64 },
     /// Invalid FEC shard total (must be <= 255 for Reed-Solomon)
     InvalidFecShardTotal { total: usize },
+    /// Invalid payout state path
+    InvalidPayoutStatePath,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -170,6 +175,9 @@ impl std::fmt::Display for ConfigError {
                     "FEC shard total {} exceeds Reed-Solomon maximum of 255",
                     total
                 )
+            }
+            ConfigError::InvalidPayoutStatePath => {
+                write!(f, "payout_state_path must not be empty")
             }
         }
     }
@@ -232,6 +240,15 @@ impl PoolConfig {
             return Err(ConfigError::JdMissingPayoutScript);
         }
 
+        if self
+            .payout_state_path
+            .as_ref()
+            .map(|path| path.as_os_str().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::InvalidPayoutStatePath);
+        }
+
         // Timing jitter min must not exceed max
         if self.timing_jitter_enabled && self.timing_jitter_min_ms > self.timing_jitter_max_ms {
             return Err(ConfigError::InvalidTimingJitter {
@@ -265,6 +282,7 @@ impl Default for PoolConfig {
             max_connections: 10000,
             jd_listen_addr: None, // Disabled by default
             pool_payout_script: None,
+            payout_state_path: Some(PathBuf::from("payout-state.json")),
             noise_enabled: false,
             noise_private_key_path: None,
             jd_noise_enabled: false,
@@ -306,6 +324,14 @@ mod tests {
     #[test]
     fn default_config_validates_ok() {
         assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_has_payout_state_path() {
+        assert_eq!(
+            valid_config().payout_state_path,
+            Some(PathBuf::from("payout-state.json"))
+        );
     }
 
     // 1. InvalidNonce1Len
@@ -521,6 +547,13 @@ mod tests {
         cfg.timing_jitter_min_ms = 50;
         cfg.timing_jitter_max_ms = 50;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn empty_payout_state_path_rejected() {
+        let mut cfg = valid_config();
+        cfg.payout_state_path = Some(PathBuf::new());
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidPayoutStatePath));
     }
 
     // 12. Disabled features ignore invalid sub-config
