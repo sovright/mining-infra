@@ -6,8 +6,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::error;
 
@@ -116,6 +118,14 @@ pub struct PayoutTracker {
     seen_solutions: RwLock<BoundedSolutionSet>,
     /// Optional durable state path for payout totals.
     persistence: Option<PayoutPersistence>,
+    /// Set whenever payout totals change since the last successful flush.
+    /// Recording a share marks this rather than writing to disk inline: the
+    /// disk write (full-file serialize + fsync) is far too expensive to run on
+    /// the hot path — per accepted share, under the `miners` write lock, on the
+    /// async runtime thread. Instead `flush()` is called periodically and on
+    /// graceful shutdown, doing the write off the lock. Worst case on a hard
+    /// crash is the loss of totals accumulated since the last flush interval.
+    dirty: AtomicBool,
 }
 
 impl PayoutTracker {
@@ -126,6 +136,7 @@ impl PayoutTracker {
             window_start: RwLock::new(None),
             seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
             persistence: None,
+            dirty: AtomicBool::new(false),
         }
     }
 
@@ -147,6 +158,7 @@ impl PayoutTracker {
             window_start: RwLock::new(None),
             seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
             persistence: Some(PayoutPersistence { path }),
+            dirty: AtomicBool::new(false),
         })
     }
 
@@ -155,20 +167,12 @@ impl PayoutTracker {
     /// Validates that difficulty is finite and positive before recording.
     /// Ignores shares with invalid difficulty (NaN, Infinity, negative, zero)
     /// to prevent poisoning payout calculations.
-    pub fn record_share(&self, miner_id: &MinerId, difficulty: f64) {
-        if let Err(err) = self.try_record_share(miner_id, difficulty) {
-            error!(
-                "Failed to persist payout share for miner {}: {}",
-                miner_id, err
-            );
-        }
-    }
-
-    /// Record a share and report persistence failures to the caller.
     ///
-    /// Returns `Ok(false)` when the share was rejected because the difficulty
-    /// was invalid, and `Ok(true)` when it was recorded.
-    pub fn try_record_share(&self, miner_id: &MinerId, difficulty: f64) -> io::Result<bool> {
+    /// Durable state is NOT written here — recording only marks the tracker
+    /// dirty (see [`PayoutTracker::flush`]); the disk write happens off the hot
+    /// path. Returns `true` if the share was recorded, `false` if it was
+    /// rejected for invalid difficulty.
+    pub fn record_share(&self, miner_id: &MinerId, difficulty: f64) -> bool {
         // Guard against NaN, Infinity, negative, and zero difficulty
         if !difficulty.is_finite() || difficulty <= 0.0 {
             tracing::warn!(
@@ -176,7 +180,7 @@ impl PayoutTracker {
                 difficulty,
                 miner_id
             );
-            return Ok(false);
+            return false;
         }
 
         let now = Instant::now();
@@ -198,9 +202,18 @@ impl PayoutTracker {
         stats.window_shares += 1;
         stats.window_difficulty += difficulty;
         stats.last_share = Some(now);
+        drop(miners);
 
-        self.persist_locked(&miners)?;
-        Ok(true)
+        self.mark_dirty();
+        true
+    }
+
+    /// Mark payout totals as changed since the last flush. Cheap and lock-free;
+    /// the actual disk write is deferred to [`PayoutTracker::flush`].
+    fn mark_dirty(&self) {
+        if self.persistence.is_some() {
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 
     /// Record a share, deduplicating by solution bytes across all submission paths.
@@ -353,14 +366,11 @@ impl PayoutTracker {
 
     /// Remove a miner from the tracker (on disconnect)
     pub fn remove_miner(&self, miner_id: &MinerId) {
-        let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
-        miners.remove(miner_id);
-        if let Err(err) = self.persist_locked(&miners) {
-            error!(
-                "Failed to persist payout state after removing miner {}: {}",
-                miner_id, err
-            );
+        {
+            let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
+            miners.remove(miner_id);
         }
+        self.mark_dirty();
     }
 
     /// Clear all cross-path solution hashes.
@@ -379,8 +389,17 @@ impl PayoutTracker {
 
     /// Remove miners that haven't submitted a share within the given duration.
     ///
-    /// Prevents unbounded growth of the miners HashMap when miners
-    /// disconnect and reconnect with new channel IDs.
+    /// Without persistence this evicts stale entries to prevent unbounded growth
+    /// of the miners HashMap when miners disconnect and reconnect with new
+    /// channel IDs.
+    ///
+    /// With persistence enabled, stale entries are NOT evicted — their durable
+    /// payout totals are owed to the miner and must survive idle periods — so
+    /// only the rolling-window/active fields are reset. NOTE: this means the map
+    /// (and the on-disk file) grow with the number of distinct miner ids ever
+    /// seen; that growth is bounded by the operator's payout-settlement policy
+    /// removing fully-paid miners via [`PayoutTracker::remove_miner`], not by
+    /// this cleanup.
     pub fn cleanup_stale_miners(&self, max_idle: Duration) -> usize {
         // Use checked_sub to avoid panic if max_idle > uptime
         let cutoff = match Instant::now().checked_sub(max_idle) {
@@ -399,17 +418,13 @@ impl PayoutTracker {
                     stale += 1;
                 }
             }
+            drop(miners);
             if stale > 0 {
                 tracing::debug!(
                     "Marked {} stale miner entries inactive while preserving payout totals",
                     stale
                 );
-                if let Err(err) = self.persist_locked(&miners) {
-                    error!(
-                        "Failed to persist payout state after stale cleanup: {}",
-                        err
-                    );
-                }
+                self.mark_dirty();
             }
             return stale;
         }
@@ -423,36 +438,70 @@ impl PayoutTracker {
         removed
     }
 
-    fn persist_locked(&self, miners: &HashMap<MinerId, MinerStats>) -> io::Result<()> {
+    /// Write payout totals to disk if anything changed since the last flush.
+    ///
+    /// This is the single place durable state is written. Call it periodically
+    /// (e.g. from the server maintenance loop) and on graceful shutdown. It is a
+    /// no-op when persistence is disabled or nothing is dirty. The miners map is
+    /// serialized under a short read lock; the actual file write (and fsync)
+    /// happens AFTER the lock is released, so flushing never blocks share
+    /// recording on disk I/O. On write failure the dirty flag is restored so a
+    /// later flush retries.
+    pub fn flush(&self) -> io::Result<()> {
         let Some(persistence) = &self.persistence else {
             return Ok(());
         };
 
-        let persisted = PersistedPayoutState {
-            version: PAYOUT_STATE_VERSION,
-            miners: miners
-                .iter()
-                .map(|(miner_id, stats)| {
-                    (
-                        miner_id.clone(),
-                        PersistedMinerStats {
-                            total_shares: stats.total_shares,
-                            total_difficulty: stats.total_difficulty,
-                        },
-                    )
-                })
-                .collect(),
+        // Clear dirty first; if a share lands during the write it re-marks dirty
+        // and the next flush will pick it up.
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let json = {
+            let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+            serialize_state(&miners)
+        };
+        let json = match json {
+            Ok(json) => json,
+            Err(err) => {
+                self.dirty.store(true, Ordering::Release);
+                return Err(err);
+            }
         };
 
-        let json = serde_json::to_vec_pretty(&persisted).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("serialize payout state: {}", err),
-            )
-        })?;
-
-        atomic_write(&persistence.path, &json)
+        if let Err(err) = atomic_write(&persistence.path, &json) {
+            // Retry on the next flush rather than dropping the update.
+            self.dirty.store(true, Ordering::Release);
+            return Err(err);
+        }
+        Ok(())
     }
+}
+
+fn serialize_state(miners: &HashMap<MinerId, MinerStats>) -> io::Result<Vec<u8>> {
+    let persisted = PersistedPayoutState {
+        version: PAYOUT_STATE_VERSION,
+        miners: miners
+            .iter()
+            .map(|(miner_id, stats)| {
+                (
+                    miner_id.clone(),
+                    PersistedMinerStats {
+                        total_shares: stats.total_shares,
+                        total_difficulty: stats.total_difficulty,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    serde_json::to_vec_pretty(&persisted).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serialize payout state: {}", err),
+        )
+    })
 }
 
 fn load_persisted_miners(path: &Path) -> io::Result<HashMap<MinerId, MinerStats>> {
@@ -460,12 +509,34 @@ fn load_persisted_miners(path: &Path) -> io::Result<HashMap<MinerId, MinerStats>
         return Ok(HashMap::new());
     }
 
+    // A genuine I/O failure (permissions, unreadable device) is propagated so
+    // the operator notices a misconfiguration rather than silently losing
+    // accumulated payouts.
     let json = std::fs::read_to_string(path)?;
     if json.trim().is_empty() {
         return Ok(HashMap::new());
     }
 
-    let persisted: PersistedPayoutState = serde_json::from_str(&json).map_err(|err| {
+    // Corrupt / unparseable / wrong-version CONTENT must NOT brick the pool on
+    // boot: a truncated file from a crash, a manual edit, or a format change
+    // would otherwise make the pool refuse to start — the worst time to be
+    // down. Quarantine the bad file and start with empty totals.
+    match parse_persisted_miners(&json, path) {
+        Ok(miners) => Ok(miners),
+        Err(err) => {
+            error!(
+                "Payout state {} is unusable ({}); backing it up and starting with empty totals",
+                path.display(),
+                err
+            );
+            quarantine_corrupt_file(path);
+            Ok(HashMap::new())
+        }
+    }
+}
+
+fn parse_persisted_miners(json: &str, path: &Path) -> io::Result<HashMap<MinerId, MinerStats>> {
+    let persisted: PersistedPayoutState = serde_json::from_str(json).map_err(|err| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("parse payout state {}: {}", path.display(), err),
@@ -511,6 +582,29 @@ fn load_persisted_miners(path: &Path) -> io::Result<HashMap<MinerId, MinerStats>
         .collect()
 }
 
+/// Move an unusable state file aside so a fresh one can be written and the
+/// operator can still recover the original. Best-effort: a failure here is
+/// logged but does not block startup.
+fn quarantine_corrupt_file(path: &Path) {
+    let backup = path.with_file_name(format!(
+        "{}.corrupt-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "payout-state".to_string()),
+        std::process::id()
+    ));
+    if let Err(err) = std::fs::rename(path, &backup) {
+        error!(
+            "Failed to quarantine corrupt payout state {} -> {}: {}",
+            path.display(),
+            backup.display(),
+            err
+        );
+    } else {
+        error!("Quarantined corrupt payout state to {}", backup.display());
+    }
+}
+
 fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if let Some(parent) = path
         .parent()
@@ -531,8 +625,25 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         std::process::id()
     ));
 
-    std::fs::write(&tmp_path, bytes)?;
+    // Write + fsync the temp file before the rename so the renamed-in data is
+    // durable, not just present in the page cache. The rename itself is atomic,
+    // so a crash leaves either the old file or the fully-written new one — never
+    // a torn file. (Cheap now that flush() is periodic rather than per-share.)
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
     std::fs::rename(&tmp_path, path)?;
+
+    // fsync the directory so the rename itself survives a crash.
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -668,6 +779,8 @@ mod tests {
                     .unwrap();
             tracker.record_share(&miner, 100.0);
             tracker.record_share(&miner, 50.0);
+            // Durable state is written by flush(), not per-share.
+            tracker.flush().unwrap();
         }
 
         let restarted =
@@ -680,6 +793,7 @@ mod tests {
         assert_eq!(restarted.active_miner_count(), 0);
 
         restarted.record_share(&miner, 25.0);
+        restarted.flush().unwrap();
         let restarted_again =
             PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
         let stats = restarted_again.get_stats(&miner).unwrap();
@@ -707,6 +821,7 @@ mod tests {
         assert_eq!(stats.window_difficulty, 0.0);
         assert_eq!(stats.last_share, None);
 
+        tracker.flush().unwrap();
         let restarted =
             PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
         let stats = restarted.get_stats(&miner).unwrap();
@@ -714,6 +829,60 @@ mod tests {
         assert_eq!(stats.total_difficulty, 100.0);
 
         let _ = std::fs::remove_file(state_path);
+    }
+
+    /// A corrupt state file must not brick startup: it is quarantined and the
+    /// tracker starts with empty totals (graceful degradation over availability).
+    #[test]
+    fn test_corrupt_state_file_is_quarantined_not_fatal() {
+        let state_path = unique_payout_state_path("corrupt");
+        std::fs::write(&state_path, b"{ this is not valid json ]").unwrap();
+
+        // Must NOT return Err — the pool would otherwise refuse to start.
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        assert_eq!(tracker.get_all_stats().len(), 0, "should start empty");
+
+        // Original (bad) file was moved aside, not left in place to fail again.
+        assert!(!state_path.exists(), "corrupt file should be quarantined");
+
+        // Tracker is usable and can write a fresh, valid file.
+        tracker.record_share(&"miner1".to_string(), 10.0);
+        tracker.flush().unwrap();
+        let reloaded =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        assert_eq!(
+            reloaded
+                .get_stats(&"miner1".to_string())
+                .unwrap()
+                .total_shares,
+            1
+        );
+
+        // Clean up the quarantine backup + fresh file.
+        let backup = state_path.with_file_name(format!(
+            "{}.corrupt-{}",
+            state_path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// flush() is a no-op when nothing changed since the last flush.
+    #[test]
+    fn test_flush_is_noop_when_not_dirty() {
+        let state_path = unique_payout_state_path("noop");
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        // Nothing recorded yet: no file should be created by a flush.
+        tracker.flush().unwrap();
+        assert!(!state_path.exists(), "clean flush must not write a file");
+
+        tracker.record_share(&"miner1".to_string(), 5.0);
+        tracker.flush().unwrap();
+        assert!(state_path.exists(), "dirty flush must write a file");
+        let _ = std::fs::remove_file(&state_path);
     }
 
     #[test]

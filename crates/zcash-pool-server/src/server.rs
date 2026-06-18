@@ -451,6 +451,13 @@ impl PoolServer {
                 worker_hashrate_tracker.cleanup_stale_miners(Duration::from_secs(1800));
                 worker_hashrate_tracker.rotate_window_if_needed();
 
+                // Persist payout totals off the hot path. record_share only marks
+                // the tracker dirty; this is where durable state is actually
+                // written (no-op when nothing changed or persistence is off).
+                if let Err(e) = payout_tracker.flush() {
+                    error!("Failed to flush payout state: {}", e);
+                }
+
                 // Share-independent vardiff tick: lets overshooting channels
                 // recover. record_share-driven retargeting stops the moment a
                 // miner stops finding shares, which is exactly when difficulty
@@ -702,6 +709,12 @@ impl PoolServer {
 
                     // Give sessions a moment to close gracefully
                     tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    // Flush durable payout state before exiting so the last
+                    // window of credited shares is not lost on a clean shutdown.
+                    if let Err(e) = self.payout_tracker.flush() {
+                        error!("Failed to flush payout state on shutdown: {}", e);
+                    }
 
                     info!("Graceful shutdown complete ({} sessions closed)", session_count);
                     return Ok(());
