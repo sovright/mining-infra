@@ -3,9 +3,52 @@
 //! Tracks share submissions per miner for payout calculation.
 //! In-memory for Phase 3; can be upgraded to database-backed later.
 
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
+
+/// Bounded FIFO set for cross-path solution deduplication.
+/// Evicts the oldest-inserted entry when capacity is reached. The set is
+/// cleared on every new block epoch, so FIFO eviction order is sufficient —
+/// within one epoch the insertion order does not affect correctness.
+struct BoundedSolutionSet {
+    seen: HashSet<[u8; 32]>,
+    order: VecDeque<[u8; 32]>,
+    capacity: usize,
+}
+
+impl BoundedSolutionSet {
+    fn new(capacity: usize) -> Self {
+        // A zero capacity would make insert_if_new pop from an empty deque and
+        // panic; clamp to at least one so the set is always well-formed.
+        let capacity = capacity.max(1);
+        Self {
+            seen: HashSet::with_capacity(capacity.min(1024)),
+            order: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+        }
+    }
+
+    /// Returns `true` if `key` was not previously seen and has been recorded.
+    /// Returns `false` if `key` was already present (cross-path duplicate).
+    fn insert_if_new(&mut self, key: [u8; 32]) -> bool {
+        if self.seen.contains(&key) {
+            return false;
+        }
+        if self.seen.len() >= self.capacity {
+            // FIFO eviction: `order` and `seen` stay in sync, pop_front is Some here.
+            let oldest = self
+                .order
+                .pop_front()
+                .expect("order non-empty when seen is at capacity");
+            self.seen.remove(&oldest);
+        }
+        self.seen.insert(key);
+        self.order.push_back(key);
+        true
+    }
+}
 
 /// Unique identifier for a miner (could be pubkey, address, etc.)
 pub type MinerId = String;
@@ -25,6 +68,18 @@ pub struct MinerStats {
     pub last_share: Option<Instant>,
 }
 
+/// Maximum solution hashes held in the cross-path dedup set per block epoch.
+/// The set is cleared on every new block, so this cap only needs to cover
+/// solutions submitted within one block interval (≈75 s on Zcash mainnet).
+///
+/// Each key is stored twice (in `seen` and in `order`), so worst-case key
+/// storage is 2 × 32 B × 500k ≈ 32 MB, plus hashbrown/VecDeque overhead
+/// (~34–36 MB total). This cap is a memory backstop, NOT a within-epoch
+/// security boundary: filling it requires 500k *valid* Equihash solutions in
+/// one block interval, which is computationally infeasible, so FIFO eviction
+/// cannot be reached by an attacker before the next block clears the set.
+const MAX_CROSS_PATH_SOLUTIONS: usize = 500_000;
+
 /// PPS payout tracker
 pub struct PayoutTracker {
     /// Per-miner statistics
@@ -33,6 +88,10 @@ pub struct PayoutTracker {
     window_duration: Duration,
     /// When the current window started (first share in window)
     window_start: RwLock<Option<Instant>>,
+    /// Cross-path solution dedup: prevents double-credit when the same valid
+    /// solution reaches both the pool-server and jd-server submission paths.
+    /// Keyed by SHA-256(solution_bytes); bounded FIFO, cleared on each new block.
+    seen_solutions: RwLock<BoundedSolutionSet>,
 }
 
 impl PayoutTracker {
@@ -41,6 +100,7 @@ impl PayoutTracker {
             miners: RwLock::new(HashMap::new()),
             window_duration,
             window_start: RwLock::new(None),
+            seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
         }
     }
 
@@ -79,6 +139,54 @@ impl PayoutTracker {
         stats.window_shares += 1;
         stats.window_difficulty += difficulty;
         stats.last_share = Some(now);
+    }
+
+    /// Record a share, deduplicating by solution bytes across all submission paths.
+    ///
+    /// Both the pool-server (SV2 direct) and jd-server (JDC) call into the same
+    /// `Arc<PayoutTracker>`. A miner running both clients could submit the same
+    /// valid solution through both paths; per-path dedup sets would not catch it.
+    /// This method adds a cross-path dedup keyed by SHA-256(solution).
+    ///
+    /// Returns `true` if the share was newly recorded, `false` if it was a
+    /// cross-path duplicate (no credit issued; caller should report as Duplicate).
+    pub fn try_record_share_once(
+        &self,
+        miner_id: &MinerId,
+        difficulty: f64,
+        solution: &[u8],
+    ) -> bool {
+        // Mirror record_share's validity guard up front. An invalid-difficulty
+        // share is never credited; recording its key here would consume a dedup
+        // slot and return `true` (caller counts it accepted) while no credit was
+        // issued, and would then falsely dedup a later honest resubmission of the
+        // same solution at a valid difficulty. Reject without touching the set.
+        if !difficulty.is_finite() || difficulty <= 0.0 {
+            tracing::warn!(
+                "Ignoring cross-path share with invalid difficulty {} for miner {}",
+                difficulty,
+                miner_id
+            );
+            return false;
+        }
+
+        let key: [u8; 32] = Sha256::digest(solution).into();
+        let is_new = {
+            let mut seen = self
+                .seen_solutions
+                .write()
+                .unwrap_or_else(|e| e.into_inner());
+            seen.insert_if_new(key)
+        };
+        if is_new {
+            self.record_share(miner_id, difficulty);
+        } else {
+            tracing::warn!(
+                miner_id = %miner_id,
+                "Cross-path duplicate share rejected (same solution submitted via pool-server and jd-server)"
+            );
+        }
+        is_new
     }
 
     /// Get statistics for a miner
@@ -185,6 +293,20 @@ impl PayoutTracker {
     pub fn remove_miner(&self, miner_id: &MinerId) {
         let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
         miners.remove(miner_id);
+    }
+
+    /// Clear all cross-path solution hashes.
+    ///
+    /// Call this whenever a new block epoch starts (i.e. `is_new_block` in the
+    /// template handler). Tying the cross-path window to block epochs means an
+    /// evicted hash can never be replayed for double-credit: the job that
+    /// produced it is already stale, so both per-path dedup sets have moved on.
+    pub fn clear_cross_path_solutions(&self) {
+        let mut seen = self
+            .seen_solutions
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        *seen = BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS);
     }
 
     /// Remove miners that haven't submitted a share within the given duration.
@@ -551,6 +673,75 @@ mod tests {
             tracker.get_stats(&"miner_new".to_string()).is_some(),
             "new miner should be preserved"
         );
+    }
+
+    /// clear_cross_path_solutions resets the epoch boundary: a solution that was
+    /// previously seen must be accepted again after the clear (simulating a new
+    /// block epoch where old-job solutions are irrelevant).
+    #[test]
+    fn test_clear_cross_path_solutions_resets_dedup() {
+        let tracker = PayoutTracker::default();
+        let miner = "miner1".to_string();
+        let solution = b"fake_solution_bytes_32_chars_long".to_vec();
+
+        // First submission: credited
+        assert!(
+            tracker.try_record_share_once(&miner, 1.0, &solution),
+            "first submission must be credited"
+        );
+
+        // Second submission same epoch: cross-path dup, rejected
+        assert!(
+            !tracker.try_record_share_once(&miner, 1.0, &solution),
+            "duplicate within epoch must be rejected"
+        );
+
+        // New block epoch: clear cross-path solutions
+        tracker.clear_cross_path_solutions();
+
+        // Same solution bytes after clear: accepted again (new epoch, new job)
+        assert!(
+            tracker.try_record_share_once(&miner, 1.0, &solution),
+            "same solution must be accepted after epoch clear"
+        );
+
+        // Stats: 2 credits (first + post-clear), 1 rejected
+        let stats = tracker.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 2);
+    }
+
+    /// An invalid-difficulty share must NOT consume a cross-path dedup slot and
+    /// must NOT be reported as recorded. Otherwise the solution's hash would be
+    /// stuck in the set with no credit issued, falsely deduping a later honest
+    /// resubmission of the same solution at a valid difficulty.
+    #[test]
+    fn test_invalid_difficulty_does_not_poison_cross_path_dedup() {
+        let tracker = PayoutTracker::default();
+        let miner = "miner1".to_string();
+        let solution = b"fake_solution_bytes_32_chars_long".to_vec();
+
+        // Invalid difficulty: not recorded, returns false, set untouched.
+        assert!(
+            !tracker.try_record_share_once(&miner, 0.0, &solution),
+            "invalid difficulty must not be credited"
+        );
+        assert!(
+            !tracker.try_record_share_once(&miner, f64::NAN, &solution),
+            "NaN difficulty must not be credited"
+        );
+        assert!(
+            tracker.get_stats(&miner).is_none(),
+            "no credit should exist"
+        );
+
+        // A later honest submission of the SAME solution at a valid difficulty
+        // must be credited — proving the earlier invalid attempts did not poison
+        // the dedup set.
+        assert!(
+            tracker.try_record_share_once(&miner, 1.0, &solution),
+            "valid resubmission of the same solution must be credited"
+        );
+        assert_eq!(tracker.get_stats(&miner).unwrap().total_shares, 1);
     }
 
     /// Kill mutants on lines 180-181:

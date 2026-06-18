@@ -119,8 +119,10 @@ fn test_full_mining_lifecycle() {
     // =========================================================================
     // Phase 4: Duplicate Detection
     // =========================================================================
-    // Submit the exact same share again -- should be rejected as Duplicate
-    // because the detector already recorded it in Phase 3.
+    // Invalid solutions are NOT recorded in the duplicate detector — recording
+    // them would let an attacker fill the per-job capacity at zero PoW cost.
+    // Re-submitting the same invalid solution must still return InvalidSolution,
+    // never Duplicate.
     let result_dup = processor
         .validate_share_with_job(&share, &job, &detector, &block_target)
         .expect("validate_share_with_job should not return Err");
@@ -129,9 +131,9 @@ fn test_full_mining_lifecycle() {
     assert!(
         matches!(
             result_dup.result,
-            ShareResult::Rejected(RejectReason::Duplicate)
+            ShareResult::Rejected(RejectReason::InvalidSolution)
         ),
-        "Second identical share should be Duplicate, got: {:?}",
+        "Re-submitted invalid share must return InvalidSolution (not Duplicate), got: {:?}",
         result_dup.result
     );
 

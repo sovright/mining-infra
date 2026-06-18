@@ -163,19 +163,25 @@ pub struct JdServer {
     pending_missing: Arc<TokioRwLock<HashMap<(String, u32), PendingMissingTransactions>>>,
     /// Per-job dedup sets of seen share keys, keyed by job_id.
     ///
-    /// A share key is `sha256(nonce ‖ time_le ‖ solution[..64])`. A key is
-    /// registered the moment a share passes the cheap checks (before the
-    /// expensive Equihash verification), so byte-identical replays are rejected
-    /// as duplicates regardless of validity. Remembering an invalid share is
-    /// harmless and rate-limits resubmission of garbage. Entries for jobs that
-    /// no longer resolve are evicted at the head of each handler call.
+    /// A share key is `sha256(nonce ‖ time_le ‖ solution[..64])`. The dedup
+    /// uses a three-phase pattern to prevent two distinct attacks:
     ///
-    /// Memory bound: steady-state worst case is
-    /// `live_jobs × MAX_SEEN_SHARES_PER_JOB × 32 bytes` plus `HashSet` overhead
-    /// (~1-2 MB per job at the per-job cap). The eviction sweep alone only
-    /// scopes this to live jobs; the real backstop on `live_jobs` is token
-    /// issuance — `max_tokens_per_client` and `token_lifetime` — since each job
-    /// is pinned to an unexpired token.
+    /// 1. **Read-only pre-flight** (before Equihash): if the key is already in
+    ///    the set, reject immediately as `Duplicate` without running the verifier.
+    ///    This prevents valid-share replay DoS (force Equihash on every replay).
+    ///
+    /// 2. **Equihash validation** (structurally invalid → `BadSolution`, NOT
+    ///    recorded in dedup).  Recording invalid shares before validation would
+    ///    let an attacker fill `MAX_SEEN_SHARES_PER_JOB` at zero PoW cost and
+    ///    block all subsequent legitimate shares.
+    ///
+    /// 3. **Authoritative atomic check+insert** (after validation): handles
+    ///    concurrent submissions that raced past the pre-flight.  Only solutions
+    ///    that passed Equihash (`Ok` or `TargetNotMet`) are inserted.
+    ///
+    /// Entries for jobs that no longer resolve are evicted at the head of each
+    /// handler call.  Memory bound: `live_jobs × MAX_SEEN_SHARES_PER_JOB × 32 B`
+    /// plus `HashSet` overhead; backstopped by token issuance limits.
     seen_shares: Mutex<HashMap<u32, HashSet<[u8; 32]>>>,
 }
 
@@ -645,6 +651,15 @@ impl JdServer {
         // TODO(#51): make finder credit independent of share/solution ordering
         // (e.g. deferred credit keyed by job_id, deduped against the share path)
         // so a reordered or dropped share cannot cost the finder their credit.
+        //
+        // TODO(block-submission): this handler validates the block solution but
+        // never submits it to Zebra. JdServer has no access to the Zebra RPC;
+        // the pool-server's submit_block logic fills the gap only when the same
+        // miner ALSO connects via SV2 direct (cross_path_dup branch). A miner
+        // connected solely via JDC will have their block find silently dropped.
+        // Fix: inject a block-submission callback (Arc<dyn Fn(block_hex) ->
+        // Future<()> + Send + Sync>) into JdServer at construction and call it
+        // here after Equihash validation passes. Tracked as a separate PR.
         info!(
             channel_id = solution.channel_id,
             job_id = solution.job_id,
@@ -662,18 +677,19 @@ impl JdServer {
     /// already rejected at decode time.)
     ///
     /// Per-share validation order is cheapest-first, which is also the right DoS
-    /// posture: channel match, version match, time window, dedup-register, then
-    /// the expensive Equihash verification against the pool-granted
-    /// `share_target`. Credit is recorded only after a share clears every check.
+    /// posture: channel match, version match, time window, then the three-phase
+    /// dedup+Equihash sequence, then payout credit.
     ///
     /// Version-mismatch decision: a share whose version differs from the
     /// declared job is rejected as `StaleJob` — a version change implies the job
     /// rolled / the template changed underneath the miner.
     ///
-    /// Dedup decision: the share key is registered the moment a share passes the
-    /// cheap checks, *before* Equihash verification. Byte-identical replays are
-    /// therefore `Duplicate` regardless of validity; remembering an invalid
-    /// share is harmless and rate-limits resubmission of garbage.
+    /// Dedup decision (three-phase, see `seen_shares` doc):
+    ///   1. Prev-hash staleness rejects shares for old declared jobs (closes
+    ///      the epoch-clear double-credit window in the cross-path dedup).
+    ///   2. Read-only pre-flight rejects known replays without running Equihash.
+    ///   3. Equihash validation runs; structurally invalid shares are NOT inserted.
+    ///   4. Authoritative check+insert after validation covers concurrent races.
     pub async fn handle_submit_shares_jd(&self, msg: SubmitSharesJd) -> SubmitSharesJdResponse {
         // Evict dedup entries for jobs that no longer resolve (expired/unknown).
         // Bounded by the number of tracked jobs.
@@ -714,6 +730,13 @@ impl JdServer {
         const MAX_TIME_FORWARD: u32 = 7200;
         const MAX_TIME_BACKWARD: u32 = 60;
 
+        // Read current_prev_hash once for the whole batch so we hold the lock
+        // only briefly and don't re-acquire it on every share.
+        let current_prev_hash: Option<[u8; 32]> = {
+            let guard = self.current_prev_hash.read().await;
+            *guard
+        };
+
         for share in &msg.shares {
             let reject = |code: JdShareErrorCode,
                           rejected: &mut u16,
@@ -748,9 +771,68 @@ impl JdServer {
                 continue;
             }
 
-            // 4. Dedup: register the key BEFORE the expensive Equihash check so
-            //    byte-identical replays are caught regardless of validity.
+            // 4. Prev-hash staleness: if the pool has moved to a new tip, reject
+            //    shares for old declared jobs. Without this check, a miner whose
+            //    token has not yet expired can keep submitting shares for an old job
+            //    after the cross-path solution set is cleared on the new block and
+            //    receive a second PPS credit for a solution already credited on the
+            //    pool-server path (epoch-clear double-credit attack).
+            if let Some(expected_prev_hash) = current_prev_hash
+                && job.prev_hash != expected_prev_hash
+            {
+                reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error);
+                continue;
+            }
+
+            // 5. Cheap read-only replay guard: if this key was already seen,
+            //    reject immediately without running Equihash. Prevents an attacker
+            //    from replaying one valid solution indefinitely and forcing the
+            //    expensive verifier on every replay.
             let key = share_dedup_key(share);
+            {
+                let seen = self.seen_shares.lock().unwrap_or_else(|e| e.into_inner());
+                if seen.get(&msg.job_id).is_some_and(|s| s.contains(&key)) {
+                    reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
+                    continue;
+                }
+            }
+
+            // 6. Expensive: verify Equihash solution meets the share target.
+            //    Distinguish a structurally valid solution that simply misses
+            //    the target (TargetNotMet -> LowDifficulty) from a structurally
+            //    broken solution (everything else -> BadSolution).
+            //
+            //    Dedup insert (step 7) runs AFTER this, not before. Recording in
+            //    the dedup before validation would let an attacker exhaust the
+            //    MAX_SEEN_SHARES_PER_JOB capacity with zero-cost invalid
+            //    submissions, blocking all legitimate shares for that job.
+            //    The LowDifficulty branch cannot be exercised here without a valid
+            //    Equihash solution (TargetNotMet requires structural validity);
+            //    it is covered by Task 7's integration test alongside the accept
+            //    path, using a real CPU solver.
+            let header = build_header(&job, share.time, &share.nonce);
+            let equihash_ok = match validator.verify_share(&header, &share.solution, &share_target)
+            {
+                Ok(_) => true,
+                Err(ValidationError::TargetNotMet) => false,
+                Err(_) => {
+                    // Structurally invalid: do NOT record in dedup. Recording
+                    // would let the attacker fill capacity with no PoW cost.
+                    reject(
+                        JdShareErrorCode::BadSolution,
+                        &mut rejected,
+                        &mut first_error,
+                    );
+                    continue;
+                }
+            };
+
+            // 7. Authoritative atomic check+insert (after validation so only real
+            //    work fills the set). This is the final gatekeeper and handles
+            //    concurrent submissions that raced past the step-5 pre-flight.
+            //    INVARIANT: the contains-check and insert must remain a single
+            //    critical section under the Mutex. Do not split with `.await` and
+            //    do not move `record_share` inside this block.
             {
                 let mut seen = self.seen_shares.lock().unwrap_or_else(|e| e.into_inner());
                 let set = seen.entry(msg.job_id).or_default();
@@ -759,8 +841,6 @@ impl JdServer {
                     continue;
                 }
                 if set.len() >= MAX_SEEN_SHARES_PER_JOB {
-                    // Cap reached: treat further distinct shares as duplicates to
-                    // bound memory. Warn so operators can spot abuse.
                     warn!(
                         job_id = msg.job_id,
                         cap = MAX_SEEN_SHARES_PER_JOB,
@@ -769,37 +849,55 @@ impl JdServer {
                     reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error);
                     continue;
                 }
-                // INVARIANT: the contains-check and this insert must remain a
-                // single critical section under the Mutex. That atomicity is
-                // what serializes concurrent identical-key submissions and
-                // prevents double-credit. Do not split it with an `.await`, and
-                // do not move `record_share` inside this block.
                 set.insert(key);
             }
 
-            // 5. Expensive: verify Equihash solution meets the share target.
-            //    Distinguish a structurally valid solution that simply misses
-            //    the target (TargetNotMet -> LowDifficulty) from a structurally
-            //    broken solution (everything else -> BadSolution). The
-            //    LowDifficulty branch cannot be exercised here without a valid
-            //    Equihash solution (TargetNotMet requires structural validity);
-            //    it is covered by Task 7's integration test alongside the accept
-            //    path, using a real CPU solver.
-            let header = build_header(&job, share.time, &share.nonce);
-            if let Err(e) = validator.verify_share(&header, &share.solution, &share_target) {
-                let code = match e {
-                    ValidationError::TargetNotMet => JdShareErrorCode::LowDifficulty,
-                    _ => JdShareErrorCode::BadSolution,
-                };
-                reject(code, &mut rejected, &mut first_error);
+            if !equihash_ok {
+                reject(
+                    JdShareErrorCode::LowDifficulty,
+                    &mut rejected,
+                    &mut first_error,
+                );
                 continue;
             }
 
-            // Share is valid: credit the declaring client at the share target's
-            // difficulty.
+            // Authoritative staleness re-check + credit, performed while HOLDING the
+            // current_prev_hash read guard so the two are atomic w.r.t. a new block.
+            //
+            // The cross-path solution set is cleared on new-block events in pool-server
+            // (handle_new_template), which FIRST calls set_current_prev_hash — taking
+            // the current_prev_hash write lock — and only LATER calls
+            // clear_cross_path_solutions. By holding this read guard across the
+            // (synchronous, no-await) try_record_share_once call, we block that write,
+            // and therefore the subsequent clear, until the credit completes. Without
+            // it, a new block could update prev_hash and clear the set in the gap
+            // between the check and the credit, letting an old-job share be credited a
+            // second time after the pool-path record was wiped (epoch-clear double
+            // credit). try_record_share_once does not await, so the guard is brief and
+            // cannot deadlock (no other lock is held while awaiting it).
             let difficulty = target_to_difficulty(&Target::from_le_bytes(share_target));
-            self.payout_tracker.record_share(&job.client_id, difficulty);
-            accepted += 1;
+            let credit = {
+                let guard = self.current_prev_hash.read().await;
+                match *guard {
+                    Some(expected) if job.prev_hash != expected => None,
+                    _ => Some(self.payout_tracker.try_record_share_once(
+                        &job.client_id,
+                        difficulty,
+                        &share.solution,
+                    )),
+                }
+            };
+            match credit {
+                // Stale: a new tip landed before we could credit. Reject so the old-job
+                // share is never paid (it may already be credited on the pool path).
+                None => reject(JdShareErrorCode::StaleJob, &mut rejected, &mut first_error),
+                // Newly credited.
+                Some(true) => accepted += 1,
+                // Cross-path duplicate: same solution already credited via the
+                // pool-server path. Report Duplicate so accepted/rejected counters
+                // reflect actual credits issued.
+                Some(false) => reject(JdShareErrorCode::Duplicate, &mut rejected, &mut first_error),
+            }
         }
 
         debug!(

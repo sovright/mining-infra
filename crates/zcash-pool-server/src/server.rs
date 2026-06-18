@@ -82,6 +82,13 @@ pub struct PoolServer {
     /// Channel state (channel_id -> Channel)
     channels: Arc<RwLock<HashMap<u32, Channel>>>,
     /// Accepted worker identities (bounds Prometheus label cardinality).
+    ///
+    /// Process-lifetime by design: each accepted name creates `worker` label
+    /// series in the telemetry metric vecs that live until process restart and
+    /// have no removal path, so a name is NEVER released — not on disconnect,
+    /// not on slow-session drop. Releasing slots would let a client cycle 10k
+    /// unique names, disconnect, and repeat to grow metric cardinality without
+    /// bound. A reconnecting miner reusing its name does not consume a new slot.
     accepted_identities: Arc<RwLock<HashSet<String>>>,
     /// Channel for session messages
     session_tx: mpsc::Sender<SessionMessage>,
@@ -128,9 +135,9 @@ enum IdentityDecision {
 }
 
 /// Pure policy: immutability first, then the cardinality cap (existing names
-/// don't count against it).
+/// don't count against it, since they already occupy a process-lifetime slot).
 fn apply_identity_policy(
-    accepted: &mut std::collections::HashSet<String>,
+    accepted: &mut HashSet<String>,
     current: &Option<String>,
     name: &str,
     cap: usize,
@@ -827,7 +834,10 @@ impl PoolServer {
 
             // Clean up session and channel atomically on exit
             // Note: We take both locks before modifying either to prevent race conditions
-            // where share validation could access a channel that's partially cleaned up
+            // where share validation could access a channel that's partially cleaned up.
+            // The worker identity is intentionally NOT released here: accepted_identities
+            // is a process-lifetime cap bounding Prometheus label cardinality, and the
+            // metric series for this worker persist regardless of disconnect.
             {
                 let mut sessions_guard = sessions.write().await;
                 let mut channels_guard = channels.write().await;
@@ -931,6 +941,12 @@ impl PoolServer {
                     .collect()
             };
             self.duplicate_detector.prune_inactive(&active_job_ids);
+            // Cross-path solution hashes are only meaningful within one block epoch:
+            // once jobs are stale, per-path dedups already prevent re-submission on
+            // each individual path. Clearing here ties the cross-path window to the
+            // same epoch boundary as the per-job dedups, preventing the LRU-eviction
+            // replay attack (age out a hash, then resubmit via the other path).
+            self.payout_tracker.clear_cross_path_solutions();
             info!("New block detected, pruned inactive jobs from duplicate detector");
         }
 
@@ -992,6 +1008,9 @@ impl PoolServer {
         }
 
         if !slow_or_closed.is_empty() {
+            // Drop the session/channel state for slow or closed peers. Worker
+            // identities are NOT released: accepted_identities is a process-lifetime
+            // cap (see its field doc) — the metric label series outlive the session.
             let mut sessions = self.sessions.write().await;
             let mut channels = self.channels.write().await;
             for channel_id in slow_or_closed {
@@ -1184,6 +1203,21 @@ impl PoolServer {
         // Apply vardiff update and record payout atomically under one lock.
         // This prevents the channel from being removed between the two operations.
         let mut stale_after_validation = false;
+        // Set to true when try_record_share_once returns false: same valid solution
+        // already credited via the jd-server path. Treat as Duplicate so vardiff,
+        // accepted counters, and metrics are not updated for a non-credited share.
+        let mut cross_path_dup = false;
+        // Compute miner_id before acquiring channels.write() to avoid lock-order
+        // inversion: the cleanup task in handle_new_connection acquires
+        // connection_times.write() then channels.write(), so we must not hold
+        // channels.write() while awaiting connection_times.read().
+        let miner_id: MinerId = self
+            .connection_times
+            .read()
+            .await
+            .get(&channel_id)
+            .map(|(_, addr)| addr.ip().to_string())
+            .unwrap_or_else(|| format!("channel_{}", channel_id));
         let maybe_new_target = if let Ok(ref validation) = result {
             if validation.accepted {
                 let difficulty = validation.difficulty;
@@ -1203,23 +1237,28 @@ impl PoolServer {
                         stale_after_validation = true;
                         None
                     } else {
-                        let new_target = if channel.record_share().is_some() {
+                        // Cross-path dedup check BEFORE updating vardiff: if the
+                        // same valid solution already arrived via the jd-server path,
+                        // skip vardiff and all accepted-share accounting. The
+                        // try_record_share_once call is the authoritative credit gate.
+                        let payout_credited = if let Some(diff) = difficulty {
+                            self.payout_tracker.try_record_share_once(
+                                &miner_id,
+                                diff,
+                                &share.solution,
+                            )
+                        } else {
+                            true
+                        };
+
+                        if !payout_credited {
+                            cross_path_dup = true;
+                            None
+                        } else if channel.record_share().is_some() {
                             Some(channel.current_target())
                         } else {
                             None
-                        };
-                        // Record payout inside same lock scope
-                        if let Some(diff) = difficulty {
-                            let miner_id: MinerId = self
-                                .connection_times
-                                .read()
-                                .await
-                                .get(&channel_id)
-                                .map(|(_, addr)| addr.ip().to_string())
-                                .unwrap_or_else(|| format!("channel_{}", channel_id));
-                            self.payout_tracker.record_share(&miner_id, diff);
                         }
-                        new_target
                     }
                 } else {
                     warn!("Channel {} removed during share validation", channel_id);
@@ -1254,6 +1293,91 @@ impl PoolServer {
                     );
                     zcash_mining_protocol::messages::ShareResult::Rejected(
                         zcash_mining_protocol::messages::RejectReason::StaleJob,
+                    )
+                } else if validation.accepted && cross_path_dup {
+                    // Payout was already issued via the jd-server path, so no
+                    // credit, vardiff, or accepted-counter update here. However,
+                    // block propagation must still happen: the JD path does not
+                    // build or submit full blocks, so the pool path must do it even
+                    // when this share is a payout duplicate.
+                    //
+                    // NOTE(test-gap): this branch (cross_path_dup && is_block) has
+                    // no automated test. handle_share_submission is not unit-testable
+                    // without mocking submit_block; an integration test would need
+                    // two concurrent connections (JDC + SV2 direct) submitting the
+                    // same block solution. Tracked for the integration-test milestone.
+                    if validation.is_block {
+                        info!(
+                            "BLOCK FOUND (cross-path duplicate) by channel {}! Submitting block.",
+                            channel_id
+                        );
+
+                        // Relay announce mirrors the normal block-found path so
+                        // fast propagation fires regardless of which path saw the
+                        // block-valid share first.
+                        #[cfg(feature = "relay")]
+                        if let Some(ref relay) = self.relay {
+                            let header = job
+                                .build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
+                            let relay_data = {
+                                let distributor = self.job_distributor.read().await;
+                                distributor.current_template().map(|t| {
+                                    let tx_hashes: Vec<[u8; 32]> = t
+                                        .transactions
+                                        .iter()
+                                        .filter_map(|tx| {
+                                            let bytes = hex::decode(&tx.hash).ok()?;
+                                            if bytes.len() == 32 {
+                                                let mut arr = [0u8; 32];
+                                                arr.copy_from_slice(&bytes);
+                                                arr.reverse();
+                                                Some(arr)
+                                            } else {
+                                                None
+                                            }
+                                        })
+                                        .collect();
+                                    let coinbase = t.coinbase.clone();
+                                    (coinbase, tx_hashes)
+                                })
+                            };
+                            if let Some((coinbase, tx_hashes)) = relay_data {
+                                let relay = Arc::clone(relay);
+                                tokio::spawn(async move {
+                                    if let Err(e) =
+                                        relay.announce_block(&header, &coinbase, &tx_hashes).await
+                                    {
+                                        warn!(
+                                            "Failed to announce cross-path dup block to relay: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            }
+                        }
+
+                        if let Err(e) = self.submit_block(&job, &share).await {
+                            warn!(
+                                "Failed to submit block for cross-path dup job {}: {}",
+                                share.job_id, e
+                            );
+                        }
+
+                        // A block was found and submitted by this branch; record
+                        // the block-found metric even though the share is a payout
+                        // duplicate, so cross-path blocks are not dropped from
+                        // per-worker block-found stats (the normal accepted path
+                        // records this too).
+                        self.metrics.record_worker_block_found(&worker_label);
+                    }
+                    self.metrics.record_share_rejected("CrossPathDuplicate");
+                    self.metrics.record_worker_share_rejected(&worker_label);
+                    debug!(
+                        "Rejecting share from channel {} as cross-path duplicate (payout already issued via jd-server)",
+                        channel_id
+                    );
+                    zcash_mining_protocol::messages::ShareResult::Rejected(
+                        zcash_mining_protocol::messages::RejectReason::Duplicate,
                     )
                 } else if validation.accepted {
                     // Check for block find
@@ -1591,7 +1715,7 @@ mod tests {
 
     #[test]
     fn identity_policy() {
-        let mut accepted = std::collections::HashSet::new();
+        let mut accepted: HashSet<String> = HashSet::new();
 
         // First identity accepted
         assert_eq!(
@@ -1617,6 +1741,13 @@ mod tests {
         assert_eq!(
             apply_identity_policy(&mut accepted, &None, "rig-3", 2),
             IdentityDecision::CapReached
+        );
+
+        // A name already in the process-lifetime set is still accepted at the cap
+        // (it occupies an existing slot), so a reconnecting worker is never locked out.
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &None, "rig-1", 2),
+            IdentityDecision::Accept
         );
     }
 

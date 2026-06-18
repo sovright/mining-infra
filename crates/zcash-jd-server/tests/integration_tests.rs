@@ -731,9 +731,10 @@ async fn test_submit_shares_duplicate_in_batch() {
     let server = JdServer::new(test_config(), payout.clone());
     let job_id = declare_test_job(&server).await;
 
-    // The SAME share submitted twice. Dedup registers the key when the share
-    // passes the cheap checks (before Equihash), so the first copy is rejected
-    // as BadSolution (garbage solution) and the second as Duplicate.
+    // The SAME invalid share submitted twice. Invalid shares are NOT recorded in
+    // the dedup (recording them would let an attacker exhaust per-job capacity at
+    // zero PoW cost). Both copies are rejected as BadSolution — the second is
+    // never Duplicate because the first was never inserted.
     let share = valid_struct_share(1);
     let msg = SubmitSharesJd {
         channel_id: JOB_CHANNEL,

@@ -19,6 +19,15 @@ pub trait DuplicateDetector: Send + Sync {
     /// epoch are recorded.
     fn start_job(&self, job_id: u32);
 
+    /// Read-only duplicate check — does NOT record the share.
+    ///
+    /// Use this as a cheap pre-flight before expensive Equihash validation so
+    /// that known-duplicate replays are rejected without running the verifier.
+    /// Always follow a `false` return with `check_and_record` after validation
+    /// succeeds; that second call is the authoritative atomic check+insert and
+    /// handles concurrent submissions of the same key.
+    fn is_seen(&self, job_id: u32, nonce_2: &[u8], solution: &[u8]) -> bool;
+
     /// Check if a share is a duplicate (and record it if not)
     /// Returns true if it IS a duplicate, false if it's new
     fn check_and_record(&self, job_id: u32, nonce_2: &[u8], solution: &[u8]) -> bool;
@@ -84,6 +93,15 @@ impl DuplicateDetector for InMemoryDuplicateDetector {
             e.into_inner()
         });
         jobs.remove(&job_id);
+    }
+
+    fn is_seen(&self, job_id: u32, nonce_2: &[u8], solution: &[u8]) -> bool {
+        let hash = Self::hash_share(nonce_2, solution);
+        let jobs = self.jobs.read().unwrap_or_else(|e| {
+            warn!("Duplicate detector lock was poisoned in is_seen, recovering");
+            e.into_inner()
+        });
+        jobs.get(&job_id).is_some_and(|s| s.contains(&hash))
     }
 
     fn check_and_record(&self, job_id: u32, nonce_2: &[u8], solution: &[u8]) -> bool {
