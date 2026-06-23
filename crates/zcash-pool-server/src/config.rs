@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use zcash_jd_server::ValidationLevel;
 
 /// Pool server configuration
@@ -99,6 +100,17 @@ pub struct PoolConfig {
     pub timing_jitter_max_ms: u64,
     /// Warn if Noise is disabled (plain mode is insecure)
     pub warn_plain_mode: bool,
+
+    /// Optional bind address for the inbound settlement control plane.
+    pub control_addr: Option<SocketAddr>,
+    /// Bearer token required for control-plane requests. Required when
+    /// `control_addr` is set.
+    pub control_auth_token: Option<String>,
+    /// How long a settled, idle worker is retained before pruning.
+    pub payout_settlement_retention: Duration,
+    /// Where pruned settlement records are archived (JSONL). Defaults next to
+    /// `payout_state_path` when unset.
+    pub payout_archive_path: Option<PathBuf>,
 }
 
 /// Configuration validation errors
@@ -128,6 +140,8 @@ pub enum ConfigError {
     InvalidFecShardTotal { total: usize },
     /// Invalid payout state path
     InvalidPayoutStatePath,
+    /// control_addr set but control_auth_token is missing or empty
+    ControlAddrMissingToken,
 }
 
 impl std::fmt::Display for ConfigError {
@@ -178,6 +192,12 @@ impl std::fmt::Display for ConfigError {
             }
             ConfigError::InvalidPayoutStatePath => {
                 write!(f, "payout_state_path must not be empty")
+            }
+            ConfigError::ControlAddrMissingToken => {
+                write!(
+                    f,
+                    "control_addr set but control_auth_token is missing or empty"
+                )
             }
         }
     }
@@ -265,6 +285,17 @@ impl PoolConfig {
             }
         }
 
+        // control_addr requires a non-empty auth token
+        if self.control_addr.is_some()
+            && self
+                .control_auth_token
+                .as_ref()
+                .map(|t| t.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ConfigError::ControlAddrMissingToken);
+        }
+
         Ok(())
     }
 }
@@ -308,6 +339,10 @@ impl Default for PoolConfig {
             timing_jitter_min_ms: 0,
             timing_jitter_max_ms: 50,
             warn_plain_mode: true,
+            control_addr: None,
+            control_auth_token: None,
+            payout_settlement_retention: Duration::from_secs(86_400),
+            payout_archive_path: None,
         }
     }
 }
@@ -316,6 +351,7 @@ impl Default for PoolConfig {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+    use std::time::Duration;
 
     fn valid_config() -> PoolConfig {
         PoolConfig::default()
@@ -572,5 +608,21 @@ mod tests {
         cfg.timing_jitter_min_ms = 100;
         cfg.timing_jitter_max_ms = 50;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn control_addr_requires_token() {
+        let mut cfg = valid_config();
+        cfg.control_addr = Some(SocketAddr::from(([127, 0, 0, 1], 9091)));
+        cfg.control_auth_token = None;
+        assert!(cfg.validate().is_err());
+
+        cfg.control_auth_token = Some("secret".to_string());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_has_settlement_retention() {
+        assert_eq!(valid_config().payout_settlement_retention, Duration::from_secs(86_400));
     }
 }
