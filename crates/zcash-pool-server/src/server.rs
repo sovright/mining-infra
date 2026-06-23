@@ -367,6 +367,16 @@ impl PoolServer {
             });
         }
 
+        // Start control server if configured
+        if let Some(control_addr) = self.config.control_addr {
+            if let Some(token) = self.config.control_auth_token.clone() {
+                let tracker = Arc::clone(&self.payout_tracker);
+                tokio::spawn(async move {
+                    crate::control::start_control_server(control_addr, token, tracker).await;
+                });
+            }
+        }
+
         // Bind to listen address
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         info!("Pool server listening on {}", self.config.listen_addr);
@@ -440,6 +450,13 @@ impl PoolServer {
         let sessions = Arc::clone(&self.sessions);
         let channels = Arc::clone(&self.channels);
         let metrics = Arc::clone(&self.metrics);
+        let settlement_retention = self.config.payout_settlement_retention;
+        let prune_archive_path = self.config.payout_archive_path.clone().or_else(|| {
+            self.config
+                .payout_state_path
+                .as_ref()
+                .map(|p| p.with_file_name("payout-archive.jsonl"))
+        });
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -456,6 +473,15 @@ impl PoolServer {
                 // written (no-op when nothing changed or persistence is off).
                 if let Err(e) = payout_tracker.flush() {
                     error!("Failed to flush payout state: {}", e);
+                }
+
+                // Prune settled miners to keep state file compact.
+                if let Some(ref archive_path) = prune_archive_path {
+                    match payout_tracker.prune_settled_miners(settlement_retention, archive_path) {
+                        Ok(n) if n > 0 => info!("pruned {} settled miners", n),
+                        Ok(_) => {}
+                        Err(e) => error!("prune_settled_miners failed: {}", e),
+                    }
                 }
 
                 // Share-independent vardiff tick: lets overshooting channels
