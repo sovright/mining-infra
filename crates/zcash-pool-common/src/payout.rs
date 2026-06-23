@@ -126,6 +126,13 @@ struct PersistedMinerStats {
 
 const PAYOUT_STATE_VERSION: u32 = 1;
 
+/// Result of a successful settlement, returned for caller confirmation.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettleOutcome {
+    pub total_shares: u64,
+    pub settled_total_shares: u64,
+}
+
 #[derive(Debug, Clone, Default)]
 struct SettlementState {
     settled_total_shares: u64,
@@ -437,35 +444,51 @@ impl PayoutTracker {
         self.mark_dirty();
     }
 
-    /// Mark a miner's current total credit as settled by an operator payout.
+    /// Record an explicit settlement watermark supplied by the payout engine.
     ///
-    /// This records a settlement watermark; it does not remove the miner from
-    /// hot state. Use [`Self::prune_settled_miners`] after the retention window
-    /// to archive and remove fully settled, idle entries.
-    pub fn mark_miner_settled<S>(&self, miner_id: &MinerId, settlement_ref: S) -> bool
+    /// The watermark is clamped to the worker's current `total_shares` (never
+    /// settle shares the pool has not credited) and is monotonic (never moves
+    /// backward), so repeated/retried calls are idempotent. Returns `None` for
+    /// unknown or ephemeral (unnamed) workers.
+    pub fn mark_miner_settled<S>(
+        &self,
+        miner_id: &MinerId,
+        settled_total_shares: u64,
+        settlement_ref: S,
+    ) -> Option<SettleOutcome>
     where
         S: Into<String>,
     {
-        let (total_shares, total_difficulty) = {
+        if is_ephemeral_miner_id(miner_id) {
+            return None;
+        }
+
+        let (current_total, current_difficulty) = {
             let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
-            let Some(stats) = miners.get(miner_id) else {
-                return false;
-            };
+            let stats = miners.get(miner_id)?;
             (stats.total_shares, stats.total_difficulty)
         };
 
         let now_unix_ms = unix_ms_now();
         let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
         let settlement = settlements.entry(miner_id.clone()).or_default();
-        settlement.settled_total_shares = total_shares;
-        settlement.settled_total_difficulty = total_difficulty;
+
+        let clamped = settled_total_shares.min(current_total);
+        let new_watermark = clamped.max(settlement.settled_total_shares);
+        settlement.settled_total_shares = new_watermark;
+        // Difficulty watermark tracks the current sum at the settled share count;
+        // it is archived for audit but no longer gates pruning (see Task A3).
+        settlement.settled_total_difficulty = current_difficulty;
         settlement.last_share_unix_ms.get_or_insert(now_unix_ms);
         settlement.settled_at_unix_ms = Some(now_unix_ms);
         settlement.settlement_ref = Some(settlement_ref.into());
         drop(settlements);
 
         self.mark_dirty();
-        true
+        Some(SettleOutcome {
+            total_shares: current_total,
+            settled_total_shares: new_watermark,
+        })
     }
 
     /// Clear all cross-path solution hashes.
@@ -1178,7 +1201,8 @@ mod tests {
             PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
 
         tracker.record_share(&miner, 100.0);
-        assert!(tracker.mark_miner_settled(&miner, "batch-1"));
+        let total = tracker.get_stats(&miner).unwrap().total_shares;
+        assert!(tracker.mark_miner_settled(&miner, total, "batch-1").is_some());
         tracker.cleanup_stale_miners(Duration::ZERO);
 
         let pruned = tracker
@@ -1219,7 +1243,8 @@ mod tests {
                 PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone())
                     .unwrap();
             tracker.record_share(&miner, 100.0);
-            assert!(tracker.mark_miner_settled(&miner, "batch-1"));
+            let total = tracker.get_stats(&miner).unwrap().total_shares;
+            assert!(tracker.mark_miner_settled(&miner, total, "batch-1").is_some());
             tracker.flush().unwrap();
         }
 
@@ -1248,7 +1273,8 @@ mod tests {
             PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
 
         tracker.record_share(&miner, 100.0);
-        assert!(tracker.mark_miner_settled(&miner, "batch-1"));
+        let total = tracker.get_stats(&miner).unwrap().total_shares;
+        assert!(tracker.mark_miner_settled(&miner, total, "batch-1").is_some());
         tracker.record_share(&miner, 25.0);
         tracker.cleanup_stale_miners(Duration::ZERO);
 
@@ -1680,5 +1706,28 @@ mod tests {
         assert!(is_ephemeral_miner_id("channel_42"));
         assert!(!is_ephemeral_miner_id("rig1"));
         assert!(!is_ephemeral_miner_id("worker.channel_1")); // only a prefix match counts
+    }
+
+    #[test]
+    fn settle_clamps_and_is_monotonic() {
+        let t = PayoutTracker::new(Duration::from_secs(600));
+        for _ in 0..10 { t.record_share(&"rig1".to_string(), 1.0); }
+
+        // Clamp: cannot settle more than current total.
+        let o = t.mark_miner_settled(&"rig1".to_string(), 999, "batch-1").unwrap();
+        assert_eq!(o.total_shares, 10);
+        assert_eq!(o.settled_total_shares, 10);
+
+        // Monotonic: a lower explicit total never moves the watermark backward.
+        let o = t.mark_miner_settled(&"rig1".to_string(), 3, "batch-2").unwrap();
+        assert_eq!(o.settled_total_shares, 10);
+    }
+
+    #[test]
+    fn settle_unknown_or_ephemeral_returns_none() {
+        let t = PayoutTracker::new(Duration::from_secs(600));
+        assert!(t.mark_miner_settled(&"ghost".to_string(), 1, "b").is_none());
+        t.record_share(&"channel_7".to_string(), 1.0);
+        assert!(t.mark_miner_settled(&"channel_7".to_string(), 1, "b").is_none());
     }
 }
