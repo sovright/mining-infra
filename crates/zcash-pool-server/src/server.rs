@@ -1227,17 +1227,6 @@ impl PoolServer {
         // already credited via the jd-server path. Treat as Duplicate so vardiff,
         // accepted counters, and metrics are not updated for a non-credited share.
         let mut cross_path_dup = false;
-        // Compute miner_id before acquiring channels.write() to avoid lock-order
-        // inversion: the cleanup task in handle_new_connection acquires
-        // connection_times.write() then channels.write(), so we must not hold
-        // channels.write() while awaiting connection_times.read().
-        let miner_id: MinerId = self
-            .connection_times
-            .read()
-            .await
-            .get(&channel_id)
-            .map(|(_, addr)| addr.ip().to_string())
-            .unwrap_or_else(|| format!("channel_{}", channel_id));
         let maybe_new_target = if let Ok(ref validation) = result {
             if validation.accepted {
                 let difficulty = validation.difficulty;
@@ -1257,6 +1246,10 @@ impl PoolServer {
                         stale_after_validation = true;
                         None
                     } else {
+                        // Key payout credit by worker name, not IP, so credits
+                        // survive reconnections as long as the worker label is stable.
+                        let miner_id: MinerId =
+                            resolve_worker_label(&channel.worker_identity, channel_id);
                         // Cross-path dedup check BEFORE updating vardiff: if the
                         // same valid solution already arrived via the jd-server path,
                         // skip vardiff and all accepted-share accounting. The
@@ -1775,5 +1768,14 @@ mod tests {
     fn worker_label_resolution() {
         assert_eq!(resolve_worker_label(&Some("rig-1".into()), 5), "rig-1");
         assert_eq!(resolve_worker_label(&None, 5), "channel_5");
+    }
+
+    #[test]
+    fn payout_keyed_by_worker_label_not_ip() {
+        // Named worker -> worker name.
+        assert_eq!(resolve_worker_label(&Some("rig1".to_string()), 42), "rig1");
+        // Unnamed -> ephemeral channel id, which payout treats as non-durable.
+        assert_eq!(resolve_worker_label(&None, 42), "channel_42");
+        assert!(zcash_pool_common::is_ephemeral_miner_id(&resolve_worker_label(&None, 42)));
     }
 }
