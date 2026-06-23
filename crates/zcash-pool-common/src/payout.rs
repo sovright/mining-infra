@@ -450,6 +450,9 @@ impl PayoutTracker {
     /// settle shares the pool has not credited) and is monotonic (never moves
     /// backward), so repeated/retried calls are idempotent. Returns `None` for
     /// unknown or ephemeral (unnamed) workers.
+    ///
+    /// `settlement_ref` reflects the most recent settle call (last-writer-wins)
+    /// and is updated even when the watermark does not advance.
     pub fn mark_miner_settled<S>(
         &self,
         miner_id: &MinerId,

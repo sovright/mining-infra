@@ -617,6 +617,10 @@ mod tests {
         cfg.control_auth_token = None;
         assert!(cfg.validate().is_err());
 
+        // An empty token is also rejected, not just a missing one.
+        cfg.control_auth_token = Some(String::new());
+        assert!(cfg.validate().is_err());
+
         cfg.control_auth_token = Some("secret".to_string());
         assert!(cfg.validate().is_ok());
     }

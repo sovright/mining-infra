@@ -132,16 +132,24 @@ enum IdentityDecision {
     Accept,
     AlreadySet,
     CapReached,
+    /// The declared identity uses the reserved ephemeral prefix and is refused;
+    /// the channel stays unnamed (credited as an ephemeral `channel_<id>`).
+    Reserved,
 }
 
-/// Pure policy: immutability first, then the cardinality cap (existing names
-/// don't count against it, since they already occupy a process-lifetime slot).
+/// Pure policy: reserved-prefix refusal first (a miner must not be able to claim
+/// the ephemeral namespace), then immutability, then the cardinality cap
+/// (existing names don't count against it, since they already occupy a
+/// process-lifetime slot).
 fn apply_identity_policy(
     accepted: &mut HashSet<String>,
     current: &Option<String>,
     name: &str,
     cap: usize,
 ) -> IdentityDecision {
+    if zcash_pool_common::is_ephemeral_miner_id(name) {
+        return IdentityDecision::Reserved;
+    }
     if current.is_some() {
         return IdentityDecision::AlreadySet;
     }
@@ -1133,6 +1141,12 @@ impl PoolServer {
                             MAX_WORKER_IDENTITIES, channel_id, channel_id
                         );
                     }
+                    IdentityDecision::Reserved => {
+                        warn!(
+                            "Channel {} declared reserved-prefix identity '{}'; refused, stays as channel_{}",
+                            channel_id, worker_name, channel_id
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1787,6 +1801,13 @@ mod tests {
         assert_eq!(
             apply_identity_policy(&mut accepted, &None, "rig-1", 2),
             IdentityDecision::Accept
+        );
+
+        // A miner-declared identity using the reserved ephemeral prefix is
+        // refused (cannot be set), regardless of cap/immutability state.
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &None, "channel_5", 2),
+            IdentityDecision::Reserved
         );
     }
 

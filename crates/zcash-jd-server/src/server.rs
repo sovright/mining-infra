@@ -35,7 +35,7 @@ use zcash_equihash_validator::{
     EquihashValidator, Target, ValidationError, compact_to_target, target_to_difficulty,
 };
 use zcash_mining_protocol::codec::MessageFrame;
-use zcash_pool_common::PayoutTracker;
+use zcash_pool_common::{PayoutTracker, is_ephemeral_miner_id};
 use zcash_template_provider::calculate_block_commitments_hash;
 use zcash_template_provider::types::Hash256;
 
@@ -394,6 +394,17 @@ impl JdServer {
         user_id: &str,
         requested_mode: JobDeclarationMode,
     ) -> Result<AllocateMiningJobTokenSuccess> {
+        // The token's client_id becomes the durable payout credit key. Refuse
+        // identities in the reserved ephemeral namespace: such credit would be
+        // treated as unnamed (never persisted, never settleable, idle-evicted),
+        // silently dropping the miner's owed shares.
+        if is_ephemeral_miner_id(user_id) {
+            return Err(JdServerError::Protocol(format!(
+                "user_identifier '{}' uses the reserved ephemeral prefix",
+                user_id
+            )));
+        }
+
         // Determine granted mode based on request and server configuration
         let granted_mode = if requested_mode == JobDeclarationMode::FullTemplate {
             if self.config.full_template_enabled {
@@ -1615,6 +1626,22 @@ mod tests {
         assert_eq!(response.coinbase_output, config.pool_payout_script);
         assert!(response.async_mining_allowed);
         assert_eq!(response.granted_mode, JobDeclarationMode::CoinbaseOnly);
+    }
+
+    #[test]
+    fn allocate_token_rejects_reserved_prefix_identity() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        // Reserved ephemeral-prefix user_identifier is refused.
+        let reserved =
+            server.handle_allocate_token(1, "channel_evil", JobDeclarationMode::CoinbaseOnly);
+        assert!(reserved.is_err());
+
+        // A normal identifier still allocates.
+        let ok = server.handle_allocate_token(2, "rig-1", JobDeclarationMode::CoinbaseOnly);
+        assert!(ok.is_ok());
     }
 
     #[tokio::test]
