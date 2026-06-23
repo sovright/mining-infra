@@ -58,6 +58,18 @@ impl BoundedSolutionSet {
 /// Unique identifier for a miner (could be pubkey, address, etc.)
 pub type MinerId = String;
 
+/// Reserved prefix marking an ephemeral, unnamed worker identity
+/// (`resolve_worker_label` produces `channel_<id>` when no worker name was
+/// supplied). Entries with this prefix are never settle-eligible and are
+/// evicted on idle even when persistence is enabled.
+pub const EPHEMERAL_MINER_PREFIX: &str = "channel_";
+
+/// True if `id` is an ephemeral/unnamed worker identity (see
+/// [`EPHEMERAL_MINER_PREFIX`]).
+pub fn is_ephemeral_miner_id(id: &str) -> bool {
+    id.starts_with(EPHEMERAL_MINER_PREFIX)
+}
+
 /// Per-miner statistics
 #[derive(Debug, Clone, Default)]
 pub struct MinerStats {
@@ -1661,5 +1673,12 @@ mod tests {
         let removed = tracker.cleanup_stale_miners(Duration::from_secs(3600));
         assert_eq!(removed, 0, "no miners should be removed when all are fresh");
         assert_eq!(tracker.get_all_stats().len(), 1);
+    }
+
+    #[test]
+    fn ephemeral_id_detection() {
+        assert!(is_ephemeral_miner_id("channel_42"));
+        assert!(!is_ephemeral_miner_id("rig1"));
+        assert!(!is_ephemeral_miner_id("worker.channel_1")); // only a prefix match counts
     }
 }
