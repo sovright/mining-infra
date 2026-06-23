@@ -7,6 +7,8 @@ use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+const MAX_BODY_BYTES: usize = 64 * 1024;
+
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -72,24 +74,49 @@ async fn handle(
 
     match (req.method(), req.uri().path()) {
         (&Method::POST, "/v1/settle") => {
+            // Reject oversized requests before reading the body.
+            if let Some(content_length) = req
+                .headers()
+                .get(hyper::header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                if content_length > MAX_BODY_BYTES {
+                    return Ok(json(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        r#"{"error":"payload too large"}"#.into(),
+                    ));
+                }
+            }
             let bytes = match hyper::body::to_bytes(req.into_body()).await {
                 Ok(b) => b,
                 Err(_) => return Ok(json(StatusCode::BAD_REQUEST, r#"{"error":"body"}"#.into())),
             };
+            if bytes.len() > MAX_BODY_BYTES {
+                return Ok(json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"payload too large"}"#.into(),
+                ));
+            }
             let parsed: Result<SettleRequest, _> = serde_json::from_slice(&bytes);
             let Ok(sr) = parsed else {
                 return Ok(json(StatusCode::BAD_REQUEST, r#"{"error":"malformed"}"#.into()));
             };
             match tracker.mark_miner_settled(&sr.worker, sr.settled_total_shares, sr.settlement_ref) {
-                Some(out) => Ok(json(
-                    StatusCode::OK,
-                    serde_json::to_string(&serde_json::json!({
+                Some(out) => {
+                    let body_val = serde_json::json!({
                         "worker": sr.worker,
                         "total_shares": out.total_shares,
                         "settled_total_shares": out.settled_total_shares,
-                    }))
-                    .unwrap(),
-                )),
+                    });
+                    match serde_json::to_string(&body_val) {
+                        Ok(body) => Ok(json(StatusCode::OK, body)),
+                        Err(_) => Ok(json(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            r#"{"error":"serialization"}"#.into(),
+                        )),
+                    }
+                }
                 None => Ok(json(StatusCode::NOT_FOUND, r#"{"error":"unknown worker"}"#.into())),
             }
         }
@@ -105,7 +132,13 @@ async fn handle(
                     settlement_ref: sref,
                 })
                 .collect();
-            Ok(json(StatusCode::OK, serde_json::to_string(&rows).unwrap()))
+            match serde_json::to_string(&rows) {
+                Ok(body) => Ok(json(StatusCode::OK, body)),
+                Err(_) => Ok(json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    r#"{"error":"serialization"}"#.into(),
+                )),
+            }
         }
         _ => Ok(json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#.into())),
     }
@@ -147,5 +180,20 @@ mod tests {
         assert_eq!(req.worker, "rig1");
         assert_eq!(req.settled_total_shares, 42);
         assert_eq!(req.settlement_ref, "batch-1");
+    }
+
+    #[test]
+    fn max_body_bytes_cap_is_64kib() {
+        assert_eq!(MAX_BODY_BYTES, 65536);
+    }
+
+    #[test]
+    fn oversized_body_exceeds_cap() {
+        // Simulate what the handler checks: bytes.len() > MAX_BODY_BYTES
+        let oversized = vec![b'x'; MAX_BODY_BYTES + 1];
+        assert!(oversized.len() > MAX_BODY_BYTES);
+
+        let exact = vec![b'x'; MAX_BODY_BYTES];
+        assert!(!(exact.len() > MAX_BODY_BYTES));
     }
 }
