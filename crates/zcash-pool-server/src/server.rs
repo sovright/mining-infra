@@ -368,13 +368,13 @@ impl PoolServer {
         }
 
         // Start control server if configured
-        if let Some(control_addr) = self.config.control_addr {
-            if let Some(token) = self.config.control_auth_token.clone() {
-                let tracker = Arc::clone(&self.payout_tracker);
-                tokio::spawn(async move {
-                    crate::control::start_control_server(control_addr, token, tracker).await;
-                });
-            }
+        if let Some(control_addr) = self.config.control_addr
+            && let Some(token) = self.config.control_auth_token.clone()
+        {
+            let tracker = Arc::clone(&self.payout_tracker);
+            tokio::spawn(async move {
+                crate::control::start_control_server(control_addr, token, tracker).await;
+            });
         }
 
         // Bind to listen address
@@ -1802,6 +1802,8 @@ mod tests {
         assert_eq!(resolve_worker_label(&Some("rig1".to_string()), 42), "rig1");
         // Unnamed -> ephemeral channel id, which payout treats as non-durable.
         assert_eq!(resolve_worker_label(&None, 42), "channel_42");
-        assert!(zcash_pool_common::is_ephemeral_miner_id(&resolve_worker_label(&None, 42)));
+        assert!(zcash_pool_common::is_ephemeral_miner_id(
+            &resolve_worker_label(&None, 42)
+        ));
     }
 }

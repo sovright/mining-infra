@@ -69,7 +69,10 @@ async fn handle(
     tracker: Arc<PayoutTracker>,
 ) -> Result<Response<Body>, Infallible> {
     if !authorized(&req, &token) {
-        return Ok(json(StatusCode::UNAUTHORIZED, r#"{"error":"unauthorized"}"#.into()));
+        return Ok(json(
+            StatusCode::UNAUTHORIZED,
+            r#"{"error":"unauthorized"}"#.into(),
+        ));
     }
 
     match (req.method(), req.uri().path()) {
@@ -80,13 +83,12 @@ async fn handle(
                 .get(hyper::header::CONTENT_LENGTH)
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<usize>().ok())
+                && content_length > MAX_BODY_BYTES
             {
-                if content_length > MAX_BODY_BYTES {
-                    return Ok(json(
-                        StatusCode::PAYLOAD_TOO_LARGE,
-                        r#"{"error":"payload too large"}"#.into(),
-                    ));
-                }
+                return Ok(json(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    r#"{"error":"payload too large"}"#.into(),
+                ));
             }
             let bytes = match hyper::body::to_bytes(req.into_body()).await {
                 Ok(b) => b,
@@ -100,9 +102,13 @@ async fn handle(
             }
             let parsed: Result<SettleRequest, _> = serde_json::from_slice(&bytes);
             let Ok(sr) = parsed else {
-                return Ok(json(StatusCode::BAD_REQUEST, r#"{"error":"malformed"}"#.into()));
+                return Ok(json(
+                    StatusCode::BAD_REQUEST,
+                    r#"{"error":"malformed"}"#.into(),
+                ));
             };
-            match tracker.mark_miner_settled(&sr.worker, sr.settled_total_shares, sr.settlement_ref) {
+            match tracker.mark_miner_settled(&sr.worker, sr.settled_total_shares, sr.settlement_ref)
+            {
                 Some(out) => {
                     let body_val = serde_json::json!({
                         "worker": sr.worker,
@@ -117,20 +123,25 @@ async fn handle(
                         )),
                     }
                 }
-                None => Ok(json(StatusCode::NOT_FOUND, r#"{"error":"unknown worker"}"#.into())),
+                None => Ok(json(
+                    StatusCode::NOT_FOUND,
+                    r#"{"error":"unknown worker"}"#.into(),
+                )),
             }
         }
         (&Method::GET, "/v1/payouts") => {
             let rows: Vec<PayoutRow> = tracker
                 .payout_rows()
                 .into_iter()
-                .map(|(worker, total_shares, total_difficulty, settled, sref)| PayoutRow {
-                    worker,
-                    total_shares,
-                    total_difficulty,
-                    settled_total_shares: settled,
-                    settlement_ref: sref,
-                })
+                .map(
+                    |(worker, total_shares, total_difficulty, settled, sref)| PayoutRow {
+                        worker,
+                        total_shares,
+                        total_difficulty,
+                        settled_total_shares: settled,
+                        settlement_ref: sref,
+                    },
+                )
                 .collect();
             match serde_json::to_string(&rows) {
                 Ok(body) => Ok(json(StatusCode::OK, body)),
@@ -140,7 +151,10 @@ async fn handle(
                 )),
             }
         }
-        _ => Ok(json(StatusCode::NOT_FOUND, r#"{"error":"not found"}"#.into())),
+        _ => Ok(json(
+            StatusCode::NOT_FOUND,
+            r#"{"error":"not found"}"#.into(),
+        )),
     }
 }
 
@@ -194,6 +208,6 @@ mod tests {
         assert!(oversized.len() > MAX_BODY_BYTES);
 
         let exact = vec![b'x'; MAX_BODY_BYTES];
-        assert!(!(exact.len() > MAX_BODY_BYTES));
+        assert!(exact.len() <= MAX_BODY_BYTES);
     }
 }

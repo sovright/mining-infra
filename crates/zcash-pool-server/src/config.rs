@@ -623,6 +623,9 @@ mod tests {
 
     #[test]
     fn default_config_has_settlement_retention() {
-        assert_eq!(valid_config().payout_settlement_retention, Duration::from_secs(86_400));
+        assert_eq!(
+            valid_config().payout_settlement_retention,
+            Duration::from_secs(86_400)
+        );
     }
 }

@@ -545,11 +545,13 @@ impl PayoutTracker {
             });
             drop(miners);
             if stale > 0 {
-                let mut settlements =
-                    self.settlements.write().unwrap_or_else(|e| e.into_inner());
+                let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
                 settlements.retain(|id, _| !is_ephemeral_miner_id(id));
                 self.mark_dirty();
-                tracing::debug!("cleanup_stale_miners: processed {} stale entries (ephemeral evicted, named reset)", stale);
+                tracing::debug!(
+                    "cleanup_stale_miners: processed {} stale entries (ephemeral evicted, named reset)",
+                    stale
+                );
             }
             return stale;
         }
@@ -1225,7 +1227,11 @@ mod tests {
 
         tracker.record_share(&miner, 100.0);
         let total = tracker.get_stats(&miner).unwrap().total_shares;
-        assert!(tracker.mark_miner_settled(&miner, total, "batch-1").is_some());
+        assert!(
+            tracker
+                .mark_miner_settled(&miner, total, "batch-1")
+                .is_some()
+        );
         tracker.cleanup_stale_miners(Duration::ZERO);
 
         let pruned = tracker
@@ -1267,7 +1273,11 @@ mod tests {
                     .unwrap();
             tracker.record_share(&miner, 100.0);
             let total = tracker.get_stats(&miner).unwrap().total_shares;
-            assert!(tracker.mark_miner_settled(&miner, total, "batch-1").is_some());
+            assert!(
+                tracker
+                    .mark_miner_settled(&miner, total, "batch-1")
+                    .is_some()
+            );
             tracker.flush().unwrap();
         }
 
@@ -1297,7 +1307,11 @@ mod tests {
 
         tracker.record_share(&miner, 100.0);
         let total = tracker.get_stats(&miner).unwrap().total_shares;
-        assert!(tracker.mark_miner_settled(&miner, total, "batch-1").is_some());
+        assert!(
+            tracker
+                .mark_miner_settled(&miner, total, "batch-1")
+                .is_some()
+        );
         tracker.record_share(&miner, 25.0);
         tracker.cleanup_stale_miners(Duration::ZERO);
 
@@ -1734,15 +1748,21 @@ mod tests {
     #[test]
     fn settle_clamps_and_is_monotonic() {
         let t = PayoutTracker::new(Duration::from_secs(600));
-        for _ in 0..10 { t.record_share(&"rig1".to_string(), 1.0); }
+        for _ in 0..10 {
+            t.record_share(&"rig1".to_string(), 1.0);
+        }
 
         // Clamp: cannot settle more than current total.
-        let o = t.mark_miner_settled(&"rig1".to_string(), 999, "batch-1").unwrap();
+        let o = t
+            .mark_miner_settled(&"rig1".to_string(), 999, "batch-1")
+            .unwrap();
         assert_eq!(o.total_shares, 10);
         assert_eq!(o.settled_total_shares, 10);
 
         // Monotonic: a lower explicit total never moves the watermark backward.
-        let o = t.mark_miner_settled(&"rig1".to_string(), 3, "batch-2").unwrap();
+        let o = t
+            .mark_miner_settled(&"rig1".to_string(), 3, "batch-2")
+            .unwrap();
         assert_eq!(o.settled_total_shares, 10);
     }
 
@@ -1751,7 +1771,10 @@ mod tests {
         let t = PayoutTracker::new(Duration::from_secs(600));
         assert!(t.mark_miner_settled(&"ghost".to_string(), 1, "b").is_none());
         t.record_share(&"channel_7".to_string(), 1.0);
-        assert!(t.mark_miner_settled(&"channel_7".to_string(), 1, "b").is_none());
+        assert!(
+            t.mark_miner_settled(&"channel_7".to_string(), 1, "b")
+                .is_none()
+        );
     }
 
     /// Discriminating test: passes under the count-only gate, fails under the
@@ -1770,7 +1793,10 @@ mod tests {
         let archive = dir.join(format!(
             "settle-arch-{}-{}.jsonl",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
         ));
         let _ = std::fs::remove_file(&archive);
 
@@ -1779,7 +1805,8 @@ mod tests {
             t.record_share(&"rig1".to_string(), 1.0);
         }
         // Settle count=5; this stamps settled_total_difficulty=5.0 matching total.
-        t.mark_miner_settled(&"rig1".to_string(), 5, "batch-1").unwrap();
+        t.mark_miner_settled(&"rig1".to_string(), 5, "batch-1")
+            .unwrap();
 
         // Directly mutate settled_total_difficulty to a value that differs from
         // stats.total_difficulty (5.0), while keeping settled_total_shares == 5.
@@ -1817,7 +1844,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         t.cleanup_stale_miners(Duration::ZERO);
 
-        assert!(t.get_stats(&"rig1".to_string()).is_some());   // named: retained
+        assert!(t.get_stats(&"rig1".to_string()).is_some()); // named: retained
         assert!(t.get_stats(&"channel_9".to_string()).is_none()); // ephemeral: evicted
     }
 
