@@ -529,20 +529,25 @@ impl PayoutTracker {
 
         if self.persistence.is_some() {
             let mut stale = 0;
-            for stats in miners.values_mut() {
-                if stats.last_share.map(|t| t <= cutoff).unwrap_or(false) {
+            miners.retain(|id, stats| {
+                let is_stale = stats.last_share.map(|t| t <= cutoff).unwrap_or(false);
+                if is_stale && is_ephemeral_miner_id(id) {
+                    stale += 1;
+                    return false; // drop ephemeral/unnamed entries
+                }
+                if is_stale {
                     stats.window_shares = 0;
                     stats.window_difficulty = 0.0;
                     stats.last_share = None;
                     stale += 1;
                 }
-            }
+                true
+            });
             drop(miners);
             if stale > 0 {
-                tracing::debug!(
-                    "Marked {} stale miner entries inactive while preserving payout totals",
-                    stale
-                );
+                let mut settlements =
+                    self.settlements.write().unwrap_or_else(|e| e.into_inner());
+                settlements.retain(|id, _| !is_ephemeral_miner_id(id));
                 self.mark_dirty();
             }
             return stale;
@@ -685,9 +690,7 @@ fn archive_record_if_prunable(
     cutoff_unix_ms: u64,
     pruned_at_unix_ms: u64,
 ) -> Option<SettlementArchiveRecord> {
-    if settlement.settled_total_shares != stats.total_shares
-        || settlement.settled_total_difficulty != stats.total_difficulty
-    {
+    if settlement.settled_total_shares != stats.total_shares {
         return None;
     }
 
@@ -1729,5 +1732,38 @@ mod tests {
         assert!(t.mark_miner_settled(&"ghost".to_string(), 1, "b").is_none());
         t.record_share(&"channel_7".to_string(), 1.0);
         assert!(t.mark_miner_settled(&"channel_7".to_string(), 1, "b").is_none());
+    }
+
+    #[test]
+    fn prune_gate_uses_share_count_not_difficulty() {
+        let dir = std::env::temp_dir();
+        let archive = dir.join(format!("settle-arch-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&archive);
+
+        let t = PayoutTracker::new(Duration::from_secs(600));
+        for _ in 0..5 { t.record_share(&"rig1".to_string(), 1.0); }
+        // Settle the full current count; difficulty equality is irrelevant.
+        t.mark_miner_settled(&"rig1".to_string(), 5, "batch-1").unwrap();
+
+        let pruned = t.prune_settled_miners(Duration::ZERO, &archive).unwrap();
+        assert_eq!(pruned, 1);
+        assert!(t.get_stats(&"rig1".to_string()).is_none());
+    }
+
+    #[test]
+    fn cleanup_evicts_ephemeral_but_keeps_named_under_persistence() {
+        let dir = std::env::temp_dir();
+        let state = dir.join(format!("settle-state-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&state);
+        let t = PayoutTracker::with_persistence(Duration::from_secs(600), &state).unwrap();
+
+        t.record_share(&"rig1".to_string(), 1.0);
+        t.record_share(&"channel_9".to_string(), 1.0);
+        // Force both stale by clearing last_share via a long idle cleanup.
+        std::thread::sleep(Duration::from_millis(5));
+        t.cleanup_stale_miners(Duration::ZERO);
+
+        assert!(t.get_stats(&"rig1".to_string()).is_some());   // named: retained
+        assert!(t.get_stats(&"channel_9".to_string()).is_none()); // ephemeral: evicted
     }
 }
