@@ -124,7 +124,7 @@ struct PersistedMinerStats {
     settlement_ref: Option<String>,
 }
 
-const PAYOUT_STATE_VERSION: u32 = 1;
+const PAYOUT_STATE_VERSION: u32 = 2;
 
 /// Result of a successful settlement, returned for caller confirmation.
 #[derive(Debug, Clone, Serialize)]
@@ -1800,5 +1800,10 @@ mod tests {
 
         assert!(t.get_stats(&"rig1".to_string()).is_some());   // named: retained
         assert!(t.get_stats(&"channel_9".to_string()).is_none()); // ephemeral: evicted
+    }
+
+    #[test]
+    fn payout_state_version_is_two() {
+        assert_eq!(PAYOUT_STATE_VERSION, 2);
     }
 }
