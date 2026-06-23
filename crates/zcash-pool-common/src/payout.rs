@@ -642,6 +642,25 @@ impl PayoutTracker {
         Ok(removed)
     }
 
+    /// Snapshot of per-worker totals + settlement watermark for reconciliation.
+    pub fn payout_rows(&self) -> Vec<(MinerId, u64, f64, u64, Option<String>)> {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        let settlements = self.settlements.read().unwrap_or_else(|e| e.into_inner());
+        miners
+            .iter()
+            .map(|(id, s)| {
+                let st = settlements.get(id);
+                (
+                    id.clone(),
+                    s.total_shares,
+                    s.total_difficulty,
+                    st.map(|x| x.settled_total_shares).unwrap_or(0),
+                    st.and_then(|x| x.settlement_ref.clone()),
+                )
+            })
+            .collect()
+    }
+
     /// Write payout totals to disk if anything changed since the last flush.
     ///
     /// This is the single place durable state is written. Call it periodically

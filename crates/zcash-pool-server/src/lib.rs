@@ -16,6 +16,7 @@
 
 pub mod channel;
 pub mod config;
+pub mod control;
 pub mod duplicate;
 pub mod error;
 pub mod job;
