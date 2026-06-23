@@ -549,6 +549,7 @@ impl PayoutTracker {
                     self.settlements.write().unwrap_or_else(|e| e.into_inner());
                 settlements.retain(|id, _| !is_ephemeral_miner_id(id));
                 self.mark_dirty();
+                tracing::debug!("cleanup_stale_miners: processed {} stale entries (ephemeral evicted, named reset)", stale);
             }
             return stale;
         }
@@ -1734,20 +1735,54 @@ mod tests {
         assert!(t.mark_miner_settled(&"channel_7".to_string(), 1, "b").is_none());
     }
 
+    /// Discriminating test: passes under the count-only gate, fails under the
+    /// old gate that also checked `settled_total_difficulty != stats.total_difficulty`.
+    ///
+    /// Setup:
+    ///   - 5 shares at difficulty 1.0  → total_shares=5, total_difficulty=5.0
+    ///   - mark_miner_settled(count=5) → settled_total_shares=5, settled_total_difficulty=5.0
+    ///   - DIRECTLY mutate settled_total_difficulty to 999.0 (leaving share count at 5)
+    ///
+    /// Under the OLD gate: 999.0 != 5.0 → blocked (would return 0)
+    /// Under the NEW count-only gate: settled_total_shares==total_shares → prunable (returns 1)
     #[test]
     fn prune_gate_uses_share_count_not_difficulty() {
         let dir = std::env::temp_dir();
-        let archive = dir.join(format!("settle-arch-{}.jsonl", std::process::id()));
+        let archive = dir.join(format!(
+            "settle-arch-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        ));
         let _ = std::fs::remove_file(&archive);
 
         let t = PayoutTracker::new(Duration::from_secs(600));
-        for _ in 0..5 { t.record_share(&"rig1".to_string(), 1.0); }
-        // Settle the full current count; difficulty equality is irrelevant.
+        for _ in 0..5 {
+            t.record_share(&"rig1".to_string(), 1.0);
+        }
+        // Settle count=5; this stamps settled_total_difficulty=5.0 matching total.
         t.mark_miner_settled(&"rig1".to_string(), 5, "batch-1").unwrap();
 
+        // Directly mutate settled_total_difficulty to a value that differs from
+        // stats.total_difficulty (5.0), while keeping settled_total_shares == 5.
+        // Old gate: `settled_total_difficulty != stats.total_difficulty` would block pruning.
+        // New gate: only checks share count, so pruning must still proceed.
+        {
+            let mut settlements = t.settlements.write().unwrap_or_else(|e| e.into_inner());
+            let s = settlements.get_mut("rig1").expect("settlement must exist");
+            s.settled_total_difficulty = 999.0; // mismatch with stats.total_difficulty=5.0
+        }
+
         let pruned = t.prune_settled_miners(Duration::ZERO, &archive).unwrap();
-        assert_eq!(pruned, 1);
-        assert!(t.get_stats(&"rig1".to_string()).is_none());
+        assert_eq!(
+            pruned, 1,
+            "count-only gate must prune even when settled_total_difficulty differs from total_difficulty"
+        );
+        assert!(
+            t.get_stats(&"rig1".to_string()).is_none(),
+            "miner must be removed from hot state after pruning"
+        );
+
+        let _ = std::fs::remove_file(&archive);
     }
 
     #[test]
