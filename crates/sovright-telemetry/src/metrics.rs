@@ -55,6 +55,12 @@ pub struct PoolMetrics {
     pub pool_connected_miners: IntGauge,
     /// Pool-level connected workers count
     pub pool_connected_workers: IntGauge,
+    /// Distinct named workers held in the durable payout map.
+    pub payout_durable_workers: IntGauge,
+    /// Named workers with unsettled payout credit (settled < total). A growing
+    /// value flags durable rows that are never settled (e.g. an identity that
+    /// the payout engine can't match) — the cross-repo settlement leak signal.
+    pub payout_unsettled_workers: IntGauge,
     /// Network difficulty
     pub network_difficulty: Gauge,
 
@@ -199,6 +205,18 @@ impl PoolMetrics {
         let pool_connected_workers = IntGauge::with_opts(Opts::new(
             "pool_connected_workers",
             "Number of connected workers",
+        ))
+        .expect("metric can be created");
+
+        let payout_durable_workers = IntGauge::with_opts(Opts::new(
+            "payout_durable_workers",
+            "Distinct named workers in the durable payout map",
+        ))
+        .expect("metric can be created");
+
+        let payout_unsettled_workers = IntGauge::with_opts(Opts::new(
+            "payout_unsettled_workers",
+            "Named workers with unsettled payout credit (settlement leak signal)",
         ))
         .expect("metric can be created");
 
@@ -354,6 +372,12 @@ impl PoolMetrics {
             .register(Box::new(pool_connected_workers.clone()))
             .expect("metric can be registered");
         registry
+            .register(Box::new(payout_durable_workers.clone()))
+            .expect("metric can be registered");
+        registry
+            .register(Box::new(payout_unsettled_workers.clone()))
+            .expect("metric can be registered");
+        registry
             .register(Box::new(network_difficulty.clone()))
             .expect("metric can be registered");
 
@@ -435,6 +459,8 @@ impl PoolMetrics {
             pool_total_hashrate,
             pool_connected_miners,
             pool_connected_workers,
+            payout_durable_workers,
+            payout_unsettled_workers,
             network_difficulty,
             blocks_found,
             blocks_submitted,

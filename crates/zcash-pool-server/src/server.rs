@@ -125,7 +125,11 @@ pub struct PoolServer {
 /// attacker-controlled Prometheus label values; both the label and this set
 /// live until process restart, so the cap bounds metric cardinality against
 /// a client cycling names across reconnects.
-const MAX_WORKER_IDENTITIES: usize = 10_000;
+///
+/// Reconciled with the JD token path: both protocols admit named workers under
+/// the SAME bound (`zcash_pool_common::MAX_PERSISTED_WORKERS`) so neither can
+/// grow the shared durable payout map past it.
+const MAX_WORKER_IDENTITIES: usize = zcash_pool_common::MAX_PERSISTED_WORKERS;
 
 #[derive(Debug, PartialEq)]
 enum IdentityDecision {
@@ -490,6 +494,21 @@ impl PoolServer {
                         Ok(_) => {}
                         Err(e) => error!("prune_settled_miners failed: {}", e),
                     }
+                }
+
+                // Observability: surface durable-map size and the count of named
+                // workers with unsettled credit. A persistently growing
+                // `unsettled` is the settlement-leak signal — durable rows whose
+                // identity the payout engine never settles (e.g. a JD client_id
+                // that no `stratum_auth` matches), which prune can never reclaim.
+                let (durable_named, unsettled_named) = payout_tracker.durable_worker_summary();
+                metrics.payout_durable_workers.set(durable_named as i64);
+                metrics.payout_unsettled_workers.set(unsettled_named as i64);
+                if unsettled_named > 0 {
+                    debug!(
+                        durable_named,
+                        unsettled_named, "Durable payout workers with unsettled credit"
+                    );
                 }
 
                 // Share-independent vardiff tick: lets overshooting channels

@@ -97,6 +97,14 @@ pub struct MinerStats {
 /// cannot be reached by an attacker before the next block clears the set.
 const MAX_CROSS_PATH_SOLUTIONS: usize = 500_000;
 
+/// Cap on the number of distinct *named* (non-ephemeral) workers admitted into
+/// the durable payout map. Bounds the durable map and on-disk file against an
+/// identity space that settlement/pruning hasn't (yet) caught up with. The SV2
+/// path enforces the same cap at identity declaration; the JD path enforces it
+/// at token allocation — both reconcile to this single value so neither
+/// protocol can grow the durable map past it.
+pub const MAX_PERSISTED_WORKERS: usize = 10_000;
+
 #[derive(Debug, Clone)]
 struct PayoutPersistence {
     path: PathBuf,
@@ -431,6 +439,50 @@ impl PayoutTracker {
             .values()
             .filter(|s| s.last_share.map(|t| t > cutoff).unwrap_or(false))
             .count()
+    }
+
+    /// Number of distinct *named* (non-ephemeral) workers in the durable map.
+    /// Used to enforce [`MAX_PERSISTED_WORKERS`] symmetrically across the SV2
+    /// and JD identity-admission paths.
+    pub fn named_worker_count(&self) -> usize {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        miners
+            .keys()
+            .filter(|id| !is_ephemeral_miner_id(id))
+            .count()
+    }
+
+    /// Whether the durable map already holds this worker id (so admitting it
+    /// again does not consume a new slot against the cap).
+    pub fn knows_worker(&self, worker: &str) -> bool {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        miners.contains_key(worker)
+    }
+
+    /// Count of named workers that hold *unsettled* payout credit
+    /// (`settled_total_shares < total_shares`). This is the leak signal: rows
+    /// that keep accumulating credit but are never settled (e.g. a worker whose
+    /// pool credit-key never matches a `stratum_auth` the payout engine settles
+    /// by) will show up and grow here. Returns `(named_total, named_unsettled)`.
+    pub fn durable_worker_summary(&self) -> (usize, usize) {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        let settlements = self.settlements.read().unwrap_or_else(|e| e.into_inner());
+        let mut named_total = 0;
+        let mut named_unsettled = 0;
+        for (id, stats) in miners.iter() {
+            if is_ephemeral_miner_id(id) {
+                continue;
+            }
+            named_total += 1;
+            let settled = settlements
+                .get(id)
+                .map(|s| s.settled_total_shares)
+                .unwrap_or(0);
+            if settled < stats.total_shares {
+                named_unsettled += 1;
+            }
+        }
+        (named_total, named_unsettled)
     }
 
     /// Remove a miner from the tracker (on disconnect)
@@ -1431,6 +1483,38 @@ mod tests {
     fn test_active_miner_count_empty() {
         let tracker = PayoutTracker::default();
         assert_eq!(tracker.active_miner_count(), 0);
+    }
+
+    #[test]
+    fn test_named_worker_count_excludes_ephemeral_and_knows_worker() {
+        let tracker = PayoutTracker::default();
+        tracker.record_share(&"rig1".to_string(), 1.0);
+        tracker.record_share(&"rig2".to_string(), 1.0);
+        // Ephemeral (channel_*) entries must not count against the named cap.
+        tracker.record_share(&format!("{}7", EPHEMERAL_MINER_PREFIX), 1.0);
+
+        assert_eq!(tracker.named_worker_count(), 2);
+        assert!(tracker.knows_worker("rig1"));
+        assert!(!tracker.knows_worker("rig3"));
+    }
+
+    #[test]
+    fn test_durable_worker_summary_flags_unsettled() {
+        // Use persistence so settlement watermarks are tracked.
+        let state_path = unique_payout_state_path("summary");
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        tracker.record_share(&"rig1".to_string(), 1.0);
+        tracker.record_share(&"rig2".to_string(), 1.0);
+
+        // Both named, both unsettled.
+        assert_eq!(tracker.durable_worker_summary(), (2, 2));
+
+        // Settle rig1 up to its current total → no longer unsettled.
+        tracker.mark_miner_settled(&"rig1".to_string(), 1, "batch-1");
+        assert_eq!(tracker.durable_worker_summary(), (2, 1));
+
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
