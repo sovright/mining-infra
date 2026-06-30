@@ -988,6 +988,7 @@ fn log_submission_outcome(
             metrics.inc_submit_dry_run_candidates();
             info!(
                 block_hash = %candidate.block_hash,
+                consensus_block_hash = %candidate.consensus_block_hash,
                 tx_count = candidate.tx_count,
                 block_bytes = candidate.block_bytes,
                 "Relay block submit dry-run candidate"
@@ -1013,6 +1014,7 @@ fn log_submission_outcome(
                 metrics.inc_submit_successes();
                 info!(
                     block_hash = %candidate.block_hash,
+                    consensus_block_hash = %candidate.consensus_block_hash,
                     tx_count = candidate.tx_count,
                     block_bytes = candidate.block_bytes,
                     submit_status = status.as_str(),
@@ -1023,6 +1025,7 @@ fn log_submission_outcome(
                 metrics.inc_submit_duplicates();
                 info!(
                     block_hash = %candidate.block_hash,
+                    consensus_block_hash = %candidate.consensus_block_hash,
                     tx_count = candidate.tx_count,
                     block_bytes = candidate.block_bytes,
                     submit_status = status.as_str(),
@@ -1038,6 +1041,7 @@ fn log_submission_outcome(
             metrics.inc_submit_gate_rejected(reason);
             info!(
                 block_hash = %candidate.block_hash,
+                consensus_block_hash = %candidate.consensus_block_hash,
                 tx_count = candidate.tx_count,
                 block_bytes = candidate.block_bytes,
                 gate_reason = reason.as_str(),

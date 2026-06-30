@@ -305,6 +305,7 @@ mod tests {
     fn candidate(hash: &str) -> SubmissionCandidate {
         SubmissionCandidate {
             block_hash: hash.to_string(),
+            consensus_block_hash: hash.to_string(),
             block_hex: "ff".to_string(),
             tx_count: 1,
             block_bytes: 1,

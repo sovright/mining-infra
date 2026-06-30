@@ -21,7 +21,7 @@ pub use builder::CompactBlockBuilder;
 pub use compact_block::{CompactBlock, PrefilledTx};
 pub use error::CompactBlockError;
 pub use fec::FecError;
-pub use hash::zcash_block_hash;
+pub use hash::{consensus_block_hash, consensus_block_hash_display, zcash_block_hash};
 pub use mempool::{
     MempoolError, MempoolProvider, TestMempool, TxCache, TxCacheConfig, TxCacheInsertOutcome,
     TxCacheSnapshot,
