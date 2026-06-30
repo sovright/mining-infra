@@ -2,10 +2,12 @@
 //!
 //! Provides async networking for FIBRE-style block relay.
 
+mod arrival;
 mod client;
 mod metrics;
 mod node;
 
+pub use arrival::ArrivalSink;
 pub use client::{BlockReceiver, BlockSender, RelayClient, RelayPayload};
 pub use metrics::{MetricsSnapshot, RelayMetrics, render_prometheus_text};
 pub use node::RelayNode;

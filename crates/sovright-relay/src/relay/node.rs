@@ -20,6 +20,7 @@ use crate::transport::{
     ZCASH_FULL_HEADER_SIZE,
 };
 
+use super::ArrivalSink;
 use super::metrics::RelayMetrics;
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
@@ -78,6 +79,8 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     metrics: Arc<RelayMetrics>,
     /// Raw block metadata with validated segment-0 PoW, keyed by parent block hash
     validated_raw_blocks: Arc<Mutex<HashMap<[u8; 32], ValidatedRawBlock>>>,
+    /// Optional per-block relay arrival logger (observatory timing source)
+    arrival_sink: Option<ArrivalSink>,
 }
 
 impl RelayNode<EquihashPowValidator> {
@@ -113,7 +116,16 @@ impl<V: PowValidator> RelayNode<V> {
             running: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(RelayMetrics::new()),
             validated_raw_blocks: Arc::new(Mutex::new(HashMap::new())),
+            arrival_sink: None,
         })
+    }
+
+    /// Attach (or clear) the per-block relay arrival logger. When set, the node
+    /// appends a `relay_block_received` event (keyed by the Zcash consensus block
+    /// hash) each time it reconstructs a PoW-valid raw block.
+    pub fn with_arrival_sink(mut self, sink: Option<ArrivalSink>) -> Self {
+        self.arrival_sink = sink;
+        self
     }
 
     /// Get the listen address from config
@@ -308,6 +320,12 @@ impl<V: PowValidator> RelayNode<V> {
         match self.validator.validate(header) {
             PowResult::Valid => {
                 self.record_validated_raw_block(&segment);
+                // First moment this region's relay holds a PoW-valid block via
+                // the relay path: log its consensus block hash so the observatory
+                // can join it against native-P2P arrivals for the same block.
+                if let Some(sink) = &self.arrival_sink {
+                    sink.relay_block_received(&crate::hash::consensus_block_hash_display(header));
+                }
                 Some(true)
             }
             PowResult::Invalid => Some(false),
@@ -1180,6 +1198,56 @@ mod tests {
             segments.len() as u64
         );
         assert_eq!(metrics.raw_segment_validation_failures, 0);
+    }
+
+    #[test]
+    fn validated_raw_block_emits_arrival_event_with_consensus_hash() {
+        let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE + 256];
+        raw_block[0] = 0x04;
+        let block_hash = raw_block_header_hash(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
+        let segments = split_raw_block(block_hash, &raw_block, 2_000).unwrap();
+
+        let arrival_path = std::env::temp_dir().join(format!(
+            "sovright-relay-arrival-node-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
+        let node = RelayNode::with_validator(config, StubPowValidator)
+            .unwrap()
+            .with_arrival_sink(Some(ArrivalSink::new(&arrival_path).unwrap()));
+        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), [0u8; 32]);
+
+        for segment in &segments {
+            let chunks = node.chunker.raw_block_segment_to_chunks(segment).unwrap();
+            for chunk in &chunks {
+                let _ = node.process_chunk_for_session(
+                    &mut session,
+                    chunk,
+                    chunk.header.block_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                );
+            }
+        }
+
+        // The arrival log must carry the Zcash *consensus* hash (double-SHA256,
+        // display), not the relay's internal object id.
+        let expected =
+            crate::hash::consensus_block_hash_display(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
+        let contents = std::fs::read_to_string(&arrival_path).unwrap();
+        assert!(
+            contents.lines().any(|line| {
+                line.contains("\"event\":\"relay_block_received\"") && line.contains(&expected)
+            }),
+            "expected relay_block_received with consensus hash {expected}, got:\n{contents}"
+        );
+        let _ = std::fs::remove_file(arrival_path);
     }
 
     #[test]

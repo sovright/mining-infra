@@ -29,7 +29,7 @@ pub use mempool::{
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
-    BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
+    ArrivalSink, BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
     RelayPayload, render_prometheus_text,
 };
 pub use segmented_block::{
