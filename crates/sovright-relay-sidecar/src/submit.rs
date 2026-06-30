@@ -11,7 +11,8 @@ use std::pin::Pin;
 
 use sovright_relay::{
     BlockHash, CompactBlock, CompactBlockReconstructor, GetBlockTxn, MempoolProvider,
-    ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
+    ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display,
+    zcash_block_hash,
 };
 
 use crate::rpc::ZebraRpc;
@@ -43,7 +44,12 @@ pub enum SubmitBlockMode {
 /// Fully serialized block candidate that is safe to submit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionCandidate {
+    /// Relay internal BLAKE2b object id (NOT the consensus block hash).
     pub block_hash: String,
+    /// Zcash consensus block hash in DISPLAY order, matching Zebra/getblockhash
+    /// and the P2P-ingress `hash` field. Lets submit outcomes be cross-referenced
+    /// with ingress receipts and the first-to-Zebra win attribution pipeline.
+    pub consensus_block_hash: String,
     pub block_hex: String,
     pub tx_count: usize,
     pub block_bytes: usize,
@@ -233,6 +239,7 @@ pub fn build_submission_candidate(
 
     Ok(SubmissionCandidate {
         block_hash: compact.header_hash().to_string(),
+        consensus_block_hash: consensus_block_hash_display(&compact.header),
         block_hex: hex::encode(&block),
         tx_count: txs.len(),
         block_bytes: block.len(),
@@ -297,6 +304,7 @@ fn build_submission_candidate_from_transactions(
 
     Ok(SubmissionCandidate {
         block_hash: hex::encode(zcash_block_hash(header)),
+        consensus_block_hash: consensus_block_hash_display(header),
         block_hex: hex::encode(&block),
         tx_count: transactions.len(),
         block_bytes: block.len(),
@@ -331,6 +339,7 @@ pub fn build_raw_block_submission_candidate(
 
     Ok(SubmissionCandidate {
         block_hash: hex::encode(block_hash),
+        consensus_block_hash: consensus_block_hash_display(header),
         block_hex: hex::encode(raw_block),
         tx_count,
         block_bytes: raw_block.len(),
