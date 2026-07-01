@@ -6,6 +6,20 @@ use std::time::{Duration, Instant};
 
 use super::MessageType;
 use hmac::{Hmac, Mac};
+
+/// Result of one assembly-cleanup pass, feeding the delivery/miss instrument.
+/// A "miss" is a block whose chunk assembly timed out before enough chunks
+/// arrived to reconstruct -- the delivery failure that drives the propagation
+/// tail (reconstruction itself is fast once chunks are present).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AssemblyCleanupStats {
+    /// Assemblies dropped after timing out without reconstructing.
+    pub expired_incomplete: u64,
+    /// Of those, ones that had received >= 90% of `data_shards` -- a marginal
+    /// miss a parity bump or retransmit would likely have saved, as opposed to
+    /// a wholesale delivery failure (few chunks ever arrived).
+    pub expired_incomplete_near: u64,
+}
 use sha2::Sha256;
 use std::collections::VecDeque;
 use subtle::ConstantTimeEq;
@@ -244,11 +258,28 @@ impl RelaySession {
         }
     }
 
-    /// Remove completed or expired assemblies
-    pub fn cleanup_assemblies(&mut self, assembly_timeout: Duration) {
+    /// Remove completed or expired assemblies, counting timed-out incomplete
+    /// ones (delivery misses) and how many were near the reconstruction
+    /// threshold. `data_shards` is the reconstruction threshold.
+    pub fn cleanup_assemblies(
+        &mut self,
+        assembly_timeout: Duration,
+        data_shards: usize,
+    ) -> AssemblyCleanupStats {
+        let mut stats = AssemblyCleanupStats::default();
+        let near_threshold = data_shards.saturating_mul(9) / 10;
         self.pending_blocks.retain(|_, assembly| {
-            !assembly.is_expired(assembly_timeout) && !assembly.is_complete()
+            let expired = assembly.is_expired(assembly_timeout);
+            let complete = assembly.is_complete();
+            if expired && !complete && !assembly.pow_validated {
+                stats.expired_incomplete += 1;
+                if assembly.received_count() >= near_threshold {
+                    stats.expired_incomplete_near += 1;
+                }
+            }
+            !expired && !complete
         });
+        stats
     }
 
     /// Cleanup old replay entries
@@ -287,6 +318,48 @@ mod tests {
         }
 
         assert!(assembly.is_complete());
+    }
+
+    #[test]
+    fn cleanup_counts_timed_out_incomplete_assemblies() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let mut session = RelaySession::new(addr, [0x42; 32]);
+        let old = Instant::now() - Duration::from_secs(60);
+        // data_shards = 10 -> near threshold = 9.
+
+        // A: near-complete (9 chunks), expired -> miss AND near.
+        let mut a = BlockAssembly::new([0xa1; 32], 12);
+        for i in 0..9 {
+            a.add_chunk(i, vec![0u8; 4]);
+        }
+        a.started_at = old;
+        session.pending_blocks.insert([0xa1; 32], a);
+
+        // B: wholesale miss (2 chunks), expired -> miss, NOT near.
+        let mut b = BlockAssembly::new([0xb2; 32], 12);
+        for i in 0..2 {
+            b.add_chunk(i, vec![0u8; 4]);
+        }
+        b.started_at = old;
+        session.pending_blocks.insert([0xb2; 32], b);
+
+        // C: expired but already reconstructed -> NOT a miss.
+        let mut c = BlockAssembly::new([0xc3; 32], 12);
+        c.add_chunk(0, vec![0u8; 4]);
+        c.pow_validated = true;
+        c.started_at = old;
+        session.pending_blocks.insert([0xc3; 32], c);
+
+        // D: fresh incomplete -> retained, not a miss.
+        let mut d = BlockAssembly::new([0xd4; 32], 12);
+        d.add_chunk(0, vec![0u8; 4]);
+        session.pending_blocks.insert([0xd4; 32], d);
+
+        let stats = session.cleanup_assemblies(Duration::from_secs(10), 10);
+        assert_eq!(stats.expired_incomplete, 2); // A + B
+        assert_eq!(stats.expired_incomplete_near, 1); // A only (9 >= 9)
+        assert!(session.pending_blocks.contains_key(&[0xd4; 32])); // fresh kept
+        assert!(!session.pending_blocks.contains_key(&[0xa1; 32])); // expired dropped
     }
 
     #[test]
