@@ -590,6 +590,9 @@ impl<V: PowValidator> RelayNode<V> {
                         if chunk.header.msg_type == MessageType::RawBlockSegment {
                             if valid {
                                 self.metrics.inc_raw_segment_validation_successes();
+                                self.metrics.record_reconstruct_latency_ms(
+                                    assembly.started_at.elapsed().as_millis() as u64,
+                                );
                             } else {
                                 self.metrics.inc_raw_segment_validation_failures();
                             }
