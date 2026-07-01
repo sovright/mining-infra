@@ -234,7 +234,9 @@ impl<V: PowValidator> RelayNode<V> {
         let before = sessions.len();
         sessions.retain(|_, session| !session.is_expired(timeout));
         for session in sessions.values_mut() {
-            session.cleanup_assemblies(assembly_timeout);
+            let stats = session.cleanup_assemblies(assembly_timeout, self.config.data_shards);
+            self.metrics
+                .add_assembly_misses(stats.expired_incomplete, stats.expired_incomplete_near);
             session.cleanup_recent();
         }
         let expired = (before - sessions.len()) as u64;

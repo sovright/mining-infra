@@ -51,6 +51,12 @@ pub struct RelayMetrics {
     pub reconstruct_latency_over_2s: AtomicU64,
     /// Reconstructions that took longer than 10s (severe tail).
     pub reconstruct_latency_over_10s: AtomicU64,
+    /// Block assemblies dropped after timing out without reconstructing
+    /// (delivery misses -- the tail cause, since reconstruction itself is fast).
+    pub assembly_misses: AtomicU64,
+    /// Of those misses, ones that had >= 90% of data_shards when dropped
+    /// (marginal: a parity bump / retransmit would likely have saved them).
+    pub assembly_misses_near: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -183,6 +189,13 @@ impl RelayMetrics {
         }
     }
 
+    /// Record assemblies that timed out without reconstructing (delivery misses)
+    /// and how many were near the reconstruction threshold.
+    pub fn add_assembly_misses(&self, total: u64, near: u64) {
+        self.assembly_misses.fetch_add(total, Ordering::Relaxed);
+        self.assembly_misses_near.fetch_add(near, Ordering::Relaxed);
+    }
+
     /// Get snapshot of current metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -221,6 +234,8 @@ impl RelayMetrics {
             reconstruct_latency_sum_ms: self.reconstruct_latency_sum_ms.load(Ordering::Relaxed),
             reconstruct_latency_over_2s: self.reconstruct_latency_over_2s.load(Ordering::Relaxed),
             reconstruct_latency_over_10s: self.reconstruct_latency_over_10s.load(Ordering::Relaxed),
+            assembly_misses: self.assembly_misses.load(Ordering::Relaxed),
+            assembly_misses_near: self.assembly_misses_near.load(Ordering::Relaxed),
         }
     }
 }
@@ -251,6 +266,8 @@ pub struct MetricsSnapshot {
     pub reconstruct_latency_sum_ms: u64,
     pub reconstruct_latency_over_2s: u64,
     pub reconstruct_latency_over_10s: u64,
+    pub assembly_misses: u64,
+    pub assembly_misses_near: u64,
 }
 
 /// Render relay metrics in Prometheus text exposition format.
@@ -424,6 +441,20 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "counter",
         snapshot.reconstruct_latency_over_10s,
     );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_assembly_misses_total",
+        "Block assemblies dropped after timing out without reconstructing (delivery misses).",
+        "counter",
+        snapshot.assembly_misses,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_assembly_misses_near_total",
+        "Delivery misses that had >= 90% of data_shards when dropped (marginal, near-reconstructable).",
+        "counter",
+        snapshot.assembly_misses_near,
+    );
     text
 }
 
@@ -498,6 +529,8 @@ mod tests {
             reconstruct_latency_sum_ms: 8000,
             reconstruct_latency_over_2s: 2,
             reconstruct_latency_over_10s: 1,
+            assembly_misses: 7,
+            assembly_misses_near: 3,
         };
 
         let text = render_prometheus_text(&snapshot, 5);
@@ -521,6 +554,8 @@ mod tests {
         assert!(text.contains("sovright_relay_relay_reconstruct_latency_sum_ms 8000\n"));
         assert!(text.contains("sovright_relay_relay_reconstruct_latency_over_2s_total 2\n"));
         assert!(text.contains("sovright_relay_relay_reconstruct_latency_over_10s_total 1\n"));
+        assert!(text.contains("sovright_relay_relay_assembly_misses_total 7\n"));
+        assert!(text.contains("sovright_relay_relay_assembly_misses_near_total 3\n"));
         assert!(text.contains("sovright_relay_relay_raw_segment_validation_failures_total 10\n"));
         assert!(text.contains("sovright_relay_relay_raw_segment_cached_promotions_total 11\n"));
         assert!(text.contains("sovright_relay_relay_auth_failures_total 1\n"));
