@@ -2,8 +2,8 @@
 
 use clap::Parser;
 use sovright_relay::{
-    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, TxCache,
-    TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
+    ArrivalSink, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
+    TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
     reassemble_raw_block,
 };
 use std::collections::HashMap;
@@ -268,7 +268,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
 
     info!(zebra_url = %zebra_url, "Starting relay sidecar");
-    let metrics = Arc::new(SidecarMetrics::default());
+    let arrival_sink = std::env::var_os("SOVRIGHT_RELAY_ARRIVAL_LOG")
+        .map(PathBuf::from)
+        .and_then(|path| match ArrivalSink::new(&path) {
+            Ok(sink) => {
+                info!(path = %path.display(), "Compact-block relay arrival logging enabled");
+                Some(sink)
+            }
+            Err(error) => {
+                warn!(%error, "Failed to open relay arrival log; continuing without it");
+                None
+            }
+        });
+    let metrics = Arc::new(SidecarMetrics {
+        arrival_sink,
+        ..SidecarMetrics::default()
+    });
     let mempool = Arc::new(SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
         enabled: tx_cache_enabled,
         max_entries: tx_cache_max_entries,
@@ -1089,7 +1104,12 @@ fn record_compact_reconstruction_outcome(
                 "Prepared getblocktxn fallback for incomplete compact reconstruction"
             );
         }
-        Ok(_) => metrics.inc_compact_reconstruction_completes(),
+        Ok(other) => {
+            metrics.inc_compact_reconstruction_completes();
+            if let Some(hash) = other.candidate_consensus_hash() {
+                metrics.record_relay_compact_arrival(hash);
+            }
+        }
         Err(RelayBlockError::ReconstructionIncomplete {
             block_hash: _,
             missing_indexes: _,
@@ -1153,9 +1173,20 @@ struct SidecarMetrics {
     tx_feed_invalid_lines: AtomicU64,
     tx_feed_cache_disabled: AtomicU64,
     tx_feed_dropped_too_large: AtomicU64,
+    /// Optional per-block relay arrival log (shared with relay-node). Records a
+    /// `relay_block_received` event when a compact block is reconstructed from
+    /// the mempool, so the observatory times the fast compact-block path.
+    arrival_sink: Option<ArrivalSink>,
 }
 
 impl SidecarMetrics {
+    /// Log a compact-block relay arrival by its Zcash consensus block hash.
+    fn record_relay_compact_arrival(&self, consensus_hash: &str) {
+        if let Some(sink) = &self.arrival_sink {
+            sink.relay_block_received(consensus_hash);
+        }
+    }
+
     fn inc_compact_blocks_received(&self) {
         self.compact_blocks_received.fetch_add(1, Ordering::Relaxed);
     }

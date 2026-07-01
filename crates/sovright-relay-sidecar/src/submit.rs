@@ -77,6 +77,24 @@ pub enum SubmissionOutcome {
     },
 }
 
+impl SubmissionOutcome {
+    /// The Zcash consensus block hash of a successfully reconstructed candidate
+    /// (DryRun / Submitted / GateRejected). `None` for `NeedsTransactions`,
+    /// which did not reconstruct a block. Used to log the compact-block relay
+    /// arrival so the observatory can time the fast path (not just the
+    /// raw-segment fallback).
+    pub fn candidate_consensus_hash(&self) -> Option<&str> {
+        match self {
+            SubmissionOutcome::DryRun(candidate)
+            | SubmissionOutcome::Submitted { candidate, .. }
+            | SubmissionOutcome::GateRejected { candidate, .. } => {
+                Some(candidate.consensus_block_hash.as_str())
+            }
+            SubmissionOutcome::NeedsTransactions { .. } => None,
+        }
+    }
+}
+
 /// Classified Zebra `submitblock` result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubmitBlockStatus {
@@ -693,6 +711,21 @@ mod tests {
                 expected: 1,
                 actual: 2,
             }
+        );
+    }
+
+    #[test]
+    fn candidate_consensus_hash_returns_reconstructed_hash() {
+        let candidate = SubmissionCandidate {
+            block_hash: "internal-id".to_string(),
+            consensus_block_hash: "00abcdef".to_string(),
+            block_hex: "00".to_string(),
+            tx_count: 1,
+            block_bytes: 1,
+        };
+        assert_eq!(
+            SubmissionOutcome::DryRun(candidate).candidate_consensus_hash(),
+            Some("00abcdef"),
         );
     }
 
