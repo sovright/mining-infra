@@ -26,6 +26,7 @@ use relay::RelayWrapper;
 use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
+use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
@@ -169,6 +170,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         send_burst_delay_micros,
         metrics_textfile,
         submit_gate_cfg,
+        zebra_mempool_sync_enabled,
+        zebra_mempool_sync_interval_ms,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -195,6 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.send_burst_delay_micros,
             cfg.metrics_textfile.clone(),
             Some(cfg.submit_gate.clone()),
+            cfg.zebra_mempool_sync_enabled,
+            cfg.zebra_mempool_sync_interval_ms,
         )
     } else {
         // Use CLI args
@@ -246,6 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.send_burst_delay_micros,
             args.metrics_textfile.clone(),
             None,
+            false, // zebra mempool sync is config-only (off for bare CLI)
+            2000,
         )
     };
 
@@ -306,6 +313,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize Zebra RPC client
     let rpc = Arc::new(ZebraRpc::new(&zebra_url).await?);
     info!("Connected to Zebra RPC");
+
+    // Fold the local Zebra mempool into the reconstruction cache (opt-in). The
+    // relay tx-feed only captures the ingress peers' relayed subset; Zebra sees
+    // the full mempool, so this closes the compact-reconstruction coverage gap.
+    if zebra_mempool_sync_enabled {
+        match mempool.tx_cache() {
+            Some(cache) => {
+                let sync_rpc = Arc::clone(&rpc);
+                let sync_metrics = Arc::clone(&metrics);
+                let interval = Duration::from_millis(zebra_mempool_sync_interval_ms.max(100));
+                info!(
+                    interval_ms = zebra_mempool_sync_interval_ms,
+                    "Zebra mempool sync enabled"
+                );
+                tokio::spawn(run_zebra_mempool_sync(
+                    sync_rpc,
+                    cache,
+                    interval,
+                    move || sync_metrics.inc_zebra_mempool_sync_inserts(),
+                ));
+            }
+            None => warn!("zebra_mempool_sync_enabled but tx cache is disabled; ignoring"),
+        }
+    }
 
     // Initialize relay
     let relay = RelayWrapper::new_with_fec(
@@ -1173,6 +1204,8 @@ struct SidecarMetrics {
     tx_feed_invalid_lines: AtomicU64,
     tx_feed_cache_disabled: AtomicU64,
     tx_feed_dropped_too_large: AtomicU64,
+    /// Transactions folded into the tx cache from the local Zebra mempool.
+    zebra_mempool_sync_inserts: AtomicU64,
     /// Optional per-block relay arrival log (shared with relay-node). Records a
     /// `relay_block_received` event when a compact block is reconstructed from
     /// the mempool, so the observatory times the fast compact-block path.
@@ -1180,6 +1213,11 @@ struct SidecarMetrics {
 }
 
 impl SidecarMetrics {
+    fn inc_zebra_mempool_sync_inserts(&self) {
+        self.zebra_mempool_sync_inserts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Log a compact-block relay arrival by its Zcash consensus block hash.
     fn record_relay_compact_arrival(&self, consensus_hash: &str) {
         if let Some(sink) = &self.arrival_sink {
@@ -1409,6 +1447,7 @@ impl SidecarMetrics {
         let tx_feed_invalid_lines = self.tx_feed_invalid_lines.load(Ordering::Relaxed);
         let tx_feed_cache_disabled = self.tx_feed_cache_disabled.load(Ordering::Relaxed);
         let tx_feed_dropped_too_large = self.tx_feed_dropped_too_large.load(Ordering::Relaxed);
+        let zebra_mempool_sync_inserts = self.zebra_mempool_sync_inserts.load(Ordering::Relaxed);
 
         format!(
             concat!(
@@ -1487,6 +1526,8 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_tx_feed_cache_disabled_total {tx_feed_cache_disabled}\n",
                 "# TYPE sovright_relay_sidecar_tx_feed_dropped_too_large_total counter\n",
                 "sovright_relay_sidecar_tx_feed_dropped_too_large_total {tx_feed_dropped_too_large}\n",
+                "# TYPE sovright_relay_sidecar_zebra_mempool_sync_inserts_total counter\n",
+                "sovright_relay_sidecar_zebra_mempool_sync_inserts_total {zebra_mempool_sync_inserts}\n",
             ),
             compact_blocks_received = compact_blocks_received,
             compact_reconstruction_attempts = compact_reconstruction_attempts,
@@ -1525,6 +1566,7 @@ impl SidecarMetrics {
             tx_feed_invalid_lines = tx_feed_invalid_lines,
             tx_feed_cache_disabled = tx_feed_cache_disabled,
             tx_feed_dropped_too_large = tx_feed_dropped_too_large,
+            zebra_mempool_sync_inserts = zebra_mempool_sync_inserts,
             submit_gate_accepted = submit_gate_accepted,
             submit_gate_rejected_pow = submit_gate_rejected_pow,
             submit_gate_rejected_unknown_parent = submit_gate_rejected_unknown_parent,
