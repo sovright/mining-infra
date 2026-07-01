@@ -93,6 +93,18 @@ pub struct Config {
     #[serde(default)]
     pub send_burst_delay_micros: u64,
 
+    /// Fold the local Zebra mempool into the compact-reconstruction tx cache.
+    /// Defense-in-depth for tx coverage: the relay tx-feed only captures the
+    /// ingress peers' relayed subset, so ~20% of blocks miss a short id; the
+    /// local Zebra node sees the full mempool. Off by default; enable on one
+    /// canary and confirm reconstruction incompletes fall before fleet-wide.
+    #[serde(default)]
+    pub zebra_mempool_sync_enabled: bool,
+
+    /// Poll interval for the Zebra mempool sync, milliseconds.
+    #[serde(default = "default_zebra_mempool_sync_interval_ms")]
+    pub zebra_mempool_sync_interval_ms: u64,
+
     /// Optional Prometheus textfile path for sidecar receive metrics.
     #[serde(default)]
     pub metrics_textfile: Option<PathBuf>,
@@ -161,6 +173,10 @@ fn default_submit_gate_dedup_window_secs() -> u64 {
 
 fn default_submit_gate_dedup_capacity() -> usize {
     256
+}
+
+fn default_zebra_mempool_sync_interval_ms() -> u64 {
+    2000
 }
 
 fn default_zebra_url() -> String {
