@@ -196,7 +196,7 @@ pub async fn run_peer(
                 let consensus_hash = msg
                     .payload
                     .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
-                    .map(|header| sovright_relay::consensus_block_hash_display(header))
+                    .map(sovright_relay::consensus_block_hash_display)
                     .unwrap_or_default();
                 events.p2p_block_received(&peer, &display, &consensus_hash, msg.payload.len())?;
                 crawler.score_peer(
