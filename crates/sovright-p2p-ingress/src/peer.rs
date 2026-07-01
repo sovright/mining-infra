@@ -193,7 +193,12 @@ pub async fn run_peer(
                 }
                 let display =
                     received_block_display_hash(&mut pending_block_responses, &msg.payload)?;
-                events.p2p_block_received(&peer, &display, msg.payload.len())?;
+                let consensus_hash = msg
+                    .payload
+                    .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
+                    .map(sovright_relay::consensus_block_hash_display)
+                    .unwrap_or_default();
+                events.p2p_block_received(&peer, &display, &consensus_hash, msg.payload.len())?;
                 crawler.score_peer(
                     peer_addr,
                     config.peer_score_block_received,
