@@ -899,7 +899,9 @@ enum RawSegmentInsert {
         segments: Vec<RawBlockSegment>,
         first_seen: Instant,
     },
-    Dropped { reason: &'static str },
+    Dropped {
+        reason: &'static str,
+    },
 }
 
 impl RawSegmentBuffer {
