@@ -68,6 +68,9 @@ pub struct RelayBridge {
     sender: BlockSender,
     data_shards: usize,
     parity_shards: usize,
+    /// FEC chunker cached at construction: building the RS(224,32) codec is
+    /// ~100ms of matrix math, far too expensive for the per-block hot path.
+    chunker: Arc<BlockChunker>,
     compact_from_tx_cache: bool,
     raw_fallback_with_tx_cache: bool,
     raw_segment_send_rounds: usize,
@@ -111,6 +114,10 @@ impl RelayBridge {
             sender,
             data_shards: config.relay_data_shards,
             parity_shards: config.relay_parity_shards,
+            chunker: Arc::new(
+                BlockChunker::new(config.relay_data_shards, config.relay_parity_shards)
+                    .map_err(|e| IngressError::Relay(e.to_string()))?,
+            ),
             compact_from_tx_cache: config.relay_compact_from_tx_cache,
             raw_fallback_with_tx_cache: config.relay_raw_fallback_with_tx_cache,
             raw_segment_send_rounds: config.relay_raw_segment_send_rounds,
@@ -135,6 +142,10 @@ impl RelayBridge {
             sender,
             data_shards: config.relay_data_shards,
             parity_shards: config.relay_parity_shards,
+            chunker: Arc::new(
+                BlockChunker::new(config.relay_data_shards, config.relay_parity_shards)
+                    .map_err(|e| IngressError::Relay(e.to_string()))?,
+            ),
             compact_from_tx_cache: config.relay_compact_from_tx_cache,
             raw_fallback_with_tx_cache: config.relay_raw_fallback_with_tx_cache,
             raw_segment_send_rounds: config.relay_raw_segment_send_rounds,
@@ -273,8 +284,6 @@ impl RelayBridge {
 
     fn preflight_chunks(&self, compact: &CompactBlock) -> Result<()> {
         let block_hash = compact.header_hash();
-        let chunker = BlockChunker::new(self.data_shards, self.parity_shards)
-            .map_err(|e| IngressError::Relay(e.to_string()))?;
         let serialized_len = BlockChunker::serialize_compact_block(compact).len();
         let max_data_bytes = self.data_shards.saturating_mul(MAX_PAYLOAD_SIZE);
         if serialized_len > max_data_bytes {
@@ -286,7 +295,7 @@ impl RelayBridge {
                 self.data_shards, self.parity_shards
             )));
         }
-        chunker
+        self.chunker
             .compact_block_to_chunks(compact, block_hash.as_bytes())
             .map(|_| ())
             .map_err(|e| IngressError::Relay(e.to_string()))
@@ -399,6 +408,7 @@ mod tests {
             sender: client.sender(),
             data_shards: 10,
             parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
@@ -440,6 +450,64 @@ mod tests {
             block.extend_from_slice(&0u32.to_le_bytes());
         }
         block
+    }
+
+    #[tokio::test]
+    async fn forward_block_reuses_cached_fec_codec() {
+        // Building the production RS(224,32) codec is ~100ms of matrix
+        // construction. Rebuilding it inside every forward put a flat ~150ms
+        // on the relay's critical path per block (measured in production
+        // 2026-07-01), spending the relay's entire inter-region head start.
+        // Forwarding several distinct blocks must therefore be decisively
+        // cheaper than rebuilding the codec once per block.
+        let client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let bridge = RelayBridge {
+            sender: client.sender(),
+            data_shards: 224,
+            parity_shards: 32,
+            chunker: Arc::new(BlockChunker::new(224, 32).unwrap()),
+            compact_from_tx_cache: false,
+            raw_fallback_with_tx_cache: false,
+            raw_segment_send_rounds: 1,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
+        };
+
+        let t = std::time::Instant::now();
+        let _codec = BlockChunker::new(224, 32).unwrap();
+        let codec_build = t.elapsed();
+
+        let mut blocks = Vec::new();
+        for tag in 0u8..6 {
+            let mut block = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+            block[0] = tag; // distinct hash per block so dedup never triggers
+            crate::wire::encode_compact_size(1, &mut block);
+            block.extend_from_slice(&minimal_v1_tx(tag));
+            blocks.push(block);
+        }
+
+        // Warm-up forward absorbs any one-time lazy initialization.
+        bridge.forward_block(&blocks[0], None).await.unwrap();
+
+        let t = std::time::Instant::now();
+        for block in &blocks[1..] {
+            let forwarded = bridge.forward_block(block, None).await.unwrap();
+            assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+        }
+        let five_forwards = t.elapsed();
+
+        assert!(
+            five_forwards < codec_build.max(Duration::from_millis(5)) * 3,
+            "5 forwards took {five_forwards:?} vs codec build {codec_build:?}; \
+             the FEC codec is being rebuilt per forwarded block"
+        );
     }
 
     #[test]
@@ -507,6 +575,7 @@ mod tests {
             sender,
             data_shards: 10,
             parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
@@ -549,6 +618,7 @@ mod tests {
             sender,
             data_shards: 10,
             parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 3,
@@ -594,6 +664,7 @@ mod tests {
             sender,
             data_shards: 10,
             parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: true,
             raw_fallback_with_tx_cache: true,
             raw_segment_send_rounds: 1,
