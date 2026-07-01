@@ -545,7 +545,7 @@ fn spawn_relay_block_handler<M>(
                             {
                                 metrics.inc_submit_gate_accepted();
                             }
-                            log_submission_outcome(outcome, metrics.as_ref());
+                            log_submission_outcome(outcome, metrics.as_ref(), None);
                         }
                         RelayPayload::RawBlockSegment(segment) => {
                             metrics.inc_raw_segments_received();
@@ -570,7 +570,10 @@ fn spawn_relay_block_handler<M>(
                                         "Relay raw block segment buffered"
                                     );
                                 }
-                                RawSegmentInsert::Complete(segments) => {
+                                RawSegmentInsert::Complete {
+                                    segments,
+                                    first_seen,
+                                } => {
                                     metrics.inc_raw_segment_sets_completed();
                                     raw_segments.update_metrics(metrics.as_ref());
                                     let completed_segments = segments.len();
@@ -625,7 +628,25 @@ fn spawn_relay_block_handler<M>(
                                             {
                                                 metrics.inc_submit_gate_accepted();
                                             }
-                                            log_submission_outcome(raw_outcome, metrics.as_ref());
+                                            // Relay-internal latency from the first raw
+                                            // segment chunk of this block arriving to the
+                                            // submit decision (mesh-receive → reassemble →
+                                            // gate → submit).
+                                            let first_seen_to_submit_ms =
+                                                first_seen.elapsed().as_millis() as u64;
+                                            if matches!(
+                                                raw_outcome,
+                                                Ok(SubmissionOutcome::Submitted { .. })
+                                            ) {
+                                                metrics.observe_first_seen_to_submit_ms(
+                                                    first_seen_to_submit_ms,
+                                                );
+                                            }
+                                            log_submission_outcome(
+                                                raw_outcome,
+                                                metrics.as_ref(),
+                                                Some(first_seen_to_submit_ms),
+                                            );
                                         }
                                         Err(error) => {
                                             metrics.inc_raw_segment_reassembly_failures();
@@ -874,7 +895,10 @@ struct RawSegmentBuffer {
 
 enum RawSegmentInsert {
     Pending,
-    Complete(Vec<RawBlockSegment>),
+    Complete {
+        segments: Vec<RawBlockSegment>,
+        first_seen: Instant,
+    },
     Dropped { reason: &'static str },
 }
 
@@ -955,12 +979,16 @@ impl RawSegmentBuffer {
             .is_some_and(|entry| entry.segments.iter().all(Option::is_some))
         {
             let entry = self.remove_entry(&block_hash).expect("entry exists");
+            let first_seen = entry.first_seen;
             let segments = entry
                 .segments
                 .into_iter()
                 .map(|segment| segment.expect("complete segment set"))
                 .collect();
-            RawSegmentInsert::Complete(segments)
+            RawSegmentInsert::Complete {
+                segments,
+                first_seen,
+            }
         } else {
             RawSegmentInsert::Pending
         }
@@ -1028,6 +1056,7 @@ fn expire_raw_segment_buffer(
 fn log_submission_outcome(
     outcome: Result<SubmissionOutcome, sovright_relay_sidecar::submit::RelayBlockError>,
     metrics: &SidecarMetrics,
+    first_seen_to_submit_ms: Option<u64>,
 ) {
     match outcome {
         Ok(SubmissionOutcome::DryRun(candidate)) => {
@@ -1064,6 +1093,7 @@ fn log_submission_outcome(
                     tx_count = candidate.tx_count,
                     block_bytes = candidate.block_bytes,
                     submit_status = status.as_str(),
+                    ?first_seen_to_submit_ms,
                     "Relay block accepted by Zebra"
                 );
             }
@@ -1075,6 +1105,7 @@ fn log_submission_outcome(
                     tx_count = candidate.tx_count,
                     block_bytes = candidate.block_bytes,
                     submit_status = status.as_str(),
+                    ?first_seen_to_submit_ms,
                     "Relay block already known to Zebra"
                 );
             }
@@ -1178,6 +1209,11 @@ struct SidecarMetrics {
     submit_dry_run_candidates: AtomicU64,
     submit_successes: AtomicU64,
     submit_duplicates: AtomicU64,
+    /// Relay-internal latency (milliseconds) from the first raw segment chunk
+    /// of a block arriving to the submit decision. Rendered as a sum/count pair
+    /// so Prometheus can derive the average over the submit path.
+    relay_first_seen_to_submit_ms_sum: AtomicU64,
+    relay_first_seen_to_submit_ms_count: AtomicU64,
     submit_rpc_failures: AtomicU64,
     submit_rejections: AtomicU64,
     not_submit_candidates: AtomicU64,
@@ -1298,6 +1334,15 @@ impl SidecarMetrics {
         self.submit_duplicates.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one relay first-seen-to-submit latency observation, accumulating
+    /// the sum and count so Prometheus can derive an average.
+    fn observe_first_seen_to_submit_ms(&self, ms: u64) {
+        self.relay_first_seen_to_submit_ms_sum
+            .fetch_add(ms, Ordering::Relaxed);
+        self.relay_first_seen_to_submit_ms_count
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     fn inc_submit_rpc_failures(&self) {
         self.submit_rpc_failures.fetch_add(1, Ordering::Relaxed);
     }
@@ -1414,6 +1459,12 @@ impl SidecarMetrics {
         let submit_dry_run_candidates = self.submit_dry_run_candidates.load(Ordering::Relaxed);
         let submit_successes = self.submit_successes.load(Ordering::Relaxed);
         let submit_duplicates = self.submit_duplicates.load(Ordering::Relaxed);
+        let relay_first_seen_to_submit_ms_sum = self
+            .relay_first_seen_to_submit_ms_sum
+            .load(Ordering::Relaxed);
+        let relay_first_seen_to_submit_ms_count = self
+            .relay_first_seen_to_submit_ms_count
+            .load(Ordering::Relaxed);
         let submit_rpc_failures = self.submit_rpc_failures.load(Ordering::Relaxed);
         let submit_rejections = self.submit_rejections.load(Ordering::Relaxed);
         let not_submit_candidates = self.not_submit_candidates.load(Ordering::Relaxed);
@@ -1483,6 +1534,10 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_submit_successes_total {submit_successes}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_duplicates_total counter\n",
                 "sovright_relay_sidecar_relay_submit_duplicates_total {submit_duplicates}\n",
+                "# TYPE sovright_relay_sidecar_relay_first_seen_to_submit_ms_sum counter\n",
+                "sovright_relay_sidecar_relay_first_seen_to_submit_ms_sum {relay_first_seen_to_submit_ms_sum}\n",
+                "# TYPE sovright_relay_sidecar_relay_first_seen_to_submit_ms_count counter\n",
+                "sovright_relay_sidecar_relay_first_seen_to_submit_ms_count {relay_first_seen_to_submit_ms_count}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_rpc_failures_total counter\n",
                 "sovright_relay_sidecar_relay_submit_rpc_failures_total {submit_rpc_failures}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_rejections_total counter\n",
@@ -1548,6 +1603,8 @@ impl SidecarMetrics {
             submit_dry_run_candidates = submit_dry_run_candidates,
             submit_successes = submit_successes,
             submit_duplicates = submit_duplicates,
+            relay_first_seen_to_submit_ms_sum = relay_first_seen_to_submit_ms_sum,
+            relay_first_seen_to_submit_ms_count = relay_first_seen_to_submit_ms_count,
             submit_rpc_failures = submit_rpc_failures,
             submit_rejections = submit_rejections,
             not_submit_candidates = not_submit_candidates,
@@ -1665,14 +1722,66 @@ mod tests {
         }
 
         match buffer.insert(last, now) {
-            RawSegmentInsert::Complete(segments) => {
+            RawSegmentInsert::Complete {
+                segments,
+                first_seen,
+            } => {
                 assert_eq!(reassemble_raw_block(&segments).unwrap(), raw_block);
+                assert_eq!(first_seen, now);
             }
             RawSegmentInsert::Pending => panic!("expected complete segment set"),
             RawSegmentInsert::Dropped { reason } => panic!("unexpected drop: {reason}"),
         }
         assert!(buffer.entries.is_empty());
         assert_eq!(buffer.total_payload_bytes, 0);
+    }
+
+    #[test]
+    fn raw_segment_buffer_reports_first_seen_of_first_insert() {
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+        let block_hash = [0x77; 32];
+        let raw_block = vec![0xcd; 25];
+        let mut segments =
+            split_raw_block(block_hash, &raw_block, RawBlockSegment::HEADER_LEN + 5).unwrap();
+        assert!(segments.len() > 1);
+        let last = segments.pop().unwrap();
+
+        let t0 = Instant::now();
+        let t1 = t0.checked_add(Duration::from_millis(50)).unwrap();
+
+        // The first insert happens at t0; every remaining segment (including the
+        // completing one) arrives later at t1.
+        for segment in segments {
+            assert!(matches!(
+                buffer.insert(segment, t0),
+                RawSegmentInsert::Pending
+            ));
+        }
+        match buffer.insert(last, t1) {
+            RawSegmentInsert::Complete { first_seen, .. } => {
+                // first_seen must reflect the FIRST insert, not the completing one.
+                assert_eq!(first_seen, t0);
+            }
+            RawSegmentInsert::Pending => panic!("expected complete segment set"),
+            RawSegmentInsert::Dropped { reason } => panic!("unexpected drop: {reason}"),
+        }
+    }
+
+    #[test]
+    fn observe_first_seen_to_submit_ms_accumulates_sum_and_count() {
+        let metrics = SidecarMetrics::default();
+        metrics.observe_first_seen_to_submit_ms(100);
+        metrics.observe_first_seen_to_submit_ms(50);
+
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_first_seen_to_submit_ms_sum 150"),
+            "unexpected sum render: {text}"
+        );
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_first_seen_to_submit_ms_count 2"),
+            "unexpected count render: {text}"
+        );
     }
 
     #[test]
@@ -2075,6 +2184,7 @@ mod tests {
         log_submission_outcome(
             Err(RelayBlockError::MissingTransactions { short_ids: 1 }),
             &metrics,
+            None,
         );
 
         let text = metrics.render_prometheus_text();
