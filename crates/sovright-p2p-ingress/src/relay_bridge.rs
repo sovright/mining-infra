@@ -186,6 +186,11 @@ impl RelayBridge {
             compact_block_from_raw_block(block_payload)?
         };
         let tx_count = compact.tx_count();
+        // Wire size of the compact object as serialized for the relay. The
+        // event's bytes field reports what is actually sent per mode (0 for
+        // deduplicated), NOT the full block size -- downstream consumers
+        // compare it against p2p_block_received bytes to measure savings.
+        let compact_wire_bytes = BlockChunker::serialize_compact_block(&compact).len();
 
         // First-seen-wins dedup. Under steady state multiple Zcash P2P peers
         // deliver the same block within the same few hundred milliseconds.
@@ -203,7 +208,7 @@ impl RelayBridge {
             if ring.contains(&header_hash, now) {
                 return Ok(ForwardedBlock {
                     tx_count,
-                    bytes: block_payload.len(),
+                    bytes: 0,
                     relay_objects: 0,
                     mode: ForwardMode::Deduplicated,
                 });
@@ -214,11 +219,12 @@ impl RelayBridge {
             if text.contains("all-prefilled compact block too large") {
                 let segments =
                     self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
+                let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
                 let relay_objects = self.send_raw_block_segments(&segments).await?;
                 self.record_forwarded(header_hash);
                 return Ok(ForwardedBlock {
                     tx_count,
-                    bytes: block_payload.len(),
+                    bytes: raw_wire_bytes,
                     relay_objects,
                     mode: ForwardMode::RawBlockSegments,
                 });
@@ -235,11 +241,12 @@ impl RelayBridge {
         {
             let segments =
                 self.raw_block_segments(*compact.header_hash().as_bytes(), block_payload)?;
+            let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
             let raw_segment_relay_objects = self.send_raw_block_segments(&segments).await?;
             self.record_forwarded(header_hash);
             return Ok(ForwardedBlock {
                 tx_count,
-                bytes: block_payload.len(),
+                bytes: compact_wire_bytes + raw_wire_bytes,
                 relay_objects: raw_segment_relay_objects + 1,
                 mode: ForwardMode::CompactBlockWithRawFallback,
             });
@@ -247,7 +254,7 @@ impl RelayBridge {
         self.record_forwarded(header_hash);
         Ok(ForwardedBlock {
             tx_count,
-            bytes: block_payload.len(),
+            bytes: compact_wire_bytes,
             relay_objects: 1,
             mode: ForwardMode::CompactBlock,
         })
@@ -330,6 +337,10 @@ impl RelayBridge {
         self.data_shards
             .saturating_mul(MAX_PAYLOAD_SIZE)
             .saturating_sub(RELAY_LEN_PREFIX_BYTES)
+    }
+
+    fn raw_segments_wire_bytes(&self, segments: &[RawBlockSegment]) -> usize {
+        segments.iter().map(|s| s.encoded_len()).sum::<usize>() * self.raw_segment_send_rounds
     }
 
     async fn send_raw_block_segments(&self, segments: &[RawBlockSegment]) -> Result<usize> {
@@ -508,6 +519,98 @@ mod tests {
             "5 forwards took {five_forwards:?} vs codec build {codec_build:?}; \
              the FEC codec is being rebuilt per forwarded block"
         );
+    }
+
+    #[tokio::test]
+    async fn forwarded_bytes_report_wire_bytes_per_mode() {
+        // The bytes field previously logged block_payload.len() for every
+        // mode, so downstream wire-vs-full comparisons (dashboard bytes card,
+        // 24h fullness panel) compared full-to-full by construction. It must
+        // report what was actually handed to the relay per mode.
+        let (raw_block, tx0, tx1) = two_tx_raw_block();
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4096,
+            max_tx_bytes: 512,
+        });
+        cache.insert(TxInventoryKey::wtx([0x31; 32], [0x41; 32]).to_wtxid(), tx0);
+        cache.insert(TxInventoryKey::wtx([0x32; 32], [0x42; 32]).to_wtxid(), tx1);
+
+        let client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let bridge = RelayBridge {
+            sender: client.sender(),
+            data_shards: 10,
+            parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
+            compact_from_tx_cache: true,
+            raw_fallback_with_tx_cache: false,
+            raw_segment_send_rounds: 1,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
+        };
+
+        let forwarded = bridge.forward_block(&raw_block, Some(&cache)).await.unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+        let compact =
+            crate::block::compact_block_from_raw_block_with_tx_cache(&raw_block, &cache).unwrap();
+        let compact_wire = BlockChunker::serialize_compact_block(&compact).len();
+        assert_eq!(forwarded.bytes, compact_wire);
+
+        // Dedup suppresses the send entirely: nothing goes on the wire.
+        let forwarded = bridge.forward_block(&raw_block, Some(&cache)).await.unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::Deduplicated);
+        assert_eq!(forwarded.bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn forwarded_bytes_count_raw_fallback_segments_and_rounds() {
+        let (raw_block, tx0, tx1) = two_tx_raw_block();
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4096,
+            max_tx_bytes: 512,
+        });
+        cache.insert(TxInventoryKey::wtx([0x33; 32], [0x43; 32]).to_wtxid(), tx0);
+        cache.insert(TxInventoryKey::wtx([0x34; 32], [0x44; 32]).to_wtxid(), tx1);
+
+        let client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let bridge = RelayBridge {
+            sender: client.sender(),
+            data_shards: 10,
+            parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
+            compact_from_tx_cache: true,
+            raw_fallback_with_tx_cache: true,
+            raw_segment_send_rounds: 2,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
+        };
+
+        let forwarded = bridge.forward_block(&raw_block, Some(&cache)).await.unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::CompactBlockWithRawFallback);
+        let compact =
+            crate::block::compact_block_from_raw_block_with_tx_cache(&raw_block, &cache).unwrap();
+        let compact_wire = BlockChunker::serialize_compact_block(&compact).len();
+        let segments = bridge
+            .plan_raw_block_segments(*compact.header_hash().as_bytes(), &raw_block)
+            .map(|plan| split_raw_block(*compact.header_hash().as_bytes(), &raw_block, plan.max_segment_frame_bytes).unwrap())
+            .unwrap();
+        let raw_wire: usize = segments.iter().map(|s| s.encoded_len()).sum();
+        assert_eq!(forwarded.bytes, compact_wire + raw_wire * 2);
     }
 
     #[test]
