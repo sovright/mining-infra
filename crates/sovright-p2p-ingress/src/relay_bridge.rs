@@ -556,7 +556,10 @@ mod tests {
             ))),
         };
 
-        let forwarded = bridge.forward_block(&raw_block, Some(&cache)).await.unwrap();
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&cache))
+            .await
+            .unwrap();
         assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
         let compact =
             crate::block::compact_block_from_raw_block_with_tx_cache(&raw_block, &cache).unwrap();
@@ -564,7 +567,10 @@ mod tests {
         assert_eq!(forwarded.bytes, compact_wire);
 
         // Dedup suppresses the send entirely: nothing goes on the wire.
-        let forwarded = bridge.forward_block(&raw_block, Some(&cache)).await.unwrap();
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&cache))
+            .await
+            .unwrap();
         assert_eq!(forwarded.mode, ForwardMode::Deduplicated);
         assert_eq!(forwarded.bytes, 0);
     }
@@ -600,14 +606,24 @@ mod tests {
             ))),
         };
 
-        let forwarded = bridge.forward_block(&raw_block, Some(&cache)).await.unwrap();
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&cache))
+            .await
+            .unwrap();
         assert_eq!(forwarded.mode, ForwardMode::CompactBlockWithRawFallback);
         let compact =
             crate::block::compact_block_from_raw_block_with_tx_cache(&raw_block, &cache).unwrap();
         let compact_wire = BlockChunker::serialize_compact_block(&compact).len();
         let segments = bridge
             .plan_raw_block_segments(*compact.header_hash().as_bytes(), &raw_block)
-            .map(|plan| split_raw_block(*compact.header_hash().as_bytes(), &raw_block, plan.max_segment_frame_bytes).unwrap())
+            .map(|plan| {
+                split_raw_block(
+                    *compact.header_hash().as_bytes(),
+                    &raw_block,
+                    plan.max_segment_frame_bytes,
+                )
+                .unwrap()
+            })
             .unwrap();
         let raw_wire: usize = segments.iter().map(|s| s.encoded_len()).sum();
         assert_eq!(forwarded.bytes, compact_wire + raw_wire * 2);
