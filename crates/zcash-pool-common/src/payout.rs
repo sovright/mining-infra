@@ -1985,7 +1985,7 @@ mod tests {
         let lines: Vec<&str> = archive.lines().filter(|l| !l.trim().is_empty()).collect();
         assert_eq!(
             lines.len(),
-            (removed1 + removed2) as usize,
+            removed1 + removed2,
             "archive must contain exactly one record per removal"
         );
         let unique: HashSet<&str> = lines.iter().copied().collect();
