@@ -210,4 +210,88 @@ mod tests {
         let exact = vec![b'x'; MAX_BODY_BYTES];
         assert!(exact.len() <= MAX_BODY_BYTES);
     }
+
+    // ---- HTTP-level handler tests -------------------------------------------
+    //
+    // These drive the real `handle()` request flow against an in-memory
+    // `PayoutTracker` and assert the status codes documented in
+    // docs/superpowers/specs/2026-06-23-settlement-api-design.md (§P3):
+    // 401 missing/bad token, 200 valid settle, 404 unknown worker,
+    // 400 malformed body.
+
+    const TEST_TOKEN: &str = "super-secret-token";
+
+    /// Tracker with one known, settle-eligible named worker ("rig1").
+    fn tracker_with_known_worker() -> Arc<PayoutTracker> {
+        let tracker = Arc::new(PayoutTracker::default());
+        tracker.record_share(&"rig1".to_string(), 1.0);
+        tracker
+    }
+
+    /// Drive `handle()` and return the response status.
+    async fn call(req: Request<Body>, tracker: Arc<PayoutTracker>) -> StatusCode {
+        let token = Arc::new(TEST_TOKEN.to_string());
+        handle(req, token, tracker).await.unwrap().status()
+    }
+
+    fn settle_request(token: Option<&str>, body: &str) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/settle")
+            .header(hyper::header::CONTENT_TYPE, "application/json");
+        if let Some(token) = token {
+            builder = builder.header(hyper::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn settle_missing_auth_header_is_401() {
+        let body = r#"{"worker":"rig1","settled_total_shares":1,"settlement_ref":"batch-1"}"#;
+        let status = call(settle_request(None, body), tracker_with_known_worker()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn settle_wrong_token_is_401() {
+        let body = r#"{"worker":"rig1","settled_total_shares":1,"settlement_ref":"batch-1"}"#;
+        let status = call(
+            settle_request(Some("wrong-token"), body),
+            tracker_with_known_worker(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn settle_valid_known_worker_is_200() {
+        let body = r#"{"worker":"rig1","settled_total_shares":1,"settlement_ref":"batch-1"}"#;
+        let status = call(
+            settle_request(Some(TEST_TOKEN), body),
+            tracker_with_known_worker(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn settle_unknown_worker_is_404() {
+        let body = r#"{"worker":"ghost","settled_total_shares":1,"settlement_ref":"batch-1"}"#;
+        let status = call(
+            settle_request(Some(TEST_TOKEN), body),
+            tracker_with_known_worker(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn settle_malformed_body_is_400() {
+        let status = call(
+            settle_request(Some(TEST_TOKEN), "{ not valid json ]"),
+            tracker_with_known_worker(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
 }

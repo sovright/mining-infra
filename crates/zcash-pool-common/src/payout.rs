@@ -658,40 +658,63 @@ impl PayoutTracker {
             return Ok(0);
         }
 
-        append_settlement_archive(archive_path.as_ref(), &records)?;
-
-        let mut removed = 0;
-        {
+        let removed = {
             let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
             let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
-            for record in &records {
-                let still_prunable = miners
-                    .get(&record.miner_id)
-                    .and_then(|stats| {
-                        settlements.get(&record.miner_id).and_then(|settlement| {
-                            archive_record_if_prunable(
-                                &record.miner_id,
-                                stats,
-                                settlement,
-                                cutoff_unix_ms,
-                                pruned_at_unix_ms,
-                            )
-                        })
-                    })
-                    .map(|candidate| {
-                        candidate.total_shares == record.total_shares
-                            && candidate.total_difficulty == record.total_difficulty
-                            && candidate.settlement_ref == record.settlement_ref
-                    })
-                    .unwrap_or(false);
 
-                if still_prunable {
-                    miners.remove(&record.miner_id);
-                    settlements.remove(&record.miner_id);
-                    removed += 1;
-                }
+            // Re-check every candidate under the write lock and keep only the
+            // records that are still prunable with unchanged totals. A share (or
+            // settlement) could have landed for a candidate between the read-lock
+            // snapshot above and this write lock, in which case it must NOT be
+            // pruned.
+            let confirmed: Vec<SettlementArchiveRecord> = records
+                .into_iter()
+                .filter(|record| {
+                    miners
+                        .get(&record.miner_id)
+                        .and_then(|stats| {
+                            settlements.get(&record.miner_id).and_then(|settlement| {
+                                archive_record_if_prunable(
+                                    &record.miner_id,
+                                    stats,
+                                    settlement,
+                                    cutoff_unix_ms,
+                                    pruned_at_unix_ms,
+                                )
+                            })
+                        })
+                        .map(|candidate| {
+                            candidate.total_shares == record.total_shares
+                                && candidate.total_difficulty == record.total_difficulty
+                                && candidate.settlement_ref == record.settlement_ref
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if confirmed.is_empty() {
+                return Ok(0);
             }
-        }
+
+            // Archive exactly the confirmed set, and only after the re-check, so
+            // the archive is 1:1 with removals: a record is never archived unless
+            // it is also removed in the same critical section. (The previous code
+            // archived every read-lock candidate before the re-check, so a record
+            // that failed the re-check was archived without being removed and then
+            // archived again on the next cycle -> duplicate archive entries.)
+            //
+            // Archive-before-remove ordering is preserved for crash-safety: the
+            // records are appended + fsynced to the archive before they leave hot
+            // state, and both steps run under the write lock so no concurrent share
+            // can change a worker's totals in between.
+            append_settlement_archive(archive_path.as_ref(), &confirmed)?;
+
+            for record in &confirmed {
+                miners.remove(&record.miner_id);
+                settlements.remove(&record.miner_id);
+            }
+            confirmed.len()
+        };
 
         if removed > 0 {
             self.mark_dirty();
@@ -1916,6 +1939,64 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&archive);
+    }
+
+    /// The archive must contain exactly one record per removal: across two prune
+    /// cycles (with a fresh share landing for an already-pruned worker between
+    /// them) the number of archived lines equals the total number of removed
+    /// workers, and no archive line is byte-for-byte duplicated. This is the
+    /// 1:1 archive⇄removal invariant — a record is never archived without being
+    /// removed (which would re-archive it on the next cycle).
+    #[test]
+    fn prune_archives_exactly_one_record_per_removal() {
+        let state_path = unique_payout_state_path("one-to-one-state");
+        let archive_path = unique_payout_state_path("one-to-one-archive");
+        let _ = std::fs::remove_file(&archive_path);
+
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        // Two named workers, both fully settled and idle → both prunable.
+        tracker.record_share(&"rig1".to_string(), 10.0);
+        tracker.record_share(&"rig2".to_string(), 20.0);
+        tracker.mark_miner_settled(&"rig1".to_string(), 1, "batch-1");
+        tracker.mark_miner_settled(&"rig2".to_string(), 1, "batch-1");
+
+        // Cycle 1: removes rig1 + rig2.
+        let removed1 = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+        assert_eq!(removed1, 2);
+
+        // A fresh share lands for a worker that was just pruned; it re-enters hot
+        // state with new, unsettled credit, then gets settled again.
+        tracker.record_share(&"rig1".to_string(), 5.0);
+        tracker.mark_miner_settled(&"rig1".to_string(), 1, "batch-2");
+
+        // Cycle 2: removes rig1 (the new settlement epoch) only.
+        let removed2 = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+        assert_eq!(removed2, 1);
+
+        // The archive must hold exactly `removed1 + removed2` records, with no
+        // byte-identical duplicate line.
+        let archive = std::fs::read_to_string(&archive_path).unwrap();
+        let lines: Vec<&str> = archive.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            (removed1 + removed2) as usize,
+            "archive must contain exactly one record per removal"
+        );
+        let unique: HashSet<&str> = lines.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            lines.len(),
+            "archive must not contain duplicate records"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(archive_path);
     }
 
     #[test]

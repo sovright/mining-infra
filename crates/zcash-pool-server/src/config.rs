@@ -106,6 +106,13 @@ pub struct PoolConfig {
     /// Bearer token required for control-plane requests. Required when
     /// `control_addr` is set.
     pub control_auth_token: Option<String>,
+    /// Opt-in acknowledgement required to bind `control_addr` to a
+    /// non-loopback address. The control plane authenticates with a static
+    /// bearer token sent in cleartext over plain HTTP, so binding it to a
+    /// routable interface exposes the token to the network. Defaults to
+    /// `false`, which restricts binds to loopback unless the operator
+    /// explicitly opts in (and fronts the plane with TLS).
+    pub allow_non_loopback_bind: bool,
     /// How long a settled, idle worker is retained before pruning.
     pub payout_settlement_retention: Duration,
     /// Where pruned settlement records are archived (JSONL). Defaults next to
@@ -142,6 +149,9 @@ pub enum ConfigError {
     InvalidPayoutStatePath,
     /// control_addr set but control_auth_token is missing or empty
     ControlAddrMissingToken,
+    /// control_addr binds a non-loopback address without the explicit
+    /// `allow_non_loopback_bind` opt-in
+    ControlAddrNonLoopbackBind(SocketAddr),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -197,6 +207,15 @@ impl std::fmt::Display for ConfigError {
                 write!(
                     f,
                     "control_addr set but control_auth_token is missing or empty"
+                )
+            }
+            ConfigError::ControlAddrNonLoopbackBind(addr) => {
+                write!(
+                    f,
+                    "control_addr {} is not a loopback address: the control plane sends its \
+                     bearer token in cleartext over plain HTTP; keep it on loopback or front it \
+                     with TLS, or set allow_non_loopback_bind=true to override",
+                    addr
                 )
             }
         }
@@ -296,6 +315,15 @@ impl PoolConfig {
             return Err(ConfigError::ControlAddrMissingToken);
         }
 
+        // A non-loopback control bind exposes the cleartext bearer token to the
+        // network. Refuse it unless the operator explicitly opts in.
+        if let Some(addr) = self.control_addr
+            && !addr.ip().is_loopback()
+            && !self.allow_non_loopback_bind
+        {
+            return Err(ConfigError::ControlAddrNonLoopbackBind(addr));
+        }
+
         Ok(())
     }
 }
@@ -341,6 +369,7 @@ impl Default for PoolConfig {
             warn_plain_mode: true,
             control_addr: None,
             control_auth_token: None,
+            allow_non_loopback_bind: false,
             payout_settlement_retention: Duration::from_secs(86_400),
             payout_archive_path: None,
         }
@@ -622,6 +651,45 @@ mod tests {
         assert!(cfg.validate().is_err());
 
         cfg.control_auth_token = Some("secret".to_string());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn control_addr_loopback_bind_ok() {
+        // Loopback binds (IPv4 127/8 and IPv6 ::1) validate without the opt-in.
+        let mut cfg = valid_config();
+        cfg.control_auth_token = Some("secret".to_string());
+
+        cfg.control_addr = Some(SocketAddr::from(([127, 0, 0, 1], 9091)));
+        assert!(cfg.validate().is_ok());
+
+        cfg.control_addr = Some(SocketAddr::from(([127, 5, 6, 7], 9091)));
+        assert!(cfg.validate().is_ok(), "all of 127.0.0.0/8 is loopback");
+
+        cfg.control_addr = Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9091)));
+        assert!(cfg.validate().is_ok(), "::1 is loopback");
+    }
+
+    #[test]
+    fn control_addr_non_loopback_bind_rejected_by_default() {
+        let mut cfg = valid_config();
+        cfg.control_auth_token = Some("secret".to_string());
+        let addr = SocketAddr::from(([0, 0, 0, 0], 9091));
+        cfg.control_addr = Some(addr);
+
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::ControlAddrNonLoopbackBind(addr)),
+            "non-loopback control bind must be refused without the opt-in"
+        );
+    }
+
+    #[test]
+    fn control_addr_non_loopback_bind_allowed_with_opt_in() {
+        let mut cfg = valid_config();
+        cfg.control_auth_token = Some("secret".to_string());
+        cfg.control_addr = Some(SocketAddr::from(([0, 0, 0, 0], 9091)));
+        cfg.allow_non_loopback_bind = true;
         assert!(cfg.validate().is_ok());
     }
 
