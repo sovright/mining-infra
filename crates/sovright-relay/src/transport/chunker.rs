@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::compact_block::CompactBlock;
 use crate::fec::{FecDecoder, FecEncoder, FecError, adaptive_shards, adaptive_shards_skeleton};
-use crate::segmented_block::{RawBlockSegment, segment_object_hash};
+use crate::segmented_block::{RawBlockSegment, compact_v3_object_hash, segment_object_hash};
 use crate::transport::{MAX_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE_V3, MAX_TOTAL_CHUNKS};
 
 /// Maximum header size (Zcash headers are ~2189 bytes, allow some margin)
@@ -537,7 +537,11 @@ impl BlockChunker {
         block_hash: &[u8; 32],
     ) -> Result<Vec<Chunk>, FecError> {
         let data = Self::serialize_compact_block(compact);
-        self.data_to_chunks_adaptive(MessageType::Block, block_hash, &data)
+        // Route v3 (adaptive) compact chunks under a domain-separated object
+        // hash so they never share a reassembly buffer with v2 chunks for the
+        // same block in a mixed-scheme fleet (see `compact_v3_object_hash`).
+        let object_hash = compact_v3_object_hash(*block_hash);
+        self.data_to_chunks_adaptive(MessageType::Block, &object_hash, &data)
     }
 
     /// Convert a compact skeleton into adaptively-sized (version-3) FEC chunks
@@ -889,6 +893,40 @@ mod tests {
         assert_eq!(recovered.nonce, compact.nonce);
         assert_eq!(recovered.short_ids.len(), compact.short_ids.len());
         assert_eq!(recovered.prefilled_txs.len(), compact.prefilled_txs.len());
+    }
+
+    /// Regression for the 2026-07-03 live incident: v2 and v3 chunks for the
+    /// SAME block MUST carry distinct object hashes, so a mixed-scheme fleet
+    /// (some origins v2, some v3, forwarding the same block) never collides two
+    /// incompatible schemes in one receiver reassembly buffer.
+    #[test]
+    fn adaptive_v3_and_fixed_v2_route_under_distinct_object_hashes() {
+        let chunker = BlockChunker::new(10, 3).unwrap();
+        let compact = make_test_compact_block();
+        let block_hash = [0x77; 32];
+
+        let v2 = chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
+        let v3 = chunker
+            .compact_block_to_chunks_adaptive(&compact, &block_hash)
+            .unwrap();
+
+        let v2_obj = v2[0].header.block_hash;
+        let v3_obj = v3[0].header.block_hash;
+        assert_ne!(
+            v2_obj, v3_obj,
+            "v2 and v3 chunks for one block must not share a reassembly key"
+        );
+        assert_eq!(v2_obj, block_hash, "v2 stays under the raw block hash");
+        assert_eq!(
+            v3_obj,
+            compact_v3_object_hash(block_hash),
+            "v3 routes under the domain-separated hash"
+        );
+        // All v2 chunks share the v2 hash; all v3 chunks share the v3 hash.
+        assert!(v2.iter().all(|c| c.header.block_hash == v2_obj));
+        assert!(v3.iter().all(|c| c.header.block_hash == v3_obj));
     }
 
     /// Adaptive path recovers from a dropped chunk via the parity shard.
