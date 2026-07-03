@@ -1,4 +1,5 @@
 mod block;
+mod coinbase;
 mod config;
 mod crawler;
 mod error;
