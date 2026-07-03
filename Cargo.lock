@@ -4605,6 +4605,8 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "proptest",
+ "serde",
+ "serde_json",
  "sha2 0.10.9",
  "tracing",
 ]
@@ -4616,9 +4618,11 @@ dependencies = [
  "byteorder",
  "criterion",
  "hex",
+ "hyper 0.14.32",
  "rand 0.8.5",
  "rustc-hash",
  "serde",
+ "serde_json",
  "sha2 0.10.9",
  "sovright-noise",
  "sovright-relay",
