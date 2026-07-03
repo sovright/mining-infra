@@ -869,7 +869,9 @@ mod tests {
         let block_hash = [0x02; 32];
 
         // v2 fixed path: 13 chunks, intermediate headers carry data_shards == 0.
-        let v2 = chunker.compact_block_to_chunks(&compact, &block_hash).unwrap();
+        let v2 = chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
         assert_eq!(v2.len(), 13);
         assert!(v2.iter().all(|c| c.header.data_shards == 0));
         let v2_shard = v2[0].payload.len();
@@ -886,8 +888,7 @@ mod tests {
             .unwrap();
         let ds = v3[0].header.data_shards as usize;
         let v3_shard = v3[0].payload.len();
-        let v3_shards: Vec<Option<Vec<u8>>> =
-            v3.into_iter().map(|c| Some(c.payload)).collect();
+        let v3_shards: Vec<Option<Vec<u8>>> = v3.into_iter().map(|c| Some(c.payload)).collect();
         let recovered_v3 = chunker
             .chunks_to_compact_block_with_shards(v3_shards, v3_shard * ds, ds)
             .unwrap();
