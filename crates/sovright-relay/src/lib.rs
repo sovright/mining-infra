@@ -34,7 +34,7 @@ pub use relay::{
 };
 pub use segmented_block::{
     RawBlockSegment, SegmentedBlockError, reassemble_raw_block, segment_object_hash,
-    split_raw_block,
+    skeleton_object_hash, split_raw_block,
 };
 pub use transport::{
     BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,
