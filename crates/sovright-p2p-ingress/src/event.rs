@@ -261,8 +261,9 @@ impl EventSink {
         hash: &str,
         consensus_hash: &str,
         bytes: usize,
+        miner_script: Option<&str>,
     ) -> Result<()> {
-        self.write(json!({
+        let mut value = json!({
             "event": "p2p_block_received",
             "peer": peer,
             "hash": hash,
@@ -272,7 +273,14 @@ impl EventSink {
             "consensus_hash": consensus_hash,
             "bytes": bytes,
             "observed_at_unix_ms": now_unix_ms(),
-        }))
+        });
+        // Best-effort coinbase miner payout scriptPubKey (hex). Present only
+        // when the coinbase parsed and had a transparent output; the join key
+        // downstream against Zebra's getblock verbosity-2 scriptPubKey.hex.
+        if let Some(miner_script) = miner_script {
+            value["miner_script"] = json!(miner_script);
+        }
+        self.write(value)
     }
 
     pub fn p2p_relay_block_forwarded(
