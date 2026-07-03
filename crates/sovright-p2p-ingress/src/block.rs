@@ -32,6 +32,29 @@ pub(crate) fn compact_block_from_raw_block_with_tx_cache(
     })
 }
 
+/// Build the compact *skeleton* for a raw block: the coinbase prefilled, and a
+/// short_id for every non-coinbase transaction the origin can resolve to a
+/// wtxid, so each receiver resolves those short_ids against its OWN mempool.
+///
+/// The origin can only compute a short_id for a transaction whose wtxid it
+/// already knows: its tx cache is a reverse payload->wtxid index, not a Zcash
+/// transaction hasher, so it cannot derive a wtxid for a transaction it never
+/// saw on the P2P network. Non-coinbase transactions the cache cannot resolve
+/// are therefore prefilled -- unavoidable, and still correct (the receiver
+/// reconstructs those verbatim). In the steady state, where the origin cache
+/// holds every non-coinbase transaction, the skeleton collapses to
+/// header + coinbase + all-short_ids: a single UDP packet.
+///
+/// This is, by construction, the maximally short-id'd tx-cache compaction. It
+/// is named and documented separately because it is the *fast-path* object: it
+/// is sent first and with heavier FEC parity, ahead of the full compact block.
+pub(crate) fn skeleton_compact_block_from_raw_block(
+    block_payload: &[u8],
+    tx_cache: &TxCache,
+) -> Result<CompactBlock> {
+    compact_block_from_raw_block_with_tx_cache(block_payload, tx_cache)
+}
+
 fn compact_block_from_raw_block_with_resolver<F>(
     block_payload: &[u8],
     mut resolve_wtxid: F,
@@ -508,6 +531,83 @@ mod tests {
                 panic!("unexpected invalid compact block: {reason}");
             }
         }
+    }
+
+    #[test]
+    fn skeleton_prefills_only_coinbase_and_short_ids_all_resolvable_txs() {
+        // With the origin cache holding every non-coinbase transaction, the
+        // skeleton prefills ONLY the coinbase (index 0) and emits a short_id for
+        // each other transaction, computed exactly as ShortId::compute expects.
+        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        let coinbase = minimal_v5_tx(0x11);
+        let tx1 = minimal_v5_tx(0x22);
+        let tx2 = minimal_v5_tx(0x33);
+
+        let mut block = header.clone();
+        crate::wire::encode_compact_size(3, &mut block);
+        block.extend_from_slice(&coinbase);
+        block.extend_from_slice(&tx1);
+        block.extend_from_slice(&tx2);
+
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 8_192,
+            max_tx_bytes: 2_048,
+        });
+        let tx1_key = TxInventoryKey::wtx([0x51; 32], [0x52; 32]);
+        let tx2_key = TxInventoryKey::wtx([0x53; 32], [0x54; 32]);
+        cache.insert(tx1_key.to_wtxid(), tx1.clone());
+        cache.insert(tx2_key.to_wtxid(), tx2.clone());
+
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache).unwrap();
+
+        let header_hash = sovright_relay::zcash_block_hash(&header);
+        assert_eq!(skeleton.header, header);
+        // Only the coinbase is prefilled.
+        assert_eq!(skeleton.prefilled_txs.len(), 1);
+        assert_eq!(skeleton.prefilled_txs[0].index, 0);
+        assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
+        // Every non-coinbase tx is a short_id matching ShortId::compute.
+        assert_eq!(
+            skeleton.short_ids,
+            vec![
+                ShortId::compute(&tx1_key.to_wtxid(), &header_hash, skeleton.nonce),
+                ShortId::compute(&tx2_key.to_wtxid(), &header_hash, skeleton.nonce),
+            ]
+        );
+    }
+
+    #[test]
+    fn skeleton_prefills_txs_the_origin_cannot_resolve() {
+        // A non-coinbase tx the origin cache does not hold cannot be short_id'd
+        // (no known wtxid), so it is prefilled verbatim -- unavoidable and still
+        // correct. The coinbase and the unresolved tx are prefilled; the one
+        // cached tx becomes a short_id.
+        let header = vec![0xcd; ZCASH_FULL_HEADER_SIZE];
+        let coinbase = minimal_v5_tx(0x11);
+        let cached = minimal_v5_tx(0x22);
+        let uncached = minimal_v5_tx(0x33);
+
+        let mut block = header;
+        crate::wire::encode_compact_size(3, &mut block);
+        block.extend_from_slice(&coinbase);
+        block.extend_from_slice(&cached);
+        block.extend_from_slice(&uncached);
+
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 8_192,
+            max_tx_bytes: 2_048,
+        });
+        cache.insert(TxInventoryKey::wtx([0x61; 32], [0x62; 32]).to_wtxid(), cached);
+
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache).unwrap();
+
+        assert_eq!(skeleton.short_ids.len(), 1);
+        // coinbase (index 0) + the uncached tx are prefilled.
+        assert_eq!(skeleton.prefilled_txs.len(), 2);
+        assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
+        assert_eq!(skeleton.prefilled_txs[1].tx_data, uncached);
     }
 
     #[test]

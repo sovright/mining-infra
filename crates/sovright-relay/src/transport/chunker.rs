@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::compact_block::CompactBlock;
-use crate::fec::{FecDecoder, FecEncoder, FecError, adaptive_shards};
+use crate::fec::{FecDecoder, FecEncoder, FecError, adaptive_shards, adaptive_shards_skeleton};
 use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{MAX_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE_V3, MAX_TOTAL_CHUNKS};
 
@@ -315,6 +315,12 @@ impl BlockChunker {
                         total_chunks,
                         shard.len() as u16,
                     ),
+                    MessageType::CompactSkeleton => ChunkHeader::new_compact_skeleton(
+                        object_hash,
+                        i as u16,
+                        total_chunks,
+                        shard.len() as u16,
+                    ),
                     MessageType::Keepalive | MessageType::Auth => {
                         return Err(FecError::EncodingFailed(
                             "unsupported chunk data message type".into(),
@@ -425,8 +431,39 @@ impl BlockChunker {
         object_hash: &[u8; 32],
         data: &[u8],
     ) -> Result<Vec<Chunk>, FecError> {
-        let Some((data_shards, parity_shards)) = adaptive_shards(data.len(), MAX_PAYLOAD_SIZE_V3)
-        else {
+        self.data_to_chunks_adaptive_inner(
+            msg_type,
+            object_hash,
+            data,
+            adaptive_shards(data.len(), MAX_PAYLOAD_SIZE_V3),
+        )
+    }
+
+    /// Adaptively FEC-encode `data` for a compact *skeleton*, applying the
+    /// heavier skeleton parity floor (see [`adaptive_shards_skeleton`]) so a
+    /// single lost packet still reconstructs. Falls back to the fixed scheme for
+    /// blocks too large for the adaptive shard space.
+    fn data_to_chunks_adaptive_skeleton(
+        &self,
+        object_hash: &[u8; 32],
+        data: &[u8],
+    ) -> Result<Vec<Chunk>, FecError> {
+        self.data_to_chunks_adaptive_inner(
+            MessageType::CompactSkeleton,
+            object_hash,
+            data,
+            adaptive_shards_skeleton(data.len(), MAX_PAYLOAD_SIZE_V3),
+        )
+    }
+
+    fn data_to_chunks_adaptive_inner(
+        &self,
+        msg_type: MessageType,
+        object_hash: &[u8; 32],
+        data: &[u8],
+        shards: Option<(usize, usize)>,
+    ) -> Result<Vec<Chunk>, FecError> {
+        let Some((data_shards, parity_shards)) = shards else {
             // Too large for adaptive sizing: keep the current behavior and emit
             // fixed-profile (version-2) chunks.
             return self.data_to_chunks(msg_type, object_hash, data);
@@ -464,6 +501,13 @@ impl BlockChunker {
                         shard.len() as u16,
                         ds,
                     ),
+                    MessageType::CompactSkeleton => ChunkHeader::new_compact_skeleton_v3(
+                        object_hash,
+                        i as u16,
+                        total_chunks,
+                        shard.len() as u16,
+                        ds,
+                    ),
                     MessageType::Keepalive | MessageType::Auth => {
                         return Err(FecError::EncodingFailed(
                             "unsupported chunk data message type".into(),
@@ -494,6 +538,22 @@ impl BlockChunker {
     ) -> Result<Vec<Chunk>, FecError> {
         let data = Self::serialize_compact_block(compact);
         self.data_to_chunks_adaptive(MessageType::Block, block_hash, &data)
+    }
+
+    /// Convert a compact skeleton into adaptively-sized (version-3) FEC chunks
+    /// under [`MessageType::CompactSkeleton`], applying the heavier skeleton
+    /// parity floor. Falls back to the fixed profile for oversized skeletons.
+    ///
+    /// `object_hash` is the skeleton's relay routing id (distinct from the full
+    /// block's id so the two do not collide in the mesh); the payload is a
+    /// serialized `CompactBlock` decoded exactly like a normal compact block.
+    pub fn compact_block_to_chunks_skeleton(
+        &self,
+        compact: &CompactBlock,
+        object_hash: &[u8; 32],
+    ) -> Result<Vec<Chunk>, FecError> {
+        let data = Self::serialize_compact_block(compact);
+        self.data_to_chunks_adaptive_skeleton(object_hash, &data)
     }
 
     /// Convert a raw block segment into adaptively-sized (version-3) FEC chunks,
@@ -951,6 +1011,60 @@ mod tests {
         assert_eq!(chunks.len(), 256);
         assert!(chunks.iter().all(|c| c.header.data_shards == 0));
         assert!(chunks.iter().all(|c| c.header.version == 1));
+    }
+
+    /// The skeleton encode path emits CompactSkeleton v3 chunks with the heavier
+    /// skeleton parity floor. The ~2.2 KB test block needs 2 data shards; the
+    /// skeleton floor forces 2 parity (4 chunks total) where the normal adaptive
+    /// profile would ship only 1 parity (3 chunks). That extra parity lets the
+    /// skeleton survive TWO lost packets, which the normal profile could not.
+    #[test]
+    fn skeleton_chunks_use_compact_skeleton_type_and_higher_parity() {
+        let chunker = BlockChunker::new(10, 3).unwrap();
+        let compact = make_test_compact_block();
+        let object_hash = [0x5c; 32];
+
+        // The normal adaptive profile for this block: 2 data + 1 parity.
+        let normal = chunker
+            .compact_block_to_chunks_adaptive(&compact, &object_hash)
+            .unwrap();
+        assert_eq!(normal.len(), 3, "normal adaptive: 2 data + 1 parity");
+
+        let chunks = chunker
+            .compact_block_to_chunks_skeleton(&compact, &object_hash)
+            .unwrap();
+        // Skeleton floor: 2 data + max(2, ceil(2/4)) = 2 parity = 4 chunks.
+        assert_eq!(chunks.len(), 4, "skeleton: 2 data + 2 parity");
+        assert!(chunks.iter().all(|c| c.header.version == 3));
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.header.msg_type == MessageType::CompactSkeleton)
+        );
+        assert!(chunks.iter().all(|c| c.header.data_shards == 2));
+
+        let data_shards = chunks[0].header.data_shards as usize;
+        let total = chunks.len();
+
+        // Lose BOTH data packets (chunks 0 and 1). RS(2,2) rebuilds them from the
+        // two surviving parity packets -- two-packet resilience the normal
+        // 2-data/1-parity profile could never provide.
+        let shard_size = chunks[0].payload.len();
+        let mut shard_opts: Vec<Option<Vec<u8>>> = vec![None; total];
+        for chunk in &chunks {
+            let wire = chunk.to_bytes();
+            let parsed = Chunk::from_bytes(&wire).unwrap();
+            if parsed.header.chunk_id >= 2 {
+                shard_opts[parsed.header.chunk_id as usize] = Some(parsed.payload);
+            }
+        }
+
+        let original_len = shard_size * data_shards;
+        let recovered = chunker
+            .chunks_to_compact_block_with_shards(shard_opts, original_len, data_shards)
+            .unwrap();
+        assert_eq!(recovered.header, compact.header);
+        assert_eq!(recovered.nonce, compact.nonce);
     }
 
     #[test]

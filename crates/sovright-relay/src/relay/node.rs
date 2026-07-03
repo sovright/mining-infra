@@ -270,7 +270,11 @@ impl<V: PowValidator> RelayNode<V> {
         msg_type: MessageType,
     ) -> Option<bool> {
         match msg_type {
-            MessageType::Block => self.validate_compact_block_pow(assembly),
+            // A skeleton carries the full block header in its serialized
+            // CompactBlock, so PoW validates exactly like a compact block.
+            MessageType::Block | MessageType::CompactSkeleton => {
+                self.validate_compact_block_pow(assembly)
+            }
             MessageType::RawBlockSegment => self.validate_raw_block_segment(assembly),
             MessageType::Keepalive | MessageType::Auth => None,
         }
@@ -576,6 +580,10 @@ impl<V: PowValidator> RelayNode<V> {
                     MessageType::RawBlockSegment => {
                         self.metrics.inc_raw_segment_chunks_forwarded(chunks_sent)
                     }
+                    // Skeleton chunk forwarding is not counted under a dedicated
+                    // node metric (skeleton observability lives on the sidecar,
+                    // which reports fast-path wins); forwarding still happens.
+                    MessageType::CompactSkeleton => {}
                     MessageType::Keepalive | MessageType::Auth => {}
                 }
             }
@@ -731,7 +739,7 @@ impl<V: PowValidator> RelayNode<V> {
         // Validate chunk type and counts
         if !matches!(
             chunk.header.msg_type,
-            MessageType::Block | MessageType::RawBlockSegment
+            MessageType::Block | MessageType::RawBlockSegment | MessageType::CompactSkeleton
         ) {
             self.metrics.inc_invalid_chunks();
             return Err(TransportError::InvalidChunk(format!(
@@ -743,6 +751,8 @@ impl<V: PowValidator> RelayNode<V> {
         match chunk.header.msg_type {
             MessageType::Block => self.metrics.inc_compact_block_chunks_received(),
             MessageType::RawBlockSegment => self.metrics.inc_raw_segment_chunks_received(),
+            // Not counted under a dedicated node metric; forwarded like a block.
+            MessageType::CompactSkeleton => {}
             MessageType::Keepalive | MessageType::Auth => {}
         }
         if chunk.header.total_chunks == 0 || chunk.header.total_chunks > MAX_TOTAL_CHUNKS {
@@ -986,6 +996,12 @@ fn data_header(
             total_chunks,
             payload_len,
         )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )),
         MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
             "unsupported forwarded chunk message type".into(),
         )),
@@ -1009,6 +1025,13 @@ fn authenticated_data_header(
             hmac,
         )),
         MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment_authenticated(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_authenticated(
             object_hash,
             chunk_id,
             total_chunks,
@@ -1044,6 +1067,13 @@ fn data_header_v3(
             payload_len,
             data_shards,
         )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+        )),
         MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
             "unsupported forwarded chunk message type".into(),
         )),
@@ -1070,6 +1100,14 @@ fn authenticated_data_header_v3(
             hmac,
         )),
         MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment_authenticated_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            hmac,
+        )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_authenticated_v3(
             object_hash,
             chunk_id,
             total_chunks,
@@ -1606,6 +1644,98 @@ mod tests {
                 .expect("timeout waiting for forwarded v3 chunk")
                 .unwrap();
             let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
+            assert_eq!(parsed.header.version, 3);
+            assert_eq!(parsed.header.data_shards, data_shards);
+            assert!(verify_session.verify_hmac_v3(
+                &parsed.header.block_hash,
+                parsed.header.chunk_id,
+                parsed.header.total_chunks,
+                parsed.header.payload_len,
+                parsed.header.data_shards,
+                &parsed.payload,
+                &parsed.header.hmac,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_compact_skeleton_chunks_after_pow_validation() {
+        // A CompactSkeleton is PoW-validated at the node exactly like a compact
+        // block (it carries the header) and forwarded to peers as authenticated
+        // v3 CompactSkeleton chunks under its own object id.
+        let auth_key = [0x42; 32];
+        let config =
+            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(sender_addr, RelaySession::new(sender_addr, auth_key));
+            sessions.insert(receiver_addr, RelaySession::new(receiver_addr, auth_key));
+        }
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0xbeef, Vec::new(), Vec::new());
+        let block_hash = *compact.header_hash().as_bytes();
+        let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+        let chunks = node
+            .chunker
+            .compact_block_to_chunks_skeleton(&compact, &object_hash)
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.header.msg_type == MessageType::CompactSkeleton && c.header.version == 3)
+        );
+        let data_shards = chunks[0].header.data_shards;
+
+        let mut ready = Vec::new();
+        {
+            let mut sessions = node.sessions.write().await;
+            let session = sessions.get_mut(&sender_addr).unwrap();
+            for chunk in &chunks {
+                ready.extend(node.process_chunk_for_session(
+                    session,
+                    chunk,
+                    object_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                ));
+            }
+        }
+        let forwarded_total: usize = ready.iter().map(|r| r.chunks.len()).sum();
+        assert_eq!(forwarded_total, chunks.len(), "skeleton chunks forwardable");
+        assert!(
+            ready
+                .iter()
+                .all(|r| r.msg_type == MessageType::CompactSkeleton)
+        );
+
+        for r in &ready {
+            node.forward_to_peers(
+                sender_addr,
+                r.msg_type,
+                &r.block_hash,
+                r.total_chunks,
+                r.data_shards,
+                &r.chunks,
+            )
+            .await
+            .unwrap();
+        }
+
+        let verify_session = RelaySession::new(receiver_addr, auth_key);
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..chunks.len() {
+            let (len, _) = timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                .await
+                .expect("timeout waiting for forwarded skeleton chunk")
+                .unwrap();
+            let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
+            assert_eq!(parsed.header.msg_type, MessageType::CompactSkeleton);
             assert_eq!(parsed.header.version, 3);
             assert_eq!(parsed.header.data_shards, data_shards);
             assert!(verify_session.verify_hmac_v3(

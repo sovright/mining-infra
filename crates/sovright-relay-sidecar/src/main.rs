@@ -4,7 +4,7 @@ use clap::Parser;
 use sovright_relay::{
     ArrivalSink, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
     TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
-    reassemble_raw_block,
+    reassemble_raw_block, zcash_block_hash,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -461,6 +461,145 @@ where
     }
 }
 
+/// Capacity of the fast-path submit dedup ring (block hashes).
+const FAST_PATH_DEDUP_CAPACITY: usize = 256;
+/// TTL for a fast-path dedup entry. A skeleton and the full compact block for
+/// the same block arrive within a few hundred milliseconds, so this only needs
+/// to bridge that race; sized generously to also absorb slow reorg retries.
+const FAST_PATH_DEDUP_WINDOW: Duration = Duration::from_secs(300);
+
+/// Bounded, time-windowed set of block hashes already reconstructed and
+/// submitted (or dry-run built) by a fast path -- the skeleton or the non-gated
+/// full compact block. It guarantees a block is never submitted twice when both
+/// its skeleton and its full compact block arrive: whichever reconstructs first
+/// records the hash, and the other becomes a no-op. Kept local to the
+/// single-threaded receive task, so no lock is needed. Mirrors the submit-gate
+/// dedup ring (that ring only covers the all-prefilled gated path).
+struct HashDedupRing {
+    capacity: usize,
+    window: Duration,
+    entries: std::collections::VecDeque<(String, Instant)>,
+}
+
+impl HashDedupRing {
+    fn new(capacity: usize, window: Duration) -> Self {
+        Self {
+            capacity,
+            window,
+            entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn contains(&mut self, hash: &str, now: Instant) -> bool {
+        self.evict_expired(now);
+        self.entries.iter().any(|(h, _)| h == hash)
+    }
+
+    fn record(&mut self, hash: String, now: Instant) {
+        self.evict_expired(now);
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((hash, now));
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        while let Some((_, ts)) = self.entries.front() {
+            if now.duration_since(*ts) > self.window {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Reconstruct + submit a compact block on a fast path -- either the skeleton
+/// (`is_skeleton = true`) or the non-gated full compact block -- deduplicating
+/// by block hash so the skeleton and the full compact block for the same block
+/// never both submit.
+///
+/// The skeleton path reconstructs from the mempool and submits ONLY on a
+/// complete reconstruction; an unresolved short_id drops silently (the full
+/// compact block is the push fallback) and never triggers getblocktxn. Both
+/// paths record the block hash on a successful submit/dry-run, and skip when the
+/// hash is already present.
+#[allow(clippy::too_many_arguments)]
+async fn submit_compact_fast_path<S, M>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    compact_reconstruction_enabled: bool,
+    mempool: &M,
+    metrics: &SidecarMetrics,
+    dedup: &mut HashDedupRing,
+    now: Instant,
+    is_skeleton: bool,
+) where
+    S: SubmitBlock + Sync,
+    M: MempoolProvider,
+{
+    let block_hash = hex::encode(zcash_block_hash(&compact.header));
+    if dedup.contains(&block_hash, now) {
+        // The other fast path already reconstructed + submitted this block.
+        if is_skeleton {
+            metrics.inc_skeleton_deduplicated();
+        } else {
+            metrics.inc_full_block_deduplicated();
+        }
+        debug!(
+            block_hash = %block_hash,
+            is_skeleton,
+            "fast-path block already submitted; skipping duplicate"
+        );
+        return;
+    }
+
+    let outcome = if is_skeleton {
+        metrics.inc_skeleton_received();
+        // A skeleton submits ONLY on complete mempool reconstruction; it never
+        // sends getblocktxn (the full compact block is the push fallback).
+        handle_relay_compact_block_with_mempool(submitter, compact, mode, mempool).await
+    } else {
+        handle_relay_compact_payload(
+            submitter,
+            compact,
+            mode,
+            compact_reconstruction_enabled,
+            mempool,
+            metrics,
+        )
+        .await
+    };
+
+    match &outcome {
+        Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_)) => {
+            dedup.record(block_hash, now);
+            if is_skeleton {
+                metrics.inc_skeleton_submit_successes();
+            }
+        }
+        Ok(SubmissionOutcome::NeedsTransactions { .. }) => {
+            // Incomplete reconstruction. For a skeleton this is the expected
+            // miss: drop and wait for the full compact block. Do NOT record the
+            // hash, so the full block still submits.
+            if is_skeleton {
+                metrics.inc_skeleton_incomplete();
+            }
+        }
+        Ok(SubmissionOutcome::GateRejected { .. }) => {}
+        Err(_) => {
+            if is_skeleton {
+                metrics.inc_skeleton_incomplete();
+            }
+        }
+    }
+    log_submission_outcome(outcome, metrics, None);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_relay_block_handler<M>(
     mut receiver: BlockReceiver,
@@ -477,6 +616,10 @@ fn spawn_relay_block_handler<M>(
 {
     tokio::spawn(async move {
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
+        // Fast-path submit dedup shared by the skeleton and the non-gated
+        // compact block paths (see `submit_compact_fast_path`).
+        let mut fast_path_dedup =
+            HashDedupRing::new(FAST_PATH_DEDUP_CAPACITY, FAST_PATH_DEDUP_WINDOW);
         let mut cleanup_interval =
             tokio::time::interval(raw_segment_cleanup_interval(raw_segment_buffer_config.ttl));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -496,7 +639,7 @@ fn spawn_relay_block_handler<M>(
                             let use_gate = gate.is_some()
                                 && (!compact_reconstruction_enabled
                                     || compact.short_ids.is_empty());
-                            let outcome = if let (true, Some(gate), Some(chain_view)) =
+                            if let (true, Some(gate), Some(chain_view)) =
                                 (use_gate, &gate, &chain_view)
                             {
                                 let parent_height = if compact.header.len() >= 36 {
@@ -511,41 +654,66 @@ fn spawn_relay_block_handler<M>(
                                 } else {
                                     0
                                 };
-                                let mut gate_guard = gate.lock().await;
-                                handle_relay_compact_block_with_gate(
-                                    rpc.as_ref(),
-                                    &compact,
-                                    mode,
-                                    &mut gate_guard,
-                                    parent_height,
-                                )
-                                .await
+                                let outcome = {
+                                    let mut gate_guard = gate.lock().await;
+                                    handle_relay_compact_block_with_gate(
+                                        rpc.as_ref(),
+                                        &compact,
+                                        mode,
+                                        &mut gate_guard,
+                                        parent_height,
+                                    )
+                                    .await
+                                };
+                                // Per-cause GateRejected metric is incremented in
+                                // log_submission_outcome; here we tick the
+                                // accepted-by-gate counter for outcomes that came
+                                // through the gated handler and were not rejected.
+                                if matches!(
+                                    outcome,
+                                    Ok(SubmissionOutcome::DryRun(_))
+                                        | Ok(SubmissionOutcome::Submitted { .. })
+                                ) {
+                                    metrics.inc_submit_gate_accepted();
+                                }
+                                log_submission_outcome(outcome, metrics.as_ref(), None);
                             } else {
-                                handle_relay_compact_payload(
+                                // Non-gated fast path: reconstruct + submit with
+                                // block-hash dedup, so a skeleton and the full
+                                // compact block for the same block never both
+                                // submit (in either race order).
+                                submit_compact_fast_path(
                                     rpc.as_ref(),
                                     &compact,
                                     mode,
                                     compact_reconstruction_enabled,
                                     mempool.as_ref(),
                                     metrics.as_ref(),
+                                    &mut fast_path_dedup,
+                                    Instant::now(),
+                                    false,
                                 )
-                                .await
-                            };
-                            // Per-cause GateRejected metric is incremented in
-                            // log_submission_outcome; here we tick the
-                            // accepted-by-gate counter for outcomes that
-                            // came through the gated handler and were not
-                            // rejected by the gate.
-                            if use_gate
-                                && matches!(
-                                    outcome,
-                                    Ok(SubmissionOutcome::DryRun(_))
-                                        | Ok(SubmissionOutcome::Submitted { .. })
-                                )
-                            {
-                                metrics.inc_submit_gate_accepted();
+                                .await;
                             }
-                            log_submission_outcome(outcome, metrics.as_ref(), None);
+                        }
+                        RelayPayload::CompactSkeleton(compact) => {
+                            // Skeleton fast path: attempt full mempool
+                            // reconstruction. On a complete reconstruction submit
+                            // and record the block hash (so the later full compact
+                            // block is a no-op); on any unresolved short_id drop
+                            // silently and wait for the full compact block.
+                            submit_compact_fast_path(
+                                rpc.as_ref(),
+                                &compact,
+                                mode,
+                                compact_reconstruction_enabled,
+                                mempool.as_ref(),
+                                metrics.as_ref(),
+                                &mut fast_path_dedup,
+                                Instant::now(),
+                                true,
+                            )
+                            .await;
                         }
                         RelayPayload::RawBlockSegment(segment) => {
                             metrics.inc_raw_segments_received();
@@ -1204,6 +1372,20 @@ struct SidecarMetrics {
     compact_reconstruction_unresolved_short_ids: AtomicU64,
     compact_reconstruction_getblocktxn_requests: AtomicU64,
     compact_reconstruction_getblocktxn_requested_transactions: AtomicU64,
+    /// Compact skeletons received on the fast path.
+    skeleton_received: AtomicU64,
+    /// Skeletons reconstructed from the mempool and submitted before the full
+    /// compact block arrived -- the skeleton-first wins.
+    skeleton_submit_successes: AtomicU64,
+    /// Skeletons that could not fully reconstruct (an unresolved short_id), so
+    /// the sidecar dropped them and waited for the full compact block.
+    skeleton_incomplete: AtomicU64,
+    /// Skeletons dropped because the block was already submitted (the full
+    /// compact block won the race first).
+    skeleton_deduplicated: AtomicU64,
+    /// Full compact blocks dropped because a skeleton already submitted the
+    /// block -- the no-double-submit path when the skeleton wins.
+    full_block_deduplicated: AtomicU64,
     raw_segments_received: AtomicU64,
     raw_segment_sets_completed: AtomicU64,
     raw_segment_drops: AtomicU64,
@@ -1303,6 +1485,27 @@ impl SidecarMetrics {
             .fetch_add(1, Ordering::Relaxed);
         self.compact_reconstruction_getblocktxn_requested_transactions
             .fetch_add(requested_transactions as u64, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_received(&self) {
+        self.skeleton_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_submit_successes(&self) {
+        self.skeleton_submit_successes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_incomplete(&self) {
+        self.skeleton_incomplete.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_deduplicated(&self) {
+        self.skeleton_deduplicated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_full_block_deduplicated(&self) {
+        self.full_block_deduplicated.fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_raw_segments_received(&self) {
@@ -1453,6 +1656,11 @@ impl SidecarMetrics {
         let compact_reconstruction_getblocktxn_requested_transactions = self
             .compact_reconstruction_getblocktxn_requested_transactions
             .load(Ordering::Relaxed);
+        let skeleton_received = self.skeleton_received.load(Ordering::Relaxed);
+        let skeleton_submit_successes = self.skeleton_submit_successes.load(Ordering::Relaxed);
+        let skeleton_incomplete = self.skeleton_incomplete.load(Ordering::Relaxed);
+        let skeleton_deduplicated = self.skeleton_deduplicated.load(Ordering::Relaxed);
+        let full_block_deduplicated = self.full_block_deduplicated.load(Ordering::Relaxed);
         let raw_segments_received = self.raw_segments_received.load(Ordering::Relaxed);
         let raw_segment_sets_completed = self.raw_segment_sets_completed.load(Ordering::Relaxed);
         let raw_segment_drops = self.raw_segment_drops.load(Ordering::Relaxed);
@@ -1522,6 +1730,16 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requests_total {compact_reconstruction_getblocktxn_requests}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requested_transactions_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requested_transactions_total {compact_reconstruction_getblocktxn_requested_transactions}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_received_total counter\n",
+                "sovright_relay_sidecar_skeleton_received_total {skeleton_received}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_submit_successes_total counter\n",
+                "sovright_relay_sidecar_skeleton_submit_successes_total {skeleton_submit_successes}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_incomplete_total counter\n",
+                "sovright_relay_sidecar_skeleton_incomplete_total {skeleton_incomplete}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_deduplicated_total counter\n",
+                "sovright_relay_sidecar_skeleton_deduplicated_total {skeleton_deduplicated}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_full_block_deduplicated_total counter\n",
+                "sovright_relay_sidecar_skeleton_full_block_deduplicated_total {full_block_deduplicated}\n",
                 "# TYPE sovright_relay_sidecar_relay_raw_segments_received_total counter\n",
                 "sovright_relay_sidecar_relay_raw_segments_received_total {raw_segments_received}\n",
                 "# TYPE sovright_relay_sidecar_relay_raw_segment_sets_completed_total counter\n",
@@ -1598,6 +1816,11 @@ impl SidecarMetrics {
                 compact_reconstruction_getblocktxn_requests,
             compact_reconstruction_getblocktxn_requested_transactions =
                 compact_reconstruction_getblocktxn_requested_transactions,
+            skeleton_received = skeleton_received,
+            skeleton_submit_successes = skeleton_submit_successes,
+            skeleton_incomplete = skeleton_incomplete,
+            skeleton_deduplicated = skeleton_deduplicated,
+            full_block_deduplicated = full_block_deduplicated,
             raw_segments_received = raw_segments_received,
             raw_segment_sets_completed = raw_segment_sets_completed,
             raw_segment_drops = raw_segment_drops,
@@ -1672,7 +1895,8 @@ fn write_metrics_textfile(
 mod tests {
     use super::*;
     use sovright_relay::{
-        AuthDigest, CompactBlockBuilder, TestMempool, TxId, WtxId, split_raw_block,
+        AuthDigest, CompactBlockBuilder, PrefilledTx, ShortId, TestMempool, TxId, WtxId,
+        split_raw_block,
     };
     use std::sync::atomic::Ordering;
 
@@ -1767,6 +1991,262 @@ mod tests {
             RawSegmentInsert::Pending => panic!("expected complete segment set"),
             RawSegmentInsert::Dropped { reason } => panic!("unexpected drop: {reason}"),
         }
+    }
+
+    #[tokio::test]
+    async fn skeleton_wins_then_full_block_is_a_noop() {
+        // A skeleton whose short_ids all resolve in the mempool reconstructs and
+        // submits; the subsequent full compact block for the same block hash is
+        // deduped -- never a double submit.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let header = vec![0xab; 2189];
+        let nonce = 9;
+        let coinbase = vec![0x01, 0x02];
+        let tx1 = vec![0x03, 0x04, 0x05];
+        let wtxid = make_wtxid(0x11);
+        let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
+        let skeleton = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase.clone(),
+            }],
+        );
+        let mut mempool = TestMempool::new();
+        mempool.insert(wtxid, tx1);
+
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.skeleton_submit_successes.load(Ordering::Relaxed), 1);
+
+        // Full compact block for the same block -> deduped, no second submit.
+        let full = skeleton.clone();
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            1,
+            "block must never be submitted twice"
+        );
+        assert_eq!(metrics.full_block_deduplicated.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_skeleton_waits_and_full_block_submits() {
+        // A skeleton with an unresolved short_id does not submit; the full
+        // compact block (the origin prefills that tx as the push fallback) then
+        // reconstructs without the mempool and submits normally.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let header = vec![0xcd; 2189];
+        let nonce = 3;
+        let coinbase = vec![0x01];
+        let tx1 = vec![0x02, 0x03];
+        let short_id = ShortId::compute(&make_wtxid(0x21), &zcash_block_hash(&header), nonce);
+        let empty_mempool = TestMempool::new();
+
+        let skeleton = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase.clone(),
+            }],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &empty_mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            0,
+            "incomplete skeleton must not submit"
+        );
+        assert_eq!(metrics.skeleton_incomplete.load(Ordering::Relaxed), 1);
+
+        // Full compact block: coinbase + tx1 both prefilled -> submits.
+        let full = CompactBlock::new(
+            header,
+            nonce,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: coinbase,
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: tx1,
+                },
+            ],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &empty_mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            1,
+            "full compact block submits after an incomplete skeleton"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_block_wins_then_late_skeleton_is_a_noop() {
+        // Reverse race: the full compact block submits first, so a later
+        // skeleton for the same block is deduped.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let header = vec![0xef; 2189];
+        let nonce = 5;
+        let coinbase = vec![0x01];
+        let tx1 = vec![0x02, 0x03];
+        let wtxid = make_wtxid(0x31);
+        let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
+
+        let full = CompactBlock::new(
+            header.clone(),
+            nonce,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: coinbase.clone(),
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: tx1.clone(),
+                },
+            ],
+        );
+        let mut mempool = TestMempool::new();
+        mempool.insert(wtxid, tx1);
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+        assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+
+        let skeleton = CompactBlock::new(
+            header,
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase,
+            }],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            1,
+            "late skeleton must not resubmit"
+        );
+        assert_eq!(metrics.skeleton_deduplicated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn skeleton_metrics_render_in_prometheus_text() {
+        let metrics = SidecarMetrics::default();
+        metrics.inc_skeleton_received();
+        metrics.inc_skeleton_submit_successes();
+        metrics.inc_skeleton_incomplete();
+        metrics.inc_skeleton_deduplicated();
+        metrics.inc_full_block_deduplicated();
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("sovright_relay_sidecar_skeleton_received_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_submit_successes_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_incomplete_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_deduplicated_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_full_block_deduplicated_total 1"));
+    }
+
+    #[test]
+    fn hash_dedup_ring_expires_and_bounds() {
+        let mut ring = HashDedupRing::new(2, Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert!(!ring.contains("a", t0));
+        ring.record("a".to_string(), t0);
+        assert!(ring.contains("a", t0));
+        // Expired after the window.
+        assert!(!ring.contains("a", t0 + Duration::from_secs(31)));
+        // Capacity bound evicts the oldest.
+        let t1 = t0 + Duration::from_secs(1);
+        ring.record("x".to_string(), t1);
+        ring.record("y".to_string(), t1);
+        ring.record("z".to_string(), t1);
+        assert!(!ring.contains("x", t1), "oldest evicted at capacity");
+        assert!(ring.contains("y", t1));
+        assert!(ring.contains("z", t1));
     }
 
     #[test]

@@ -32,6 +32,10 @@ pub enum RelayPayload {
     CompactBlock(CompactBlock),
     /// One segment of a raw serialized block.
     RawBlockSegment(RawBlockSegment),
+    /// Compact-skeleton fast-path object: a `CompactBlock` (all-short_id form)
+    /// sent first and redundantly ahead of the full compact block, routed to
+    /// the receiver's skeleton fast path.
+    CompactSkeleton(CompactBlock),
 }
 
 /// Handle for sending blocks through the relay client
@@ -56,6 +60,20 @@ impl BlockSender {
     ) -> Result<(), TransportError> {
         self.tx
             .send(RelayPayload::RawBlockSegment(segment))
+            .await
+            .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
+    }
+
+    /// Send a compact skeleton to be relayed on the fast path.
+    ///
+    /// The skeleton is the reconstruction-critical `CompactBlock` (header +
+    /// nonce + all-non-coinbase short_ids, coinbase prefilled). It is chunked
+    /// under [`MessageType::CompactSkeleton`] with a heavier parity floor and a
+    /// distinct relay object id, so it reassembles independently of, and ahead
+    /// of, the full compact block that follows as the push fallback.
+    pub async fn send_skeleton(&self, skeleton: CompactBlock) -> Result<(), TransportError> {
+        self.tx
+            .send(RelayPayload::CompactSkeleton(skeleton))
             .await
             .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
     }
@@ -318,7 +336,29 @@ impl RelayClient {
             RelayPayload::RawBlockSegment(segment) => {
                 self.send_raw_block_segment_internal(socket, segment).await
             }
+            RelayPayload::CompactSkeleton(skeleton) => {
+                self.send_skeleton_internal(socket, skeleton).await
+            }
         }
+    }
+
+    /// Send a compact skeleton to all relay nodes on the fast path.
+    ///
+    /// The skeleton always uses the adaptive (v3) codec with the heavier
+    /// skeleton parity floor, and is routed under a domain-separated object id
+    /// so it does not collide with the full compact block of the same block.
+    async fn send_skeleton_internal(
+        &self,
+        socket: Arc<UdpSocket>,
+        skeleton: &CompactBlock,
+    ) -> Result<(), TransportError> {
+        let block_hash = self.compute_block_hash(skeleton);
+        let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+        let chunks = self
+            .chunker
+            .compact_block_to_chunks_skeleton(skeleton, &object_hash)?;
+        self.send_chunks_internal(socket, &object_hash, chunks, "compact skeleton")
+            .await
     }
 
     /// Send a block to all relay nodes
@@ -399,6 +439,16 @@ impl RelayClient {
                             hmac,
                         )
                     }
+                    MessageType::CompactSkeleton => {
+                        ChunkHeader::new_compact_skeleton_authenticated_v3(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            chunk.header.data_shards,
+                            hmac,
+                        )
+                    }
                     MessageType::Keepalive | MessageType::Auth => {
                         return Err(TransportError::InvalidChunk(
                             "unsupported outgoing chunk message type".into(),
@@ -423,6 +473,15 @@ impl RelayClient {
                     ),
                     MessageType::RawBlockSegment => {
                         ChunkHeader::new_raw_block_segment_authenticated(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            hmac,
+                        )
+                    }
+                    MessageType::CompactSkeleton => {
+                        ChunkHeader::new_compact_skeleton_authenticated(
                             &chunk.header.block_hash,
                             chunk.header.chunk_id,
                             chunk.header.total_chunks,
@@ -500,7 +559,7 @@ impl RelayClient {
         // Validate chunk header
         if !matches!(
             chunk.header.msg_type,
-            MessageType::Block | MessageType::RawBlockSegment
+            MessageType::Block | MessageType::RawBlockSegment | MessageType::CompactSkeleton
         ) {
             log_raw_segment_chunk_drop(&chunk, "unsupported message type");
             return;
@@ -689,6 +748,14 @@ impl RelayClient {
                 .chunks_to_raw_block_segment_with_shards(chunks, original_len, data_shards)
                 .ok()
                 .map(RelayPayload::RawBlockSegment),
+            // A skeleton is a serialized CompactBlock; decode it identically but
+            // deliver it as a distinct payload so the receiver routes it to the
+            // skeleton fast path.
+            MessageType::CompactSkeleton => self
+                .chunker
+                .chunks_to_compact_block_with_shards(chunks, original_len, data_shards)
+                .ok()
+                .map(RelayPayload::CompactSkeleton),
             MessageType::Keepalive | MessageType::Auth => None,
         }
     }
@@ -943,7 +1010,77 @@ mod tests {
                 assert_eq!(block.nonce, 0xdead_beef);
                 assert_eq!(block.header, vec![0xab; 2189]);
             }
-            RelayPayload::RawBlockSegment(_) => panic!("expected compact block"),
+            other => panic!("expected compact block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_reassembles_and_delivers_compact_skeleton() {
+        // A skeleton encoded under MessageType::CompactSkeleton, routed by its
+        // domain-separated object id, must reassemble and be delivered as a
+        // distinct RelayPayload::CompactSkeleton (not a CompactBlock).
+        let auth_key = [0x42; 32];
+        let config = ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], auth_key)
+            .with_auth_required(true);
+        let client = RelayClient::new(config).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut client = client;
+        client.incoming_tx = Some(tx);
+
+        let skeleton = CompactBlock::new(vec![0xab; 2189], 0xfeed, Vec::new(), Vec::new());
+        let block_hash = client.compute_block_hash(&skeleton);
+        let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+        let chunks = client
+            .chunker
+            .compact_block_to_chunks_skeleton(&skeleton, &object_hash)
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.header.msg_type == MessageType::CompactSkeleton)
+        );
+        assert!(chunks.iter().all(|c| c.header.version == 3));
+
+        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
+        let mut recent_delivered = HashMap::new();
+        for chunk in chunks {
+            let hmac = session.compute_hmac_v3(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                chunk.header.data_shards,
+                &chunk.payload,
+            );
+            let auth_header = ChunkHeader::new_compact_skeleton_authenticated_v3(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                chunk.header.data_shards,
+                hmac,
+            );
+            client
+                .handle_incoming_chunk(
+                    Chunk::new(auth_header, chunk.payload),
+                    &mut pending,
+                    &mut recent_delivered,
+                )
+                .await;
+        }
+
+        let delivered = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("skeleton should be delivered")
+            .expect("channel open");
+        match delivered {
+            RelayPayload::CompactSkeleton(block) => {
+                assert_eq!(block.nonce, 0xfeed);
+                assert_eq!(block.header, vec![0xab; 2189]);
+            }
+            other => panic!("expected compact skeleton, got {other:?}"),
         }
     }
 

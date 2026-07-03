@@ -9,12 +9,24 @@ use tokio::sync::RwLock;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use crate::block::{compact_block_from_raw_block, compact_block_from_raw_block_with_tx_cache};
+use crate::block::{
+    compact_block_from_raw_block, compact_block_from_raw_block_with_tx_cache,
+    skeleton_compact_block_from_raw_block,
+};
 use crate::config::Config;
 use crate::error::{IngressError, Result};
 use crate::tx_cache::TxCache;
 
 const RELAY_LEN_PREFIX_BYTES: usize = 4;
+
+/// Upper bound on the serialized compact-skeleton size worth sending as a
+/// redundant, heavier-parity early copy ahead of the full compact block. The
+/// skeleton is a strict duplicate of the reconstruction-critical data, so for a
+/// large object the extra copy is pure overhead -- above this the full compact
+/// block (the push fallback) is left to carry it alone. Typical Zcash compact
+/// blocks are ~1.5-2.5 KB (the Equihash header dominates); this admits normal
+/// blocks and skips oversized / cold-cache (large-prefill) ones.
+const SKELETON_MAX_WIRE_BYTES: usize = 8 * 1024;
 
 /// Bounded, time-windowed LRU of recently-forwarded block hashes. Used by
 /// `RelayBridge::forward_block` to implement first-seen-wins dedup so the
@@ -72,6 +84,10 @@ pub struct RelayBridge {
     /// ~100ms of matrix math, far too expensive for the per-block hot path.
     chunker: Arc<BlockChunker>,
     compact_from_tx_cache: bool,
+    /// Send a compact skeleton first (and redundantly) ahead of the full
+    /// compact block. Only acts when `compact_from_tx_cache` is also on and a
+    /// tx cache is supplied to `forward_block`.
+    skeleton_first: bool,
     raw_fallback_with_tx_cache: bool,
     raw_segment_send_rounds: usize,
     raw_segment_round_delay: Duration,
@@ -119,6 +135,7 @@ impl RelayBridge {
                     .map_err(|e| IngressError::Relay(e.to_string()))?,
             ),
             compact_from_tx_cache: config.relay_compact_from_tx_cache,
+            skeleton_first: config.relay_skeleton_first,
             raw_fallback_with_tx_cache: config.relay_raw_fallback_with_tx_cache,
             raw_segment_send_rounds: config.relay_raw_segment_send_rounds,
             raw_segment_round_delay: Duration::from_millis(
@@ -147,6 +164,7 @@ impl RelayBridge {
                     .map_err(|e| IngressError::Relay(e.to_string()))?,
             ),
             compact_from_tx_cache: config.relay_compact_from_tx_cache,
+            skeleton_first: config.relay_skeleton_first,
             raw_fallback_with_tx_cache: config.relay_raw_fallback_with_tx_cache,
             raw_segment_send_rounds: config.relay_raw_segment_send_rounds,
             raw_segment_round_delay: Duration::from_millis(
@@ -231,6 +249,41 @@ impl RelayBridge {
                 });
             }
             return Err(self.with_segment_plan(error, &compact, block_payload));
+        }
+        // Skeleton fast path: emit the reconstruction-critical skeleton first
+        // (and with heavier FEC parity) so a receiver that already holds the
+        // block's transactions reconstructs and submits before the FEC'd compact
+        // bodies arrive. The full compact block below is the push fallback, so it
+        // is ALWAYS sent afterward -- the skeleton never suppresses it. Only
+        // meaningful with tx-cache compaction (short_id compact blocks).
+        if self.skeleton_first
+            && self.compact_from_tx_cache
+            && let Some(tx_cache) = tx_cache
+        {
+            match skeleton_compact_block_from_raw_block(block_payload, tx_cache) {
+                Ok(skeleton) => {
+                    // Small-block guard: the skeleton is only worth an extra
+                    // redundant, heavier-parity early copy when (a) it carries
+                    // short_ids a receiver can resolve from its own mempool --
+                    // an all-prefilled skeleton reconstructs from nothing, so
+                    // it would only ever duplicate the full block -- and (b) it
+                    // is small enough that the duplicate send is cheap. Oversized
+                    // / cold-cache (large-prefill) blocks are left to the full
+                    // compact block alone.
+                    let skeleton_bytes = BlockChunker::serialize_compact_block(&skeleton).len();
+                    if !skeleton.short_ids.is_empty()
+                        && skeleton_bytes <= SKELETON_MAX_WIRE_BYTES
+                    {
+                        self.sender
+                            .send_skeleton(skeleton)
+                            .await
+                            .map_err(map_transport_error)?;
+                    }
+                }
+                Err(error) => {
+                    warn!(%error, "Failed to build compact skeleton; sending full compact block only");
+                }
+            }
         }
         self.sender
             .send(compact.clone())
@@ -422,6 +475,7 @@ mod tests {
             parity_shards: 3,
             chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: false,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
@@ -483,6 +537,7 @@ mod tests {
             parity_shards: 32,
             chunker: Arc::new(BlockChunker::new(224, 32).unwrap()),
             compact_from_tx_cache: false,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
@@ -548,6 +603,7 @@ mod tests {
             parity_shards: 3,
             chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: true,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
@@ -598,6 +654,7 @@ mod tests {
             parity_shards: 3,
             chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: true,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: true,
             raw_segment_send_rounds: 2,
             raw_segment_round_delay: Duration::ZERO,
@@ -697,6 +754,7 @@ mod tests {
             parity_shards: 3,
             chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: false,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
@@ -717,7 +775,7 @@ mod tests {
             let payload = outgoing.recv().await.expect("segment queued");
             match payload {
                 RelayPayload::RawBlockSegment(segment) => segments.push(segment),
-                RelayPayload::CompactBlock(_) => panic!("expected raw block segment"),
+                other => panic!("expected raw block segment, got {other:?}"),
             }
         }
 
@@ -740,6 +798,7 @@ mod tests {
             parity_shards: 3,
             chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: false,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: false,
             raw_segment_send_rounds: 3,
             raw_segment_round_delay: Duration::ZERO,
@@ -762,7 +821,7 @@ mod tests {
             let payload = outgoing.recv().await.expect("segment queued");
             match payload {
                 RelayPayload::RawBlockSegment(segment) => segments.push(segment),
-                RelayPayload::CompactBlock(_) => panic!("expected raw block segment"),
+                other => panic!("expected raw block segment, got {other:?}"),
             }
         }
 
@@ -786,6 +845,7 @@ mod tests {
             parity_shards: 3,
             chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
             compact_from_tx_cache: true,
+            skeleton_first: false,
             raw_fallback_with_tx_cache: true,
             raw_segment_send_rounds: 1,
             raw_segment_round_delay: Duration::ZERO,
@@ -816,7 +876,7 @@ mod tests {
                 assert_eq!(compact.tx_count(), 2);
                 assert_eq!(compact.short_ids.len(), 1);
             }
-            RelayPayload::RawBlockSegment(_) => panic!("compact block should be sent first"),
+            other => panic!("compact block should be sent first, got {other:?}"),
         }
 
         let mut segments = Vec::new();
@@ -824,10 +884,174 @@ mod tests {
             let payload = outgoing.recv().await.expect("raw fallback segment queued");
             match payload {
                 RelayPayload::RawBlockSegment(segment) => segments.push(segment),
-                RelayPayload::CompactBlock(_) => panic!("expected raw fallback segment"),
+                other => panic!("expected raw fallback segment, got {other:?}"),
             }
         }
         assert_eq!(reassemble_raw_block(&segments).unwrap(), raw_block);
+    }
+
+    #[tokio::test]
+    async fn forward_block_flag_off_emits_no_skeleton() {
+        // With skeleton_first off, forward_block sends exactly the compact block
+        // and nothing else -- byte-for-byte the current behavior.
+        let mut client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let sender = client.sender();
+        let (_receiver, mut outgoing) = client.take_receiver().unwrap();
+        let bridge = RelayBridge {
+            sender,
+            data_shards: 10,
+            parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
+            compact_from_tx_cache: true,
+            skeleton_first: false,
+            raw_fallback_with_tx_cache: false,
+            raw_segment_send_rounds: 1,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
+        };
+        let (raw_block, _tx0, tx1) = two_tx_raw_block();
+        let tx_cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4_096,
+            max_tx_bytes: 2_048,
+        });
+        tx_cache.insert(TxInventoryKey::wtx([0x41; 32], [0x42; 32]).to_wtxid(), tx1);
+
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&tx_cache))
+            .await
+            .unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+
+        // Exactly one payload, and it is the compact block (no skeleton).
+        match outgoing.recv().await.expect("compact block queued") {
+            RelayPayload::CompactBlock(_) => {}
+            other => panic!("expected only a compact block, got {other:?}"),
+        }
+        assert!(
+            outgoing.try_recv().is_err(),
+            "no second payload should be sent when skeleton_first is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn forward_block_skeleton_first_sends_skeleton_then_compact() {
+        // With skeleton_first on and tx-cache compaction, forward_block emits the
+        // CompactSkeleton FIRST, then the full CompactBlock push fallback.
+        let mut client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let sender = client.sender();
+        let (_receiver, mut outgoing) = client.take_receiver().unwrap();
+        let bridge = RelayBridge {
+            sender,
+            data_shards: 10,
+            parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
+            compact_from_tx_cache: true,
+            skeleton_first: true,
+            raw_fallback_with_tx_cache: false,
+            raw_segment_send_rounds: 1,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
+        };
+        let (raw_block, _tx0, tx1) = two_tx_raw_block();
+        let tx_cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4_096,
+            max_tx_bytes: 2_048,
+        });
+        tx_cache.insert(TxInventoryKey::wtx([0x41; 32], [0x42; 32]).to_wtxid(), tx1);
+
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&tx_cache))
+            .await
+            .unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+
+        // Skeleton first ...
+        let skeleton = match outgoing.recv().await.expect("skeleton queued") {
+            RelayPayload::CompactSkeleton(skeleton) => skeleton,
+            other => panic!("expected skeleton first, got {other:?}"),
+        };
+        assert_eq!(skeleton.short_ids.len(), 1, "tx1 resolved to a short_id");
+        assert_eq!(skeleton.prefilled_txs.len(), 1, "only coinbase prefilled");
+
+        // ... then the full compact block push fallback.
+        match outgoing.recv().await.expect("compact block queued") {
+            RelayPayload::CompactBlock(compact) => {
+                assert_eq!(compact.header, skeleton.header);
+            }
+            other => panic!("expected compact block second, got {other:?}"),
+        }
+        assert!(outgoing.try_recv().is_err(), "exactly two payloads");
+    }
+
+    #[tokio::test]
+    async fn forward_block_skeleton_guard_skips_all_prefilled() {
+        // Small-block guard: a block whose txs are NOT in the cache is
+        // all-prefilled (no short_ids), so its skeleton could only duplicate the
+        // full block -- the guard must suppress it and send ONLY the compact
+        // block, even with skeleton_first on.
+        let mut client = RelayClient::new(
+            ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], [0x42; 32])
+                .with_auth_required(true),
+        )
+        .unwrap();
+        let sender = client.sender();
+        let (_receiver, mut outgoing) = client.take_receiver().unwrap();
+        let bridge = RelayBridge {
+            sender,
+            data_shards: 10,
+            parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
+            compact_from_tx_cache: true,
+            skeleton_first: true,
+            raw_fallback_with_tx_cache: false,
+            raw_segment_send_rounds: 1,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                64,
+                Duration::from_secs(30),
+            ))),
+        };
+        let (raw_block, _tx0, _tx1) = two_tx_raw_block();
+        // Empty cache => tx1 cannot resolve to a short_id => all-prefilled.
+        let tx_cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 4_096,
+            max_tx_bytes: 2_048,
+        });
+
+        let forwarded = bridge
+            .forward_block(&raw_block, Some(&tx_cache))
+            .await
+            .unwrap();
+        assert_eq!(forwarded.mode, ForwardMode::CompactBlock);
+
+        // Exactly one payload -- the compact block -- and it is NOT a skeleton.
+        match outgoing.recv().await.expect("compact block queued") {
+            RelayPayload::CompactBlock(compact) => {
+                assert!(compact.short_ids.is_empty(), "all txs prefilled");
+            }
+            other => panic!("expected compact block, got {other:?}"),
+        }
+        assert!(
+            outgoing.try_recv().is_err(),
+            "guard must suppress the skeleton for an all-prefilled block"
+        );
     }
 
     fn test_config() -> Config {
@@ -866,6 +1090,7 @@ mod tests {
             relay_send_burst_packets: 0,
             relay_send_burst_delay_micros: 0,
             relay_compact_from_tx_cache: false,
+            relay_skeleton_first: false,
             relay_raw_fallback_with_tx_cache: false,
             relay_raw_segment_send_rounds: 1,
             relay_raw_segment_round_delay_millis: 0,
