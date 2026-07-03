@@ -564,7 +564,8 @@ mod tests {
     #[test]
     fn enroll_bad_key_or_endpoint_does_not_burn_invite() {
         // A malformed later field must not consume the single-use invite.
-        let cases: [(&str, fn(&mut EnrollRequest)); 2] = [
+        type ReqMut = fn(&mut EnrollRequest);
+        let cases: [(&str, ReqMut); 2] = [
             ("key", |r| r.mesh_key_hex = "abcd".into()),
             ("endpoint", |r| r.node_endpoint = "not-an-addr".into()),
         ];
