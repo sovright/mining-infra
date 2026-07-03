@@ -125,12 +125,7 @@ pub struct InjectionRequest {
 /// Order is fixed and length-delimited so no field boundary is ambiguous:
 /// `miner_id \n timestamp \n nonce_hex \n body_len \n` followed by the raw body.
 /// The relay MUST reconstruct this exact preimage to verify.
-pub fn signing_preimage(
-    miner_id: &str,
-    timestamp: u64,
-    nonce: &[u8; 16],
-    body: &[u8],
-) -> Vec<u8> {
+pub fn signing_preimage(miner_id: &str, timestamp: u64, nonce: &[u8; 16], body: &[u8]) -> Vec<u8> {
     let mut pre = Vec::with_capacity(miner_id.len() + 64 + body.len());
     pre.extend_from_slice(miner_id.as_bytes());
     pre.push(b'\n');
@@ -298,8 +293,7 @@ mod tests {
         let body = b"serialized-block-bytes".to_vec();
         let auth = compute_auth(&creds.key, &creds.miner_id, 1_700_000_000, &nonce, &body);
         assert_eq!(
-            auth,
-            "234313eae67f00382b39655e9c9aa0229043b947837a28349375fe86ee3c9da0",
+            auth, "234313eae67f00382b39655e9c9aa0229043b947837a28349375fe86ee3c9da0",
             "auth vector drifted; regenerate intentionally, not by accident"
         );
     }

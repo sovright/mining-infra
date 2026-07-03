@@ -77,8 +77,9 @@ fn usage() -> String {
 
 fn read_block_hex(args: &Args) -> Result<Vec<u8>, String> {
     let hex_text = match &args.block_file {
-        Some(path) => std::fs::read_to_string(path)
-            .map_err(|e| format!("failed to read {path}: {e}"))?,
+        Some(path) => {
+            std::fs::read_to_string(path).map_err(|e| format!("failed to read {path}: {e}"))?
+        }
         None => {
             let mut buf = String::new();
             std::io::stdin()
@@ -114,8 +115,8 @@ fn poc_nonce() -> [u8; 16] {
 
 fn run() -> Result<(), String> {
     let args = parse_args()?;
-    let creds = MinerCredentials::from_hex_key(&args.miner_id, &args.key_hex)
-        .map_err(|e| e.to_string())?;
+    let creds =
+        MinerCredentials::from_hex_key(&args.miner_id, &args.key_hex).map_err(|e| e.to_string())?;
     let body = read_block_hex(&args)?;
 
     let req = InjectionRequest::build(
