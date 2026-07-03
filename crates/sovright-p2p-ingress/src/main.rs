@@ -9,6 +9,7 @@ mod relay_bridge;
 mod tx_cache;
 mod tx_feed;
 mod wire;
+mod wtxid;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;

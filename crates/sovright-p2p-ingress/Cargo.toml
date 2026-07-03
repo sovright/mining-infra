@@ -16,3 +16,10 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+zcash_primitives = { workspace = true }
+zcash_protocol = { workspace = true }
+
+[dev-dependencies]
+# Test-only: assert the from-bytes wtxid path equals the sidecar's authoritative
+# from-Zebra-display construction byte-for-byte (guards against short_id drift).
+sovright-relay-sidecar = { path = "../sovright-relay-sidecar" }
