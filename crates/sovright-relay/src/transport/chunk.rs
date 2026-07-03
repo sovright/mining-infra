@@ -70,6 +70,15 @@ pub enum MessageType {
     Auth = 2,
     /// Segmented raw block object chunk
     RawBlockSegment = 3,
+    /// Compact-skeleton fast-path object chunk.
+    ///
+    /// Wire-identical to a [`MessageType::Block`] chunk (it carries a serialized
+    /// `CompactBlock`); only the type byte differs so a receiver routes it to
+    /// the skeleton fast path instead of the normal compact-block path. A
+    /// skeleton is the reconstruction-critical header + nonce + all-non-coinbase
+    /// short_ids (coinbase prefilled), sent first and redundantly ahead of the
+    /// full compact block.
+    CompactSkeleton = 4,
 }
 
 impl TryFrom<u8> for MessageType {
@@ -81,6 +90,7 @@ impl TryFrom<u8> for MessageType {
             1 => Ok(MessageType::Keepalive),
             2 => Ok(MessageType::Auth),
             3 => Ok(MessageType::RawBlockSegment),
+            4 => Ok(MessageType::CompactSkeleton),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid message type: {}", value),
@@ -325,6 +335,79 @@ impl ChunkHeader {
         )
     }
 
+    /// Create a new compact-skeleton chunk header (version 1, unauthenticated).
+    pub fn new_compact_skeleton(
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+    ) -> Self {
+        Self::new(
+            MessageType::CompactSkeleton,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )
+    }
+
+    /// Create a new authenticated compact-skeleton chunk header (version 2).
+    pub fn new_compact_skeleton_authenticated(
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        hmac: [u8; 32],
+    ) -> Self {
+        Self::new_authenticated(
+            MessageType::CompactSkeleton,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )
+    }
+
+    /// Create a version-3 (adaptive) compact-skeleton header without authentication.
+    pub fn new_compact_skeleton_v3(
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        data_shards: u16,
+    ) -> Self {
+        Self::new_v3(
+            MessageType::CompactSkeleton,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            [0u8; 32],
+        )
+    }
+
+    /// Create an authenticated version-3 (adaptive) compact-skeleton header.
+    pub fn new_compact_skeleton_authenticated_v3(
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        data_shards: u16,
+        hmac: [u8; 32],
+    ) -> Self {
+        Self::new_v3(
+            MessageType::CompactSkeleton,
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            hmac,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_v3(
         msg_type: MessageType,
@@ -444,7 +527,10 @@ impl ChunkHeader {
                 format!("payload_len {} exceeds max {}", payload_len, max_payload),
             ));
         }
-        if matches!(msg_type, MessageType::Block | MessageType::RawBlockSegment) && payload_len == 0
+        if matches!(
+            msg_type,
+            MessageType::Block | MessageType::RawBlockSegment | MessageType::CompactSkeleton
+        ) && payload_len == 0
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -790,6 +876,46 @@ mod tests {
         // data_shards > total_chunks => invalid.
         bytes[44..46].copy_from_slice(&9u16.to_be_bytes());
         assert!(ChunkHeader::from_bytes(&bytes).is_err());
+    }
+
+    #[test]
+    fn compact_skeleton_message_type_survives_to_from_bytes() {
+        // A CompactSkeleton chunk is wire-identical to a Block chunk save for
+        // the type byte (5 = CompactSkeleton), which must survive the round trip.
+        let block_hash = [0x5c; 32];
+        let hmac = [0x6d; 32];
+        let header = ChunkHeader::new_compact_skeleton_authenticated(&block_hash, 2, 5, 7, hmac);
+        assert_eq!(header.version, 2);
+        assert_eq!(header.msg_type, MessageType::CompactSkeleton);
+
+        let bytes = header.to_bytes();
+        // Type byte lives at offset 5 and must encode CompactSkeleton == 4.
+        assert_eq!(bytes[5], MessageType::CompactSkeleton as u8);
+        assert_eq!(bytes[5], 4);
+
+        let parsed = ChunkHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.msg_type, MessageType::CompactSkeleton);
+
+        let payload = vec![1, 2, 3, 4, 5, 6, 7];
+        let chunk = Chunk::new(header, payload.clone());
+        let wire = chunk.to_bytes();
+        let parsed = Chunk::from_bytes(&wire).unwrap();
+        assert_eq!(parsed.header.msg_type, MessageType::CompactSkeleton);
+        assert_eq!(parsed.payload, payload);
+    }
+
+    #[test]
+    fn compact_skeleton_v3_roundtrip_carries_data_shards() {
+        let block_hash = [0x77; 32];
+        let hmac = [0x88; 32];
+        let header =
+            ChunkHeader::new_compact_skeleton_authenticated_v3(&block_hash, 0, 3, 9, 1, hmac);
+        assert_eq!(header.version, 3);
+        let bytes = header.to_bytes();
+        let parsed = ChunkHeader::from_bytes(&bytes).unwrap();
+        assert_eq!(parsed.msg_type, MessageType::CompactSkeleton);
+        assert_eq!(parsed.data_shards, 1);
+        assert_eq!(parsed.total_chunks, 3);
     }
 
     #[test]

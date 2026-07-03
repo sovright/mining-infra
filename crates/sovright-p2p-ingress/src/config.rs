@@ -50,6 +50,12 @@ pub struct Config {
     pub relay_send_burst_packets: usize,
     pub relay_send_burst_delay_micros: u64,
     pub relay_compact_from_tx_cache: bool,
+    /// Send a compact *skeleton* (header + nonce + all-non-coinbase short_ids +
+    /// coinbase) first and redundantly ahead of the full compact block, so a
+    /// receiver that already holds the txs reconstructs before the FEC'd bodies
+    /// arrive. Read from `SOVRIGHT_P2P_RELAY_SKELETON_FIRST` (default false).
+    /// Only meaningful with `relay_compact_from_tx_cache`; a no-op otherwise.
+    pub relay_skeleton_first: bool,
     pub relay_raw_fallback_with_tx_cache: bool,
     pub relay_raw_segment_send_rounds: usize,
     pub relay_raw_segment_round_delay_millis: u64,
@@ -112,6 +118,7 @@ impl Config {
             env_u64("SOVRIGHT_P2P_RELAY_SEND_BURST_DELAY_MICROS", 0)?;
         let relay_compact_from_tx_cache =
             env_bool("SOVRIGHT_P2P_RELAY_COMPACT_FROM_TX_CACHE", false)?;
+        let relay_skeleton_first = env_bool("SOVRIGHT_P2P_RELAY_SKELETON_FIRST", false)?;
         let relay_raw_fallback_with_tx_cache =
             env_bool("SOVRIGHT_P2P_RELAY_RAW_FALLBACK_WITH_TX_CACHE", false)?;
         let relay_raw_segment_send_rounds =
@@ -169,6 +176,7 @@ impl Config {
             relay_send_burst_packets,
             relay_send_burst_delay_micros,
             relay_compact_from_tx_cache,
+            relay_skeleton_first,
             relay_raw_fallback_with_tx_cache,
             relay_raw_segment_send_rounds,
             relay_raw_segment_round_delay_millis,
@@ -435,6 +443,30 @@ mod tests {
 
         let config = Config::from_env().unwrap();
         assert!(!config.relay_adaptive_fec);
+    }
+
+    #[test]
+    fn relay_skeleton_first_defaults_off_and_parses_true() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        {
+            let _guard = EnvGuard::set(&[
+                ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+                ("SOVRIGHT_P2P_PEERS", "".to_string()),
+                ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            ]);
+            let config = Config::from_env().unwrap();
+            assert!(!config.relay_skeleton_first, "defaults off");
+        }
+        {
+            let _guard = EnvGuard::set(&[
+                ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+                ("SOVRIGHT_P2P_PEERS", "".to_string()),
+                ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+                ("SOVRIGHT_P2P_RELAY_SKELETON_FIRST", "true".to_string()),
+            ]);
+            let config = Config::from_env().unwrap();
+            assert!(config.relay_skeleton_first);
+        }
     }
 
     #[test]
