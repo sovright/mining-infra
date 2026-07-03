@@ -827,7 +827,8 @@ mod tests {
     fn v3_chunk_roundtrip_over_wire() {
         let block_hash = [0x33; 32];
         let hmac = [0x44; 32];
-        let header = ChunkHeader::new_raw_block_segment_authenticated_v3(&block_hash, 0, 2, 5, 1, hmac);
+        let header =
+            ChunkHeader::new_raw_block_segment_authenticated_v3(&block_hash, 0, 2, 5, 1, hmac);
         let payload = vec![9, 8, 7, 6, 5];
         let chunk = Chunk::new(header, payload.clone());
 
@@ -843,8 +844,14 @@ mod tests {
 
     #[test]
     fn v3_max_payload_fits_datagram_budget() {
-        let header =
-            ChunkHeader::new_block_authenticated_v3(&[0u8; 32], 0, 2, MAX_PAYLOAD_SIZE_V3 as u16, 1, [0u8; 32]);
+        let header = ChunkHeader::new_block_authenticated_v3(
+            &[0u8; 32],
+            0,
+            2,
+            MAX_PAYLOAD_SIZE_V3 as u16,
+            1,
+            [0u8; 32],
+        );
         let chunk = Chunk::new(header, vec![0xab; MAX_PAYLOAD_SIZE_V3]);
         assert_eq!(chunk.to_bytes().len(), MAX_AUTHENTICATED_DATAGRAM_SIZE);
         assert!(chunk.to_bytes().len() <= MAX_AUTHENTICATED_DATAGRAM_SIZE);

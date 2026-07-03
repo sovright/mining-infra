@@ -271,9 +271,7 @@ impl RelayBridge {
                     // / cold-cache (large-prefill) blocks are left to the full
                     // compact block alone.
                     let skeleton_bytes = BlockChunker::serialize_compact_block(&skeleton).len();
-                    if !skeleton.short_ids.is_empty()
-                        && skeleton_bytes <= SKELETON_MAX_WIRE_BYTES
-                    {
+                    if !skeleton.short_ids.is_empty() && skeleton_bytes <= SKELETON_MAX_WIRE_BYTES {
                         self.sender
                             .send_skeleton(skeleton)
                             .await

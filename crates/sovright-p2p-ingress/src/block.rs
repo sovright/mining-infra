@@ -599,7 +599,10 @@ mod tests {
             max_bytes: 8_192,
             max_tx_bytes: 2_048,
         });
-        cache.insert(TxInventoryKey::wtx([0x61; 32], [0x62; 32]).to_wtxid(), cached);
+        cache.insert(
+            TxInventoryKey::wtx([0x61; 32], [0x62; 32]).to_wtxid(),
+            cached,
+        );
 
         let skeleton = skeleton_compact_block_from_raw_block(&block, &cache).unwrap();
 
