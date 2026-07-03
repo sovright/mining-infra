@@ -2610,6 +2610,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "sovright-miner-injector"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "hmac",
+ "sha2",
+]
+
+[[package]]
 name = "sovright-noise"
 version = "0.1.0"
 dependencies = [

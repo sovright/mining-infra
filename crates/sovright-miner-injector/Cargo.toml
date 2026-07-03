@@ -1,0 +1,24 @@
+[package]
+name = "sovright-miner-injector"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "PoC miner-side client: submit a freshly-found Zcash block to a Sovright relay's block-injection endpoint."
+
+# NOTE: This is a proof-of-concept (Phase 3 of docs/miner-direct-injection.md).
+# It deliberately uses only crates already vendored in the workspace lockfile
+# (hmac, sha2, hex) and the std library for TCP/HTTP, so it adds no new deps.
+
+[[bin]]
+name = "sovright-inject-block"
+path = "src/main.rs"
+
+[lib]
+name = "sovright_miner_injector"
+path = "src/lib.rs"
+
+[dependencies]
+hmac = "0.12"
+sha2 = { workspace = true }
+hex = { workspace = true }
