@@ -10,8 +10,8 @@ mod pow;
 mod session;
 
 pub use chunk::{
-    CHUNK_MAGIC, Chunk, ChunkHeader, HEADER_SIZE_V1, HEADER_SIZE_V2, MAX_PAYLOAD_SIZE,
-    MAX_TOTAL_CHUNKS, MessageType,
+    CHUNK_MAGIC, Chunk, ChunkHeader, HEADER_SIZE, HEADER_SIZE_V1, HEADER_SIZE_V2, HEADER_SIZE_V3,
+    MAX_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE_V3, MAX_TOTAL_CHUNKS, MessageType, header_size_for_version,
 };
 pub use chunker::BlockChunker;
 pub use config::{ClientConfig, RelayConfig};

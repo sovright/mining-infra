@@ -44,6 +44,12 @@ pub struct BlockAssembly {
     pub msg_type: MessageType,
     /// Total expected chunks
     pub total_chunks: usize,
+    /// Per-block FEC data-shard count from the chunk header.
+    ///
+    /// Zero means "not carried on the wire" (a version-1/2 chunk); the receiver
+    /// falls back to its fixed configured `data_shards`. Nonzero is the
+    /// adaptive (version-3) per-block count captured from the first chunk.
+    pub data_shards: u16,
     /// Received chunk payloads (indexed by chunk_id)
     pub chunks: Vec<Option<Vec<u8>>>,
     /// When we started receiving this block
@@ -72,11 +78,25 @@ impl BlockAssembly {
             block_hash,
             msg_type,
             total_chunks,
+            data_shards: 0,
             chunks: vec![None; total_chunks],
             started_at: Instant::now(),
             original_len: None,
             pow_validated: false,
             forwarded: vec![false; total_chunks],
+        }
+    }
+
+    /// Effective data-shard count for reconstruction.
+    ///
+    /// Returns the per-block adaptive value captured from a version-3 chunk
+    /// header, or `fixed` (the receiver's configured `data_shards`) for a
+    /// version-1/2 assembly that carries no per-block shard count.
+    pub fn effective_data_shards(&self, fixed: usize) -> usize {
+        if self.data_shards > 0 {
+            self.data_shards as usize
+        } else {
+            fixed
         }
     }
 
@@ -149,7 +169,10 @@ impl RelaySession {
         self.last_seen.elapsed() > timeout
     }
 
-    /// Compute HMAC for a chunk
+    /// Compute HMAC for a version-2 chunk.
+    ///
+    /// Covers block_hash, chunk_id, total_chunks, payload_len, and payload.
+    /// Byte-for-byte stable across releases -- do not change the fold order.
     pub fn compute_hmac(
         &self,
         block_hash: &[u8; 32],
@@ -171,7 +194,36 @@ impl RelaySession {
         output
     }
 
-    /// Verify HMAC for a chunk
+    /// Compute HMAC for a version-3 (adaptive) chunk.
+    ///
+    /// Identical to [`RelaySession::compute_hmac`] but additionally authenticates
+    /// the per-block `data_shards` count, folded in after `payload_len` and
+    /// before the payload. A v3 chunk whose `data_shards` is tampered with will
+    /// therefore fail verification.
+    pub fn compute_hmac_v3(
+        &self,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        data_shards: u16,
+        payload: &[u8],
+    ) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(&self.auth_key)
+            .expect("32-byte key should always be valid for HMAC-SHA256");
+        mac.update(block_hash);
+        mac.update(&chunk_id.to_be_bytes());
+        mac.update(&total_chunks.to_be_bytes());
+        mac.update(&payload_len.to_be_bytes());
+        mac.update(&data_shards.to_be_bytes());
+        mac.update(payload);
+        let result = mac.finalize();
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&result.into_bytes());
+        output
+    }
+
+    /// Verify HMAC for a version-2 chunk
     pub fn verify_hmac(
         &self,
         block_hash: &[u8; 32],
@@ -183,6 +235,29 @@ impl RelaySession {
     ) -> bool {
         let expected = self.compute_hmac(block_hash, chunk_id, total_chunks, payload_len, payload);
         // Use constant-time comparison to prevent timing attacks
+        expected.ct_eq(provided).into()
+    }
+
+    /// Verify HMAC for a version-3 (adaptive) chunk, authenticating `data_shards`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_hmac_v3(
+        &self,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        data_shards: u16,
+        payload: &[u8],
+        provided: &[u8; 32],
+    ) -> bool {
+        let expected = self.compute_hmac_v3(
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            payload,
+        );
         expected.ct_eq(provided).into()
     }
 
@@ -411,6 +486,43 @@ mod tests {
             &tampered,
             &hmac
         ));
+    }
+
+    #[test]
+    fn session_hmac_v3_authenticates_data_shards() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session = RelaySession::new(addr, [0x42; 32]);
+
+        let block_hash = [0xab; 32];
+        let payload = [0x01, 0x02, 0x03];
+        let hmac = session.compute_hmac_v3(&block_hash, 5, 10, 3, 7, &payload);
+
+        // Correct data_shards verifies.
+        assert!(session.verify_hmac_v3(&block_hash, 5, 10, 3, 7, &payload, &hmac));
+        // Flipping data_shards fails verification.
+        assert!(!session.verify_hmac_v3(&block_hash, 5, 10, 3, 8, &payload, &hmac));
+    }
+
+    #[test]
+    fn session_hmac_v3_differs_from_v2() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session = RelaySession::new(addr, [0x24; 32]);
+
+        let block_hash = [0x11; 32];
+        let payload = [0xaa, 0xbb, 0xcc];
+        let v2 = session.compute_hmac(&block_hash, 1, 3, 3, &payload);
+        let v3 = session.compute_hmac_v3(&block_hash, 1, 3, 3, 2, &payload);
+        assert_ne!(v2, v3, "folding data_shards must change the HMAC");
+    }
+
+    #[test]
+    fn effective_data_shards_prefers_per_block_value() {
+        let mut assembly = BlockAssembly::new([0u8; 32], 3);
+        // v2/v1 assembly (data_shards == 0) falls back to the fixed config.
+        assert_eq!(assembly.effective_data_shards(224), 224);
+        // v3 assembly uses the captured per-block value.
+        assembly.data_shards = 2;
+        assert_eq!(assembly.effective_data_shards(224), 2);
     }
 
     #[test]
