@@ -190,6 +190,12 @@ pub struct ClientConfig {
     pub send_burst_packets: usize,
     /// Optional delay after each outbound packet burst.
     pub send_burst_delay: Duration,
+    /// Emit adaptive (version-3) FEC chunks sized per block on the send path.
+    ///
+    /// When false (default) the client emits fixed-profile version-2 chunks.
+    /// The receive path always decodes both v2 and v3 regardless of this flag,
+    /// so a mixed-version fleet interoperates during rollout.
+    pub adaptive_fec: bool,
 }
 
 impl ClientConfig {
@@ -205,6 +211,7 @@ impl ClientConfig {
             auth_required: false,
             send_burst_packets: 0,
             send_burst_delay: Duration::ZERO,
+            adaptive_fec: false,
         }
     }
 
@@ -212,6 +219,12 @@ impl ClientConfig {
     pub fn with_fec(mut self, data_shards: usize, parity_shards: usize) -> Self {
         self.data_shards = data_shards;
         self.parity_shards = parity_shards;
+        self
+    }
+
+    /// Builder method: enable adaptive (version-3) FEC on the send path.
+    pub fn with_adaptive_fec(mut self, adaptive: bool) -> Self {
+        self.adaptive_fec = adaptive;
         self
     }
 

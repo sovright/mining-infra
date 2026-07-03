@@ -163,6 +163,7 @@ impl RelayBridge {
         let client_config = ClientConfig::new(config.relay_peers.clone(), auth_key)
             .with_bind_addr(config.relay_bind_addr)
             .with_fec(config.relay_data_shards, config.relay_parity_shards)
+            .with_adaptive_fec(config.relay_adaptive_fec)
             .with_send_pacing(
                 config.relay_send_burst_packets,
                 Duration::from_micros(config.relay_send_burst_delay_micros),
@@ -861,6 +862,7 @@ mod tests {
             relay_auth_key: Some([0x42; 32]),
             relay_data_shards: 96,
             relay_parity_shards: 32,
+            relay_adaptive_fec: false,
             relay_send_burst_packets: 0,
             relay_send_burst_delay_micros: 0,
             relay_compact_from_tx_cache: false,

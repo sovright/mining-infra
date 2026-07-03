@@ -42,6 +42,11 @@ pub struct Config {
     pub relay_auth_key: Option<[u8; 32]>,
     pub relay_data_shards: usize,
     pub relay_parity_shards: usize,
+    /// Emit adaptive (version-3) FEC chunks sized per block on the relay send
+    /// path. Read from `SOVRIGHT_P2P_RELAY_ADAPTIVE_FEC` (default false). The
+    /// receive path always decodes both v2 and v3, so this is safe to roll out
+    /// across a mixed-version fleet.
+    pub relay_adaptive_fec: bool,
     pub relay_send_burst_packets: usize,
     pub relay_send_burst_delay_micros: u64,
     pub relay_compact_from_tx_cache: bool,
@@ -101,6 +106,7 @@ impl Config {
         };
         let relay_data_shards = env_usize("SOVRIGHT_P2P_RELAY_DATA_SHARDS", 10)?;
         let relay_parity_shards = env_usize("SOVRIGHT_P2P_RELAY_PARITY_SHARDS", 3)?;
+        let relay_adaptive_fec = env_bool("SOVRIGHT_P2P_RELAY_ADAPTIVE_FEC", false)?;
         let relay_send_burst_packets = env_usize("SOVRIGHT_P2P_RELAY_SEND_BURST_PACKETS", 0)?;
         let relay_send_burst_delay_micros =
             env_u64("SOVRIGHT_P2P_RELAY_SEND_BURST_DELAY_MICROS", 0)?;
@@ -159,6 +165,7 @@ impl Config {
             relay_auth_key,
             relay_data_shards,
             relay_parity_shards,
+            relay_adaptive_fec,
             relay_send_burst_packets,
             relay_send_burst_delay_micros,
             relay_compact_from_tx_cache,
@@ -400,6 +407,34 @@ mod tests {
 
         assert_eq!(config.relay_raw_segment_send_rounds, 3);
         assert_eq!(config.relay_raw_segment_round_delay_millis, 25);
+    }
+
+    #[test]
+    fn parses_relay_adaptive_fec_flag() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_ADAPTIVE_FEC", "true".to_string()),
+        ]);
+
+        let config = Config::from_env().unwrap();
+        assert!(config.relay_adaptive_fec);
+    }
+
+    #[test]
+    fn relay_adaptive_fec_parses_false() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_ADAPTIVE_FEC", "false".to_string()),
+        ]);
+
+        let config = Config::from_env().unwrap();
+        assert!(!config.relay_adaptive_fec);
     }
 
     #[test]
