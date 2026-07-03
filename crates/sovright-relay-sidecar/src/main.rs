@@ -2,9 +2,9 @@
 
 use clap::Parser;
 use sovright_relay::{
-    BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload, TxCache,
-    TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
-    reassemble_raw_block,
+    ArrivalSink, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
+    TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
+    reassemble_raw_block, zcash_block_hash,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -26,6 +26,7 @@ use relay::RelayWrapper;
 use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
+use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
@@ -169,6 +170,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         send_burst_delay_micros,
         metrics_textfile,
         submit_gate_cfg,
+        zebra_mempool_sync_enabled,
+        zebra_mempool_sync_interval_ms,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -195,6 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             cfg.send_burst_delay_micros,
             cfg.metrics_textfile.clone(),
             Some(cfg.submit_gate.clone()),
+            cfg.zebra_mempool_sync_enabled,
+            cfg.zebra_mempool_sync_interval_ms,
         )
     } else {
         // Use CLI args
@@ -246,6 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             args.send_burst_delay_micros,
             args.metrics_textfile.clone(),
             None,
+            false, // zebra mempool sync is config-only (off for bare CLI)
+            2000,
         )
     };
 
@@ -268,7 +275,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     )?;
 
     info!(zebra_url = %zebra_url, "Starting relay sidecar");
-    let metrics = Arc::new(SidecarMetrics::default());
+    let arrival_sink = std::env::var_os("SOVRIGHT_RELAY_ARRIVAL_LOG")
+        .map(PathBuf::from)
+        .and_then(|path| match ArrivalSink::new(&path) {
+            Ok(sink) => {
+                info!(path = %path.display(), "Compact-block relay arrival logging enabled");
+                Some(sink)
+            }
+            Err(error) => {
+                warn!(%error, "Failed to open relay arrival log; continuing without it");
+                None
+            }
+        });
+    let metrics = Arc::new(SidecarMetrics {
+        arrival_sink,
+        ..SidecarMetrics::default()
+    });
     let mempool = Arc::new(SidecarMempool::from_tx_cache_config(SidecarTxCacheConfig {
         enabled: tx_cache_enabled,
         max_entries: tx_cache_max_entries,
@@ -291,6 +313,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Initialize Zebra RPC client
     let rpc = Arc::new(ZebraRpc::new(&zebra_url).await?);
     info!("Connected to Zebra RPC");
+
+    // Fold the local Zebra mempool into the reconstruction cache (opt-in). The
+    // relay tx-feed only captures the ingress peers' relayed subset; Zebra sees
+    // the full mempool, so this closes the compact-reconstruction coverage gap.
+    if zebra_mempool_sync_enabled {
+        match mempool.tx_cache() {
+            Some(cache) => {
+                let sync_rpc = Arc::clone(&rpc);
+                let sync_metrics = Arc::clone(&metrics);
+                let interval = Duration::from_millis(zebra_mempool_sync_interval_ms.max(100));
+                info!(
+                    interval_ms = zebra_mempool_sync_interval_ms,
+                    "Zebra mempool sync enabled"
+                );
+                tokio::spawn(run_zebra_mempool_sync(
+                    sync_rpc,
+                    cache,
+                    interval,
+                    move || sync_metrics.inc_zebra_mempool_sync_inserts(),
+                ));
+            }
+            None => warn!("zebra_mempool_sync_enabled but tx cache is disabled; ignoring"),
+        }
+    }
 
     // Initialize relay
     let relay = RelayWrapper::new_with_fec(
@@ -415,6 +461,145 @@ where
     }
 }
 
+/// Capacity of the fast-path submit dedup ring (block hashes).
+const FAST_PATH_DEDUP_CAPACITY: usize = 256;
+/// TTL for a fast-path dedup entry. A skeleton and the full compact block for
+/// the same block arrive within a few hundred milliseconds, so this only needs
+/// to bridge that race; sized generously to also absorb slow reorg retries.
+const FAST_PATH_DEDUP_WINDOW: Duration = Duration::from_secs(300);
+
+/// Bounded, time-windowed set of block hashes already reconstructed and
+/// submitted (or dry-run built) by a fast path -- the skeleton or the non-gated
+/// full compact block. It guarantees a block is never submitted twice when both
+/// its skeleton and its full compact block arrive: whichever reconstructs first
+/// records the hash, and the other becomes a no-op. Kept local to the
+/// single-threaded receive task, so no lock is needed. Mirrors the submit-gate
+/// dedup ring (that ring only covers the all-prefilled gated path).
+struct HashDedupRing {
+    capacity: usize,
+    window: Duration,
+    entries: std::collections::VecDeque<(String, Instant)>,
+}
+
+impl HashDedupRing {
+    fn new(capacity: usize, window: Duration) -> Self {
+        Self {
+            capacity,
+            window,
+            entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
+        }
+    }
+
+    fn contains(&mut self, hash: &str, now: Instant) -> bool {
+        self.evict_expired(now);
+        self.entries.iter().any(|(h, _)| h == hash)
+    }
+
+    fn record(&mut self, hash: String, now: Instant) {
+        self.evict_expired(now);
+        if self.capacity == 0 {
+            return;
+        }
+        if self.entries.len() == self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((hash, now));
+    }
+
+    fn evict_expired(&mut self, now: Instant) {
+        while let Some((_, ts)) = self.entries.front() {
+            if now.duration_since(*ts) > self.window {
+                self.entries.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+/// Reconstruct + submit a compact block on a fast path -- either the skeleton
+/// (`is_skeleton = true`) or the non-gated full compact block -- deduplicating
+/// by block hash so the skeleton and the full compact block for the same block
+/// never both submit.
+///
+/// The skeleton path reconstructs from the mempool and submits ONLY on a
+/// complete reconstruction; an unresolved short_id drops silently (the full
+/// compact block is the push fallback) and never triggers getblocktxn. Both
+/// paths record the block hash on a successful submit/dry-run, and skip when the
+/// hash is already present.
+#[allow(clippy::too_many_arguments)]
+async fn submit_compact_fast_path<S, M>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    compact_reconstruction_enabled: bool,
+    mempool: &M,
+    metrics: &SidecarMetrics,
+    dedup: &mut HashDedupRing,
+    now: Instant,
+    is_skeleton: bool,
+) where
+    S: SubmitBlock + Sync,
+    M: MempoolProvider,
+{
+    let block_hash = hex::encode(zcash_block_hash(&compact.header));
+    if dedup.contains(&block_hash, now) {
+        // The other fast path already reconstructed + submitted this block.
+        if is_skeleton {
+            metrics.inc_skeleton_deduplicated();
+        } else {
+            metrics.inc_full_block_deduplicated();
+        }
+        debug!(
+            block_hash = %block_hash,
+            is_skeleton,
+            "fast-path block already submitted; skipping duplicate"
+        );
+        return;
+    }
+
+    let outcome = if is_skeleton {
+        metrics.inc_skeleton_received();
+        // A skeleton submits ONLY on complete mempool reconstruction; it never
+        // sends getblocktxn (the full compact block is the push fallback).
+        handle_relay_compact_block_with_mempool(submitter, compact, mode, mempool).await
+    } else {
+        handle_relay_compact_payload(
+            submitter,
+            compact,
+            mode,
+            compact_reconstruction_enabled,
+            mempool,
+            metrics,
+        )
+        .await
+    };
+
+    match &outcome {
+        Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_)) => {
+            dedup.record(block_hash, now);
+            if is_skeleton {
+                metrics.inc_skeleton_submit_successes();
+            }
+        }
+        Ok(SubmissionOutcome::NeedsTransactions { .. }) => {
+            // Incomplete reconstruction. For a skeleton this is the expected
+            // miss: drop and wait for the full compact block. Do NOT record the
+            // hash, so the full block still submits.
+            if is_skeleton {
+                metrics.inc_skeleton_incomplete();
+            }
+        }
+        Ok(SubmissionOutcome::GateRejected { .. }) => {}
+        Err(_) => {
+            if is_skeleton {
+                metrics.inc_skeleton_incomplete();
+            }
+        }
+    }
+    log_submission_outcome(outcome, metrics, None);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_relay_block_handler<M>(
     mut receiver: BlockReceiver,
@@ -431,6 +616,10 @@ fn spawn_relay_block_handler<M>(
 {
     tokio::spawn(async move {
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
+        // Fast-path submit dedup shared by the skeleton and the non-gated
+        // compact block paths (see `submit_compact_fast_path`).
+        let mut fast_path_dedup =
+            HashDedupRing::new(FAST_PATH_DEDUP_CAPACITY, FAST_PATH_DEDUP_WINDOW);
         let mut cleanup_interval =
             tokio::time::interval(raw_segment_cleanup_interval(raw_segment_buffer_config.ttl));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -450,7 +639,7 @@ fn spawn_relay_block_handler<M>(
                             let use_gate = gate.is_some()
                                 && (!compact_reconstruction_enabled
                                     || compact.short_ids.is_empty());
-                            let outcome = if let (true, Some(gate), Some(chain_view)) =
+                            if let (true, Some(gate), Some(chain_view)) =
                                 (use_gate, &gate, &chain_view)
                             {
                                 let parent_height = if compact.header.len() >= 36 {
@@ -465,41 +654,66 @@ fn spawn_relay_block_handler<M>(
                                 } else {
                                     0
                                 };
-                                let mut gate_guard = gate.lock().await;
-                                handle_relay_compact_block_with_gate(
-                                    rpc.as_ref(),
-                                    &compact,
-                                    mode,
-                                    &mut gate_guard,
-                                    parent_height,
-                                )
-                                .await
+                                let outcome = {
+                                    let mut gate_guard = gate.lock().await;
+                                    handle_relay_compact_block_with_gate(
+                                        rpc.as_ref(),
+                                        &compact,
+                                        mode,
+                                        &mut gate_guard,
+                                        parent_height,
+                                    )
+                                    .await
+                                };
+                                // Per-cause GateRejected metric is incremented in
+                                // log_submission_outcome; here we tick the
+                                // accepted-by-gate counter for outcomes that came
+                                // through the gated handler and were not rejected.
+                                if matches!(
+                                    outcome,
+                                    Ok(SubmissionOutcome::DryRun(_))
+                                        | Ok(SubmissionOutcome::Submitted { .. })
+                                ) {
+                                    metrics.inc_submit_gate_accepted();
+                                }
+                                log_submission_outcome(outcome, metrics.as_ref(), None);
                             } else {
-                                handle_relay_compact_payload(
+                                // Non-gated fast path: reconstruct + submit with
+                                // block-hash dedup, so a skeleton and the full
+                                // compact block for the same block never both
+                                // submit (in either race order).
+                                submit_compact_fast_path(
                                     rpc.as_ref(),
                                     &compact,
                                     mode,
                                     compact_reconstruction_enabled,
                                     mempool.as_ref(),
                                     metrics.as_ref(),
+                                    &mut fast_path_dedup,
+                                    Instant::now(),
+                                    false,
                                 )
-                                .await
-                            };
-                            // Per-cause GateRejected metric is incremented in
-                            // log_submission_outcome; here we tick the
-                            // accepted-by-gate counter for outcomes that
-                            // came through the gated handler and were not
-                            // rejected by the gate.
-                            if use_gate
-                                && matches!(
-                                    outcome,
-                                    Ok(SubmissionOutcome::DryRun(_))
-                                        | Ok(SubmissionOutcome::Submitted { .. })
-                                )
-                            {
-                                metrics.inc_submit_gate_accepted();
+                                .await;
                             }
-                            log_submission_outcome(outcome, metrics.as_ref());
+                        }
+                        RelayPayload::CompactSkeleton(compact) => {
+                            // Skeleton fast path: attempt full mempool
+                            // reconstruction. On a complete reconstruction submit
+                            // and record the block hash (so the later full compact
+                            // block is a no-op); on any unresolved short_id drop
+                            // silently and wait for the full compact block.
+                            submit_compact_fast_path(
+                                rpc.as_ref(),
+                                &compact,
+                                mode,
+                                compact_reconstruction_enabled,
+                                mempool.as_ref(),
+                                metrics.as_ref(),
+                                &mut fast_path_dedup,
+                                Instant::now(),
+                                true,
+                            )
+                            .await;
                         }
                         RelayPayload::RawBlockSegment(segment) => {
                             metrics.inc_raw_segments_received();
@@ -524,7 +738,10 @@ fn spawn_relay_block_handler<M>(
                                         "Relay raw block segment buffered"
                                     );
                                 }
-                                RawSegmentInsert::Complete(segments) => {
+                                RawSegmentInsert::Complete {
+                                    segments,
+                                    first_seen,
+                                } => {
                                     metrics.inc_raw_segment_sets_completed();
                                     raw_segments.update_metrics(metrics.as_ref());
                                     let completed_segments = segments.len();
@@ -579,7 +796,25 @@ fn spawn_relay_block_handler<M>(
                                             {
                                                 metrics.inc_submit_gate_accepted();
                                             }
-                                            log_submission_outcome(raw_outcome, metrics.as_ref());
+                                            // Relay-internal latency from the first raw
+                                            // segment chunk of this block arriving to the
+                                            // submit decision (mesh-receive → reassemble →
+                                            // gate → submit).
+                                            let first_seen_to_submit_ms =
+                                                first_seen.elapsed().as_millis() as u64;
+                                            if matches!(
+                                                raw_outcome,
+                                                Ok(SubmissionOutcome::Submitted { .. })
+                                            ) {
+                                                metrics.observe_first_seen_to_submit_ms(
+                                                    first_seen_to_submit_ms,
+                                                );
+                                            }
+                                            log_submission_outcome(
+                                                raw_outcome,
+                                                metrics.as_ref(),
+                                                Some(first_seen_to_submit_ms),
+                                            );
                                         }
                                         Err(error) => {
                                             metrics.inc_raw_segment_reassembly_failures();
@@ -828,8 +1063,13 @@ struct RawSegmentBuffer {
 
 enum RawSegmentInsert {
     Pending,
-    Complete(Vec<RawBlockSegment>),
-    Dropped { reason: &'static str },
+    Complete {
+        segments: Vec<RawBlockSegment>,
+        first_seen: Instant,
+    },
+    Dropped {
+        reason: &'static str,
+    },
 }
 
 impl RawSegmentBuffer {
@@ -909,12 +1149,16 @@ impl RawSegmentBuffer {
             .is_some_and(|entry| entry.segments.iter().all(Option::is_some))
         {
             let entry = self.remove_entry(&block_hash).expect("entry exists");
+            let first_seen = entry.first_seen;
             let segments = entry
                 .segments
                 .into_iter()
                 .map(|segment| segment.expect("complete segment set"))
                 .collect();
-            RawSegmentInsert::Complete(segments)
+            RawSegmentInsert::Complete {
+                segments,
+                first_seen,
+            }
         } else {
             RawSegmentInsert::Pending
         }
@@ -982,12 +1226,14 @@ fn expire_raw_segment_buffer(
 fn log_submission_outcome(
     outcome: Result<SubmissionOutcome, sovright_relay_sidecar::submit::RelayBlockError>,
     metrics: &SidecarMetrics,
+    first_seen_to_submit_ms: Option<u64>,
 ) {
     match outcome {
         Ok(SubmissionOutcome::DryRun(candidate)) => {
             metrics.inc_submit_dry_run_candidates();
             info!(
                 block_hash = %candidate.block_hash,
+                consensus_block_hash = %candidate.consensus_block_hash,
                 tx_count = candidate.tx_count,
                 block_bytes = candidate.block_bytes,
                 "Relay block submit dry-run candidate"
@@ -1013,9 +1259,11 @@ fn log_submission_outcome(
                 metrics.inc_submit_successes();
                 info!(
                     block_hash = %candidate.block_hash,
+                    consensus_block_hash = %candidate.consensus_block_hash,
                     tx_count = candidate.tx_count,
                     block_bytes = candidate.block_bytes,
                     submit_status = status.as_str(),
+                    ?first_seen_to_submit_ms,
                     "Relay block accepted by Zebra"
                 );
             }
@@ -1023,9 +1271,11 @@ fn log_submission_outcome(
                 metrics.inc_submit_duplicates();
                 info!(
                     block_hash = %candidate.block_hash,
+                    consensus_block_hash = %candidate.consensus_block_hash,
                     tx_count = candidate.tx_count,
                     block_bytes = candidate.block_bytes,
                     submit_status = status.as_str(),
+                    ?first_seen_to_submit_ms,
                     "Relay block already known to Zebra"
                 );
             }
@@ -1038,6 +1288,7 @@ fn log_submission_outcome(
             metrics.inc_submit_gate_rejected(reason);
             info!(
                 block_hash = %candidate.block_hash,
+                consensus_block_hash = %candidate.consensus_block_hash,
                 tx_count = candidate.tx_count,
                 block_bytes = candidate.block_bytes,
                 gate_reason = reason.as_str(),
@@ -1085,7 +1336,12 @@ fn record_compact_reconstruction_outcome(
                 "Prepared getblocktxn fallback for incomplete compact reconstruction"
             );
         }
-        Ok(_) => metrics.inc_compact_reconstruction_completes(),
+        Ok(other) => {
+            metrics.inc_compact_reconstruction_completes();
+            if let Some(hash) = other.candidate_consensus_hash() {
+                metrics.record_relay_compact_arrival(hash);
+            }
+        }
         Err(RelayBlockError::ReconstructionIncomplete {
             block_hash: _,
             missing_indexes: _,
@@ -1116,6 +1372,20 @@ struct SidecarMetrics {
     compact_reconstruction_unresolved_short_ids: AtomicU64,
     compact_reconstruction_getblocktxn_requests: AtomicU64,
     compact_reconstruction_getblocktxn_requested_transactions: AtomicU64,
+    /// Compact skeletons received on the fast path.
+    skeleton_received: AtomicU64,
+    /// Skeletons reconstructed from the mempool and submitted before the full
+    /// compact block arrived -- the skeleton-first wins.
+    skeleton_submit_successes: AtomicU64,
+    /// Skeletons that could not fully reconstruct (an unresolved short_id), so
+    /// the sidecar dropped them and waited for the full compact block.
+    skeleton_incomplete: AtomicU64,
+    /// Skeletons dropped because the block was already submitted (the full
+    /// compact block won the race first).
+    skeleton_deduplicated: AtomicU64,
+    /// Full compact blocks dropped because a skeleton already submitted the
+    /// block -- the no-double-submit path when the skeleton wins.
+    full_block_deduplicated: AtomicU64,
     raw_segments_received: AtomicU64,
     raw_segment_sets_completed: AtomicU64,
     raw_segment_drops: AtomicU64,
@@ -1123,6 +1393,11 @@ struct SidecarMetrics {
     submit_dry_run_candidates: AtomicU64,
     submit_successes: AtomicU64,
     submit_duplicates: AtomicU64,
+    /// Relay-internal latency (milliseconds) from the first raw segment chunk
+    /// of a block arriving to the submit decision. Rendered as a sum/count pair
+    /// so Prometheus can derive the average over the submit path.
+    relay_first_seen_to_submit_ms_sum: AtomicU64,
+    relay_first_seen_to_submit_ms_count: AtomicU64,
     submit_rpc_failures: AtomicU64,
     submit_rejections: AtomicU64,
     not_submit_candidates: AtomicU64,
@@ -1149,9 +1424,27 @@ struct SidecarMetrics {
     tx_feed_invalid_lines: AtomicU64,
     tx_feed_cache_disabled: AtomicU64,
     tx_feed_dropped_too_large: AtomicU64,
+    /// Transactions folded into the tx cache from the local Zebra mempool.
+    zebra_mempool_sync_inserts: AtomicU64,
+    /// Optional per-block relay arrival log (shared with relay-node). Records a
+    /// `relay_block_received` event when a compact block is reconstructed from
+    /// the mempool, so the observatory times the fast compact-block path.
+    arrival_sink: Option<ArrivalSink>,
 }
 
 impl SidecarMetrics {
+    fn inc_zebra_mempool_sync_inserts(&self) {
+        self.zebra_mempool_sync_inserts
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Log a compact-block relay arrival by its Zcash consensus block hash.
+    fn record_relay_compact_arrival(&self, consensus_hash: &str) {
+        if let Some(sink) = &self.arrival_sink {
+            sink.relay_block_received(consensus_hash);
+        }
+    }
+
     fn inc_compact_blocks_received(&self) {
         self.compact_blocks_received.fetch_add(1, Ordering::Relaxed);
     }
@@ -1194,6 +1487,27 @@ impl SidecarMetrics {
             .fetch_add(requested_transactions as u64, Ordering::Relaxed);
     }
 
+    fn inc_skeleton_received(&self) {
+        self.skeleton_received.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_submit_successes(&self) {
+        self.skeleton_submit_successes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_incomplete(&self) {
+        self.skeleton_incomplete.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_deduplicated(&self) {
+        self.skeleton_deduplicated.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_full_block_deduplicated(&self) {
+        self.full_block_deduplicated.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn inc_raw_segments_received(&self) {
         self.raw_segments_received.fetch_add(1, Ordering::Relaxed);
     }
@@ -1223,6 +1537,15 @@ impl SidecarMetrics {
 
     fn inc_submit_duplicates(&self) {
         self.submit_duplicates.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record one relay first-seen-to-submit latency observation, accumulating
+    /// the sum and count so Prometheus can derive an average.
+    fn observe_first_seen_to_submit_ms(&self, ms: u64) {
+        self.relay_first_seen_to_submit_ms_sum
+            .fetch_add(ms, Ordering::Relaxed);
+        self.relay_first_seen_to_submit_ms_count
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_submit_rpc_failures(&self) {
@@ -1333,6 +1656,11 @@ impl SidecarMetrics {
         let compact_reconstruction_getblocktxn_requested_transactions = self
             .compact_reconstruction_getblocktxn_requested_transactions
             .load(Ordering::Relaxed);
+        let skeleton_received = self.skeleton_received.load(Ordering::Relaxed);
+        let skeleton_submit_successes = self.skeleton_submit_successes.load(Ordering::Relaxed);
+        let skeleton_incomplete = self.skeleton_incomplete.load(Ordering::Relaxed);
+        let skeleton_deduplicated = self.skeleton_deduplicated.load(Ordering::Relaxed);
+        let full_block_deduplicated = self.full_block_deduplicated.load(Ordering::Relaxed);
         let raw_segments_received = self.raw_segments_received.load(Ordering::Relaxed);
         let raw_segment_sets_completed = self.raw_segment_sets_completed.load(Ordering::Relaxed);
         let raw_segment_drops = self.raw_segment_drops.load(Ordering::Relaxed);
@@ -1341,6 +1669,12 @@ impl SidecarMetrics {
         let submit_dry_run_candidates = self.submit_dry_run_candidates.load(Ordering::Relaxed);
         let submit_successes = self.submit_successes.load(Ordering::Relaxed);
         let submit_duplicates = self.submit_duplicates.load(Ordering::Relaxed);
+        let relay_first_seen_to_submit_ms_sum = self
+            .relay_first_seen_to_submit_ms_sum
+            .load(Ordering::Relaxed);
+        let relay_first_seen_to_submit_ms_count = self
+            .relay_first_seen_to_submit_ms_count
+            .load(Ordering::Relaxed);
         let submit_rpc_failures = self.submit_rpc_failures.load(Ordering::Relaxed);
         let submit_rejections = self.submit_rejections.load(Ordering::Relaxed);
         let not_submit_candidates = self.not_submit_candidates.load(Ordering::Relaxed);
@@ -1374,6 +1708,7 @@ impl SidecarMetrics {
         let tx_feed_invalid_lines = self.tx_feed_invalid_lines.load(Ordering::Relaxed);
         let tx_feed_cache_disabled = self.tx_feed_cache_disabled.load(Ordering::Relaxed);
         let tx_feed_dropped_too_large = self.tx_feed_dropped_too_large.load(Ordering::Relaxed);
+        let zebra_mempool_sync_inserts = self.zebra_mempool_sync_inserts.load(Ordering::Relaxed);
 
         format!(
             concat!(
@@ -1395,6 +1730,16 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requests_total {compact_reconstruction_getblocktxn_requests}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requested_transactions_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_getblocktxn_requested_transactions_total {compact_reconstruction_getblocktxn_requested_transactions}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_received_total counter\n",
+                "sovright_relay_sidecar_skeleton_received_total {skeleton_received}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_submit_successes_total counter\n",
+                "sovright_relay_sidecar_skeleton_submit_successes_total {skeleton_submit_successes}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_incomplete_total counter\n",
+                "sovright_relay_sidecar_skeleton_incomplete_total {skeleton_incomplete}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_deduplicated_total counter\n",
+                "sovright_relay_sidecar_skeleton_deduplicated_total {skeleton_deduplicated}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_full_block_deduplicated_total counter\n",
+                "sovright_relay_sidecar_skeleton_full_block_deduplicated_total {full_block_deduplicated}\n",
                 "# TYPE sovright_relay_sidecar_relay_raw_segments_received_total counter\n",
                 "sovright_relay_sidecar_relay_raw_segments_received_total {raw_segments_received}\n",
                 "# TYPE sovright_relay_sidecar_relay_raw_segment_sets_completed_total counter\n",
@@ -1409,6 +1754,10 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_submit_successes_total {submit_successes}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_duplicates_total counter\n",
                 "sovright_relay_sidecar_relay_submit_duplicates_total {submit_duplicates}\n",
+                "# TYPE sovright_relay_sidecar_relay_first_seen_to_submit_ms_sum counter\n",
+                "sovright_relay_sidecar_relay_first_seen_to_submit_ms_sum {relay_first_seen_to_submit_ms_sum}\n",
+                "# TYPE sovright_relay_sidecar_relay_first_seen_to_submit_ms_count counter\n",
+                "sovright_relay_sidecar_relay_first_seen_to_submit_ms_count {relay_first_seen_to_submit_ms_count}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_rpc_failures_total counter\n",
                 "sovright_relay_sidecar_relay_submit_rpc_failures_total {submit_rpc_failures}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_rejections_total counter\n",
@@ -1452,6 +1801,8 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_tx_feed_cache_disabled_total {tx_feed_cache_disabled}\n",
                 "# TYPE sovright_relay_sidecar_tx_feed_dropped_too_large_total counter\n",
                 "sovright_relay_sidecar_tx_feed_dropped_too_large_total {tx_feed_dropped_too_large}\n",
+                "# TYPE sovright_relay_sidecar_zebra_mempool_sync_inserts_total counter\n",
+                "sovright_relay_sidecar_zebra_mempool_sync_inserts_total {zebra_mempool_sync_inserts}\n",
             ),
             compact_blocks_received = compact_blocks_received,
             compact_reconstruction_attempts = compact_reconstruction_attempts,
@@ -1465,6 +1816,11 @@ impl SidecarMetrics {
                 compact_reconstruction_getblocktxn_requests,
             compact_reconstruction_getblocktxn_requested_transactions =
                 compact_reconstruction_getblocktxn_requested_transactions,
+            skeleton_received = skeleton_received,
+            skeleton_submit_successes = skeleton_submit_successes,
+            skeleton_incomplete = skeleton_incomplete,
+            skeleton_deduplicated = skeleton_deduplicated,
+            full_block_deduplicated = full_block_deduplicated,
             raw_segments_received = raw_segments_received,
             raw_segment_sets_completed = raw_segment_sets_completed,
             raw_segment_drops = raw_segment_drops,
@@ -1472,6 +1828,8 @@ impl SidecarMetrics {
             submit_dry_run_candidates = submit_dry_run_candidates,
             submit_successes = submit_successes,
             submit_duplicates = submit_duplicates,
+            relay_first_seen_to_submit_ms_sum = relay_first_seen_to_submit_ms_sum,
+            relay_first_seen_to_submit_ms_count = relay_first_seen_to_submit_ms_count,
             submit_rpc_failures = submit_rpc_failures,
             submit_rejections = submit_rejections,
             not_submit_candidates = not_submit_candidates,
@@ -1490,6 +1848,7 @@ impl SidecarMetrics {
             tx_feed_invalid_lines = tx_feed_invalid_lines,
             tx_feed_cache_disabled = tx_feed_cache_disabled,
             tx_feed_dropped_too_large = tx_feed_dropped_too_large,
+            zebra_mempool_sync_inserts = zebra_mempool_sync_inserts,
             submit_gate_accepted = submit_gate_accepted,
             submit_gate_rejected_pow = submit_gate_rejected_pow,
             submit_gate_rejected_unknown_parent = submit_gate_rejected_unknown_parent,
@@ -1536,7 +1895,8 @@ fn write_metrics_textfile(
 mod tests {
     use super::*;
     use sovright_relay::{
-        AuthDigest, CompactBlockBuilder, TestMempool, TxId, WtxId, split_raw_block,
+        AuthDigest, CompactBlockBuilder, PrefilledTx, ShortId, TestMempool, TxId, WtxId,
+        split_raw_block,
     };
     use std::sync::atomic::Ordering;
 
@@ -1588,14 +1948,322 @@ mod tests {
         }
 
         match buffer.insert(last, now) {
-            RawSegmentInsert::Complete(segments) => {
+            RawSegmentInsert::Complete {
+                segments,
+                first_seen,
+            } => {
                 assert_eq!(reassemble_raw_block(&segments).unwrap(), raw_block);
+                assert_eq!(first_seen, now);
             }
             RawSegmentInsert::Pending => panic!("expected complete segment set"),
             RawSegmentInsert::Dropped { reason } => panic!("unexpected drop: {reason}"),
         }
         assert!(buffer.entries.is_empty());
         assert_eq!(buffer.total_payload_bytes, 0);
+    }
+
+    #[test]
+    fn raw_segment_buffer_reports_first_seen_of_first_insert() {
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+        let block_hash = [0x77; 32];
+        let raw_block = vec![0xcd; 25];
+        let mut segments =
+            split_raw_block(block_hash, &raw_block, RawBlockSegment::HEADER_LEN + 5).unwrap();
+        assert!(segments.len() > 1);
+        let last = segments.pop().unwrap();
+
+        let t0 = Instant::now();
+        let t1 = t0.checked_add(Duration::from_millis(50)).unwrap();
+
+        // The first insert happens at t0; every remaining segment (including the
+        // completing one) arrives later at t1.
+        for segment in segments {
+            assert!(matches!(
+                buffer.insert(segment, t0),
+                RawSegmentInsert::Pending
+            ));
+        }
+        match buffer.insert(last, t1) {
+            RawSegmentInsert::Complete { first_seen, .. } => {
+                // first_seen must reflect the FIRST insert, not the completing one.
+                assert_eq!(first_seen, t0);
+            }
+            RawSegmentInsert::Pending => panic!("expected complete segment set"),
+            RawSegmentInsert::Dropped { reason } => panic!("unexpected drop: {reason}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn skeleton_wins_then_full_block_is_a_noop() {
+        // A skeleton whose short_ids all resolve in the mempool reconstructs and
+        // submits; the subsequent full compact block for the same block hash is
+        // deduped -- never a double submit.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let header = vec![0xab; 2189];
+        let nonce = 9;
+        let coinbase = vec![0x01, 0x02];
+        let tx1 = vec![0x03, 0x04, 0x05];
+        let wtxid = make_wtxid(0x11);
+        let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
+        let skeleton = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase.clone(),
+            }],
+        );
+        let mut mempool = TestMempool::new();
+        mempool.insert(wtxid, tx1);
+
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(metrics.skeleton_submit_successes.load(Ordering::Relaxed), 1);
+
+        // Full compact block for the same block -> deduped, no second submit.
+        let full = skeleton.clone();
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            1,
+            "block must never be submitted twice"
+        );
+        assert_eq!(metrics.full_block_deduplicated.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn incomplete_skeleton_waits_and_full_block_submits() {
+        // A skeleton with an unresolved short_id does not submit; the full
+        // compact block (the origin prefills that tx as the push fallback) then
+        // reconstructs without the mempool and submits normally.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let header = vec![0xcd; 2189];
+        let nonce = 3;
+        let coinbase = vec![0x01];
+        let tx1 = vec![0x02, 0x03];
+        let short_id = ShortId::compute(&make_wtxid(0x21), &zcash_block_hash(&header), nonce);
+        let empty_mempool = TestMempool::new();
+
+        let skeleton = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase.clone(),
+            }],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &empty_mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            0,
+            "incomplete skeleton must not submit"
+        );
+        assert_eq!(metrics.skeleton_incomplete.load(Ordering::Relaxed), 1);
+
+        // Full compact block: coinbase + tx1 both prefilled -> submits.
+        let full = CompactBlock::new(
+            header,
+            nonce,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: coinbase,
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: tx1,
+                },
+            ],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &empty_mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            1,
+            "full compact block submits after an incomplete skeleton"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_block_wins_then_late_skeleton_is_a_noop() {
+        // Reverse race: the full compact block submits first, so a later
+        // skeleton for the same block is deduped.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let header = vec![0xef; 2189];
+        let nonce = 5;
+        let coinbase = vec![0x01];
+        let tx1 = vec![0x02, 0x03];
+        let wtxid = make_wtxid(0x31);
+        let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
+
+        let full = CompactBlock::new(
+            header.clone(),
+            nonce,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: coinbase.clone(),
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: tx1.clone(),
+                },
+            ],
+        );
+        let mut mempool = TestMempool::new();
+        mempool.insert(wtxid, tx1);
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+        assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
+
+        let skeleton = CompactBlock::new(
+            header,
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase,
+            }],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        assert_eq!(
+            submitter.calls.load(Ordering::SeqCst),
+            1,
+            "late skeleton must not resubmit"
+        );
+        assert_eq!(metrics.skeleton_deduplicated.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn skeleton_metrics_render_in_prometheus_text() {
+        let metrics = SidecarMetrics::default();
+        metrics.inc_skeleton_received();
+        metrics.inc_skeleton_submit_successes();
+        metrics.inc_skeleton_incomplete();
+        metrics.inc_skeleton_deduplicated();
+        metrics.inc_full_block_deduplicated();
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains("sovright_relay_sidecar_skeleton_received_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_submit_successes_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_incomplete_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_deduplicated_total 1"));
+        assert!(text.contains("sovright_relay_sidecar_skeleton_full_block_deduplicated_total 1"));
+    }
+
+    #[test]
+    fn hash_dedup_ring_expires_and_bounds() {
+        let mut ring = HashDedupRing::new(2, Duration::from_secs(30));
+        let t0 = Instant::now();
+        assert!(!ring.contains("a", t0));
+        ring.record("a".to_string(), t0);
+        assert!(ring.contains("a", t0));
+        // Expired after the window.
+        assert!(!ring.contains("a", t0 + Duration::from_secs(31)));
+        // Capacity bound evicts the oldest.
+        let t1 = t0 + Duration::from_secs(1);
+        ring.record("x".to_string(), t1);
+        ring.record("y".to_string(), t1);
+        ring.record("z".to_string(), t1);
+        assert!(!ring.contains("x", t1), "oldest evicted at capacity");
+        assert!(ring.contains("y", t1));
+        assert!(ring.contains("z", t1));
+    }
+
+    #[test]
+    fn observe_first_seen_to_submit_ms_accumulates_sum_and_count() {
+        let metrics = SidecarMetrics::default();
+        metrics.observe_first_seen_to_submit_ms(100);
+        metrics.observe_first_seen_to_submit_ms(50);
+
+        let text = metrics.render_prometheus_text();
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_first_seen_to_submit_ms_sum 150"),
+            "unexpected sum render: {text}"
+        );
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_first_seen_to_submit_ms_count 2"),
+            "unexpected count render: {text}"
+        );
     }
 
     #[test]
@@ -1998,6 +2666,7 @@ mod tests {
         log_submission_outcome(
             Err(RelayBlockError::MissingTransactions { short_ids: 1 }),
             &metrics,
+            None,
         );
 
         let text = metrics.render_prometheus_text();

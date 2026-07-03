@@ -43,6 +43,20 @@ pub struct RelayMetrics {
     pub sessions_expired: AtomicU64,
     /// Incoming packets rejected because the session limit was reached
     pub session_limit_rejections: AtomicU64,
+    /// Raw-segment reconstructions observed (first chunk -> PoW validated).
+    pub reconstruct_latency_count: AtomicU64,
+    /// Sum of reconstruction latencies, milliseconds (with count -> average).
+    pub reconstruct_latency_sum_ms: AtomicU64,
+    /// Reconstructions that took longer than 2s (tail: loss forced retransmits).
+    pub reconstruct_latency_over_2s: AtomicU64,
+    /// Reconstructions that took longer than 10s (severe tail).
+    pub reconstruct_latency_over_10s: AtomicU64,
+    /// Block assemblies dropped after timing out without reconstructing
+    /// (delivery misses -- the tail cause, since reconstruction itself is fast).
+    pub assembly_misses: AtomicU64,
+    /// Of those misses, ones that had >= 90% of data_shards when dropped
+    /// (marginal: a parity bump / retransmit would likely have saved them).
+    pub assembly_misses_near: AtomicU64,
 }
 
 impl RelayMetrics {
@@ -157,6 +171,31 @@ impl RelayMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one reconstruction latency (first chunk -> PoW validated), ms.
+    /// Feeds the average plus the >2s / >10s tail counters that indicate loss
+    /// beyond the FEC parity margin forcing retransmits.
+    pub fn record_reconstruct_latency_ms(&self, ms: u64) {
+        self.reconstruct_latency_count
+            .fetch_add(1, Ordering::Relaxed);
+        self.reconstruct_latency_sum_ms
+            .fetch_add(ms, Ordering::Relaxed);
+        if ms > 2_000 {
+            self.reconstruct_latency_over_2s
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if ms > 10_000 {
+            self.reconstruct_latency_over_10s
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Record assemblies that timed out without reconstructing (delivery misses)
+    /// and how many were near the reconstruction threshold.
+    pub fn add_assembly_misses(&self, total: u64, near: u64) {
+        self.assembly_misses.fetch_add(total, Ordering::Relaxed);
+        self.assembly_misses_near.fetch_add(near, Ordering::Relaxed);
+    }
+
     /// Get snapshot of current metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -191,6 +230,12 @@ impl RelayMetrics {
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_expired: self.sessions_expired.load(Ordering::Relaxed),
             session_limit_rejections: self.session_limit_rejections.load(Ordering::Relaxed),
+            reconstruct_latency_count: self.reconstruct_latency_count.load(Ordering::Relaxed),
+            reconstruct_latency_sum_ms: self.reconstruct_latency_sum_ms.load(Ordering::Relaxed),
+            reconstruct_latency_over_2s: self.reconstruct_latency_over_2s.load(Ordering::Relaxed),
+            reconstruct_latency_over_10s: self.reconstruct_latency_over_10s.load(Ordering::Relaxed),
+            assembly_misses: self.assembly_misses.load(Ordering::Relaxed),
+            assembly_misses_near: self.assembly_misses_near.load(Ordering::Relaxed),
         }
     }
 }
@@ -217,6 +262,12 @@ pub struct MetricsSnapshot {
     pub sessions_created: u64,
     pub sessions_expired: u64,
     pub session_limit_rejections: u64,
+    pub reconstruct_latency_count: u64,
+    pub reconstruct_latency_sum_ms: u64,
+    pub reconstruct_latency_over_2s: u64,
+    pub reconstruct_latency_over_10s: u64,
+    pub assembly_misses: u64,
+    pub assembly_misses_near: u64,
 }
 
 /// Render relay metrics in Prometheus text exposition format.
@@ -362,6 +413,48 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "counter",
         snapshot.session_limit_rejections,
     );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_reconstruct_latency_count",
+        "Raw-segment reconstructions timed (first chunk -> PoW validated).",
+        "counter",
+        snapshot.reconstruct_latency_count,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_reconstruct_latency_sum_ms",
+        "Sum of raw-segment reconstruction latencies in milliseconds.",
+        "counter",
+        snapshot.reconstruct_latency_sum_ms,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_reconstruct_latency_over_2s_total",
+        "Raw-segment reconstructions slower than 2s (loss-induced retransmit tail).",
+        "counter",
+        snapshot.reconstruct_latency_over_2s,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_reconstruct_latency_over_10s_total",
+        "Raw-segment reconstructions slower than 10s (severe tail).",
+        "counter",
+        snapshot.reconstruct_latency_over_10s,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_assembly_misses_total",
+        "Block assemblies dropped after timing out without reconstructing (delivery misses).",
+        "counter",
+        snapshot.assembly_misses,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_assembly_misses_near_total",
+        "Delivery misses that had >= 90% of data_shards when dropped (marginal, near-reconstructable).",
+        "counter",
+        snapshot.assembly_misses_near,
+    );
     text
 }
 
@@ -432,6 +525,12 @@ mod tests {
             sessions_created: 3,
             sessions_expired: 4,
             session_limit_rejections: 6,
+            reconstruct_latency_count: 20,
+            reconstruct_latency_sum_ms: 8000,
+            reconstruct_latency_over_2s: 2,
+            reconstruct_latency_over_10s: 1,
+            assembly_misses: 7,
+            assembly_misses_near: 3,
         };
 
         let text = render_prometheus_text(&snapshot, 5);
@@ -451,6 +550,12 @@ mod tests {
         assert!(text.contains("sovright_relay_relay_raw_segment_duplicate_chunks_total 1\n"));
         assert!(text.contains("sovright_relay_relay_raw_segment_validation_deferred_total 8\n"));
         assert!(text.contains("sovright_relay_relay_raw_segment_validation_successes_total 9\n"));
+        assert!(text.contains("sovright_relay_relay_reconstruct_latency_count 20\n"));
+        assert!(text.contains("sovright_relay_relay_reconstruct_latency_sum_ms 8000\n"));
+        assert!(text.contains("sovright_relay_relay_reconstruct_latency_over_2s_total 2\n"));
+        assert!(text.contains("sovright_relay_relay_reconstruct_latency_over_10s_total 1\n"));
+        assert!(text.contains("sovright_relay_relay_assembly_misses_total 7\n"));
+        assert!(text.contains("sovright_relay_relay_assembly_misses_near_total 3\n"));
         assert!(text.contains("sovright_relay_relay_raw_segment_validation_failures_total 10\n"));
         assert!(text.contains("sovright_relay_relay_raw_segment_cached_promotions_total 11\n"));
         assert!(text.contains("sovright_relay_relay_auth_failures_total 1\n"));
@@ -458,5 +563,20 @@ mod tests {
         assert!(text.contains("sovright_relay_relay_sessions_created_total 3\n"));
         assert!(text.contains("sovright_relay_relay_sessions_expired_total 4\n"));
         assert!(text.contains("sovright_relay_relay_session_limit_rejections_total 6\n"));
+    }
+
+    #[test]
+    fn record_reconstruct_latency_tracks_count_sum_and_tails() {
+        let metrics = RelayMetrics::new();
+        metrics.record_reconstruct_latency_ms(300); // fast
+        metrics.record_reconstruct_latency_ms(2_000); // exactly 2s: NOT over_2s (strict >)
+        metrics.record_reconstruct_latency_ms(3_500); // over_2s
+        metrics.record_reconstruct_latency_ms(25_000); // over_2s AND over_10s
+
+        let s = metrics.snapshot();
+        assert_eq!(s.reconstruct_latency_count, 4);
+        assert_eq!(s.reconstruct_latency_sum_ms, 300 + 2_000 + 3_500 + 25_000);
+        assert_eq!(s.reconstruct_latency_over_2s, 2);
+        assert_eq!(s.reconstruct_latency_over_10s, 1);
     }
 }

@@ -6,6 +6,20 @@ use std::time::{Duration, Instant};
 
 use super::MessageType;
 use hmac::{Hmac, Mac};
+
+/// Result of one assembly-cleanup pass, feeding the delivery/miss instrument.
+/// A "miss" is a block whose chunk assembly timed out before enough chunks
+/// arrived to reconstruct -- the delivery failure that drives the propagation
+/// tail (reconstruction itself is fast once chunks are present).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AssemblyCleanupStats {
+    /// Assemblies dropped after timing out without reconstructing.
+    pub expired_incomplete: u64,
+    /// Of those, ones that had received >= 90% of `data_shards` -- a marginal
+    /// miss a parity bump or retransmit would likely have saved, as opposed to
+    /// a wholesale delivery failure (few chunks ever arrived).
+    pub expired_incomplete_near: u64,
+}
 use sha2::Sha256;
 use std::collections::VecDeque;
 use subtle::ConstantTimeEq;
@@ -30,6 +44,12 @@ pub struct BlockAssembly {
     pub msg_type: MessageType,
     /// Total expected chunks
     pub total_chunks: usize,
+    /// Per-block FEC data-shard count from the chunk header.
+    ///
+    /// Zero means "not carried on the wire" (a version-1/2 chunk); the receiver
+    /// falls back to its fixed configured `data_shards`. Nonzero is the
+    /// adaptive (version-3) per-block count captured from the first chunk.
+    pub data_shards: u16,
     /// Received chunk payloads (indexed by chunk_id)
     pub chunks: Vec<Option<Vec<u8>>>,
     /// When we started receiving this block
@@ -58,11 +78,25 @@ impl BlockAssembly {
             block_hash,
             msg_type,
             total_chunks,
+            data_shards: 0,
             chunks: vec![None; total_chunks],
             started_at: Instant::now(),
             original_len: None,
             pow_validated: false,
             forwarded: vec![false; total_chunks],
+        }
+    }
+
+    /// Effective data-shard count for reconstruction.
+    ///
+    /// Returns the per-block adaptive value captured from a version-3 chunk
+    /// header, or `fixed` (the receiver's configured `data_shards`) for a
+    /// version-1/2 assembly that carries no per-block shard count.
+    pub fn effective_data_shards(&self, fixed: usize) -> usize {
+        if self.data_shards > 0 {
+            self.data_shards as usize
+        } else {
+            fixed
         }
     }
 
@@ -135,7 +169,10 @@ impl RelaySession {
         self.last_seen.elapsed() > timeout
     }
 
-    /// Compute HMAC for a chunk
+    /// Compute HMAC for a version-2 chunk.
+    ///
+    /// Covers block_hash, chunk_id, total_chunks, payload_len, and payload.
+    /// Byte-for-byte stable across releases -- do not change the fold order.
     pub fn compute_hmac(
         &self,
         block_hash: &[u8; 32],
@@ -157,7 +194,36 @@ impl RelaySession {
         output
     }
 
-    /// Verify HMAC for a chunk
+    /// Compute HMAC for a version-3 (adaptive) chunk.
+    ///
+    /// Identical to [`RelaySession::compute_hmac`] but additionally authenticates
+    /// the per-block `data_shards` count, folded in after `payload_len` and
+    /// before the payload. A v3 chunk whose `data_shards` is tampered with will
+    /// therefore fail verification.
+    pub fn compute_hmac_v3(
+        &self,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        data_shards: u16,
+        payload: &[u8],
+    ) -> [u8; 32] {
+        let mut mac = HmacSha256::new_from_slice(&self.auth_key)
+            .expect("32-byte key should always be valid for HMAC-SHA256");
+        mac.update(block_hash);
+        mac.update(&chunk_id.to_be_bytes());
+        mac.update(&total_chunks.to_be_bytes());
+        mac.update(&payload_len.to_be_bytes());
+        mac.update(&data_shards.to_be_bytes());
+        mac.update(payload);
+        let result = mac.finalize();
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&result.into_bytes());
+        output
+    }
+
+    /// Verify HMAC for a version-2 chunk
     pub fn verify_hmac(
         &self,
         block_hash: &[u8; 32],
@@ -169,6 +235,29 @@ impl RelaySession {
     ) -> bool {
         let expected = self.compute_hmac(block_hash, chunk_id, total_chunks, payload_len, payload);
         // Use constant-time comparison to prevent timing attacks
+        expected.ct_eq(provided).into()
+    }
+
+    /// Verify HMAC for a version-3 (adaptive) chunk, authenticating `data_shards`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_hmac_v3(
+        &self,
+        block_hash: &[u8; 32],
+        chunk_id: u16,
+        total_chunks: u16,
+        payload_len: u16,
+        data_shards: u16,
+        payload: &[u8],
+        provided: &[u8; 32],
+    ) -> bool {
+        let expected = self.compute_hmac_v3(
+            block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            payload,
+        );
         expected.ct_eq(provided).into()
     }
 
@@ -244,11 +333,28 @@ impl RelaySession {
         }
     }
 
-    /// Remove completed or expired assemblies
-    pub fn cleanup_assemblies(&mut self, assembly_timeout: Duration) {
+    /// Remove completed or expired assemblies, counting timed-out incomplete
+    /// ones (delivery misses) and how many were near the reconstruction
+    /// threshold. `data_shards` is the reconstruction threshold.
+    pub fn cleanup_assemblies(
+        &mut self,
+        assembly_timeout: Duration,
+        data_shards: usize,
+    ) -> AssemblyCleanupStats {
+        let mut stats = AssemblyCleanupStats::default();
+        let near_threshold = data_shards.saturating_mul(9) / 10;
         self.pending_blocks.retain(|_, assembly| {
-            !assembly.is_expired(assembly_timeout) && !assembly.is_complete()
+            let expired = assembly.is_expired(assembly_timeout);
+            let complete = assembly.is_complete();
+            if expired && !complete && !assembly.pow_validated {
+                stats.expired_incomplete += 1;
+                if assembly.received_count() >= near_threshold {
+                    stats.expired_incomplete_near += 1;
+                }
+            }
+            !expired && !complete
         });
+        stats
     }
 
     /// Cleanup old replay entries
@@ -287,6 +393,48 @@ mod tests {
         }
 
         assert!(assembly.is_complete());
+    }
+
+    #[test]
+    fn cleanup_counts_timed_out_incomplete_assemblies() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let mut session = RelaySession::new(addr, [0x42; 32]);
+        let old = Instant::now() - Duration::from_secs(60);
+        // data_shards = 10 -> near threshold = 9.
+
+        // A: near-complete (9 chunks), expired -> miss AND near.
+        let mut a = BlockAssembly::new([0xa1; 32], 12);
+        for i in 0..9 {
+            a.add_chunk(i, vec![0u8; 4]);
+        }
+        a.started_at = old;
+        session.pending_blocks.insert([0xa1; 32], a);
+
+        // B: wholesale miss (2 chunks), expired -> miss, NOT near.
+        let mut b = BlockAssembly::new([0xb2; 32], 12);
+        for i in 0..2 {
+            b.add_chunk(i, vec![0u8; 4]);
+        }
+        b.started_at = old;
+        session.pending_blocks.insert([0xb2; 32], b);
+
+        // C: expired but already reconstructed -> NOT a miss.
+        let mut c = BlockAssembly::new([0xc3; 32], 12);
+        c.add_chunk(0, vec![0u8; 4]);
+        c.pow_validated = true;
+        c.started_at = old;
+        session.pending_blocks.insert([0xc3; 32], c);
+
+        // D: fresh incomplete -> retained, not a miss.
+        let mut d = BlockAssembly::new([0xd4; 32], 12);
+        d.add_chunk(0, vec![0u8; 4]);
+        session.pending_blocks.insert([0xd4; 32], d);
+
+        let stats = session.cleanup_assemblies(Duration::from_secs(10), 10);
+        assert_eq!(stats.expired_incomplete, 2); // A + B
+        assert_eq!(stats.expired_incomplete_near, 1); // A only (9 >= 9)
+        assert!(session.pending_blocks.contains_key(&[0xd4; 32])); // fresh kept
+        assert!(!session.pending_blocks.contains_key(&[0xa1; 32])); // expired dropped
     }
 
     #[test]
@@ -338,6 +486,43 @@ mod tests {
             &tampered,
             &hmac
         ));
+    }
+
+    #[test]
+    fn session_hmac_v3_authenticates_data_shards() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session = RelaySession::new(addr, [0x42; 32]);
+
+        let block_hash = [0xab; 32];
+        let payload = [0x01, 0x02, 0x03];
+        let hmac = session.compute_hmac_v3(&block_hash, 5, 10, 3, 7, &payload);
+
+        // Correct data_shards verifies.
+        assert!(session.verify_hmac_v3(&block_hash, 5, 10, 3, 7, &payload, &hmac));
+        // Flipping data_shards fails verification.
+        assert!(!session.verify_hmac_v3(&block_hash, 5, 10, 3, 8, &payload, &hmac));
+    }
+
+    #[test]
+    fn session_hmac_v3_differs_from_v2() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session = RelaySession::new(addr, [0x24; 32]);
+
+        let block_hash = [0x11; 32];
+        let payload = [0xaa, 0xbb, 0xcc];
+        let v2 = session.compute_hmac(&block_hash, 1, 3, 3, &payload);
+        let v3 = session.compute_hmac_v3(&block_hash, 1, 3, 3, 2, &payload);
+        assert_ne!(v2, v3, "folding data_shards must change the HMAC");
+    }
+
+    #[test]
+    fn effective_data_shards_prefers_per_block_value() {
+        let mut assembly = BlockAssembly::new([0u8; 32], 3);
+        // v2/v1 assembly (data_shards == 0) falls back to the fixed config.
+        assert_eq!(assembly.effective_data_shards(224), 224);
+        // v3 assembly uses the captured per-block value.
+        assembly.data_shards = 2;
+        assert_eq!(assembly.effective_data_shards(224), 2);
     }
 
     #[test]

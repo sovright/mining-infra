@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
 
-use sovright_relay::{RelayConfig, RelayNode, render_prometheus_text};
+use sovright_relay::{ArrivalSink, RelayConfig, RelayNode, render_prometheus_text};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -18,6 +18,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let config = config_from_env()?;
     let mut node = RelayNode::new(config)?;
+    if let Some(path) = env::var_os("SOVRIGHT_RELAY_ARRIVAL_LOG") {
+        let path = PathBuf::from(path);
+        info!(path = %path.display(), "Relay block-arrival logging enabled");
+        node = node.with_arrival_sink(Some(ArrivalSink::new(&path)?));
+    }
     node.bind().await?;
 
     let local_addr = node

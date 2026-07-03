@@ -255,11 +255,21 @@ impl EventSink {
         }))
     }
 
-    pub fn p2p_block_received(&self, peer: &str, hash: &str, bytes: usize) -> Result<()> {
+    pub fn p2p_block_received(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        bytes: usize,
+    ) -> Result<()> {
         self.write(json!({
             "event": "p2p_block_received",
             "peer": peer,
             "hash": hash,
+            // Zcash consensus block hash (display order), matching the relay
+            // arrival log so the dashboard can join block size to propagation
+            // latency. Empty when the header could not be read.
+            "consensus_hash": consensus_hash,
             "bytes": bytes,
             "observed_at_unix_ms": now_unix_ms(),
         }))

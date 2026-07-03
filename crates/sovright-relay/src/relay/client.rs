@@ -32,6 +32,10 @@ pub enum RelayPayload {
     CompactBlock(CompactBlock),
     /// One segment of a raw serialized block.
     RawBlockSegment(RawBlockSegment),
+    /// Compact-skeleton fast-path object: a `CompactBlock` (all-short_id form)
+    /// sent first and redundantly ahead of the full compact block, routed to
+    /// the receiver's skeleton fast path.
+    CompactSkeleton(CompactBlock),
 }
 
 /// Handle for sending blocks through the relay client
@@ -56,6 +60,20 @@ impl BlockSender {
     ) -> Result<(), TransportError> {
         self.tx
             .send(RelayPayload::RawBlockSegment(segment))
+            .await
+            .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
+    }
+
+    /// Send a compact skeleton to be relayed on the fast path.
+    ///
+    /// The skeleton is the reconstruction-critical `CompactBlock` (header +
+    /// nonce + all-non-coinbase short_ids, coinbase prefilled). It is chunked
+    /// under [`MessageType::CompactSkeleton`] with a heavier parity floor and a
+    /// distinct relay object id, so it reassembles independently of, and ahead
+    /// of, the full compact block that follows as the push fallback.
+    pub async fn send_skeleton(&self, skeleton: CompactBlock) -> Result<(), TransportError> {
+        self.tx
+            .send(RelayPayload::CompactSkeleton(skeleton))
             .await
             .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
     }
@@ -318,7 +336,29 @@ impl RelayClient {
             RelayPayload::RawBlockSegment(segment) => {
                 self.send_raw_block_segment_internal(socket, segment).await
             }
+            RelayPayload::CompactSkeleton(skeleton) => {
+                self.send_skeleton_internal(socket, skeleton).await
+            }
         }
+    }
+
+    /// Send a compact skeleton to all relay nodes on the fast path.
+    ///
+    /// The skeleton always uses the adaptive (v3) codec with the heavier
+    /// skeleton parity floor, and is routed under a domain-separated object id
+    /// so it does not collide with the full compact block of the same block.
+    async fn send_skeleton_internal(
+        &self,
+        socket: Arc<UdpSocket>,
+        skeleton: &CompactBlock,
+    ) -> Result<(), TransportError> {
+        let block_hash = self.compute_block_hash(skeleton);
+        let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+        let chunks = self
+            .chunker
+            .compact_block_to_chunks_skeleton(skeleton, &object_hash)?;
+        self.send_chunks_internal(socket, &object_hash, chunks, "compact skeleton")
+            .await
     }
 
     /// Send a block to all relay nodes
@@ -329,7 +369,15 @@ impl RelayClient {
     ) -> Result<(), TransportError> {
         let block_hash = self.compute_block_hash(block);
 
-        let chunks = self.chunker.compact_block_to_chunks(block, &block_hash)?;
+        // With adaptive FEC on, size the block to a handful of version-3 chunks
+        // (falling back to the fixed v2 profile for oversized blocks). Otherwise
+        // keep the fixed v2 behavior.
+        let chunks = if self.config.adaptive_fec {
+            self.chunker
+                .compact_block_to_chunks_adaptive(block, &block_hash)?
+        } else {
+            self.chunker.compact_block_to_chunks(block, &block_hash)?
+        };
         self.send_chunks_internal(socket, &block_hash, chunks, "compact block")
             .await
     }
@@ -360,35 +408,92 @@ impl RelayClient {
 
         let mut payloads = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            // Compute HMAC for this chunk
-            let hmac = session.compute_hmac(
-                &chunk.header.block_hash,
-                chunk.header.chunk_id,
-                chunk.header.total_chunks,
-                chunk.header.payload_len,
-                &chunk.payload,
-            );
-
-            // Create authenticated version 2 chunk
-            let auth_header = match chunk.header.msg_type {
-                MessageType::Block => ChunkHeader::new_block_authenticated(
+            // A nonzero data_shards marks a version-3 (adaptive) intermediate
+            // chunk: authenticate it with the v3 HMAC (which covers data_shards)
+            // and emit a v3 header. Otherwise fall back to the fixed v2 path.
+            let auth_header = if chunk.header.data_shards > 0 {
+                let hmac = session.compute_hmac_v3(
                     &chunk.header.block_hash,
                     chunk.header.chunk_id,
                     chunk.header.total_chunks,
                     chunk.header.payload_len,
-                    hmac,
-                ),
-                MessageType::RawBlockSegment => ChunkHeader::new_raw_block_segment_authenticated(
+                    chunk.header.data_shards,
+                    &chunk.payload,
+                );
+                match chunk.header.msg_type {
+                    MessageType::Block => ChunkHeader::new_block_authenticated_v3(
+                        &chunk.header.block_hash,
+                        chunk.header.chunk_id,
+                        chunk.header.total_chunks,
+                        chunk.header.payload_len,
+                        chunk.header.data_shards,
+                        hmac,
+                    ),
+                    MessageType::RawBlockSegment => {
+                        ChunkHeader::new_raw_block_segment_authenticated_v3(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            chunk.header.data_shards,
+                            hmac,
+                        )
+                    }
+                    MessageType::CompactSkeleton => {
+                        ChunkHeader::new_compact_skeleton_authenticated_v3(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            chunk.header.data_shards,
+                            hmac,
+                        )
+                    }
+                    MessageType::Keepalive | MessageType::Auth => {
+                        return Err(TransportError::InvalidChunk(
+                            "unsupported outgoing chunk message type".into(),
+                        ));
+                    }
+                }
+            } else {
+                let hmac = session.compute_hmac(
                     &chunk.header.block_hash,
                     chunk.header.chunk_id,
                     chunk.header.total_chunks,
                     chunk.header.payload_len,
-                    hmac,
-                ),
-                MessageType::Keepalive | MessageType::Auth => {
-                    return Err(TransportError::InvalidChunk(
-                        "unsupported outgoing chunk message type".into(),
-                    ));
+                    &chunk.payload,
+                );
+                match chunk.header.msg_type {
+                    MessageType::Block => ChunkHeader::new_block_authenticated(
+                        &chunk.header.block_hash,
+                        chunk.header.chunk_id,
+                        chunk.header.total_chunks,
+                        chunk.header.payload_len,
+                        hmac,
+                    ),
+                    MessageType::RawBlockSegment => {
+                        ChunkHeader::new_raw_block_segment_authenticated(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            hmac,
+                        )
+                    }
+                    MessageType::CompactSkeleton => {
+                        ChunkHeader::new_compact_skeleton_authenticated(
+                            &chunk.header.block_hash,
+                            chunk.header.chunk_id,
+                            chunk.header.total_chunks,
+                            chunk.header.payload_len,
+                            hmac,
+                        )
+                    }
+                    MessageType::Keepalive | MessageType::Auth => {
+                        return Err(TransportError::InvalidChunk(
+                            "unsupported outgoing chunk message type".into(),
+                        ));
+                    }
                 }
             };
             payloads.push(Chunk::new(auth_header, chunk.payload).to_bytes());
@@ -454,7 +559,7 @@ impl RelayClient {
         // Validate chunk header
         if !matches!(
             chunk.header.msg_type,
-            MessageType::Block | MessageType::RawBlockSegment
+            MessageType::Block | MessageType::RawBlockSegment | MessageType::CompactSkeleton
         ) {
             log_raw_segment_chunk_drop(&chunk, "unsupported message type");
             return;
@@ -467,29 +572,51 @@ impl RelayClient {
             log_raw_segment_chunk_drop(&chunk, "too many chunks");
             return; // Drop invalid chunk
         }
-        let expected_total = self.config.data_shards + self.config.parity_shards;
-        if total_chunks != expected_total {
-            log_raw_segment_chunk_drop(&chunk, "mismatched FEC profile");
-            return; // Drop mismatched FEC config chunks
+        // Version-3 (adaptive) chunks carry a per-block data_shards count and a
+        // per-block total, so only version-1/2 chunks must match the receiver's
+        // fixed FEC profile. v3 totals are bounded by the MAX_TOTAL_CHUNKS check
+        // above and the header's own `1 <= data_shards < total_chunks` guard.
+        let is_v3 = chunk.header.version == 3;
+        if !is_v3 {
+            let expected_total = self.config.data_shards + self.config.parity_shards;
+            if total_chunks != expected_total {
+                log_raw_segment_chunk_drop(&chunk, "mismatched FEC profile");
+                return; // Drop mismatched FEC config chunks
+            }
         }
 
-        // Enforce authentication if configured
+        // Enforce authentication if configured. Both v2 and v3 are authenticated.
         let auth_required = self.config.auth_required;
-        if auth_required && chunk.header.version != 2 {
+        if auth_required && chunk.header.version != 2 && chunk.header.version != 3 {
             log_raw_segment_chunk_drop(&chunk, "authentication required");
             return; // Drop unauthenticated chunk
         }
-        if chunk.header.version == 2 {
+        {
             use crate::transport::RelaySession;
             let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
-            if !session.verify_hmac(
-                &block_hash,
-                chunk.header.chunk_id,
-                chunk.header.total_chunks,
-                chunk.header.payload_len,
-                &chunk.payload,
-                &chunk.header.hmac,
-            ) {
+            let authenticated = match chunk.header.version {
+                2 => session.verify_hmac(
+                    &block_hash,
+                    chunk.header.chunk_id,
+                    chunk.header.total_chunks,
+                    chunk.header.payload_len,
+                    &chunk.payload,
+                    &chunk.header.hmac,
+                ),
+                3 => session.verify_hmac_v3(
+                    &block_hash,
+                    chunk.header.chunk_id,
+                    chunk.header.total_chunks,
+                    chunk.header.payload_len,
+                    chunk.header.data_shards,
+                    &chunk.payload,
+                    &chunk.header.hmac,
+                ),
+                // Version 1 is unauthenticated; only reachable when auth is not
+                // required (the guard above drops v1 when auth is required).
+                _ => true,
+            };
+            if !authenticated {
                 log_raw_segment_chunk_drop(&chunk, "authentication failed");
                 return; // Drop failed auth
             }
@@ -509,6 +636,17 @@ impl RelayClient {
         if assembly.total_chunks != total_chunks || assembly.msg_type != chunk.header.msg_type {
             log_raw_segment_chunk_drop(&chunk, "assembly metadata mismatch");
             return;
+        }
+        // Capture (or validate) the per-block adaptive shard count. v3 chunks
+        // carry a nonzero data_shards; v1/v2 carry 0 (fixed profile). All chunks
+        // of one block must agree.
+        if chunk.header.data_shards != 0 {
+            if assembly.data_shards == 0 {
+                assembly.data_shards = chunk.header.data_shards;
+            } else if assembly.data_shards != chunk.header.data_shards {
+                log_raw_segment_chunk_drop(&chunk, "data_shards mismatch");
+                return;
+            }
         }
 
         // Drop duplicate chunk to avoid unnecessary work
@@ -537,15 +675,19 @@ impl RelayClient {
             }
         }
 
+        // Effective data-shard count: the per-block v3 value, or the fixed
+        // configured profile for v1/v2 chunks.
+        let effective_data_shards = assembly.effective_data_shards(self.config.data_shards);
+
         // Set original length estimate once we know shard size
         if *original_len == 0
             && let Some(shard) = assembly.chunks.iter().filter_map(|c| c.as_ref()).next()
         {
-            *original_len = shard.len() * self.config.data_shards;
+            *original_len = shard.len() * effective_data_shards;
         }
 
         // Try to reconstruct if we have enough chunks
-        if assembly.can_reconstruct(self.config.data_shards) {
+        if assembly.can_reconstruct(effective_data_shards) {
             // Extract chunks for decoding
             let shard_opts: Vec<Option<Vec<u8>>> = assembly.chunks.clone();
 
@@ -553,7 +695,7 @@ impl RelayClient {
             let est_len = *original_len;
 
             if est_len > 0 {
-                match self.decode_payload(msg_type, shard_opts, est_len) {
+                match self.decode_payload(msg_type, shard_opts, est_len, effective_data_shards) {
                     Some(payload) => {
                         if msg_type == MessageType::RawBlockSegment {
                             info!(
@@ -589,18 +731,31 @@ impl RelayClient {
         msg_type: MessageType,
         chunks: Vec<Option<Vec<u8>>>,
         original_len: usize,
+        data_shards: usize,
     ) -> Option<RelayPayload> {
+        // Decoding runs the Reed-Solomon codec of the per-block shape
+        // (data_shards, total_chunks - data_shards). For v2 chunks this equals
+        // the fixed configured profile; for v3 it is the adaptive per-block
+        // shape carried in the header.
         match msg_type {
             MessageType::Block => self
                 .chunker
-                .chunks_to_compact_block(chunks, original_len)
+                .chunks_to_compact_block_with_shards(chunks, original_len, data_shards)
                 .ok()
                 .map(RelayPayload::CompactBlock),
             MessageType::RawBlockSegment => self
                 .chunker
-                .chunks_to_raw_block_segment(chunks, original_len)
+                .chunks_to_raw_block_segment_with_shards(chunks, original_len, data_shards)
                 .ok()
                 .map(RelayPayload::RawBlockSegment),
+            // A skeleton is a serialized CompactBlock; decode it identically but
+            // deliver it as a distinct payload so the receiver routes it to the
+            // skeleton fast path.
+            MessageType::CompactSkeleton => self
+                .chunker
+                .chunks_to_compact_block_with_shards(chunks, original_len, data_shards)
+                .ok()
+                .map(RelayPayload::CompactSkeleton),
             MessageType::Keepalive | MessageType::Auth => None,
         }
     }
@@ -792,6 +947,194 @@ mod tests {
 
         let (assembly, _) = pending.get(&block_hash).unwrap();
         assert_eq!(assembly.received_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn client_reconstructs_authenticated_v3_compact_block() {
+        // Receive-side v3: a small compact block encoded as adaptive v3 chunks,
+        // authenticated with the v3 HMAC, must reassemble using the per-block
+        // data_shards from the header and be delivered to the user.
+        let auth_key = [0x42; 32];
+        let config = ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], auth_key)
+            .with_auth_required(true);
+        let client = RelayClient::new(config).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut client = client;
+        client.incoming_tx = Some(tx);
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0xdead_beef, Vec::new(), Vec::new());
+        let block_hash = client.compute_block_hash(&compact);
+        let chunks = client
+            .chunker
+            .compact_block_to_chunks_adaptive(&compact, &block_hash)
+            .unwrap();
+        assert!(chunks.iter().all(|c| c.header.version == 3));
+        assert!(chunks.len() >= 3);
+
+        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
+        let mut recent_delivered = HashMap::new();
+        for chunk in chunks {
+            let hmac = session.compute_hmac_v3(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                chunk.header.data_shards,
+                &chunk.payload,
+            );
+            let auth_header = ChunkHeader::new_block_authenticated_v3(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                chunk.header.data_shards,
+                hmac,
+            );
+            client
+                .handle_incoming_chunk(
+                    Chunk::new(auth_header, chunk.payload),
+                    &mut pending,
+                    &mut recent_delivered,
+                )
+                .await;
+        }
+
+        let delivered = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("v3 compact block should be delivered")
+            .expect("channel open");
+        match delivered {
+            RelayPayload::CompactBlock(block) => {
+                assert_eq!(block.nonce, 0xdead_beef);
+                assert_eq!(block.header, vec![0xab; 2189]);
+            }
+            other => panic!("expected compact block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_reassembles_and_delivers_compact_skeleton() {
+        // A skeleton encoded under MessageType::CompactSkeleton, routed by its
+        // domain-separated object id, must reassemble and be delivered as a
+        // distinct RelayPayload::CompactSkeleton (not a CompactBlock).
+        let auth_key = [0x42; 32];
+        let config = ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], auth_key)
+            .with_auth_required(true);
+        let client = RelayClient::new(config).unwrap();
+
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut client = client;
+        client.incoming_tx = Some(tx);
+
+        let skeleton = CompactBlock::new(vec![0xab; 2189], 0xfeed, Vec::new(), Vec::new());
+        let block_hash = client.compute_block_hash(&skeleton);
+        let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+        let chunks = client
+            .chunker
+            .compact_block_to_chunks_skeleton(&skeleton, &object_hash)
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.header.msg_type == MessageType::CompactSkeleton)
+        );
+        assert!(chunks.iter().all(|c| c.header.version == 3));
+
+        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
+        let mut recent_delivered = HashMap::new();
+        for chunk in chunks {
+            let hmac = session.compute_hmac_v3(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                chunk.header.data_shards,
+                &chunk.payload,
+            );
+            let auth_header = ChunkHeader::new_compact_skeleton_authenticated_v3(
+                &chunk.header.block_hash,
+                chunk.header.chunk_id,
+                chunk.header.total_chunks,
+                chunk.header.payload_len,
+                chunk.header.data_shards,
+                hmac,
+            );
+            client
+                .handle_incoming_chunk(
+                    Chunk::new(auth_header, chunk.payload),
+                    &mut pending,
+                    &mut recent_delivered,
+                )
+                .await;
+        }
+
+        let delivered = timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .expect("skeleton should be delivered")
+            .expect("channel open");
+        match delivered {
+            RelayPayload::CompactSkeleton(block) => {
+                assert_eq!(block.nonce, 0xfeed);
+                assert_eq!(block.header, vec![0xab; 2189]);
+            }
+            other => panic!("expected compact skeleton, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_drops_v3_chunk_with_tampered_data_shards() {
+        // A v3 chunk whose data_shards is altered after HMAC computation must
+        // fail authentication (the v3 HMAC covers data_shards).
+        let auth_key = [0x42; 32];
+        let config = ClientConfig::new(vec!["127.0.0.1:1".parse().unwrap()], auth_key)
+            .with_auth_required(true);
+        let client = RelayClient::new(config).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut client = client;
+        client.incoming_tx = Some(tx);
+
+        let compact = CompactBlock::new(vec![0xcd; 2189], 1, Vec::new(), Vec::new());
+        let block_hash = client.compute_block_hash(&compact);
+        let chunks = client
+            .chunker
+            .compact_block_to_chunks_adaptive(&compact, &block_hash)
+            .unwrap();
+        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+
+        let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
+        let mut recent_delivered = HashMap::new();
+        let chunk = &chunks[0];
+        let hmac = session.compute_hmac_v3(
+            &chunk.header.block_hash,
+            chunk.header.chunk_id,
+            chunk.header.total_chunks,
+            chunk.header.payload_len,
+            chunk.header.data_shards,
+            &chunk.payload,
+        );
+        // Tamper: bump data_shards in the header but keep the HMAC over the old value.
+        let tampered = ChunkHeader::new_block_authenticated_v3(
+            &chunk.header.block_hash,
+            chunk.header.chunk_id,
+            chunk.header.total_chunks,
+            chunk.header.payload_len,
+            chunk.header.data_shards + 1,
+            hmac,
+        );
+        client
+            .handle_incoming_chunk(
+                Chunk::new(tampered, chunk.payload.clone()),
+                &mut pending,
+                &mut recent_delivered,
+            )
+            .await;
+
+        assert!(pending.is_empty(), "tampered v3 chunk must be dropped");
+        let recv = timeout(Duration::from_millis(50), rx.recv()).await;
+        assert!(recv.is_err() || recv.unwrap().is_none());
     }
 
     #[tokio::test]

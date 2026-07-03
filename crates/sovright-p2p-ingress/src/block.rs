@@ -3,6 +3,7 @@ use sovright_relay::{CompactBlock, PrefilledTx, ShortId, WtxId, ZCASH_FULL_HEADE
 use crate::error::{IngressError, Result};
 use crate::tx_cache::TxCache;
 use crate::wire::{decode_compact_size, read_u32_le};
+use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
 
 const OVERWINTERED_FLAG: u32 = 1 << 31;
 const OVERWINTER_VERSION_GROUP_ID: u32 = 0x03C4_8270;
@@ -29,6 +30,43 @@ pub(crate) fn compact_block_from_raw_block_with_tx_cache(
 ) -> Result<CompactBlock> {
     compact_block_from_raw_block_with_resolver(block_payload, |tx_payload| {
         tx_cache.wtxid_for_payload(tx_payload)
+    })
+}
+
+/// Build the compact *skeleton* for a raw block: the coinbase prefilled, and a
+/// short_id for every non-coinbase transaction the origin can resolve to a
+/// wtxid, so each receiver resolves those short_ids against its OWN mempool.
+///
+/// The origin can only compute a short_id for a transaction whose wtxid it
+/// already knows: its tx cache is a reverse payload->wtxid index, not a Zcash
+/// transaction hasher, so it cannot derive a wtxid for a transaction it never
+/// saw on the P2P network. Non-coinbase transactions the cache cannot resolve
+/// are therefore prefilled -- unavoidable, and still correct (the receiver
+/// reconstructs those verbatim). In the steady state, where the origin cache
+/// holds every non-coinbase transaction, the skeleton collapses to
+/// header + coinbase + all-short_ids: a single UDP packet.
+///
+/// Unlike the normal compact builder, the skeleton also resolves cache-MISS
+/// transactions by hashing their raw bytes: for each non-coinbase tx not found
+/// in the cache, it computes the wtxid directly with `wtxid_from_tx_bytes`
+/// (v5/ZIP-244 only) and emits a short_id, falling back to a prefill only when
+/// that too fails (pre-v5, or unparseable). This is what makes the skeleton
+/// genuinely smaller than the cache alone allows -- the origin no longer has to
+/// have seen a transaction on the P2P network to short_id it, matching the
+/// sidecar mempool's own v5-only wtxid construction so the short_ids resolve on
+/// the receivers.
+///
+/// This is, by construction, the maximally short-id'd tx-cache compaction. It
+/// is named and documented separately because it is the *fast-path* object: it
+/// is sent first and with heavier FEC parity, ahead of the full compact block.
+pub(crate) fn skeleton_compact_block_from_raw_block(
+    block_payload: &[u8],
+    tx_cache: &TxCache,
+) -> Result<CompactBlock> {
+    compact_block_from_raw_block_with_resolver(block_payload, |tx_payload| {
+        tx_cache
+            .wtxid_for_payload(tx_payload)
+            .or_else(|| wtxid_from_tx_bytes(tx_payload, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID))
     })
 }
 
@@ -508,6 +546,138 @@ mod tests {
                 panic!("unexpected invalid compact block: {reason}");
             }
         }
+    }
+
+    #[test]
+    fn skeleton_prefills_only_coinbase_and_short_ids_all_resolvable_txs() {
+        // With the origin cache holding every non-coinbase transaction, the
+        // skeleton prefills ONLY the coinbase (index 0) and emits a short_id for
+        // each other transaction, computed exactly as ShortId::compute expects.
+        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        let coinbase = minimal_v5_tx(0x11);
+        let tx1 = minimal_v5_tx(0x22);
+        let tx2 = minimal_v5_tx(0x33);
+
+        let mut block = header.clone();
+        crate::wire::encode_compact_size(3, &mut block);
+        block.extend_from_slice(&coinbase);
+        block.extend_from_slice(&tx1);
+        block.extend_from_slice(&tx2);
+
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 8_192,
+            max_tx_bytes: 2_048,
+        });
+        let tx1_key = TxInventoryKey::wtx([0x51; 32], [0x52; 32]);
+        let tx2_key = TxInventoryKey::wtx([0x53; 32], [0x54; 32]);
+        cache.insert(tx1_key.to_wtxid(), tx1.clone());
+        cache.insert(tx2_key.to_wtxid(), tx2.clone());
+
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache).unwrap();
+
+        let header_hash = sovright_relay::zcash_block_hash(&header);
+        assert_eq!(skeleton.header, header);
+        // Only the coinbase is prefilled.
+        assert_eq!(skeleton.prefilled_txs.len(), 1);
+        assert_eq!(skeleton.prefilled_txs[0].index, 0);
+        assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
+        // Every non-coinbase tx is a short_id matching ShortId::compute.
+        assert_eq!(
+            skeleton.short_ids,
+            vec![
+                ShortId::compute(&tx1_key.to_wtxid(), &header_hash, skeleton.nonce),
+                ShortId::compute(&tx2_key.to_wtxid(), &header_hash, skeleton.nonce),
+            ]
+        );
+    }
+
+    #[test]
+    fn skeleton_prefills_txs_the_origin_cannot_resolve() {
+        // A non-coinbase tx that is neither cached NOR resolvable from its raw
+        // bytes -- here a pre-v5 (v4) tx, which has no ZIP-244 auth digest --
+        // still cannot be short_id'd and is prefilled verbatim (unavoidable and
+        // still correct). The cached tx becomes a short_id; the coinbase and the
+        // pre-v5 tx are prefilled.
+        //
+        // (A cache-MISS *v5* tx, by contrast, is now short_id'd from its bytes;
+        // see `skeleton_short_ids_cache_miss_v5_txs_from_bytes`.)
+        let header = vec![0xcd; ZCASH_FULL_HEADER_SIZE];
+        let coinbase = minimal_v5_tx(0x11);
+        let cached = minimal_v5_tx(0x22);
+        let unresolvable = shielded_v4_tx(0x33);
+
+        let mut block = header;
+        crate::wire::encode_compact_size(3, &mut block);
+        block.extend_from_slice(&coinbase);
+        block.extend_from_slice(&cached);
+        block.extend_from_slice(&unresolvable);
+
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 8_192,
+            max_tx_bytes: 2_048,
+        });
+        cache.insert(
+            TxInventoryKey::wtx([0x61; 32], [0x62; 32]).to_wtxid(),
+            cached,
+        );
+
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache).unwrap();
+
+        assert_eq!(skeleton.short_ids.len(), 1);
+        // coinbase (index 0) + the pre-v5 tx are prefilled.
+        assert_eq!(skeleton.prefilled_txs.len(), 2);
+        assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
+        assert_eq!(skeleton.prefilled_txs[1].tx_data, unresolvable);
+    }
+
+    #[test]
+    fn skeleton_short_ids_cache_miss_v5_txs_from_bytes() {
+        // The whole point of this change: with an EMPTY origin cache, a
+        // non-coinbase v5 transaction is still short_id'd -- the skeleton hashes
+        // its raw bytes to the same wtxid the sidecar would. The coinbase stays
+        // prefilled, and the normal (non-skeleton) builder is UNCHANGED: it has
+        // no from-bytes fallback and prefills the same tx.
+        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+        let coinbase = minimal_v5_tx(0x11);
+        let tx1 = minimal_v5_tx(0x22);
+
+        let mut block = header.clone();
+        crate::wire::encode_compact_size(2, &mut block);
+        block.extend_from_slice(&coinbase);
+        block.extend_from_slice(&tx1);
+
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 8,
+            max_bytes: 8_192,
+            max_tx_bytes: 4_096,
+        });
+
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache).unwrap();
+        let header_hash = sovright_relay::zcash_block_hash(&header);
+
+        // Coinbase prefilled; tx1 became a short_id computed from its own bytes.
+        assert_eq!(skeleton.prefilled_txs.len(), 1);
+        assert_eq!(skeleton.prefilled_txs[0].index, 0);
+        assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
+        let expected_wtxid =
+            crate::wtxid::wtxid_from_tx_bytes(&tx1, crate::wtxid::SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)
+                .expect("minimal v5 tx must resolve from bytes");
+        assert_eq!(
+            skeleton.short_ids,
+            vec![ShortId::compute(
+                &expected_wtxid,
+                &header_hash,
+                skeleton.nonce
+            )]
+        );
+
+        // Normal builder, same empty cache: tx1 is prefilled, no short_ids.
+        let normal = compact_block_from_raw_block_with_tx_cache(&block, &cache).unwrap();
+        assert!(normal.short_ids.is_empty());
+        assert_eq!(normal.prefilled_txs.len(), 2);
+        assert_eq!(normal.prefilled_txs[1].tx_data, tx1);
     }
 
     #[test]

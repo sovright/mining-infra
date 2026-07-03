@@ -20,6 +20,7 @@ use crate::transport::{
     ZCASH_FULL_HEADER_SIZE,
 };
 
+use super::ArrivalSink;
 use super::metrics::RelayMetrics;
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
@@ -54,6 +55,9 @@ struct ReadyChunks {
     msg_type: MessageType,
     block_hash: [u8; 32],
     total_chunks: u16,
+    /// Per-block FEC data-shard count (0 for v1/v2, nonzero for adaptive v3).
+    /// Carried so the forward path re-emits v3 chunks (with v3 HMAC) intact.
+    data_shards: u16,
     chunks: Vec<(u16, Vec<u8>)>,
 }
 
@@ -78,6 +82,8 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     metrics: Arc<RelayMetrics>,
     /// Raw block metadata with validated segment-0 PoW, keyed by parent block hash
     validated_raw_blocks: Arc<Mutex<HashMap<[u8; 32], ValidatedRawBlock>>>,
+    /// Optional per-block relay arrival logger (observatory timing source)
+    arrival_sink: Option<ArrivalSink>,
 }
 
 impl RelayNode<EquihashPowValidator> {
@@ -113,7 +119,16 @@ impl<V: PowValidator> RelayNode<V> {
             running: Arc::new(AtomicBool::new(false)),
             metrics: Arc::new(RelayMetrics::new()),
             validated_raw_blocks: Arc::new(Mutex::new(HashMap::new())),
+            arrival_sink: None,
         })
+    }
+
+    /// Attach (or clear) the per-block relay arrival logger. When set, the node
+    /// appends a `relay_block_received` event (keyed by the Zcash consensus block
+    /// hash) each time it reconstructs a PoW-valid raw block.
+    pub fn with_arrival_sink(mut self, sink: Option<ArrivalSink>) -> Self {
+        self.arrival_sink = sink;
+        self
     }
 
     /// Get the listen address from config
@@ -222,7 +237,9 @@ impl<V: PowValidator> RelayNode<V> {
         let before = sessions.len();
         sessions.retain(|_, session| !session.is_expired(timeout));
         for session in sessions.values_mut() {
-            session.cleanup_assemblies(assembly_timeout);
+            let stats = session.cleanup_assemblies(assembly_timeout, self.config.data_shards);
+            self.metrics
+                .add_assembly_misses(stats.expired_incomplete, stats.expired_incomplete_near);
             session.cleanup_recent();
         }
         let expired = (before - sessions.len()) as u64;
@@ -232,7 +249,10 @@ impl<V: PowValidator> RelayNode<V> {
         self.cleanup_validated_raw_blocks();
     }
 
-    /// Estimate original serialized length based on shard size
+    /// Estimate original serialized length based on shard size.
+    ///
+    /// Uses the assembly's effective data-shard count: the per-block adaptive
+    /// (v3) value when present, else the fixed configured profile.
     fn estimate_original_len(&self, assembly: &BlockAssembly) -> Option<usize> {
         let shard_size = assembly
             .chunks
@@ -240,7 +260,7 @@ impl<V: PowValidator> RelayNode<V> {
             .filter_map(|c| c.as_ref())
             .map(|c| c.len())
             .next()?;
-        Some(shard_size * self.config.data_shards)
+        Some(shard_size * assembly.effective_data_shards(self.config.data_shards))
     }
 
     /// Validate PoW once we can reconstruct serialized data
@@ -250,7 +270,11 @@ impl<V: PowValidator> RelayNode<V> {
         msg_type: MessageType,
     ) -> Option<bool> {
         match msg_type {
-            MessageType::Block => self.validate_compact_block_pow(assembly),
+            // A skeleton carries the full block header in its serialized
+            // CompactBlock, so PoW validates exactly like a compact block.
+            MessageType::Block | MessageType::CompactSkeleton => {
+                self.validate_compact_block_pow(assembly)
+            }
             MessageType::RawBlockSegment => self.validate_raw_block_segment(assembly),
             MessageType::Keepalive | MessageType::Auth => None,
         }
@@ -258,7 +282,12 @@ impl<V: PowValidator> RelayNode<V> {
 
     fn validate_compact_block_pow(&self, assembly: &BlockAssembly) -> Option<bool> {
         let est_len = self.estimate_original_len(assembly)?;
-        let data = match self.chunker.decode_data(assembly.chunks.clone(), est_len) {
+        let data_shards = assembly.effective_data_shards(self.config.data_shards);
+        let data = match self.chunker.decode_data_with_shards(
+            assembly.chunks.clone(),
+            est_len,
+            data_shards,
+        ) {
             Ok(data) => data,
             Err(_) => return None,
         };
@@ -308,6 +337,12 @@ impl<V: PowValidator> RelayNode<V> {
         match self.validator.validate(header) {
             PowResult::Valid => {
                 self.record_validated_raw_block(&segment);
+                // First moment this region's relay holds a PoW-valid block via
+                // the relay path: log its consensus block hash so the observatory
+                // can join it against native-P2P arrivals for the same block.
+                if let Some(sink) = &self.arrival_sink {
+                    sink.relay_block_received(&crate::hash::consensus_block_hash_display(header));
+                }
                 Some(true)
             }
             PowResult::Invalid => Some(false),
@@ -320,8 +355,9 @@ impl<V: PowValidator> RelayNode<V> {
         assembly: &BlockAssembly,
     ) -> Option<RawBlockSegment> {
         let est_len = self.estimate_original_len(assembly)?;
+        let data_shards = assembly.effective_data_shards(self.config.data_shards);
         self.chunker
-            .chunks_to_raw_block_segment(assembly.chunks.clone(), est_len)
+            .chunks_to_raw_block_segment_with_shards(assembly.chunks.clone(), est_len, data_shards)
             .ok()
     }
 
@@ -412,6 +448,7 @@ impl<V: PowValidator> RelayNode<V> {
                     msg_type: assembly.msg_type,
                     block_hash: assembly.block_hash,
                     total_chunks: assembly.total_chunks as u16,
+                    data_shards: assembly.data_shards,
                     chunks,
                 });
             }
@@ -420,12 +457,14 @@ impl<V: PowValidator> RelayNode<V> {
     }
 
     /// Forward chunks to all other sessions
+    #[allow(clippy::too_many_arguments)]
     async fn forward_to_peers(
         &self,
         src_addr: SocketAddr,
         msg_type: MessageType,
         block_hash: &[u8; 32],
         total_chunks: u16,
+        data_shards: u16,
         chunks: &[(u16, Vec<u8>)],
     ) -> Result<(), TransportError> {
         let socket = self.socket.as_ref().ok_or_else(|| {
@@ -444,33 +483,60 @@ impl<V: PowValidator> RelayNode<V> {
                 continue;
             }
 
-            // Forward all available chunks and count them
+            // Forward all available chunks and count them. Version-3 (adaptive)
+            // objects (data_shards > 0) must be re-emitted as v3 chunks carrying
+            // the same per-block data_shards -- and, when authenticated, with the
+            // v3 HMAC that covers data_shards -- so the next hop can decode them.
             let mut payloads: Vec<Vec<u8>> = Vec::new();
             for (chunk_id, data) in chunks.iter() {
+                let payload_len = data.len() as u16;
                 let header = if self.config.auth_required() {
-                    let hmac = session.compute_hmac(
-                        block_hash,
-                        *chunk_id,
-                        total_chunks,
-                        data.len() as u16,
-                        data,
-                    );
-                    authenticated_data_header(
+                    if data_shards > 0 {
+                        let hmac = session.compute_hmac_v3(
+                            block_hash,
+                            *chunk_id,
+                            total_chunks,
+                            payload_len,
+                            data_shards,
+                            data,
+                        );
+                        authenticated_data_header_v3(
+                            msg_type,
+                            block_hash,
+                            *chunk_id,
+                            total_chunks,
+                            payload_len,
+                            data_shards,
+                            hmac,
+                        )?
+                    } else {
+                        let hmac = session.compute_hmac(
+                            block_hash,
+                            *chunk_id,
+                            total_chunks,
+                            payload_len,
+                            data,
+                        );
+                        authenticated_data_header(
+                            msg_type,
+                            block_hash,
+                            *chunk_id,
+                            total_chunks,
+                            payload_len,
+                            hmac,
+                        )?
+                    }
+                } else if data_shards > 0 {
+                    data_header_v3(
                         msg_type,
                         block_hash,
                         *chunk_id,
                         total_chunks,
-                        data.len() as u16,
-                        hmac,
+                        payload_len,
+                        data_shards,
                     )?
                 } else {
-                    data_header(
-                        msg_type,
-                        block_hash,
-                        *chunk_id,
-                        total_chunks,
-                        data.len() as u16,
-                    )?
+                    data_header(msg_type, block_hash, *chunk_id, total_chunks, payload_len)?
                 };
                 let chunk = Chunk::new(header, data.clone());
                 payloads.push(chunk.to_bytes());
@@ -514,6 +580,10 @@ impl<V: PowValidator> RelayNode<V> {
                     MessageType::RawBlockSegment => {
                         self.metrics.inc_raw_segment_chunks_forwarded(chunks_sent)
                     }
+                    // Skeleton chunk forwarding is not counted under a dedicated
+                    // node metric (skeleton observability lives on the sidecar,
+                    // which reports fast-path wins); forwarding still happens.
+                    MessageType::CompactSkeleton => {}
                     MessageType::Keepalive | MessageType::Auth => {}
                 }
             }
@@ -555,6 +625,17 @@ impl<V: PowValidator> RelayNode<V> {
                 self.metrics.inc_invalid_chunks();
                 return Vec::new();
             }
+            // Capture (or validate) the per-block adaptive shard count carried by
+            // version-3 chunks. v1/v2 carry 0 (fixed profile); all chunks of one
+            // object must agree.
+            if chunk.header.data_shards != 0 {
+                if assembly.data_shards == 0 {
+                    assembly.data_shards = chunk.header.data_shards;
+                } else if assembly.data_shards != chunk.header.data_shards {
+                    self.metrics.inc_invalid_chunks();
+                    return Vec::new();
+                }
+            }
             let is_new = assembly.chunks.get(chunk_id).is_none_or(|c| c.is_none());
             assembly.add_chunk(chunk_id, chunk.payload.clone());
 
@@ -572,6 +653,9 @@ impl<V: PowValidator> RelayNode<V> {
                         if chunk.header.msg_type == MessageType::RawBlockSegment {
                             if valid {
                                 self.metrics.inc_raw_segment_validation_successes();
+                                self.metrics.record_reconstruct_latency_ms(
+                                    assembly.started_at.elapsed().as_millis() as u64,
+                                );
                             } else {
                                 self.metrics.inc_raw_segment_validation_failures();
                             }
@@ -655,7 +739,7 @@ impl<V: PowValidator> RelayNode<V> {
         // Validate chunk type and counts
         if !matches!(
             chunk.header.msg_type,
-            MessageType::Block | MessageType::RawBlockSegment
+            MessageType::Block | MessageType::RawBlockSegment | MessageType::CompactSkeleton
         ) {
             self.metrics.inc_invalid_chunks();
             return Err(TransportError::InvalidChunk(format!(
@@ -667,6 +751,8 @@ impl<V: PowValidator> RelayNode<V> {
         match chunk.header.msg_type {
             MessageType::Block => self.metrics.inc_compact_block_chunks_received(),
             MessageType::RawBlockSegment => self.metrics.inc_raw_segment_chunks_received(),
+            // Not counted under a dedicated node metric; forwarded like a block.
+            MessageType::CompactSkeleton => {}
             MessageType::Keepalive | MessageType::Auth => {}
         }
         if chunk.header.total_chunks == 0 || chunk.header.total_chunks > MAX_TOTAL_CHUNKS {
@@ -677,13 +763,19 @@ impl<V: PowValidator> RelayNode<V> {
             )));
         }
 
-        let expected_total = (self.config.data_shards + self.config.parity_shards) as u16;
-        if chunk.header.total_chunks != expected_total {
-            self.metrics.inc_invalid_chunks();
-            return Err(TransportError::InvalidChunk(format!(
-                "unexpected total_chunks: got {}, expected {}",
-                chunk.header.total_chunks, expected_total
-            )));
+        // Version-3 (adaptive) chunks carry a per-block total_chunks; only
+        // version-1/2 chunks must match this relay's fixed FEC profile. The
+        // per-block total is still bounded by the MAX_TOTAL_CHUNKS check above
+        // and the header's `1 <= data_shards < total_chunks` guard.
+        if chunk.header.version != 3 {
+            let expected_total = (self.config.data_shards + self.config.parity_shards) as u16;
+            if chunk.header.total_chunks != expected_total {
+                self.metrics.inc_invalid_chunks();
+                return Err(TransportError::InvalidChunk(format!(
+                    "unexpected total_chunks: got {}, expected {}",
+                    chunk.header.total_chunks, expected_total
+                )));
+            }
         }
 
         let block_hash = chunk.header.block_hash;
@@ -704,22 +796,12 @@ impl<V: PowValidator> RelayNode<V> {
             if let Some(session) = sessions.get_mut(&src_addr) {
                 // Existing session - enforce auth if configured
                 let auth_required = self.config.auth_required();
-                if auth_required && chunk.header.version != 2 {
-                    warn!(peer = %src_addr, "Auth required but received version 1 chunk");
+                if auth_required && chunk.header.version != 2 && chunk.header.version != 3 {
+                    warn!(peer = %src_addr, "Auth required but received unauthenticated chunk");
                     self.metrics.inc_auth_failures();
                     return Err(TransportError::AuthenticationFailed);
                 }
-                if auth_required
-                    && chunk.header.version == 2
-                    && !session.verify_hmac(
-                        &block_hash,
-                        chunk.header.chunk_id,
-                        chunk.header.total_chunks,
-                        chunk.header.payload_len,
-                        &chunk.payload,
-                        &chunk.header.hmac,
-                    )
-                {
+                if auth_required && !verify_data_chunk_hmac(session, &chunk, &block_hash) {
                     warn!(peer = %src_addr, "HMAC verification failed for existing session");
                     self.metrics.inc_auth_failures();
                     return Err(TransportError::AuthenticationFailed);
@@ -749,19 +831,12 @@ impl<V: PowValidator> RelayNode<V> {
                         chunk_id,
                         total_chunks,
                     )
-                } else if chunk.header.version == 2 {
+                } else if chunk.header.version == 2 || chunk.header.version == 3 {
                     // Try each authorized key
                     let mut authenticated_key: Option<[u8; 32]> = None;
                     for key in &self.config.authorized_keys {
                         let temp_session = RelaySession::new(src_addr, *key);
-                        if temp_session.verify_hmac(
-                            &block_hash,
-                            chunk.header.chunk_id,
-                            chunk.header.total_chunks,
-                            chunk.header.payload_len,
-                            &chunk.payload,
-                            &chunk.header.hmac,
-                        ) {
+                        if verify_data_chunk_hmac(&temp_session, &chunk, &block_hash) {
                             authenticated_key = Some(*key);
                             break;
                         }
@@ -798,6 +873,7 @@ impl<V: PowValidator> RelayNode<V> {
                 ready.msg_type,
                 &ready.block_hash,
                 ready.total_chunks,
+                ready.data_shards,
                 &ready.chunks,
             )
             .await?;
@@ -920,6 +996,12 @@ fn data_header(
             total_chunks,
             payload_len,
         )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+        )),
         MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
             "unsupported forwarded chunk message type".into(),
         )),
@@ -949,6 +1031,90 @@ fn authenticated_data_header(
             payload_len,
             hmac,
         )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_authenticated(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        )),
+        MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
+            "unsupported forwarded chunk message type".into(),
+        )),
+    }
+}
+
+fn data_header_v3(
+    msg_type: MessageType,
+    object_hash: &[u8; 32],
+    chunk_id: u16,
+    total_chunks: u16,
+    payload_len: u16,
+    data_shards: u16,
+) -> Result<ChunkHeader, TransportError> {
+    match msg_type {
+        MessageType::Block => Ok(ChunkHeader::new_block_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+        )),
+        MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+        )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+        )),
+        MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
+            "unsupported forwarded chunk message type".into(),
+        )),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn authenticated_data_header_v3(
+    msg_type: MessageType,
+    object_hash: &[u8; 32],
+    chunk_id: u16,
+    total_chunks: u16,
+    payload_len: u16,
+    data_shards: u16,
+    hmac: [u8; 32],
+) -> Result<ChunkHeader, TransportError> {
+    match msg_type {
+        MessageType::Block => Ok(ChunkHeader::new_block_authenticated_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            hmac,
+        )),
+        MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment_authenticated_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            hmac,
+        )),
+        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_authenticated_v3(
+            object_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            data_shards,
+            hmac,
+        )),
         MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
             "unsupported forwarded chunk message type".into(),
         )),
@@ -957,6 +1123,32 @@ fn authenticated_data_header(
 
 fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
     crate::zcash_block_hash(header)
+}
+
+/// Verify a data chunk's HMAC against `session`, selecting the v2 or v3 HMAC
+/// coverage by header version. Version 1 (unauthenticated) always returns false
+/// here; callers only reach this when auth is required (so v1 is rejected).
+fn verify_data_chunk_hmac(session: &RelaySession, chunk: &Chunk, block_hash: &[u8; 32]) -> bool {
+    match chunk.header.version {
+        2 => session.verify_hmac(
+            block_hash,
+            chunk.header.chunk_id,
+            chunk.header.total_chunks,
+            chunk.header.payload_len,
+            &chunk.payload,
+            &chunk.header.hmac,
+        ),
+        3 => session.verify_hmac_v3(
+            block_hash,
+            chunk.header.chunk_id,
+            chunk.header.total_chunks,
+            chunk.header.payload_len,
+            chunk.header.data_shards,
+            &chunk.payload,
+            &chunk.header.hmac,
+        ),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -1183,6 +1375,56 @@ mod tests {
     }
 
     #[test]
+    fn validated_raw_block_emits_arrival_event_with_consensus_hash() {
+        let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE + 256];
+        raw_block[0] = 0x04;
+        let block_hash = raw_block_header_hash(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
+        let segments = split_raw_block(block_hash, &raw_block, 2_000).unwrap();
+
+        let arrival_path = std::env::temp_dir().join(format!(
+            "sovright-relay-arrival-node-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
+        let node = RelayNode::with_validator(config, StubPowValidator)
+            .unwrap()
+            .with_arrival_sink(Some(ArrivalSink::new(&arrival_path).unwrap()));
+        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), [0u8; 32]);
+
+        for segment in &segments {
+            let chunks = node.chunker.raw_block_segment_to_chunks(segment).unwrap();
+            for chunk in &chunks {
+                let _ = node.process_chunk_for_session(
+                    &mut session,
+                    chunk,
+                    chunk.header.block_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                );
+            }
+        }
+
+        // The arrival log must carry the Zcash *consensus* hash (double-SHA256,
+        // display), not the relay's internal object id.
+        let expected =
+            crate::hash::consensus_block_hash_display(&raw_block[..ZCASH_FULL_HEADER_SIZE]);
+        let contents = std::fs::read_to_string(&arrival_path).unwrap();
+        assert!(
+            contents.lines().any(|line| {
+                line.contains("\"event\":\"relay_block_received\"") && line.contains(&expected)
+            }),
+            "expected relay_block_received with consensus hash {expected}, got:\n{contents}"
+        );
+        let _ = std::fs::remove_file(arrival_path);
+    }
+
+    #[test]
     fn raw_segment_zero_promotes_previously_buffered_nonzero_segments() {
         let mut raw_block = vec![0xab; ZCASH_FULL_HEADER_SIZE + 4096];
         raw_block[0] = 0x04;
@@ -1308,7 +1550,7 @@ mod tests {
         let block_hash = [0xab; 32];
         let chunks = vec![(0u16, vec![1u8; 10])];
 
-        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 1, &chunks)
+        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 1, 0, &chunks)
             .await
             .unwrap();
 
@@ -1333,6 +1575,182 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_v3_adaptive_chunks_preserving_data_shards() {
+        // End-to-end mesh path for adaptive (v3) chunks: a small compact block
+        // is encoded as v3, validated + collected by the session, then forwarded
+        // to a peer. The forwarded datagram must remain v3, carry the same
+        // per-block data_shards, and authenticate under the v3 HMAC.
+        let auth_key = [0x42; 32];
+        let config =
+            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(sender_addr, RelaySession::new(sender_addr, auth_key));
+            sessions.insert(receiver_addr, RelaySession::new(receiver_addr, auth_key));
+        }
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0x1234, Vec::new(), Vec::new());
+        let block_hash = *compact.header_hash().as_bytes();
+        let chunks = node
+            .chunker
+            .compact_block_to_chunks_adaptive(&compact, &block_hash)
+            .unwrap();
+        assert!(chunks.iter().all(|c| c.header.version == 3));
+        let data_shards = chunks[0].header.data_shards;
+        assert!(data_shards > 0);
+
+        let mut ready = Vec::new();
+        {
+            let mut sessions = node.sessions.write().await;
+            let session = sessions.get_mut(&sender_addr).unwrap();
+            for chunk in &chunks {
+                ready.extend(node.process_chunk_for_session(
+                    session,
+                    chunk,
+                    block_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                ));
+            }
+        }
+        let forwarded_total: usize = ready.iter().map(|r| r.chunks.len()).sum();
+        assert_eq!(forwarded_total, chunks.len());
+        assert!(ready.iter().all(|r| r.data_shards == data_shards));
+
+        for r in &ready {
+            node.forward_to_peers(
+                sender_addr,
+                r.msg_type,
+                &r.block_hash,
+                r.total_chunks,
+                r.data_shards,
+                &r.chunks,
+            )
+            .await
+            .unwrap();
+        }
+
+        let verify_session = RelaySession::new(receiver_addr, auth_key);
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..chunks.len() {
+            let (len, _) = timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                .await
+                .expect("timeout waiting for forwarded v3 chunk")
+                .unwrap();
+            let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
+            assert_eq!(parsed.header.version, 3);
+            assert_eq!(parsed.header.data_shards, data_shards);
+            assert!(verify_session.verify_hmac_v3(
+                &parsed.header.block_hash,
+                parsed.header.chunk_id,
+                parsed.header.total_chunks,
+                parsed.header.payload_len,
+                parsed.header.data_shards,
+                &parsed.payload,
+                &parsed.header.hmac,
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn forwards_compact_skeleton_chunks_after_pow_validation() {
+        // A CompactSkeleton is PoW-validated at the node exactly like a compact
+        // block (it carries the header) and forwarded to peers as authenticated
+        // v3 CompactSkeleton chunks under its own object id.
+        let auth_key = [0x42; 32];
+        let config =
+            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(sender_addr, RelaySession::new(sender_addr, auth_key));
+            sessions.insert(receiver_addr, RelaySession::new(receiver_addr, auth_key));
+        }
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0xbeef, Vec::new(), Vec::new());
+        let block_hash = *compact.header_hash().as_bytes();
+        let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+        let chunks = node
+            .chunker
+            .compact_block_to_chunks_skeleton(&compact, &object_hash)
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .all(|c| c.header.msg_type == MessageType::CompactSkeleton && c.header.version == 3)
+        );
+        let data_shards = chunks[0].header.data_shards;
+
+        let mut ready = Vec::new();
+        {
+            let mut sessions = node.sessions.write().await;
+            let session = sessions.get_mut(&sender_addr).unwrap();
+            for chunk in &chunks {
+                ready.extend(node.process_chunk_for_session(
+                    session,
+                    chunk,
+                    object_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                ));
+            }
+        }
+        let forwarded_total: usize = ready.iter().map(|r| r.chunks.len()).sum();
+        assert_eq!(forwarded_total, chunks.len(), "skeleton chunks forwardable");
+        assert!(
+            ready
+                .iter()
+                .all(|r| r.msg_type == MessageType::CompactSkeleton)
+        );
+
+        for r in &ready {
+            node.forward_to_peers(
+                sender_addr,
+                r.msg_type,
+                &r.block_hash,
+                r.total_chunks,
+                r.data_shards,
+                &r.chunks,
+            )
+            .await
+            .unwrap();
+        }
+
+        let verify_session = RelaySession::new(receiver_addr, auth_key);
+        let mut buf = vec![0u8; 2048];
+        for _ in 0..chunks.len() {
+            let (len, _) = timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
+                .await
+                .expect("timeout waiting for forwarded skeleton chunk")
+                .unwrap();
+            let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
+            assert_eq!(parsed.header.msg_type, MessageType::CompactSkeleton);
+            assert_eq!(parsed.header.version, 3);
+            assert_eq!(parsed.header.data_shards, data_shards);
+            assert!(verify_session.verify_hmac_v3(
+                &parsed.header.block_hash,
+                parsed.header.chunk_id,
+                parsed.header.total_chunks,
+                parsed.header.payload_len,
+                parsed.header.data_shards,
+                &parsed.payload,
+                &parsed.header.hmac,
+            ));
+        }
+    }
+
+    #[tokio::test]
     async fn forward_counts_chunks_without_eligible_receive_peers() {
         let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
             .with_unauthenticated_peers_allowed(true);
@@ -1348,7 +1766,7 @@ mod tests {
         let block_hash = [0xab; 32];
         let chunks = vec![(0u16, vec![1u8; 10]), (1u16, vec![2u8; 10])];
 
-        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 2, &chunks)
+        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 2, 0, &chunks)
             .await
             .unwrap();
 

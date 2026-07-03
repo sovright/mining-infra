@@ -1,0 +1,41 @@
+substitutions:
+  _COMMIT: "b3c2340"
+  _BUCKET: "sovright-bedrock-mainnet-bedrock-artifacts"
+  _TS: "20260630T223730Z"
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 2400s
+steps:
+  - name: rust:1-bookworm
+    id: build
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        cargo build --release -p sovright-relay-sidecar --bin relay-sidecar
+        mkdir -p out/bin
+        cp target/release/relay-sidecar out/bin/relay-sidecar
+        cd out
+        sha256sum bin/relay-sidecar > relay-sidecar.sha256
+        cat > manifest.json <<EOF
+        { "binary": "relay-sidecar", "commit": "${_COMMIT}", "target": "linux-amd64", "ts": "${_TS}" }
+        EOF
+        tar -czf relay-sidecar-${_TS}.tar.gz bin/relay-sidecar relay-sidecar.sha256 manifest.json
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    id: upload
+    entrypoint: bash
+    args:
+      - -ceu
+      - |
+        # objectCreator allows a pure media upload (no get/list precheck like the
+        # gsutil / gcloud-storage CLIs do), so upload via the raw JSON API.
+        TOKEN=$$(curl -s -H "Metadata-Flavor: Google" \
+          "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
+          | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+        OBJ="services/relay-sidecar/relay-sidecar-${_TS}.tar.gz"
+        HTTP=$$(curl -s -o /tmp/resp.json -w '%{http_code}' -X POST \
+          --data-binary @out/relay-sidecar-${_TS}.tar.gz \
+          -H "Authorization: Bearer $$TOKEN" -H "Content-Type: application/gzip" \
+          "https://storage.googleapis.com/upload/storage/v1/b/${_BUCKET}/o?uploadType=media&name=$$OBJ")
+        echo "upload HTTP $$HTTP"; cat /tmp/resp.json; echo
+        test "$$HTTP" = "200"

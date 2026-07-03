@@ -21,7 +21,7 @@ pub use builder::CompactBlockBuilder;
 pub use compact_block::{CompactBlock, PrefilledTx};
 pub use error::CompactBlockError;
 pub use fec::FecError;
-pub use hash::zcash_block_hash;
+pub use hash::{consensus_block_hash, consensus_block_hash_display, zcash_block_hash};
 pub use mempool::{
     MempoolError, MempoolProvider, TestMempool, TxCache, TxCacheConfig, TxCacheInsertOutcome,
     TxCacheSnapshot,
@@ -29,12 +29,12 @@ pub use mempool::{
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
-    BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
+    ArrivalSink, BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
     RelayPayload, render_prometheus_text,
 };
 pub use segmented_block::{
-    RawBlockSegment, SegmentedBlockError, reassemble_raw_block, segment_object_hash,
-    split_raw_block,
+    RawBlockSegment, SegmentedBlockError, compact_v3_object_hash, reassemble_raw_block,
+    segment_object_hash, skeleton_object_hash, split_raw_block,
 };
 pub use transport::{
     BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,

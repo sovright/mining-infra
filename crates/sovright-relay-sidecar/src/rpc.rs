@@ -110,6 +110,17 @@ pub struct BlockHeaderInfo {
     pub previous_block_hash: Option<String>,
 }
 
+/// Subset of verbose `getrawtransaction` used by the mempool-sync task. Extra
+/// fields are ignored. `authdigest` is absent for pre-v5 transactions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RawTransaction {
+    /// Raw transaction bytes (hex).
+    pub hex: String,
+    /// ZIP-244 auth digest (hex, display order). Absent for pre-v5 txs.
+    #[serde(default)]
+    pub authdigest: Option<String>,
+}
+
 impl ZebraRpc {
     /// Create a new Zebra RPC client
     pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -152,6 +163,30 @@ impl ZebraRpc {
             .await?;
 
         Ok(result)
+    }
+
+    /// List the transaction ids currently in the local Zebra mempool (display
+    /// order). Used by the mempool-sync task to fold Zebra's fuller mempool into
+    /// the compact-reconstruction tx cache.
+    pub async fn get_raw_mempool(
+        &self,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+        let _id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let txids: Vec<String> = self.client.request("getrawmempool", rpc_params![]).await?;
+        Ok(txids)
+    }
+
+    /// Fetch one transaction verbosely (`authdigest` + raw `hex`) by txid.
+    pub async fn get_raw_transaction(
+        &self,
+        txid: &str,
+    ) -> Result<RawTransaction, Box<dyn std::error::Error + Send + Sync>> {
+        let _id = self.request_id.fetch_add(1, Ordering::SeqCst);
+        let tx: RawTransaction = self
+            .client
+            .request("getrawtransaction", rpc_params![txid, 1])
+            .await?;
+        Ok(tx)
     }
 
     /// Fetch the current chain info (best tip + best hash).

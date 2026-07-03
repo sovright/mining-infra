@@ -284,6 +284,47 @@ pub fn segment_object_hash(block_hash: [u8; 32], segment_index: u16) -> [u8; 32]
     out
 }
 
+/// Derive the relay object identifier for a compact *skeleton* of a block.
+///
+/// A skeleton and the full compact block of the same block share the same Zcash
+/// block hash, but the relay mesh keys reassembly, replay detection, and
+/// delivery dedup by the 32-byte chunk-header object id. Routing the skeleton
+/// under a domain-separated derivation of the block hash keeps the two objects
+/// from colliding in those maps, so the skeleton fast path and the full-block
+/// push fallback reassemble and deliver independently. The receiver recomputes
+/// the real block hash from the reconstructed header, so this routing id never
+/// leaks into submission or dedup-by-block-hash.
+pub fn skeleton_object_hash(block_hash: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"FORGE compact skeleton v1");
+    hasher.update(block_hash);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
+/// Domain-separated relay routing id for an ADAPTIVE (version-3) compact block.
+///
+/// The fixed (v2) compact block is chunked under the raw block hash. The
+/// receiver keys its reassembly buffers by object hash alone, and every block is
+/// forwarded by all origins -- so in a MIXED fleet (some origins emitting v2,
+/// some v3, for the same block) v2 and v3 chunks would land in one buffer with
+/// incompatible `total_chunks`/shard schemes and corrupt the reconstruction.
+/// Routing v3 compact chunks under this distinct hash keeps the two schemes in
+/// SEPARATE buffers; the receiver reconstructs whichever completes first and the
+/// block's identity still comes from its decoded header. Mirrors
+/// [`skeleton_object_hash`].
+pub fn compact_v3_object_hash(block_hash: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"FORGE compact adaptive v3");
+    hasher.update(block_hash);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    out
+}
+
 fn sha256(data: &[u8]) -> [u8; 32] {
     let digest = Sha256::digest(data);
     let mut out = [0u8; 32];
