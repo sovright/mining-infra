@@ -125,23 +125,35 @@ pub struct PoolServer {
 /// attacker-controlled Prometheus label values; both the label and this set
 /// live until process restart, so the cap bounds metric cardinality against
 /// a client cycling names across reconnects.
-const MAX_WORKER_IDENTITIES: usize = 10_000;
+///
+/// Reconciled with the JD token path: both protocols admit named workers under
+/// the SAME bound (`zcash_pool_common::MAX_PERSISTED_WORKERS`) so neither can
+/// grow the shared durable payout map past it.
+const MAX_WORKER_IDENTITIES: usize = zcash_pool_common::MAX_PERSISTED_WORKERS;
 
 #[derive(Debug, PartialEq)]
 enum IdentityDecision {
     Accept,
     AlreadySet,
     CapReached,
+    /// The declared identity uses the reserved ephemeral prefix and is refused;
+    /// the channel stays unnamed (credited as an ephemeral `channel_<id>`).
+    Reserved,
 }
 
-/// Pure policy: immutability first, then the cardinality cap (existing names
-/// don't count against it, since they already occupy a process-lifetime slot).
+/// Pure policy: reserved-prefix refusal first (a miner must not be able to claim
+/// the ephemeral namespace), then immutability, then the cardinality cap
+/// (existing names don't count against it, since they already occupy a
+/// process-lifetime slot).
 fn apply_identity_policy(
     accepted: &mut HashSet<String>,
     current: &Option<String>,
     name: &str,
     cap: usize,
 ) -> IdentityDecision {
+    if zcash_pool_common::is_ephemeral_miner_id(name) {
+        return IdentityDecision::Reserved;
+    }
     if current.is_some() {
         return IdentityDecision::AlreadySet;
     }
@@ -229,7 +241,14 @@ impl PoolServer {
         let (session_tx, session_rx) = mpsc::channel(10000);
 
         // Create payout tracker (shared with JD server)
-        let payout_tracker = Arc::new(PayoutTracker::default());
+        let payout_tracker = Arc::new(if let Some(ref path) = config.payout_state_path {
+            info!(path = %path.display(), "Payout state persistence enabled");
+            PayoutTracker::with_persistence(Duration::from_secs(600), path.clone())
+                .map_err(|e| PoolError::Config(format!("Failed to load payout state: {}", e)))?
+        } else {
+            warn!("Payout state persistence disabled");
+            PayoutTracker::default()
+        });
         // Separate tracker keyed by worker label for per-worker hashrate metrics.
         let worker_hashrate_tracker = Arc::new(PayoutTracker::default());
 
@@ -360,6 +379,16 @@ impl PoolServer {
             });
         }
 
+        // Start control server if configured
+        if let Some(control_addr) = self.config.control_addr
+            && let Some(token) = self.config.control_auth_token.clone()
+        {
+            let tracker = Arc::clone(&self.payout_tracker);
+            tokio::spawn(async move {
+                crate::control::start_control_server(control_addr, token, tracker).await;
+            });
+        }
+
         // Bind to listen address
         let listener = TcpListener::bind(&self.config.listen_addr).await?;
         info!("Pool server listening on {}", self.config.listen_addr);
@@ -433,6 +462,13 @@ impl PoolServer {
         let sessions = Arc::clone(&self.sessions);
         let channels = Arc::clone(&self.channels);
         let metrics = Arc::clone(&self.metrics);
+        let settlement_retention = self.config.payout_settlement_retention;
+        let prune_archive_path = self.config.payout_archive_path.clone().or_else(|| {
+            self.config
+                .payout_state_path
+                .as_ref()
+                .map(|p| p.with_file_name("payout-archive.jsonl"))
+        });
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             loop {
@@ -443,6 +479,37 @@ impl PoolServer {
                 payout_tracker.rotate_window_if_needed();
                 worker_hashrate_tracker.cleanup_stale_miners(Duration::from_secs(1800));
                 worker_hashrate_tracker.rotate_window_if_needed();
+
+                // Persist payout totals off the hot path. record_share only marks
+                // the tracker dirty; this is where durable state is actually
+                // written (no-op when nothing changed or persistence is off).
+                if let Err(e) = payout_tracker.flush() {
+                    error!("Failed to flush payout state: {}", e);
+                }
+
+                // Prune settled miners to keep state file compact.
+                if let Some(ref archive_path) = prune_archive_path {
+                    match payout_tracker.prune_settled_miners(settlement_retention, archive_path) {
+                        Ok(n) if n > 0 => info!("pruned {} settled miners", n),
+                        Ok(_) => {}
+                        Err(e) => error!("prune_settled_miners failed: {}", e),
+                    }
+                }
+
+                // Observability: surface durable-map size and the count of named
+                // workers with unsettled credit. A persistently growing
+                // `unsettled` is the settlement-leak signal — durable rows whose
+                // identity the payout engine never settles (e.g. a JD client_id
+                // that no `stratum_auth` matches), which prune can never reclaim.
+                let (durable_named, unsettled_named) = payout_tracker.durable_worker_summary();
+                metrics.payout_durable_workers.set(durable_named as i64);
+                metrics.payout_unsettled_workers.set(unsettled_named as i64);
+                if unsettled_named > 0 {
+                    debug!(
+                        durable_named,
+                        unsettled_named, "Durable payout workers with unsettled credit"
+                    );
+                }
 
                 // Share-independent vardiff tick: lets overshooting channels
                 // recover. record_share-driven retargeting stops the moment a
@@ -695,6 +762,12 @@ impl PoolServer {
 
                     // Give sessions a moment to close gracefully
                     tokio::time::sleep(Duration::from_millis(500)).await;
+
+                    // Flush durable payout state before exiting so the last
+                    // window of credited shares is not lost on a clean shutdown.
+                    if let Err(e) = self.payout_tracker.flush() {
+                        error!("Failed to flush payout state on shutdown: {}", e);
+                    }
 
                     info!("Graceful shutdown complete ({} sessions closed)", session_count);
                     return Ok(());
@@ -1087,6 +1160,12 @@ impl PoolServer {
                             MAX_WORKER_IDENTITIES, channel_id, channel_id
                         );
                     }
+                    IdentityDecision::Reserved => {
+                        warn!(
+                            "Channel {} declared reserved-prefix identity '{}'; refused, stays as channel_{}",
+                            channel_id, worker_name, channel_id
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1207,17 +1286,6 @@ impl PoolServer {
         // already credited via the jd-server path. Treat as Duplicate so vardiff,
         // accepted counters, and metrics are not updated for a non-credited share.
         let mut cross_path_dup = false;
-        // Compute miner_id before acquiring channels.write() to avoid lock-order
-        // inversion: the cleanup task in handle_new_connection acquires
-        // connection_times.write() then channels.write(), so we must not hold
-        // channels.write() while awaiting connection_times.read().
-        let miner_id: MinerId = self
-            .connection_times
-            .read()
-            .await
-            .get(&channel_id)
-            .map(|(_, addr)| addr.ip().to_string())
-            .unwrap_or_else(|| format!("channel_{}", channel_id));
         let maybe_new_target = if let Ok(ref validation) = result {
             if validation.accepted {
                 let difficulty = validation.difficulty;
@@ -1237,6 +1305,10 @@ impl PoolServer {
                         stale_after_validation = true;
                         None
                     } else {
+                        // Key payout credit by worker name, not IP, so credits
+                        // survive reconnections as long as the worker label is stable.
+                        let miner_id: MinerId =
+                            resolve_worker_label(&channel.worker_identity, channel_id);
                         // Cross-path dedup check BEFORE updating vardiff: if the
                         // same valid solution already arrived via the jd-server path,
                         // skip vardiff and all accepted-share accounting. The
@@ -1749,11 +1821,29 @@ mod tests {
             apply_identity_policy(&mut accepted, &None, "rig-1", 2),
             IdentityDecision::Accept
         );
+
+        // A miner-declared identity using the reserved ephemeral prefix is
+        // refused (cannot be set), regardless of cap/immutability state.
+        assert_eq!(
+            apply_identity_policy(&mut accepted, &None, "channel_5", 2),
+            IdentityDecision::Reserved
+        );
     }
 
     #[test]
     fn worker_label_resolution() {
         assert_eq!(resolve_worker_label(&Some("rig-1".into()), 5), "rig-1");
         assert_eq!(resolve_worker_label(&None, 5), "channel_5");
+    }
+
+    #[test]
+    fn payout_keyed_by_worker_label_not_ip() {
+        // Named worker -> worker name.
+        assert_eq!(resolve_worker_label(&Some("rig1".to_string()), 42), "rig1");
+        // Unnamed -> ephemeral channel id, which payout treats as non-durable.
+        assert_eq!(resolve_worker_label(&None, 42), "channel_42");
+        assert!(zcash_pool_common::is_ephemeral_miner_id(
+            &resolve_worker_label(&None, 42)
+        ));
     }
 }

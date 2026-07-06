@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 use zcash_jd_server::ValidationLevel;
 
 /// Pool server configuration
@@ -36,6 +37,9 @@ pub struct PoolConfig {
 
     /// Pool's payout script for coinbase (used by JD Server)
     pub pool_payout_script: Option<Vec<u8>>,
+
+    /// Path to durable PPS payout state.
+    pub payout_state_path: Option<PathBuf>,
 
     /// Enable Noise encryption for miner connections
     pub noise_enabled: bool,
@@ -96,6 +100,24 @@ pub struct PoolConfig {
     pub timing_jitter_max_ms: u64,
     /// Warn if Noise is disabled (plain mode is insecure)
     pub warn_plain_mode: bool,
+
+    /// Optional bind address for the inbound settlement control plane.
+    pub control_addr: Option<SocketAddr>,
+    /// Bearer token required for control-plane requests. Required when
+    /// `control_addr` is set.
+    pub control_auth_token: Option<String>,
+    /// Opt-in acknowledgement required to bind `control_addr` to a
+    /// non-loopback address. The control plane authenticates with a static
+    /// bearer token sent in cleartext over plain HTTP, so binding it to a
+    /// routable interface exposes the token to the network. Defaults to
+    /// `false`, which restricts binds to loopback unless the operator
+    /// explicitly opts in (and fronts the plane with TLS).
+    pub allow_non_loopback_bind: bool,
+    /// How long a settled, idle worker is retained before pruning.
+    pub payout_settlement_retention: Duration,
+    /// Where pruned settlement records are archived (JSONL). Defaults next to
+    /// `payout_state_path` when unset.
+    pub payout_archive_path: Option<PathBuf>,
 }
 
 /// Configuration validation errors
@@ -123,6 +145,13 @@ pub enum ConfigError {
     InvalidTimingJitter { min_ms: u64, max_ms: u64 },
     /// Invalid FEC shard total (must be <= 255 for Reed-Solomon)
     InvalidFecShardTotal { total: usize },
+    /// Invalid payout state path
+    InvalidPayoutStatePath,
+    /// control_addr set but control_auth_token is missing or empty
+    ControlAddrMissingToken,
+    /// control_addr binds a non-loopback address without the explicit
+    /// `allow_non_loopback_bind` opt-in
+    ControlAddrNonLoopbackBind(SocketAddr),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -169,6 +198,24 @@ impl std::fmt::Display for ConfigError {
                     f,
                     "FEC shard total {} exceeds Reed-Solomon maximum of 255",
                     total
+                )
+            }
+            ConfigError::InvalidPayoutStatePath => {
+                write!(f, "payout_state_path must not be empty")
+            }
+            ConfigError::ControlAddrMissingToken => {
+                write!(
+                    f,
+                    "control_addr set but control_auth_token is missing or empty"
+                )
+            }
+            ConfigError::ControlAddrNonLoopbackBind(addr) => {
+                write!(
+                    f,
+                    "control_addr {} is not a loopback address: the control plane sends its \
+                     bearer token in cleartext over plain HTTP; keep it on loopback or front it \
+                     with TLS, or set allow_non_loopback_bind=true to override",
+                    addr
                 )
             }
         }
@@ -232,6 +279,15 @@ impl PoolConfig {
             return Err(ConfigError::JdMissingPayoutScript);
         }
 
+        if self
+            .payout_state_path
+            .as_ref()
+            .map(|path| path.as_os_str().is_empty())
+            .unwrap_or(false)
+        {
+            return Err(ConfigError::InvalidPayoutStatePath);
+        }
+
         // Timing jitter min must not exceed max
         if self.timing_jitter_enabled && self.timing_jitter_min_ms > self.timing_jitter_max_ms {
             return Err(ConfigError::InvalidTimingJitter {
@@ -246,6 +302,26 @@ impl PoolConfig {
             if total > 255 {
                 return Err(ConfigError::InvalidFecShardTotal { total });
             }
+        }
+
+        // control_addr requires a non-empty auth token
+        if self.control_addr.is_some()
+            && self
+                .control_auth_token
+                .as_ref()
+                .map(|t| t.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ConfigError::ControlAddrMissingToken);
+        }
+
+        // A non-loopback control bind exposes the cleartext bearer token to the
+        // network. Refuse it unless the operator explicitly opts in.
+        if let Some(addr) = self.control_addr
+            && !addr.ip().is_loopback()
+            && !self.allow_non_loopback_bind
+        {
+            return Err(ConfigError::ControlAddrNonLoopbackBind(addr));
         }
 
         Ok(())
@@ -265,6 +341,7 @@ impl Default for PoolConfig {
             max_connections: 10000,
             jd_listen_addr: None, // Disabled by default
             pool_payout_script: None,
+            payout_state_path: Some(PathBuf::from("payout-state.json")),
             noise_enabled: false,
             noise_private_key_path: None,
             jd_noise_enabled: false,
@@ -290,6 +367,11 @@ impl Default for PoolConfig {
             timing_jitter_min_ms: 0,
             timing_jitter_max_ms: 50,
             warn_plain_mode: true,
+            control_addr: None,
+            control_auth_token: None,
+            allow_non_loopback_bind: false,
+            payout_settlement_retention: Duration::from_secs(86_400),
+            payout_archive_path: None,
         }
     }
 }
@@ -298,6 +380,7 @@ impl Default for PoolConfig {
 mod tests {
     use super::*;
     use std::net::SocketAddr;
+    use std::time::Duration;
 
     fn valid_config() -> PoolConfig {
         PoolConfig::default()
@@ -306,6 +389,14 @@ mod tests {
     #[test]
     fn default_config_validates_ok() {
         assert!(valid_config().validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_has_payout_state_path() {
+        assert_eq!(
+            valid_config().payout_state_path,
+            Some(PathBuf::from("payout-state.json"))
+        );
     }
 
     // 1. InvalidNonce1Len
@@ -523,6 +614,13 @@ mod tests {
         assert!(cfg.validate().is_ok());
     }
 
+    #[test]
+    fn empty_payout_state_path_rejected() {
+        let mut cfg = valid_config();
+        cfg.payout_state_path = Some(PathBuf::new());
+        assert_eq!(cfg.validate(), Err(ConfigError::InvalidPayoutStatePath));
+    }
+
     // 12. Disabled features ignore invalid sub-config
     #[test]
     fn relay_disabled_ignores_missing_auth_key() {
@@ -539,5 +637,67 @@ mod tests {
         cfg.timing_jitter_min_ms = 100;
         cfg.timing_jitter_max_ms = 50;
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn control_addr_requires_token() {
+        let mut cfg = valid_config();
+        cfg.control_addr = Some(SocketAddr::from(([127, 0, 0, 1], 9091)));
+        cfg.control_auth_token = None;
+        assert!(cfg.validate().is_err());
+
+        // An empty token is also rejected, not just a missing one.
+        cfg.control_auth_token = Some(String::new());
+        assert!(cfg.validate().is_err());
+
+        cfg.control_auth_token = Some("secret".to_string());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn control_addr_loopback_bind_ok() {
+        // Loopback binds (IPv4 127/8 and IPv6 ::1) validate without the opt-in.
+        let mut cfg = valid_config();
+        cfg.control_auth_token = Some("secret".to_string());
+
+        cfg.control_addr = Some(SocketAddr::from(([127, 0, 0, 1], 9091)));
+        assert!(cfg.validate().is_ok());
+
+        cfg.control_addr = Some(SocketAddr::from(([127, 5, 6, 7], 9091)));
+        assert!(cfg.validate().is_ok(), "all of 127.0.0.0/8 is loopback");
+
+        cfg.control_addr = Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9091)));
+        assert!(cfg.validate().is_ok(), "::1 is loopback");
+    }
+
+    #[test]
+    fn control_addr_non_loopback_bind_rejected_by_default() {
+        let mut cfg = valid_config();
+        cfg.control_auth_token = Some("secret".to_string());
+        let addr = SocketAddr::from(([0, 0, 0, 0], 9091));
+        cfg.control_addr = Some(addr);
+
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::ControlAddrNonLoopbackBind(addr)),
+            "non-loopback control bind must be refused without the opt-in"
+        );
+    }
+
+    #[test]
+    fn control_addr_non_loopback_bind_allowed_with_opt_in() {
+        let mut cfg = valid_config();
+        cfg.control_auth_token = Some("secret".to_string());
+        cfg.control_addr = Some(SocketAddr::from(([0, 0, 0, 0], 9091)));
+        cfg.allow_non_loopback_bind = true;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn default_config_has_settlement_retention() {
+        assert_eq!(
+            valid_config().payout_settlement_retention,
+            Duration::from_secs(86_400)
+        );
     }
 }

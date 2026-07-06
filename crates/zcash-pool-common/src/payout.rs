@@ -1,12 +1,17 @@
 //! Simple PPS (Pay Per Share) tracking
 //!
 //! Tracks share submissions per miner for payout calculation.
-//! In-memory for Phase 3; can be upgraded to database-backed later.
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::io;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::error;
 
 /// Bounded FIFO set for cross-path solution deduplication.
 /// Evicts the oldest-inserted entry when capacity is reached. The set is
@@ -53,6 +58,18 @@ impl BoundedSolutionSet {
 /// Unique identifier for a miner (could be pubkey, address, etc.)
 pub type MinerId = String;
 
+/// Reserved prefix marking an ephemeral, unnamed worker identity
+/// (`resolve_worker_label` produces `channel_<id>` when no worker name was
+/// supplied). Entries with this prefix are never settle-eligible and are
+/// evicted on idle even when persistence is enabled.
+pub const EPHEMERAL_MINER_PREFIX: &str = "channel_";
+
+/// True if `id` is an ephemeral/unnamed worker identity (see
+/// [`EPHEMERAL_MINER_PREFIX`]).
+pub fn is_ephemeral_miner_id(id: &str) -> bool {
+    id.starts_with(EPHEMERAL_MINER_PREFIX)
+}
+
 /// Per-miner statistics
 #[derive(Debug, Clone, Default)]
 pub struct MinerStats {
@@ -80,10 +97,85 @@ pub struct MinerStats {
 /// cannot be reached by an attacker before the next block clears the set.
 const MAX_CROSS_PATH_SOLUTIONS: usize = 500_000;
 
+/// Cap on the number of distinct *named* (non-ephemeral) workers admitted into
+/// the durable payout map. Bounds the durable map and on-disk file against an
+/// identity space that settlement/pruning hasn't (yet) caught up with. The SV2
+/// path enforces the same cap at identity declaration; the JD path enforces it
+/// at token allocation — both reconcile to this single value so neither
+/// protocol can grow the durable map past it.
+pub const MAX_PERSISTED_WORKERS: usize = 10_000;
+
+#[derive(Debug, Clone)]
+struct PayoutPersistence {
+    path: PathBuf,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedPayoutState {
+    version: u32,
+    miners: BTreeMap<MinerId, PersistedMinerStats>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedMinerStats {
+    total_shares: u64,
+    total_difficulty: f64,
+    #[serde(default)]
+    settled_total_shares: u64,
+    #[serde(default)]
+    settled_total_difficulty: f64,
+    #[serde(default)]
+    last_share_unix_ms: Option<u64>,
+    #[serde(default)]
+    settled_at_unix_ms: Option<u64>,
+    #[serde(default)]
+    settlement_ref: Option<String>,
+}
+
+const PAYOUT_STATE_VERSION: u32 = 2;
+
+/// Result of a successful settlement, returned for caller confirmation.
+#[derive(Debug, Clone, Serialize)]
+pub struct SettleOutcome {
+    pub total_shares: u64,
+    pub settled_total_shares: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SettlementState {
+    settled_total_shares: u64,
+    settled_total_difficulty: f64,
+    last_share_unix_ms: Option<u64>,
+    settled_at_unix_ms: Option<u64>,
+    settlement_ref: Option<String>,
+}
+
+#[derive(Debug)]
+struct LoadedPayoutState {
+    miners: HashMap<MinerId, MinerStats>,
+    settlements: HashMap<MinerId, SettlementState>,
+}
+
+#[derive(Debug, Serialize)]
+struct SettlementArchiveRecord {
+    version: u32,
+    miner_id: MinerId,
+    total_shares: u64,
+    total_difficulty: f64,
+    settled_total_shares: u64,
+    settled_total_difficulty: f64,
+    last_share_unix_ms: Option<u64>,
+    settled_at_unix_ms: u64,
+    settlement_ref: String,
+    pruned_at_unix_ms: u64,
+}
+
 /// PPS payout tracker
 pub struct PayoutTracker {
     /// Per-miner statistics
     miners: RwLock<HashMap<MinerId, MinerStats>>,
+    /// Per-miner settlement watermarks and wall-clock timestamps.
+    settlements: RwLock<HashMap<MinerId, SettlementState>>,
     /// Window duration for rate calculations
     window_duration: Duration,
     /// When the current window started (first share in window)
@@ -92,16 +184,52 @@ pub struct PayoutTracker {
     /// solution reaches both the pool-server and jd-server submission paths.
     /// Keyed by SHA-256(solution_bytes); bounded FIFO, cleared on each new block.
     seen_solutions: RwLock<BoundedSolutionSet>,
+    /// Optional durable state path for payout totals.
+    persistence: Option<PayoutPersistence>,
+    /// Set whenever payout totals change since the last successful flush.
+    /// Recording a share marks this rather than writing to disk inline: the
+    /// disk write (full-file serialize + fsync) is far too expensive to run on
+    /// the hot path — per accepted share, under the `miners` write lock, on the
+    /// async runtime thread. Instead `flush()` is called periodically and on
+    /// graceful shutdown, doing the write off the lock. Worst case on a hard
+    /// crash is the loss of totals accumulated since the last flush interval.
+    dirty: AtomicBool,
 }
 
 impl PayoutTracker {
     pub fn new(window_duration: Duration) -> Self {
         Self {
             miners: RwLock::new(HashMap::new()),
+            settlements: RwLock::new(HashMap::new()),
             window_duration,
             window_start: RwLock::new(None),
             seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
+            persistence: None,
+            dirty: AtomicBool::new(false),
         }
+    }
+
+    /// Create a payout tracker that persists payout totals to disk.
+    ///
+    /// Only payout totals are restored after restart. Rolling-window counters
+    /// and active-miner timestamps restart empty because they describe current
+    /// process activity, not durable payout credit.
+    pub fn with_persistence<P>(window_duration: Duration, path: P) -> io::Result<Self>
+    where
+        P: Into<PathBuf>,
+    {
+        let path = path.into();
+        let loaded = load_persisted_state(&path)?;
+
+        Ok(Self {
+            miners: RwLock::new(loaded.miners),
+            settlements: RwLock::new(loaded.settlements),
+            window_duration,
+            window_start: RwLock::new(None),
+            seen_solutions: RwLock::new(BoundedSolutionSet::new(MAX_CROSS_PATH_SOLUTIONS)),
+            persistence: Some(PayoutPersistence { path }),
+            dirty: AtomicBool::new(false),
+        })
     }
 
     /// Record a share for a miner
@@ -109,7 +237,12 @@ impl PayoutTracker {
     /// Validates that difficulty is finite and positive before recording.
     /// Ignores shares with invalid difficulty (NaN, Infinity, negative, zero)
     /// to prevent poisoning payout calculations.
-    pub fn record_share(&self, miner_id: &MinerId, difficulty: f64) {
+    ///
+    /// Durable state is NOT written here — recording only marks the tracker
+    /// dirty (see [`PayoutTracker::flush`]); the disk write happens off the hot
+    /// path. Returns `true` if the share was recorded, `false` if it was
+    /// rejected for invalid difficulty.
+    pub fn record_share(&self, miner_id: &MinerId, difficulty: f64) -> bool {
         // Guard against NaN, Infinity, negative, and zero difficulty
         if !difficulty.is_finite() || difficulty <= 0.0 {
             tracing::warn!(
@@ -117,7 +250,7 @@ impl PayoutTracker {
                 difficulty,
                 miner_id
             );
-            return;
+            return false;
         }
 
         let now = Instant::now();
@@ -139,6 +272,25 @@ impl PayoutTracker {
         stats.window_shares += 1;
         stats.window_difficulty += difficulty;
         stats.last_share = Some(now);
+        drop(miners);
+
+        if self.persistence.is_some() {
+            let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
+            settlements
+                .entry(miner_id.clone())
+                .or_default()
+                .last_share_unix_ms = Some(unix_ms_now());
+        }
+        self.mark_dirty();
+        true
+    }
+
+    /// Mark payout totals as changed since the last flush. Cheap and lock-free;
+    /// the actual disk write is deferred to [`PayoutTracker::flush`].
+    fn mark_dirty(&self) {
+        if self.persistence.is_some() {
+            self.dirty.store(true, Ordering::Release);
+        }
     }
 
     /// Record a share, deduplicating by solution bytes across all submission paths.
@@ -289,10 +441,109 @@ impl PayoutTracker {
             .count()
     }
 
+    /// Number of distinct *named* (non-ephemeral) workers in the durable map.
+    /// Used to enforce [`MAX_PERSISTED_WORKERS`] symmetrically across the SV2
+    /// and JD identity-admission paths.
+    pub fn named_worker_count(&self) -> usize {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        miners
+            .keys()
+            .filter(|id| !is_ephemeral_miner_id(id))
+            .count()
+    }
+
+    /// Whether the durable map already holds this worker id (so admitting it
+    /// again does not consume a new slot against the cap).
+    pub fn knows_worker(&self, worker: &str) -> bool {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        miners.contains_key(worker)
+    }
+
+    /// Count of named workers that hold *unsettled* payout credit
+    /// (`settled_total_shares < total_shares`). This is the leak signal: rows
+    /// that keep accumulating credit but are never settled (e.g. a worker whose
+    /// pool credit-key never matches a `stratum_auth` the payout engine settles
+    /// by) will show up and grow here. Returns `(named_total, named_unsettled)`.
+    pub fn durable_worker_summary(&self) -> (usize, usize) {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        let settlements = self.settlements.read().unwrap_or_else(|e| e.into_inner());
+        let mut named_total = 0;
+        let mut named_unsettled = 0;
+        for (id, stats) in miners.iter() {
+            if is_ephemeral_miner_id(id) {
+                continue;
+            }
+            named_total += 1;
+            let settled = settlements
+                .get(id)
+                .map(|s| s.settled_total_shares)
+                .unwrap_or(0);
+            if settled < stats.total_shares {
+                named_unsettled += 1;
+            }
+        }
+        (named_total, named_unsettled)
+    }
+
     /// Remove a miner from the tracker (on disconnect)
     pub fn remove_miner(&self, miner_id: &MinerId) {
-        let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
-        miners.remove(miner_id);
+        {
+            let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
+            miners.remove(miner_id);
+            let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
+            settlements.remove(miner_id);
+        }
+        self.mark_dirty();
+    }
+
+    /// Record an explicit settlement watermark supplied by the payout engine.
+    ///
+    /// The watermark is clamped to the worker's current `total_shares` (never
+    /// settle shares the pool has not credited) and is monotonic (never moves
+    /// backward), so repeated/retried calls are idempotent. Returns `None` for
+    /// unknown or ephemeral (unnamed) workers.
+    ///
+    /// `settlement_ref` reflects the most recent settle call (last-writer-wins)
+    /// and is updated even when the watermark does not advance.
+    pub fn mark_miner_settled<S>(
+        &self,
+        miner_id: &MinerId,
+        settled_total_shares: u64,
+        settlement_ref: S,
+    ) -> Option<SettleOutcome>
+    where
+        S: Into<String>,
+    {
+        if is_ephemeral_miner_id(miner_id) {
+            return None;
+        }
+
+        let (current_total, current_difficulty) = {
+            let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+            let stats = miners.get(miner_id)?;
+            (stats.total_shares, stats.total_difficulty)
+        };
+
+        let now_unix_ms = unix_ms_now();
+        let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
+        let settlement = settlements.entry(miner_id.clone()).or_default();
+
+        let clamped = settled_total_shares.min(current_total);
+        let new_watermark = clamped.max(settlement.settled_total_shares);
+        settlement.settled_total_shares = new_watermark;
+        // Difficulty watermark tracks the current sum at the settled share count;
+        // it is archived for audit but no longer gates pruning (see Task A3).
+        settlement.settled_total_difficulty = current_difficulty;
+        settlement.last_share_unix_ms.get_or_insert(now_unix_ms);
+        settlement.settled_at_unix_ms = Some(now_unix_ms);
+        settlement.settlement_ref = Some(settlement_ref.into());
+        drop(settlements);
+
+        self.mark_dirty();
+        Some(SettleOutcome {
+            total_shares: current_total,
+            settled_total_shares: new_watermark,
+        })
     }
 
     /// Clear all cross-path solution hashes.
@@ -311,8 +562,18 @@ impl PayoutTracker {
 
     /// Remove miners that haven't submitted a share within the given duration.
     ///
-    /// Prevents unbounded growth of the miners HashMap when miners
-    /// disconnect and reconnect with new channel IDs.
+    /// Without persistence this evicts stale entries to prevent unbounded growth
+    /// of the miners HashMap when miners disconnect and reconnect with new
+    /// channel IDs.
+    ///
+    /// With persistence enabled, stale entries are NOT evicted — their durable
+    /// payout totals are owed to the miner and must survive idle periods — so
+    /// only the rolling-window/active fields are reset. NOTE: this means the map
+    /// (and the on-disk file) grow with the number of distinct miner ids ever
+    /// seen; that growth is bounded by the operator's payout-settlement policy
+    /// marking paid totals via [`PayoutTracker::mark_miner_settled`] and then
+    /// pruning fully settled entries via [`PayoutTracker::prune_settled_miners`],
+    /// not by this cleanup.
     pub fn cleanup_stale_miners(&self, max_idle: Duration) -> usize {
         // Use checked_sub to avoid panic if max_idle > uptime
         let cutoff = match Instant::now().checked_sub(max_idle) {
@@ -320,14 +581,505 @@ impl PayoutTracker {
             None => return 0, // All miners are within window, nothing to clean
         };
         let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
+
+        if self.persistence.is_some() {
+            let mut stale = 0;
+            miners.retain(|id, stats| {
+                let is_stale = stats.last_share.map(|t| t <= cutoff).unwrap_or(false);
+                if is_stale && is_ephemeral_miner_id(id) {
+                    stale += 1;
+                    return false; // drop ephemeral/unnamed entries
+                }
+                if is_stale {
+                    stats.window_shares = 0;
+                    stats.window_difficulty = 0.0;
+                    stats.last_share = None;
+                    stale += 1;
+                }
+                true
+            });
+            drop(miners);
+            if stale > 0 {
+                let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
+                settlements.retain(|id, _| !is_ephemeral_miner_id(id));
+                self.mark_dirty();
+                tracing::debug!(
+                    "cleanup_stale_miners: processed {} stale entries (ephemeral evicted, named reset)",
+                    stale
+                );
+            }
+            return stale;
+        }
+
         let before = miners.len();
         miners.retain(|_, stats| stats.last_share.map(|t| t > cutoff).unwrap_or(false));
         let removed = before - miners.len();
         if removed > 0 {
+            let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
+            settlements.retain(|miner_id, _| miners.contains_key(miner_id));
             tracing::debug!("Cleaned up {} stale miner entries", removed);
         }
         removed
     }
+
+    /// Archive and remove fully settled, idle payout entries from hot state.
+    ///
+    /// Unpaid credit is never pruned. A miner is eligible only when its current
+    /// totals exactly match the settlement watermark, it has been idle for at
+    /// least `retention`, and the settlement watermark itself has aged past the
+    /// same retention. Eligible entries are appended to `archive_path` as JSONL
+    /// before removal.
+    pub fn prune_settled_miners<P>(&self, retention: Duration, archive_path: P) -> io::Result<usize>
+    where
+        P: AsRef<Path>,
+    {
+        let cutoff_unix_ms = unix_ms_cutoff(retention);
+        let pruned_at_unix_ms = unix_ms_now();
+
+        let records = {
+            let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+            let settlements = self.settlements.read().unwrap_or_else(|e| e.into_inner());
+            miners
+                .iter()
+                .filter_map(|(miner_id, stats)| {
+                    let settlement = settlements.get(miner_id)?;
+                    archive_record_if_prunable(
+                        miner_id,
+                        stats,
+                        settlement,
+                        cutoff_unix_ms,
+                        pruned_at_unix_ms,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if records.is_empty() {
+            return Ok(0);
+        }
+
+        let removed = {
+            let mut miners = self.miners.write().unwrap_or_else(|e| e.into_inner());
+            let mut settlements = self.settlements.write().unwrap_or_else(|e| e.into_inner());
+
+            // Re-check every candidate under the write lock and keep only the
+            // records that are still prunable with unchanged totals. A share (or
+            // settlement) could have landed for a candidate between the read-lock
+            // snapshot above and this write lock, in which case it must NOT be
+            // pruned.
+            let confirmed: Vec<SettlementArchiveRecord> = records
+                .into_iter()
+                .filter(|record| {
+                    miners
+                        .get(&record.miner_id)
+                        .and_then(|stats| {
+                            settlements.get(&record.miner_id).and_then(|settlement| {
+                                archive_record_if_prunable(
+                                    &record.miner_id,
+                                    stats,
+                                    settlement,
+                                    cutoff_unix_ms,
+                                    pruned_at_unix_ms,
+                                )
+                            })
+                        })
+                        .map(|candidate| {
+                            candidate.total_shares == record.total_shares
+                                && candidate.total_difficulty == record.total_difficulty
+                                && candidate.settlement_ref == record.settlement_ref
+                        })
+                        .unwrap_or(false)
+                })
+                .collect();
+
+            if confirmed.is_empty() {
+                return Ok(0);
+            }
+
+            // Archive exactly the confirmed set, and only after the re-check, so
+            // the archive is 1:1 with removals: a record is never archived unless
+            // it is also removed in the same critical section. (The previous code
+            // archived every read-lock candidate before the re-check, so a record
+            // that failed the re-check was archived without being removed and then
+            // archived again on the next cycle -> duplicate archive entries.)
+            //
+            // Archive-before-remove ordering is preserved for crash-safety: the
+            // records are appended + fsynced to the archive before they leave hot
+            // state, and both steps run under the write lock so no concurrent share
+            // can change a worker's totals in between.
+            append_settlement_archive(archive_path.as_ref(), &confirmed)?;
+
+            for record in &confirmed {
+                miners.remove(&record.miner_id);
+                settlements.remove(&record.miner_id);
+            }
+            confirmed.len()
+        };
+
+        if removed > 0 {
+            self.mark_dirty();
+        }
+        Ok(removed)
+    }
+
+    /// Snapshot of per-worker totals + settlement watermark for reconciliation.
+    pub fn payout_rows(&self) -> Vec<(MinerId, u64, f64, u64, Option<String>)> {
+        let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+        let settlements = self.settlements.read().unwrap_or_else(|e| e.into_inner());
+        miners
+            .iter()
+            .map(|(id, s)| {
+                let st = settlements.get(id);
+                (
+                    id.clone(),
+                    s.total_shares,
+                    s.total_difficulty,
+                    st.map(|x| x.settled_total_shares).unwrap_or(0),
+                    st.and_then(|x| x.settlement_ref.clone()),
+                )
+            })
+            .collect()
+    }
+
+    /// Write payout totals to disk if anything changed since the last flush.
+    ///
+    /// This is the single place durable state is written. Call it periodically
+    /// (e.g. from the server maintenance loop) and on graceful shutdown. It is a
+    /// no-op when persistence is disabled or nothing is dirty. The miners map is
+    /// serialized under a short read lock; the actual file write (and fsync)
+    /// happens AFTER the lock is released, so flushing never blocks share
+    /// recording on disk I/O. On write failure the dirty flag is restored so a
+    /// later flush retries.
+    pub fn flush(&self) -> io::Result<()> {
+        let Some(persistence) = &self.persistence else {
+            return Ok(());
+        };
+
+        // Clear dirty first; if a share lands during the write it re-marks dirty
+        // and the next flush will pick it up.
+        if !self.dirty.swap(false, Ordering::AcqRel) {
+            return Ok(());
+        }
+
+        let json = {
+            let miners = self.miners.read().unwrap_or_else(|e| e.into_inner());
+            let settlements = self.settlements.read().unwrap_or_else(|e| e.into_inner());
+            serialize_state(&miners, &settlements)
+        };
+        let json = match json {
+            Ok(json) => json,
+            Err(err) => {
+                self.dirty.store(true, Ordering::Release);
+                return Err(err);
+            }
+        };
+
+        if let Err(err) = atomic_write(&persistence.path, &json) {
+            // Retry on the next flush rather than dropping the update.
+            self.dirty.store(true, Ordering::Release);
+            return Err(err);
+        }
+        Ok(())
+    }
+}
+
+fn archive_record_if_prunable(
+    miner_id: &MinerId,
+    stats: &MinerStats,
+    settlement: &SettlementState,
+    cutoff_unix_ms: u64,
+    pruned_at_unix_ms: u64,
+) -> Option<SettlementArchiveRecord> {
+    if settlement.settled_total_shares != stats.total_shares {
+        return None;
+    }
+
+    let last_share_unix_ms = settlement.last_share_unix_ms?;
+    if last_share_unix_ms > cutoff_unix_ms {
+        return None;
+    }
+
+    let settled_at_unix_ms = settlement.settled_at_unix_ms?;
+    if settled_at_unix_ms > cutoff_unix_ms {
+        return None;
+    }
+
+    Some(SettlementArchiveRecord {
+        version: PAYOUT_STATE_VERSION,
+        miner_id: miner_id.clone(),
+        total_shares: stats.total_shares,
+        total_difficulty: stats.total_difficulty,
+        settled_total_shares: settlement.settled_total_shares,
+        settled_total_difficulty: settlement.settled_total_difficulty,
+        last_share_unix_ms: Some(last_share_unix_ms),
+        settled_at_unix_ms,
+        settlement_ref: settlement.settlement_ref.clone()?,
+        pruned_at_unix_ms,
+    })
+}
+
+fn append_settlement_archive(path: &Path, records: &[SettlementArchiveRecord]) -> io::Result<()> {
+    if records.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    for record in records {
+        serde_json::to_writer(&mut file, record).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("serialize payout settlement archive: {}", err),
+            )
+        })?;
+        file.write_all(b"\n")?;
+    }
+    file.sync_all()?;
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+fn unix_ms_now() -> u64 {
+    unix_ms(SystemTime::now())
+}
+
+fn unix_ms_cutoff(retention: Duration) -> u64 {
+    SystemTime::now()
+        .checked_sub(retention)
+        .map(unix_ms)
+        .unwrap_or(0)
+}
+
+fn unix_ms(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn serialize_state(
+    miners: &HashMap<MinerId, MinerStats>,
+    settlements: &HashMap<MinerId, SettlementState>,
+) -> io::Result<Vec<u8>> {
+    let persisted = PersistedPayoutState {
+        version: PAYOUT_STATE_VERSION,
+        miners: miners
+            .iter()
+            .map(|(miner_id, stats)| {
+                let settlement = settlements.get(miner_id).cloned().unwrap_or_default();
+                (
+                    miner_id.clone(),
+                    PersistedMinerStats {
+                        total_shares: stats.total_shares,
+                        total_difficulty: stats.total_difficulty,
+                        settled_total_shares: settlement.settled_total_shares,
+                        settled_total_difficulty: settlement.settled_total_difficulty,
+                        last_share_unix_ms: settlement.last_share_unix_ms,
+                        settled_at_unix_ms: settlement.settled_at_unix_ms,
+                        settlement_ref: settlement.settlement_ref,
+                    },
+                )
+            })
+            .collect(),
+    };
+
+    serde_json::to_vec_pretty(&persisted).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("serialize payout state: {}", err),
+        )
+    })
+}
+
+fn load_persisted_state(path: &Path) -> io::Result<LoadedPayoutState> {
+    if !path.exists() {
+        return Ok(LoadedPayoutState {
+            miners: HashMap::new(),
+            settlements: HashMap::new(),
+        });
+    }
+
+    // A genuine I/O failure (permissions, unreadable device) is propagated so
+    // the operator notices a misconfiguration rather than silently losing
+    // accumulated payouts.
+    let json = std::fs::read_to_string(path)?;
+    if json.trim().is_empty() {
+        return Ok(LoadedPayoutState {
+            miners: HashMap::new(),
+            settlements: HashMap::new(),
+        });
+    }
+
+    // Corrupt / unparseable / wrong-version CONTENT must NOT brick the pool on
+    // boot: a truncated file from a crash, a manual edit, or a format change
+    // would otherwise make the pool refuse to start — the worst time to be
+    // down. Quarantine the bad file and start with empty totals.
+    match parse_persisted_state(&json, path) {
+        Ok(state) => Ok(state),
+        Err(err) => {
+            error!(
+                "Payout state {} is unusable ({}); backing it up and starting with empty totals",
+                path.display(),
+                err
+            );
+            quarantine_corrupt_file(path);
+            Ok(LoadedPayoutState {
+                miners: HashMap::new(),
+                settlements: HashMap::new(),
+            })
+        }
+    }
+}
+
+fn parse_persisted_state(json: &str, path: &Path) -> io::Result<LoadedPayoutState> {
+    let persisted: PersistedPayoutState = serde_json::from_str(json).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("parse payout state {}: {}", path.display(), err),
+        )
+    })?;
+
+    if persisted.version != PAYOUT_STATE_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unsupported payout state version {} in {}",
+                persisted.version,
+                path.display()
+            ),
+        ));
+    }
+
+    let mut miners = HashMap::new();
+    let mut settlements = HashMap::new();
+
+    for (miner_id, stats) in persisted.miners {
+        if !stats.total_difficulty.is_finite() || stats.total_difficulty < 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid payout difficulty {} for miner {}",
+                    stats.total_difficulty, miner_id
+                ),
+            ));
+        }
+
+        if !stats.settled_total_difficulty.is_finite() || stats.settled_total_difficulty < 0.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "invalid settled payout difficulty {} for miner {}",
+                    stats.settled_total_difficulty, miner_id
+                ),
+            ));
+        }
+
+        settlements.insert(
+            miner_id.clone(),
+            SettlementState {
+                settled_total_shares: stats.settled_total_shares,
+                settled_total_difficulty: stats.settled_total_difficulty,
+                last_share_unix_ms: stats.last_share_unix_ms,
+                settled_at_unix_ms: stats.settled_at_unix_ms,
+                settlement_ref: stats.settlement_ref,
+            },
+        );
+        miners.insert(
+            miner_id,
+            MinerStats {
+                total_shares: stats.total_shares,
+                total_difficulty: stats.total_difficulty,
+                window_shares: 0,
+                window_difficulty: 0.0,
+                last_share: None,
+            },
+        );
+    }
+
+    Ok(LoadedPayoutState {
+        miners,
+        settlements,
+    })
+}
+
+/// Move an unusable state file aside so a fresh one can be written and the
+/// operator can still recover the original. Best-effort: a failure here is
+/// logged but does not block startup.
+fn quarantine_corrupt_file(path: &Path) {
+    let backup = path.with_file_name(format!(
+        "{}.corrupt-{}",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "payout-state".to_string()),
+        std::process::id()
+    ));
+    if let Err(err) = std::fs::rename(path, &backup) {
+        error!(
+            "Failed to quarantine corrupt payout state {} -> {}: {}",
+            path.display(),
+            backup.display(),
+            err
+        );
+    } else {
+        error!("Quarantined corrupt payout state to {}", backup.display());
+    }
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let file_name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("payout state path {} has no file name", path.display()),
+        )
+    })?;
+    let tmp_path = path.with_file_name(format!(
+        ".{}.tmp-{}",
+        file_name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    // Write + fsync the temp file before the rename so the renamed-in data is
+    // durable, not just present in the page cache. The rename itself is atomic,
+    // so a crash leaves either the old file or the fully-written new one — never
+    // a torn file. (Cheap now that flush() is periodic rather than per-share.)
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, path)?;
+
+    // fsync the directory so the rename itself survives a crash.
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        && let Ok(dir) = std::fs::File::open(parent)
+    {
+        let _ = dir.sync_all();
+    }
+    Ok(())
 }
 
 impl Default for PayoutTracker {
@@ -339,6 +1091,19 @@ impl Default for PayoutTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_payout_state_path(test_name: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "bedrock-{test_name}-{}-{unique}.json",
+            std::process::id()
+        ))
+    }
 
     #[test]
     fn test_record_share() {
@@ -439,6 +1204,267 @@ mod tests {
     }
 
     #[test]
+    fn test_persistent_tracker_restores_totals_after_restart() {
+        let state_path = unique_payout_state_path("restart");
+        let miner = "miner1".to_string();
+
+        {
+            let tracker =
+                PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone())
+                    .unwrap();
+            tracker.record_share(&miner, 100.0);
+            tracker.record_share(&miner, 50.0);
+            // Durable state is written by flush(), not per-share.
+            tracker.flush().unwrap();
+        }
+
+        let restarted =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let stats = restarted.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 2);
+        assert_eq!(stats.total_difficulty, 150.0);
+        assert_eq!(stats.window_shares, 0);
+        assert_eq!(stats.window_difficulty, 0.0);
+        assert_eq!(restarted.active_miner_count(), 0);
+
+        restarted.record_share(&miner, 25.0);
+        restarted.flush().unwrap();
+        let restarted_again =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let stats = restarted_again.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 3);
+        assert_eq!(stats.total_difficulty, 175.0);
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_persistent_cleanup_preserves_payout_totals() {
+        let state_path = unique_payout_state_path("cleanup");
+        let miner = "miner1".to_string();
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        tracker.record_share(&miner, 100.0);
+        let removed = tracker.cleanup_stale_miners(Duration::ZERO);
+
+        assert_eq!(removed, 1);
+        let stats = tracker.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 1);
+        assert_eq!(stats.total_difficulty, 100.0);
+        assert_eq!(stats.window_shares, 0);
+        assert_eq!(stats.window_difficulty, 0.0);
+        assert_eq!(stats.last_share, None);
+
+        tracker.flush().unwrap();
+        let restarted =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let stats = restarted.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 1);
+        assert_eq!(stats.total_difficulty, 100.0);
+
+        let _ = std::fs::remove_file(state_path);
+    }
+
+    #[test]
+    fn test_unpaid_persistent_miner_is_not_pruned() {
+        let state_path = unique_payout_state_path("unpaid-prune");
+        let archive_path = unique_payout_state_path("unpaid-archive");
+        let miner = "miner1".to_string();
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        tracker.record_share(&miner, 100.0);
+        tracker.cleanup_stale_miners(Duration::ZERO);
+
+        let pruned = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+
+        assert_eq!(pruned, 0);
+        assert!(
+            tracker.get_stats(&miner).is_some(),
+            "unsettled payout credit must stay in hot state"
+        );
+        assert!(
+            !archive_path.exists(),
+            "unsettled payout credit must not be archived as settled"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(archive_path);
+    }
+
+    #[test]
+    fn test_settled_persistent_miner_is_archived_before_pruning() {
+        let state_path = unique_payout_state_path("settled-prune");
+        let archive_path = unique_payout_state_path("settled-archive");
+        let miner = "miner1".to_string();
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        tracker.record_share(&miner, 100.0);
+        let total = tracker.get_stats(&miner).unwrap().total_shares;
+        assert!(
+            tracker
+                .mark_miner_settled(&miner, total, "batch-1")
+                .is_some()
+        );
+        tracker.cleanup_stale_miners(Duration::ZERO);
+
+        let pruned = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(
+            tracker.get_stats(&miner).is_none(),
+            "fully settled payout entry should leave hot state"
+        );
+        let archive = std::fs::read_to_string(&archive_path).unwrap();
+        assert!(archive.contains("\"miner_id\":\"miner1\""));
+        assert!(archive.contains("\"settlement_ref\":\"batch-1\""));
+        assert!(archive.contains("\"total_shares\":1"));
+        assert!(archive.contains("\"total_difficulty\":100.0"));
+
+        tracker.flush().unwrap();
+        let restarted =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        assert!(
+            restarted.get_stats(&miner).is_none(),
+            "pruned entry must stay pruned after flushing state"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(archive_path);
+    }
+
+    #[test]
+    fn test_settlement_watermark_survives_restart_for_pruning() {
+        let state_path = unique_payout_state_path("settled-restart");
+        let archive_path = unique_payout_state_path("settled-restart-archive");
+        let miner = "miner1".to_string();
+
+        {
+            let tracker =
+                PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone())
+                    .unwrap();
+            tracker.record_share(&miner, 100.0);
+            let total = tracker.get_stats(&miner).unwrap().total_shares;
+            assert!(
+                tracker
+                    .mark_miner_settled(&miner, total, "batch-1")
+                    .is_some()
+            );
+            tracker.flush().unwrap();
+        }
+
+        let restarted =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        let pruned = restarted
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(
+            restarted.get_stats(&miner).is_none(),
+            "persisted settlement watermark should allow pruning after restart"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(archive_path);
+    }
+
+    #[test]
+    fn test_new_credit_after_settlement_blocks_pruning() {
+        let state_path = unique_payout_state_path("new-credit-after-settlement");
+        let archive_path = unique_payout_state_path("new-credit-archive");
+        let miner = "miner1".to_string();
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        tracker.record_share(&miner, 100.0);
+        let total = tracker.get_stats(&miner).unwrap().total_shares;
+        assert!(
+            tracker
+                .mark_miner_settled(&miner, total, "batch-1")
+                .is_some()
+        );
+        tracker.record_share(&miner, 25.0);
+        tracker.cleanup_stale_miners(Duration::ZERO);
+
+        let pruned = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+
+        assert_eq!(pruned, 0);
+        let stats = tracker.get_stats(&miner).unwrap();
+        assert_eq!(stats.total_shares, 2);
+        assert_eq!(stats.total_difficulty, 125.0);
+        assert!(
+            !archive_path.exists(),
+            "miner with credit after settlement must not be archived"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(archive_path);
+    }
+
+    /// A corrupt state file must not brick startup: it is quarantined and the
+    /// tracker starts with empty totals (graceful degradation over availability).
+    #[test]
+    fn test_corrupt_state_file_is_quarantined_not_fatal() {
+        let state_path = unique_payout_state_path("corrupt");
+        std::fs::write(&state_path, b"{ this is not valid json ]").unwrap();
+
+        // Must NOT return Err — the pool would otherwise refuse to start.
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        assert_eq!(tracker.get_all_stats().len(), 0, "should start empty");
+
+        // Original (bad) file was moved aside, not left in place to fail again.
+        assert!(!state_path.exists(), "corrupt file should be quarantined");
+
+        // Tracker is usable and can write a fresh, valid file.
+        tracker.record_share(&"miner1".to_string(), 10.0);
+        tracker.flush().unwrap();
+        let reloaded =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        assert_eq!(
+            reloaded
+                .get_stats(&"miner1".to_string())
+                .unwrap()
+                .total_shares,
+            1
+        );
+
+        // Clean up the quarantine backup + fresh file.
+        let backup = state_path.with_file_name(format!(
+            "{}.corrupt-{}",
+            state_path.file_name().unwrap().to_string_lossy(),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    /// flush() is a no-op when nothing changed since the last flush.
+    #[test]
+    fn test_flush_is_noop_when_not_dirty() {
+        let state_path = unique_payout_state_path("noop");
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        // Nothing recorded yet: no file should be created by a flush.
+        tracker.flush().unwrap();
+        assert!(!state_path.exists(), "clean flush must not write a file");
+
+        tracker.record_share(&"miner1".to_string(), 5.0);
+        tracker.flush().unwrap();
+        assert!(state_path.exists(), "dirty flush must write a file");
+        let _ = std::fs::remove_file(&state_path);
+    }
+
+    #[test]
     fn test_estimate_pool_hashrate_no_shares() {
         let tracker = PayoutTracker::default();
         assert_eq!(tracker.estimate_pool_hashrate(), 0.0);
@@ -480,6 +1506,38 @@ mod tests {
     fn test_active_miner_count_empty() {
         let tracker = PayoutTracker::default();
         assert_eq!(tracker.active_miner_count(), 0);
+    }
+
+    #[test]
+    fn test_named_worker_count_excludes_ephemeral_and_knows_worker() {
+        let tracker = PayoutTracker::default();
+        tracker.record_share(&"rig1".to_string(), 1.0);
+        tracker.record_share(&"rig2".to_string(), 1.0);
+        // Ephemeral (channel_*) entries must not count against the named cap.
+        tracker.record_share(&format!("{}7", EPHEMERAL_MINER_PREFIX), 1.0);
+
+        assert_eq!(tracker.named_worker_count(), 2);
+        assert!(tracker.knows_worker("rig1"));
+        assert!(!tracker.knows_worker("rig3"));
+    }
+
+    #[test]
+    fn test_durable_worker_summary_flags_unsettled() {
+        // Use persistence so settlement watermarks are tracked.
+        let state_path = unique_payout_state_path("summary");
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+        tracker.record_share(&"rig1".to_string(), 1.0);
+        tracker.record_share(&"rig2".to_string(), 1.0);
+
+        // Both named, both unsettled.
+        assert_eq!(tracker.durable_worker_summary(), (2, 2));
+
+        // Settle rig1 up to its current total → no longer unsettled.
+        tracker.mark_miner_settled(&"rig1".to_string(), 1, "batch-1");
+        assert_eq!(tracker.durable_worker_summary(), (2, 1));
+
+        let _ = std::fs::remove_file(state_path);
     }
 
     #[test]
@@ -788,5 +1846,178 @@ mod tests {
         let removed = tracker.cleanup_stale_miners(Duration::from_secs(3600));
         assert_eq!(removed, 0, "no miners should be removed when all are fresh");
         assert_eq!(tracker.get_all_stats().len(), 1);
+    }
+
+    #[test]
+    fn ephemeral_id_detection() {
+        assert!(is_ephemeral_miner_id("channel_42"));
+        assert!(!is_ephemeral_miner_id("rig1"));
+        assert!(!is_ephemeral_miner_id("worker.channel_1")); // only a prefix match counts
+    }
+
+    #[test]
+    fn settle_clamps_and_is_monotonic() {
+        let t = PayoutTracker::new(Duration::from_secs(600));
+        for _ in 0..10 {
+            t.record_share(&"rig1".to_string(), 1.0);
+        }
+
+        // Clamp: cannot settle more than current total.
+        let o = t
+            .mark_miner_settled(&"rig1".to_string(), 999, "batch-1")
+            .unwrap();
+        assert_eq!(o.total_shares, 10);
+        assert_eq!(o.settled_total_shares, 10);
+
+        // Monotonic: a lower explicit total never moves the watermark backward.
+        let o = t
+            .mark_miner_settled(&"rig1".to_string(), 3, "batch-2")
+            .unwrap();
+        assert_eq!(o.settled_total_shares, 10);
+    }
+
+    #[test]
+    fn settle_unknown_or_ephemeral_returns_none() {
+        let t = PayoutTracker::new(Duration::from_secs(600));
+        assert!(t.mark_miner_settled(&"ghost".to_string(), 1, "b").is_none());
+        t.record_share(&"channel_7".to_string(), 1.0);
+        assert!(
+            t.mark_miner_settled(&"channel_7".to_string(), 1, "b")
+                .is_none()
+        );
+    }
+
+    /// Discriminating test: passes under the count-only gate, fails under the
+    /// old gate that also checked `settled_total_difficulty != stats.total_difficulty`.
+    ///
+    /// Setup:
+    ///   - 5 shares at difficulty 1.0  → total_shares=5, total_difficulty=5.0
+    ///   - mark_miner_settled(count=5) → settled_total_shares=5, settled_total_difficulty=5.0
+    ///   - DIRECTLY mutate settled_total_difficulty to 999.0 (leaving share count at 5)
+    ///
+    /// Under the OLD gate: 999.0 != 5.0 → blocked (would return 0)
+    /// Under the NEW count-only gate: settled_total_shares==total_shares → prunable (returns 1)
+    #[test]
+    fn prune_gate_uses_share_count_not_difficulty() {
+        let dir = std::env::temp_dir();
+        let archive = dir.join(format!(
+            "settle-arch-{}-{}.jsonl",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_file(&archive);
+
+        let t = PayoutTracker::new(Duration::from_secs(600));
+        for _ in 0..5 {
+            t.record_share(&"rig1".to_string(), 1.0);
+        }
+        // Settle count=5; this stamps settled_total_difficulty=5.0 matching total.
+        t.mark_miner_settled(&"rig1".to_string(), 5, "batch-1")
+            .unwrap();
+
+        // Directly mutate settled_total_difficulty to a value that differs from
+        // stats.total_difficulty (5.0), while keeping settled_total_shares == 5.
+        // Old gate: `settled_total_difficulty != stats.total_difficulty` would block pruning.
+        // New gate: only checks share count, so pruning must still proceed.
+        {
+            let mut settlements = t.settlements.write().unwrap_or_else(|e| e.into_inner());
+            let s = settlements.get_mut("rig1").expect("settlement must exist");
+            s.settled_total_difficulty = 999.0; // mismatch with stats.total_difficulty=5.0
+        }
+
+        let pruned = t.prune_settled_miners(Duration::ZERO, &archive).unwrap();
+        assert_eq!(
+            pruned, 1,
+            "count-only gate must prune even when settled_total_difficulty differs from total_difficulty"
+        );
+        assert!(
+            t.get_stats(&"rig1".to_string()).is_none(),
+            "miner must be removed from hot state after pruning"
+        );
+
+        let _ = std::fs::remove_file(&archive);
+    }
+
+    /// The archive must contain exactly one record per removal: across two prune
+    /// cycles (with a fresh share landing for an already-pruned worker between
+    /// them) the number of archived lines equals the total number of removed
+    /// workers, and no archive line is byte-for-byte duplicated. This is the
+    /// 1:1 archive⇄removal invariant — a record is never archived without being
+    /// removed (which would re-archive it on the next cycle).
+    #[test]
+    fn prune_archives_exactly_one_record_per_removal() {
+        let state_path = unique_payout_state_path("one-to-one-state");
+        let archive_path = unique_payout_state_path("one-to-one-archive");
+        let _ = std::fs::remove_file(&archive_path);
+
+        let tracker =
+            PayoutTracker::with_persistence(Duration::from_secs(600), state_path.clone()).unwrap();
+
+        // Two named workers, both fully settled and idle → both prunable.
+        tracker.record_share(&"rig1".to_string(), 10.0);
+        tracker.record_share(&"rig2".to_string(), 20.0);
+        tracker.mark_miner_settled(&"rig1".to_string(), 1, "batch-1");
+        tracker.mark_miner_settled(&"rig2".to_string(), 1, "batch-1");
+
+        // Cycle 1: removes rig1 + rig2.
+        let removed1 = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+        assert_eq!(removed1, 2);
+
+        // A fresh share lands for a worker that was just pruned; it re-enters hot
+        // state with new, unsettled credit, then gets settled again.
+        tracker.record_share(&"rig1".to_string(), 5.0);
+        tracker.mark_miner_settled(&"rig1".to_string(), 1, "batch-2");
+
+        // Cycle 2: removes rig1 (the new settlement epoch) only.
+        let removed2 = tracker
+            .prune_settled_miners(Duration::ZERO, archive_path.clone())
+            .unwrap();
+        assert_eq!(removed2, 1);
+
+        // The archive must hold exactly `removed1 + removed2` records, with no
+        // byte-identical duplicate line.
+        let archive = std::fs::read_to_string(&archive_path).unwrap();
+        let lines: Vec<&str> = archive.lines().filter(|l| !l.trim().is_empty()).collect();
+        assert_eq!(
+            lines.len(),
+            removed1 + removed2,
+            "archive must contain exactly one record per removal"
+        );
+        let unique: HashSet<&str> = lines.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            lines.len(),
+            "archive must not contain duplicate records"
+        );
+
+        let _ = std::fs::remove_file(state_path);
+        let _ = std::fs::remove_file(archive_path);
+    }
+
+    #[test]
+    fn cleanup_evicts_ephemeral_but_keeps_named_under_persistence() {
+        let dir = std::env::temp_dir();
+        let state = dir.join(format!("settle-state-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&state);
+        let t = PayoutTracker::with_persistence(Duration::from_secs(600), &state).unwrap();
+
+        t.record_share(&"rig1".to_string(), 1.0);
+        t.record_share(&"channel_9".to_string(), 1.0);
+        // Force both stale by clearing last_share via a long idle cleanup.
+        std::thread::sleep(Duration::from_millis(5));
+        t.cleanup_stale_miners(Duration::ZERO);
+
+        assert!(t.get_stats(&"rig1".to_string()).is_some()); // named: retained
+        assert!(t.get_stats(&"channel_9".to_string()).is_none()); // ephemeral: evicted
+    }
+
+    #[test]
+    fn payout_state_version_is_two() {
+        assert_eq!(PAYOUT_STATE_VERSION, 2);
     }
 }

@@ -3,6 +3,14 @@ resolver = "3"
 members = [
     "crates/*",
 ]
+# Untracked WIP directories under crates/ that have no root Cargo.toml yet.
+# Excluded so the crates/* glob can load the workspace; harmless on CI where
+# these paths do not exist.
+exclude = [
+    "crates/bedrock-forge",
+    "crates/bedrock-noise",
+    "crates/forge-sidecar",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -35,7 +35,7 @@ use zcash_equihash_validator::{
     EquihashValidator, Target, ValidationError, compact_to_target, target_to_difficulty,
 };
 use zcash_mining_protocol::codec::MessageFrame;
-use zcash_pool_common::PayoutTracker;
+use zcash_pool_common::{MAX_PERSISTED_WORKERS, PayoutTracker, is_ephemeral_miner_id};
 use zcash_template_provider::calculate_block_commitments_hash;
 use zcash_template_provider::types::Hash256;
 
@@ -394,6 +394,31 @@ impl JdServer {
         user_id: &str,
         requested_mode: JobDeclarationMode,
     ) -> Result<AllocateMiningJobTokenSuccess> {
+        // The token's client_id becomes the durable payout credit key. Refuse
+        // identities in the reserved ephemeral namespace: such credit would be
+        // treated as unnamed (never persisted, never settleable, idle-evicted),
+        // silently dropping the miner's owed shares.
+        if is_ephemeral_miner_id(user_id) {
+            return Err(JdServerError::Protocol(format!(
+                "user_identifier '{}' uses the reserved ephemeral prefix",
+                user_id
+            )));
+        }
+
+        // Cardinality cap, symmetric with the SV2 worker-identity cap: refuse a
+        // NEW distinct named worker once the durable payout map is full, so the
+        // JD path cannot grow the durable map/file past MAX_PERSISTED_WORKERS
+        // (the SV2 path enforces the same bound at identity declaration).
+        // Already-credited workers are always allowed through.
+        if !self.payout_tracker.knows_worker(user_id)
+            && self.payout_tracker.named_worker_count() >= MAX_PERSISTED_WORKERS
+        {
+            return Err(JdServerError::Protocol(format!(
+                "worker identity cap ({}) reached; cannot allocate token for new worker '{}'",
+                MAX_PERSISTED_WORKERS, user_id
+            )));
+        }
+
         // Determine granted mode based on request and server configuration
         let granted_mode = if requested_mode == JobDeclarationMode::FullTemplate {
             if self.config.full_template_enabled {
@@ -875,6 +900,18 @@ impl JdServer {
             // second time after the pool-path record was wiped (epoch-clear double
             // credit). try_record_share_once does not await, so the guard is brief and
             // cannot deadlock (no other lock is held while awaiting it).
+            // IDENTITY CONTRACT: the durable payout credit key here is the JD
+            // token's `client_id` (the miner-declared `user_identifier`). For
+            // settlement and pruning to work, this MUST equal the same worker
+            // identity used on the other two surfaces:
+            //   pool SV2 path  -> `worker_identity` (SET_WORKER_IDENTITY)
+            //   payout engine  -> `stratum_auth` (sovright-api settles by this)
+            // i.e. `SV2 worker_identity == JD client_id == stratum_auth`.
+            // If a JD miner's client_id does not match the stratum_auth the
+            // payout engine settles by, this row is never settled and never
+            // pruned (it shows up in metrics.payout_unsettled_workers). The
+            // pool cannot enforce cross-protocol equality; operators must
+            // configure the same identity string across protocols.
             let difficulty = target_to_difficulty(&Target::from_le_bytes(share_target));
             let credit = {
                 let guard = self.current_prev_hash.read().await;
@@ -1615,6 +1652,41 @@ mod tests {
         assert_eq!(response.coinbase_output, config.pool_payout_script);
         assert!(response.async_mining_allowed);
         assert_eq!(response.granted_mode, JobDeclarationMode::CoinbaseOnly);
+    }
+
+    #[test]
+    fn allocate_token_rejects_reserved_prefix_identity() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        let server = JdServer::new(config, payout_tracker);
+
+        // Reserved ephemeral-prefix user_identifier is refused.
+        let reserved =
+            server.handle_allocate_token(1, "channel_evil", JobDeclarationMode::CoinbaseOnly);
+        assert!(reserved.is_err());
+
+        // A normal identifier still allocates.
+        let ok = server.handle_allocate_token(2, "rig-1", JobDeclarationMode::CoinbaseOnly);
+        assert!(ok.is_ok());
+    }
+
+    #[test]
+    fn allocate_token_enforces_named_worker_cap() {
+        let config = test_config();
+        let payout_tracker = Arc::new(PayoutTracker::default());
+        // Fill the durable map to the shared cap with distinct named workers.
+        for i in 0..MAX_PERSISTED_WORKERS {
+            payout_tracker.record_share(&format!("rig-{i}"), 1.0);
+        }
+        let server = JdServer::new(config, Arc::clone(&payout_tracker));
+
+        // A brand-new worker beyond the cap is refused (symmetric with SV2).
+        let over = server.handle_allocate_token(1, "rig-new", JobDeclarationMode::CoinbaseOnly);
+        assert!(over.is_err(), "new worker past the cap must be rejected");
+
+        // An already-credited worker is still allowed (occupies an existing slot).
+        let known = server.handle_allocate_token(2, "rig-0", JobDeclarationMode::CoinbaseOnly);
+        assert!(known.is_ok(), "existing worker must not be capped out");
     }
 
     #[tokio::test]

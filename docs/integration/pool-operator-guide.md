@@ -127,6 +127,7 @@ cargo run --release -p zcash-pool-server -- --config pool.toml
 |--------|---------|-------------|
 | `listen_addr` | `0.0.0.0:3333` | Miner connection endpoint |
 | `jd_listen_addr` | `0.0.0.0:3334` | JD Client endpoint |
+| `payout_state_path` | `payout-state.json` | Durable PPS payout state file |
 | `max_connections` | `10000` | Maximum concurrent miners |
 
 ### Zebra Settings

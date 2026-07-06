@@ -61,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `nonce_1_len` | 4 | Pool nonce prefix length (bytes) |
 | `initial_difficulty` | 1.0 | Starting share difficulty |
 | `target_shares_per_minute` | 5.0 | Vardiff target rate |
+| `payout_state_path` | `payout-state.json` | Durable PPS payout state file |
 | `validation_threads` | 4 | Threads for Equihash validation |
 | `max_connections` | 10000 | Maximum concurrent miners |
 
