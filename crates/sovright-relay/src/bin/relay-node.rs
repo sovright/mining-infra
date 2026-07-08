@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
 
-use sovright_relay::{ArrivalSink, AuthKey, RelayConfig, RelayNode, render_prometheus_text};
+use sovright_relay::{
+    ArrivalSink, AuthKey, KeyRole, RelayConfig, RelayNode, render_prometheus_text,
+};
 use tracing::{error, info, warn};
 
 #[tokio::main]
@@ -168,11 +170,18 @@ fn resolve_auth_keys() -> Result<AuthKeysResolution, Box<dyn std::error::Error +
     })
 }
 
-/// Parse an auth-keys file's contents: one `id:hex64` entry per line.
-/// Blank lines and lines starting with `#` are ignored. Reuses
-/// `parse_named_auth_key` per line (a bare `hex64` line, with no `id:`
-/// prefix, is accepted the same way it is for `SOVRIGHT_RELAY_AUTH_KEYS_HEX`,
-/// deriving an id from the line's 0-based position).
+/// Parse an auth-keys file's contents: one entry per line, shaped
+/// `id:hex64`, `id:hex64:full`, `id:hex64:recv`, or a bare `hex64` (no id;
+/// an id is derived from the line's 0-based position, same convention as
+/// `SOVRIGHT_RELAY_AUTH_KEYS_HEX`). Blank lines and lines starting with `#`
+/// are ignored.
+///
+/// Unlike `SOVRIGHT_RELAY_AUTH_KEYS_HEX` (env, always `Full`), a file line
+/// with no explicit role field defaults to [`KeyRole::ReceiveOnly`] -- this
+/// file is the invite-tooling's write target, so an invitee key becomes
+/// receive-only automatically, with no tooling change needed. An explicit
+/// `:full` third field opts a file line into `Full` (e.g. to add a real
+/// fleet member via the hot-reloadable file). See `parse_auth_keys_file_line`.
 fn parse_auth_keys_file_contents(
     contents: &str,
 ) -> Result<Vec<AuthKey>, Box<dyn std::error::Error + Send + Sync>> {
@@ -182,9 +191,60 @@ fn parse_auth_keys_file_contents(
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        keys.push(parse_named_auth_key(line, index)?);
+        keys.push(parse_auth_keys_file_line(line, index)?);
     }
     Ok(keys)
+}
+
+/// Parse one auth-keys FILE line: `id:hex64` (role defaults to
+/// `ReceiveOnly`), `id:hex64:full` or `id:hex64:recv` (explicit role), or a
+/// bare `hex64` with no id (role defaults to `ReceiveOnly`; an id is derived
+/// as `key<index>`).
+///
+/// The default role is `ReceiveOnly` -- this is the security-relevant
+/// default that makes invitee keys (the file's intended source, written by
+/// invite tooling) receive-only automatically. An unrecognized role token
+/// (anything other than `full` or `recv`) is a hard parse error: the
+/// caller's existing fail-safe means a bad line never silently becomes valid
+/// input, and never removes the env/fleet keys from the active set.
+fn parse_auth_keys_file_line(
+    line: &str,
+    index: usize,
+) -> Result<AuthKey, Box<dyn std::error::Error + Send + Sync>> {
+    let fields: Vec<&str> = line.splitn(3, ':').collect();
+    match fields.as_slice() {
+        [hex] => Ok(AuthKey::new(format!("key{index}"), parse_auth_key(hex)?)
+            .with_role(KeyRole::ReceiveOnly)),
+        [id, hex] => {
+            if !is_valid_key_id(id) {
+                return Err(format!(
+                    "invalid auth key id '{id}': must match [A-Za-z0-9_-]{{1,32}}"
+                )
+                .into());
+            }
+            Ok(AuthKey::new(*id, parse_auth_key(hex)?).with_role(KeyRole::ReceiveOnly))
+        }
+        [id, hex, role] => {
+            if !is_valid_key_id(id) {
+                return Err(format!(
+                    "invalid auth key id '{id}': must match [A-Za-z0-9_-]{{1,32}}"
+                )
+                .into());
+            }
+            let role = match *role {
+                "full" => KeyRole::Full,
+                "recv" => KeyRole::ReceiveOnly,
+                other => {
+                    return Err(format!(
+                        "invalid auth key role '{other}': expected 'full' or 'recv'"
+                    )
+                    .into());
+                }
+            };
+            Ok(AuthKey::new(*id, parse_auth_key(hex)?).with_role(role))
+        }
+        _ => unreachable!("str::splitn(3, ..) yields at most 3 fields"),
+    }
 }
 
 fn read_auth_keys_file(
@@ -351,12 +411,16 @@ async fn auth_keys_reload_worker(
 
 /// Compare two file-derived key sets for equality ignoring line order.
 ///
-/// Reordering lines in the auth-keys file (same ids and keys, just a
+/// Reordering lines in the auth-keys file (same ids, keys, and roles, just a
 /// different order) must NOT be treated as a change -- only an actual
-/// addition, removal, or key-value change should trigger a reload.
+/// addition, removal, key-value change, or role change should trigger a
+/// reload (role is included so flipping a line's `:full`/`:recv` field is
+/// itself picked up as a change, same as any other key edit).
 fn file_key_sets_equal(a: &[AuthKey], b: &[AuthKey]) -> bool {
-    let set_a: HashSet<(&str, [u8; 32])> = a.iter().map(|k| (k.id.as_str(), k.key)).collect();
-    let set_b: HashSet<(&str, [u8; 32])> = b.iter().map(|k| (k.id.as_str(), k.key)).collect();
+    let set_a: HashSet<(&str, [u8; 32], KeyRole)> =
+        a.iter().map(|k| (k.id.as_str(), k.key, k.role)).collect();
+    let set_b: HashSet<(&str, [u8; 32], KeyRole)> =
+        b.iter().map(|k| (k.id.as_str(), k.key, k.role)).collect();
     set_a == set_b
 }
 
@@ -770,6 +834,86 @@ mod tests {
         let hex = hex64(0xcc);
         let contents = format!("bad id!:{hex}\n");
         assert!(parse_auth_keys_file_contents(&contents).is_err());
+    }
+
+    // --- Role-scoped keys (file line role parsing) ---------------------
+
+    #[test]
+    fn file_line_id_hex_defaults_to_receive_only() {
+        let hex = hex64(0x10);
+        let key = parse_auth_keys_file_line(&format!("alice:{hex}"), 0).unwrap();
+        assert_eq!(key.id, "alice");
+        assert_eq!(key.role, KeyRole::ReceiveOnly);
+    }
+
+    #[test]
+    fn file_line_bare_hex_defaults_to_receive_only() {
+        let hex = hex64(0x11);
+        let key = parse_auth_keys_file_line(&hex, 3).unwrap();
+        assert_eq!(key.id, "key3");
+        assert_eq!(key.role, KeyRole::ReceiveOnly);
+    }
+
+    #[test]
+    fn file_line_explicit_full_role() {
+        let hex = hex64(0x12);
+        let key = parse_auth_keys_file_line(&format!("alice:{hex}:full"), 0).unwrap();
+        assert_eq!(key.role, KeyRole::Full);
+    }
+
+    #[test]
+    fn file_line_explicit_recv_role() {
+        let hex = hex64(0x13);
+        let key = parse_auth_keys_file_line(&format!("alice:{hex}:recv"), 0).unwrap();
+        assert_eq!(key.role, KeyRole::ReceiveOnly);
+    }
+
+    #[test]
+    fn file_line_bogus_role_is_a_parse_error() {
+        let hex = hex64(0x14);
+        let err = parse_auth_keys_file_line(&format!("alice:{hex}:bogus"), 0)
+            .expect_err("unknown role token must be a hard parse error");
+        assert!(err.to_string().contains("role"));
+    }
+
+    #[test]
+    fn parse_auth_keys_file_contents_applies_per_line_roles() {
+        let full_hex = hex64(0x15);
+        let recv_hex = hex64(0x16);
+        let default_hex = hex64(0x17);
+        let contents =
+            format!("fullmember:{full_hex}:full\nrecvmember:{recv_hex}:recv\nbare:{default_hex}\n");
+
+        let keys = parse_auth_keys_file_contents(&contents).unwrap();
+
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].id, "fullmember");
+        assert_eq!(keys[0].role, KeyRole::Full);
+        assert_eq!(keys[1].id, "recvmember");
+        assert_eq!(keys[1].role, KeyRole::ReceiveOnly);
+        assert_eq!(keys[2].id, "bare");
+        assert_eq!(keys[2].role, KeyRole::ReceiveOnly);
+    }
+
+    #[test]
+    fn env_keys_are_always_full_role() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fleet_hex = hex64(0x18);
+        let alice_hex = hex64(0x19);
+        unsafe {
+            env::set_var("SOVRIGHT_RELAY_AUTH_KEY_HEX", &fleet_hex);
+            env::set_var("SOVRIGHT_RELAY_AUTH_KEYS_HEX", format!("alice:{alice_hex}"));
+        }
+
+        let result = auth_keys_from_env();
+
+        unsafe {
+            env::remove_var("SOVRIGHT_RELAY_AUTH_KEY_HEX");
+            env::remove_var("SOVRIGHT_RELAY_AUTH_KEYS_HEX");
+        }
+
+        let keys = result.unwrap();
+        assert!(keys.iter().all(|k| k.role == KeyRole::Full));
     }
 
     #[test]

@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::MessageType;
+use super::config::KeyRole;
 use hmac::{Hmac, Mac};
 
 /// Result of one assembly-cleanup pass, feeding the delivery/miss instrument.
@@ -140,6 +141,10 @@ pub struct RelaySession {
     /// admitted while auth is not required -- carries an id so it can be
     /// attributed in logs/metrics; unauthenticated sessions use a sentinel id.
     key_id: String,
+    /// Authorization scope bound to this session at admission time (role-
+    /// scoped keys). Determines whether content this session authors is
+    /// relayed onward -- see [`KeyRole::ReceiveOnly`].
+    role: KeyRole,
     /// Pre-shared authentication key
     auth_key: [u8; 32],
     /// Last activity time
@@ -152,14 +157,31 @@ pub struct RelaySession {
 }
 
 impl RelaySession {
-    /// Create a new session bound to a named auth key.
+    /// Create a new session bound to a named auth key with the default
+    /// `Full` role (back-compat for every existing caller). Use
+    /// [`RelaySession::new_with_role`] to bind a session to a
+    /// [`KeyRole::ReceiveOnly`] key.
     ///
     /// `key_id` attributes this session (and everything forwarded to it) to
     /// the specific invitee/fleet key that authenticated it.
     pub fn new(peer_addr: SocketAddr, key_id: impl Into<String>, auth_key: [u8; 32]) -> Self {
+        Self::new_with_role(peer_addr, key_id, auth_key, KeyRole::Full)
+    }
+
+    /// Create a new session bound to a named auth key with an explicit role
+    /// (role-scoped keys). `role` is captured at admission time and gates
+    /// whether content this session authors is relayed onward -- see
+    /// [`KeyRole::ReceiveOnly`].
+    pub fn new_with_role(
+        peer_addr: SocketAddr,
+        key_id: impl Into<String>,
+        auth_key: [u8; 32],
+        role: KeyRole,
+    ) -> Self {
         Self {
             peer_addr,
             key_id: key_id.into(),
+            role,
             auth_key,
             last_seen: Instant::now(),
             pending_blocks: HashMap::new(),
@@ -171,6 +193,11 @@ impl RelaySession {
     /// The identity label of the key this session is bound to.
     pub fn key_id(&self) -> &str {
         &self.key_id
+    }
+
+    /// The role this session was bound with at admission time.
+    pub fn role(&self) -> KeyRole {
+        self.role
     }
 
     /// Update last seen time
@@ -591,5 +618,21 @@ mod tests {
         let addr = "127.0.0.1:8333".parse().unwrap();
         let session = RelaySession::new(addr, "alice", [0x99; 32]);
         assert_eq!(session.key_id(), "alice");
+    }
+
+    #[test]
+    fn session_new_defaults_to_full_role() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session = RelaySession::new(addr, "alice", [0x99; 32]);
+        assert_eq!(session.role(), KeyRole::Full);
+    }
+
+    #[test]
+    fn session_new_with_role_binds_receive_only() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session =
+            RelaySession::new_with_role(addr, "invitee", [0x77; 32], KeyRole::ReceiveOnly);
+        assert_eq!(session.role(), KeyRole::ReceiveOnly);
+        assert_eq!(session.key_id(), "invitee");
     }
 }
