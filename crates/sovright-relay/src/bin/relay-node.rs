@@ -90,10 +90,9 @@ fn config_from_env() -> Result<RelayConfig, Box<dyn std::error::Error + Send + S
     let default_forward_burst_delay_micros = micros_from_duration(config.forward_burst_delay)?;
 
     let auth_keys = auth_keys_from_env()?;
-    let allow_unauthenticated = env_bool("SOVRIGHT_RELAY_ALLOW_UNAUTHENTICATED", false)?;
+    require_auth_keys(&auth_keys)?;
     config = config
         .with_authorized_keys(auth_keys)
-        .with_unauthenticated_peers_allowed(allow_unauthenticated)
         .with_fec(
             env_usize("SOVRIGHT_RELAY_DATA_SHARDS", default_data_shards)?,
             env_usize("SOVRIGHT_RELAY_PARITY_SHARDS", default_parity_shards)?,
@@ -157,15 +156,20 @@ fn parse_auth_key(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error + S
     Ok(out)
 }
 
-fn env_bool(name: &str, default: bool) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    match env::var(name) {
-        Ok(value) => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            _ => Err(format!("invalid boolean {name}: {value}").into()),
-        },
-        Err(_) => Ok(default),
+/// Fail loud at startup if no relay auth key was configured.
+///
+/// PR-0 removed the unauthenticated, no-HMAC version-1 wire format entirely.
+/// There is no more "unauthenticated mode" for this binary to fall back
+/// into: previously `SOVRIGHT_RELAY_ALLOW_UNAUTHENTICATED=true` let the relay
+/// start and run key-less; that escape hatch has been removed from this
+/// binary, so a missing key is now always a hard startup error.
+fn require_auth_keys(keys: &[[u8; 32]]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if keys.is_empty() {
+        return Err("relay auth key required; unauthenticated mode removed \
+             (set SOVRIGHT_RELAY_AUTH_KEY_HEX or SOVRIGHT_RELAY_AUTH_KEYS_HEX)"
+            .into());
     }
+    Ok(())
 }
 
 fn env_usize(
@@ -234,5 +238,21 @@ mod tests {
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "new_metric 2\n");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn require_auth_keys_errors_when_empty() {
+        let result = require_auth_keys(&[]);
+        let err = result.expect_err("missing auth keys must be a startup error");
+        let message = err.to_string();
+        assert!(
+            message.contains("unauthenticated mode removed"),
+            "unexpected error message: {message}"
+        );
+    }
+
+    #[test]
+    fn require_auth_keys_accepts_configured_key() {
+        assert!(require_auth_keys(&[[0x42; 32]]).is_ok());
     }
 }

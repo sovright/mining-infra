@@ -46,7 +46,7 @@ pub struct BlockAssembly {
     pub total_chunks: usize,
     /// Per-block FEC data-shard count from the chunk header.
     ///
-    /// Zero means "not carried on the wire" (a version-1/2 chunk); the receiver
+    /// Zero means "not carried on the wire" (a version-2 chunk); the receiver
     /// falls back to its fixed configured `data_shards`. Nonzero is the
     /// adaptive (version-3) per-block count captured from the first chunk.
     pub data_shards: u16,
@@ -91,7 +91,7 @@ impl BlockAssembly {
     ///
     /// Returns the per-block adaptive value captured from a version-3 chunk
     /// header, or `fixed` (the receiver's configured `data_shards`) for a
-    /// version-1/2 assembly that carries no per-block shard count.
+    /// version-2 assembly that carries no per-block shard count.
     pub fn effective_data_shards(&self, fixed: usize) -> usize {
         if self.data_shards > 0 {
             self.data_shards as usize

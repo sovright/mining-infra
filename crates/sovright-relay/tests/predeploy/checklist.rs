@@ -235,26 +235,49 @@ async fn gate_authentication() {
 }
 
 /// Gate 9: Version compatibility
+///
+/// PR-0 removed the legacy unauthenticated version-1 (no-HMAC) wire format
+/// entirely. `ChunkHeader::new_block` now builds a version-2-shaped header
+/// (with a zero-filled HMAC placeholder pending real authentication), and a
+/// hand-crafted, well-formed version-1 datagram must be rejected by decode.
 #[test]
 fn gate_version_compatibility() {
-    // Version 1 chunk (no HMAC)
-    let v1_header = ChunkHeader::new_block(&[0u8; 32], 0, 10, 100);
-    assert_eq!(v1_header.version, 1);
+    // The unauthenticated constructor now builds version 2, not version 1.
+    let placeholder_header = ChunkHeader::new_block(&[0u8; 32], 0, 10, 100);
+    assert_eq!(placeholder_header.version, 2);
 
     // Version 2 chunk (with HMAC)
     let v2_header = ChunkHeader::new_block_authenticated(&[0u8; 32], 0, 10, 100, [0u8; 32]);
     assert_eq!(v2_header.version, 2);
 
-    // Both should serialize/deserialize correctly
-    let v1_chunk = sovright_relay::Chunk::new(v1_header, vec![0u8; 100]);
-    let v1_bytes = v1_chunk.to_bytes();
-    let v1_parsed = sovright_relay::Chunk::from_bytes(&v1_bytes).unwrap();
-    assert_eq!(v1_parsed.header.version, 1);
+    // Version 3 chunk (with HMAC and per-block data_shards)
+    let v3_header = ChunkHeader::new_block_authenticated_v3(&[0u8; 32], 0, 10, 100, 7, [0u8; 32]);
+    assert_eq!(v3_header.version, 3);
 
+    // v2 and v3 both serialize/deserialize correctly.
     let v2_chunk = sovright_relay::Chunk::new(v2_header, vec![0u8; 100]);
     let v2_bytes = v2_chunk.to_bytes();
     let v2_parsed = sovright_relay::Chunk::from_bytes(&v2_bytes).unwrap();
     assert_eq!(v2_parsed.header.version, 2);
+
+    let v3_chunk = sovright_relay::Chunk::new(v3_header, vec![0u8; 100]);
+    let v3_bytes = v3_chunk.to_bytes();
+    let v3_parsed = sovright_relay::Chunk::from_bytes(&v3_bytes).unwrap();
+    assert_eq!(v3_parsed.header.version, 3);
+
+    // A well-formed, hand-crafted version-1 (no-HMAC, 44-byte) chunk must be
+    // rejected by decode -- the format is gone, not merely unauthenticated.
+    let mut v1_bytes = [0u8; 44];
+    v1_bytes[0..4].copy_from_slice(&sovright_relay::CHUNK_MAGIC.to_be_bytes());
+    v1_bytes[4] = 1; // version 1
+    v1_bytes[5] = 0; // msg_type = Block
+    v1_bytes[38..40].copy_from_slice(&0u16.to_be_bytes()); // chunk_id
+    v1_bytes[40..42].copy_from_slice(&10u16.to_be_bytes()); // total_chunks
+    v1_bytes[42..44].copy_from_slice(&0u16.to_be_bytes()); // payload_len
+    assert!(
+        ChunkHeader::from_bytes(&v1_bytes).is_err(),
+        "well-formed version-1 header must be rejected"
+    );
 }
 
 /// Gate 10: Config validation

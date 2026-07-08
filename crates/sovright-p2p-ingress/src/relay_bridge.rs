@@ -98,12 +98,24 @@ pub struct RelayBridge {
 
 impl RelayBridge {
     pub async fn from_config(config: &Config) -> Result<Option<Self>> {
-        let Some(auth_key) = config.relay_auth_key else {
-            return Ok(None);
-        };
         if config.relay_peers.is_empty() {
+            // Relay bridging is simply not configured -- distinct from a
+            // misconfiguration where peers are set but the auth key is
+            // missing (see below).
             return Ok(None);
         }
+        let Some(auth_key) = config.relay_auth_key else {
+            // PR-0 removed the unauthenticated, no-HMAC version-1 wire
+            // format. Silently disabling the bridge here used to leave an
+            // operator who configured relay peers but forgot the auth key
+            // with a relay that quietly never sent anything; fail loud
+            // instead so the misconfiguration is caught at startup.
+            return Err(IngressError::Config(
+                "relay auth key required; unauthenticated mode removed \
+                 (set SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX)"
+                    .to_string(),
+            ));
+        };
 
         let mut client = Self::new_client_for_config(config, auth_key)?;
         client
@@ -1095,6 +1107,39 @@ mod tests {
             relay_forward_dedup_window: Duration::from_secs(30),
             relay_forward_dedup_capacity: 64,
         }
+    }
+
+    /// PR-0: an operator who configures relay peers but forgets the auth key
+    /// must get a hard startup error, not a silently disabled relay bridge
+    /// (the old behavior, back when an unauthenticated wire format existed
+    /// to fall back to).
+    #[tokio::test]
+    async fn from_config_errors_when_peers_configured_without_auth_key() {
+        let mut config = test_config();
+        config.relay_auth_key = None;
+
+        let result = RelayBridge::from_config(&config).await;
+        let err = match result {
+            Ok(_) => panic!("missing auth key with configured peers must error"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("unauthenticated mode removed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// When relay peers are simply not configured at all, the bridge stays
+    /// disabled (`Ok(None)`) regardless of the auth key -- this is not the
+    /// misconfiguration case above.
+    #[tokio::test]
+    async fn from_config_disabled_when_no_relay_peers_configured() {
+        let mut config = test_config();
+        config.relay_peers = Vec::new();
+        config.relay_auth_key = None;
+
+        let result = RelayBridge::from_config(&config).await;
+        assert!(matches!(result, Ok(None)));
     }
 
     #[test]

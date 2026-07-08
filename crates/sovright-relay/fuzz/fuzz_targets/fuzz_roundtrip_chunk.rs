@@ -7,18 +7,32 @@ fuzz_target!(|data: &[u8]| {
     let mut u = arbitrary::Unstructured::new(data);
     let Ok(mut chunk) = Chunk::arbitrary(&mut u) else { return };
 
-    // Normalize to valid protocol constraints
+    // Normalize to valid protocol constraints. Version 1 (unauthenticated,
+    // no-HMAC) was removed entirely; only versions 2 and 3 are valid wire
+    // versions now, so this fuzzes the two live formats instead of wasting
+    // input entropy on a version that decode always rejects.
     chunk.header.magic = CHUNK_MAGIC;
-    let Ok(use_v2) = u.arbitrary::<bool>() else { return };
-    chunk.header.version = if use_v2 { 2 } else { 1 };
+    let Ok(use_v3) = u.arbitrary::<bool>() else { return };
+    chunk.header.version = if use_v3 { 3 } else { 2 };
     if chunk.header.total_chunks == 0 {
         chunk.header.total_chunks = 1;
     }
     if chunk.header.total_chunks > 256 {
         chunk.header.total_chunks = 256;
     }
+    // v3 requires 1 <= data_shards < total_chunks, which in turn requires at
+    // least 2 total chunks.
+    if chunk.header.version == 3 && chunk.header.total_chunks < 2 {
+        chunk.header.total_chunks = 2;
+    }
     if chunk.header.chunk_id >= chunk.header.total_chunks {
         chunk.header.chunk_id = chunk.header.total_chunks - 1;
+    }
+    if chunk.header.version == 3 {
+        let range = chunk.header.total_chunks - 1;
+        chunk.header.data_shards = (chunk.header.data_shards % range) + 1;
+    } else {
+        chunk.header.data_shards = 0;
     }
     if chunk.payload.len() > MAX_PAYLOAD_SIZE {
         chunk.payload.truncate(MAX_PAYLOAD_SIZE);
