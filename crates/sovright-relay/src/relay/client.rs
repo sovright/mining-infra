@@ -573,7 +573,7 @@ impl RelayClient {
             return; // Drop invalid chunk
         }
         // Version-3 (adaptive) chunks carry a per-block data_shards count and a
-        // per-block total, so only version-1/2 chunks must match the receiver's
+        // per-block total, so only version-2 chunks must match the receiver's
         // fixed FEC profile. v3 totals are bounded by the MAX_TOTAL_CHUNKS check
         // above and the header's own `1 <= data_shards < total_chunks` guard.
         let is_v3 = chunk.header.version == 3;
@@ -586,6 +586,10 @@ impl RelayClient {
         }
 
         // Enforce authentication if configured. Both v2 and v3 are authenticated.
+        // Decode (`Chunk::from_bytes`) already restricts a wire-received
+        // chunk's version to {2, 3} -- the unauthenticated, no-HMAC version-1
+        // wire format has been removed entirely -- so this guard only matters
+        // for hand-built `Chunk`s (e.g. in tests) that bypass decode.
         let auth_required = self.config.auth_required;
         if auth_required && chunk.header.version != 2 && chunk.header.version != 3 {
             log_raw_segment_chunk_drop(&chunk, "authentication required");
@@ -612,9 +616,9 @@ impl RelayClient {
                     &chunk.payload,
                     &chunk.header.hmac,
                 ),
-                // Version 1 is unauthenticated; only reachable when auth is not
-                // required (the guard above drops v1 when auth is required).
-                _ => true,
+                // Any other version is unreachable for wire-decoded chunks;
+                // deny by default rather than assuming authenticated.
+                _ => false,
             };
             if !authenticated {
                 log_raw_segment_chunk_drop(&chunk, "authentication failed");
@@ -638,7 +642,7 @@ impl RelayClient {
             return;
         }
         // Capture (or validate) the per-block adaptive shard count. v3 chunks
-        // carry a nonzero data_shards; v1/v2 carry 0 (fixed profile). All chunks
+        // carry a nonzero data_shards; v2 carries 0 (fixed profile). All chunks
         // of one block must agree.
         if chunk.header.data_shards != 0 {
             if assembly.data_shards == 0 {
@@ -676,7 +680,7 @@ impl RelayClient {
         }
 
         // Effective data-shard count: the per-block v3 value, or the fixed
-        // configured profile for v1/v2 chunks.
+        // configured profile for v2 chunks.
         let effective_data_shards = assembly.effective_data_shards(self.config.data_shards);
 
         // Set original length estimate once we know shard size
@@ -1139,8 +1143,14 @@ mod tests {
 
     #[tokio::test]
     async fn client_tracks_raw_segment_assembly_type() {
+        // Chunk verification always checks the HMAC for v2/v3 chunks
+        // regardless of `auth_required` (see `handle_incoming_chunk`), so the
+        // test chunk must carry a real HMAC computed with the client's
+        // configured key -- there is no unauthenticated wire format any more
+        // for a placeholder header to fall back to.
+        let auth_key = [0x42; 32];
         let config =
-            ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], [0x42; 32]).with_fec(2, 1);
+            ClientConfig::new(vec!["127.0.0.1:8333".parse().unwrap()], auth_key).with_fec(2, 1);
         let client = RelayClient::new(config).unwrap();
 
         let (tx, _rx) = mpsc::channel(1);
@@ -1150,8 +1160,11 @@ mod tests {
         let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
 
         let block_hash = [0xcd; 32];
-        let header = ChunkHeader::new_raw_block_segment(&block_hash, 0, 3, 4);
-        let chunk = Chunk::new(header, vec![1, 2, 3, 4]);
+        let payload = vec![1, 2, 3, 4];
+        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let hmac = session.compute_hmac(&block_hash, 0, 3, payload.len() as u16, &payload);
+        let header = ChunkHeader::new_raw_block_segment_authenticated(&block_hash, 0, 3, 4, hmac);
+        let chunk = Chunk::new(header, payload);
 
         let mut recent_delivered = HashMap::new();
         client

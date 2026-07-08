@@ -1046,10 +1046,10 @@ mod tests {
         let chunks = chunker
             .data_to_chunks_adaptive(MessageType::Block, &object_hash, &big)
             .unwrap();
-        // Fixed 240/16 profile => 256 chunks, all v2-destined (data_shards == 0).
+        // Fixed 240/16 profile => 256 chunks, all v2-shaped (data_shards == 0).
         assert_eq!(chunks.len(), 256);
         assert!(chunks.iter().all(|c| c.header.data_shards == 0));
-        assert!(chunks.iter().all(|c| c.header.version == 1));
+        assert!(chunks.iter().all(|c| c.header.version == 2));
     }
 
     /// The skeleton encode path emits CompactSkeleton v3 chunks with the heavier

@@ -13,11 +13,13 @@ fn generate_fuzz_corpus() {
     let dir = format!("{}/fuzz_chunk_header", corpus_base);
     fs::create_dir_all(&dir).unwrap();
 
-    // Valid v1 header
+    // Legacy v1-shaped header. Version 1 was removed as an unauthenticated
+    // wire format in PR-0; decode now rejects it, so this corpus entry
+    // exercises the rejection path rather than a successful parse.
     let header = ChunkHeader::new_block(&[0xaa; 32], 0, 4, 100);
     let mut buf = vec![0u8; 44];
     write_header_v1(&header, &mut buf);
-    fs::write(format!("{}/valid_v1", dir), &buf).unwrap();
+    fs::write(format!("{}/rejected_v1", dir), &buf).unwrap();
 
     // Empty/short inputs
     fs::write(format!("{}/empty", dir), &[] as &[u8]).unwrap();

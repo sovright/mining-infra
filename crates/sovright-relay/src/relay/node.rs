@@ -55,7 +55,7 @@ struct ReadyChunks {
     msg_type: MessageType,
     block_hash: [u8; 32],
     total_chunks: u16,
-    /// Per-block FEC data-shard count (0 for v1/v2, nonzero for adaptive v3).
+    /// Per-block FEC data-shard count (0 for v2, nonzero for adaptive v3).
     /// Carried so the forward path re-emits v3 chunks (with v3 HMAC) intact.
     data_shards: u16,
     chunks: Vec<(u16, Vec<u8>)>,
@@ -483,60 +483,53 @@ impl<V: PowValidator> RelayNode<V> {
                 continue;
             }
 
-            // Forward all available chunks and count them. Version-3 (adaptive)
-            // objects (data_shards > 0) must be re-emitted as v3 chunks carrying
-            // the same per-block data_shards -- and, when authenticated, with the
-            // v3 HMAC that covers data_shards -- so the next hop can decode them.
+            // Forward all available chunks and count them. Every forwarded
+            // chunk is authenticated with the receiving peer's session key
+            // (which is a real shared secret for authenticated sessions, or
+            // the zero key for sessions admitted while auth is not required)
+            // and re-emitted as a full v2/v3-shaped header -- there is no
+            // unauthenticated, no-HMAC wire format any more. Version-3
+            // (adaptive) objects (data_shards > 0) must be re-emitted as v3
+            // chunks carrying the same per-block data_shards, authenticated
+            // with the v3 HMAC that covers data_shards, so the next hop can
+            // decode them.
             let mut payloads: Vec<Vec<u8>> = Vec::new();
             for (chunk_id, data) in chunks.iter() {
                 let payload_len = data.len() as u16;
-                let header = if self.config.auth_required() {
-                    if data_shards > 0 {
-                        let hmac = session.compute_hmac_v3(
-                            block_hash,
-                            *chunk_id,
-                            total_chunks,
-                            payload_len,
-                            data_shards,
-                            data,
-                        );
-                        authenticated_data_header_v3(
-                            msg_type,
-                            block_hash,
-                            *chunk_id,
-                            total_chunks,
-                            payload_len,
-                            data_shards,
-                            hmac,
-                        )?
-                    } else {
-                        let hmac = session.compute_hmac(
-                            block_hash,
-                            *chunk_id,
-                            total_chunks,
-                            payload_len,
-                            data,
-                        );
-                        authenticated_data_header(
-                            msg_type,
-                            block_hash,
-                            *chunk_id,
-                            total_chunks,
-                            payload_len,
-                            hmac,
-                        )?
-                    }
-                } else if data_shards > 0 {
-                    data_header_v3(
+                let header = if data_shards > 0 {
+                    let hmac = session.compute_hmac_v3(
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        payload_len,
+                        data_shards,
+                        data,
+                    );
+                    authenticated_data_header_v3(
                         msg_type,
                         block_hash,
                         *chunk_id,
                         total_chunks,
                         payload_len,
                         data_shards,
+                        hmac,
                     )?
                 } else {
-                    data_header(msg_type, block_hash, *chunk_id, total_chunks, payload_len)?
+                    let hmac = session.compute_hmac(
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        payload_len,
+                        data,
+                    );
+                    authenticated_data_header(
+                        msg_type,
+                        block_hash,
+                        *chunk_id,
+                        total_chunks,
+                        payload_len,
+                        hmac,
+                    )?
                 };
                 let chunk = Chunk::new(header, data.clone());
                 payloads.push(chunk.to_bytes());
@@ -626,7 +619,7 @@ impl<V: PowValidator> RelayNode<V> {
                 return Vec::new();
             }
             // Capture (or validate) the per-block adaptive shard count carried by
-            // version-3 chunks. v1/v2 carry 0 (fixed profile); all chunks of one
+            // version-3 chunks. v2 carries 0 (fixed profile); all chunks of one
             // object must agree.
             if chunk.header.data_shards != 0 {
                 if assembly.data_shards == 0 {
@@ -764,7 +757,7 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         // Version-3 (adaptive) chunks carry a per-block total_chunks; only
-        // version-1/2 chunks must match this relay's fixed FEC profile. The
+        // version-2 chunks must match this relay's fixed FEC profile. The
         // per-block total is still bounded by the MAX_TOTAL_CHUNKS check above
         // and the header's `1 <= data_shards < total_chunks` guard.
         if chunk.header.version != 3 {
@@ -794,13 +787,11 @@ impl<V: PowValidator> RelayNode<V> {
             let mut sessions = self.sessions.write().await;
 
             if let Some(session) = sessions.get_mut(&src_addr) {
-                // Existing session - enforce auth if configured
+                // Existing session - enforce auth if configured. Decode already
+                // restricts `chunk.header.version` to {2, 3} (the removed
+                // version 1 is rejected in `Chunk::from_bytes`), so there is no
+                // separate "unauthenticated wire format" case to gate here.
                 let auth_required = self.config.auth_required();
-                if auth_required && chunk.header.version != 2 && chunk.header.version != 3 {
-                    warn!(peer = %src_addr, "Auth required but received unauthenticated chunk");
-                    self.metrics.inc_auth_failures();
-                    return Err(TransportError::AuthenticationFailed);
-                }
                 if auth_required && !verify_data_chunk_hmac(session, &chunk, &block_hash) {
                     warn!(peer = %src_addr, "HMAC verification failed for existing session");
                     self.metrics.inc_auth_failures();
@@ -831,8 +822,10 @@ impl<V: PowValidator> RelayNode<V> {
                         chunk_id,
                         total_chunks,
                     )
-                } else if chunk.header.version == 2 || chunk.header.version == 3 {
-                    // Try each authorized key
+                } else {
+                    // Decode already restricts `chunk.header.version` to {2, 3},
+                    // so any well-formed chunk reaching here is v2 or v3 and can
+                    // be checked against the authorized-key list.
                     let mut authenticated_key: Option<[u8; 32]> = None;
                     for key in &self.config.authorized_keys {
                         let temp_session = RelaySession::new(src_addr, *key);
@@ -859,10 +852,6 @@ impl<V: PowValidator> RelayNode<V> {
                         self.metrics.inc_auth_failures();
                         return Err(TransportError::AuthenticationFailed);
                     }
-                } else {
-                    warn!(peer = %src_addr, "Auth required but received version 1 chunk");
-                    self.metrics.inc_auth_failures();
-                    return Err(TransportError::AuthenticationFailed);
                 }
             }
         };
@@ -904,7 +893,7 @@ impl<V: PowValidator> RelayNode<V> {
         if let Some(session) = sessions.get_mut(&src_addr) {
             let auth_required = self.config.auth_required();
             if auth_required && chunk.header.version != 2 {
-                warn!(peer = %src_addr, "Auth required but received version 1 keepalive");
+                warn!(peer = %src_addr, "Auth required but received unsupported keepalive version");
                 self.metrics.inc_auth_failures();
                 return Err(TransportError::AuthenticationFailed);
             }
@@ -942,7 +931,7 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         if chunk.header.version != 2 {
-            warn!(peer = %src_addr, "Auth required but received version 1 keepalive");
+            warn!(peer = %src_addr, "Auth required but received unsupported keepalive version");
             self.metrics.inc_auth_failures();
             return Err(TransportError::AuthenticationFailed);
         }
@@ -976,38 +965,6 @@ impl<V: PowValidator> RelayNode<V> {
     }
 }
 
-fn data_header(
-    msg_type: MessageType,
-    object_hash: &[u8; 32],
-    chunk_id: u16,
-    total_chunks: u16,
-    payload_len: u16,
-) -> Result<ChunkHeader, TransportError> {
-    match msg_type {
-        MessageType::Block => Ok(ChunkHeader::new_block(
-            object_hash,
-            chunk_id,
-            total_chunks,
-            payload_len,
-        )),
-        MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment(
-            object_hash,
-            chunk_id,
-            total_chunks,
-            payload_len,
-        )),
-        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton(
-            object_hash,
-            chunk_id,
-            total_chunks,
-            payload_len,
-        )),
-        MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
-            "unsupported forwarded chunk message type".into(),
-        )),
-    }
-}
-
 fn authenticated_data_header(
     msg_type: MessageType,
     object_hash: &[u8; 32],
@@ -1037,42 +994,6 @@ fn authenticated_data_header(
             total_chunks,
             payload_len,
             hmac,
-        )),
-        MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
-            "unsupported forwarded chunk message type".into(),
-        )),
-    }
-}
-
-fn data_header_v3(
-    msg_type: MessageType,
-    object_hash: &[u8; 32],
-    chunk_id: u16,
-    total_chunks: u16,
-    payload_len: u16,
-    data_shards: u16,
-) -> Result<ChunkHeader, TransportError> {
-    match msg_type {
-        MessageType::Block => Ok(ChunkHeader::new_block_v3(
-            object_hash,
-            chunk_id,
-            total_chunks,
-            payload_len,
-            data_shards,
-        )),
-        MessageType::RawBlockSegment => Ok(ChunkHeader::new_raw_block_segment_v3(
-            object_hash,
-            chunk_id,
-            total_chunks,
-            payload_len,
-            data_shards,
-        )),
-        MessageType::CompactSkeleton => Ok(ChunkHeader::new_compact_skeleton_v3(
-            object_hash,
-            chunk_id,
-            total_chunks,
-            payload_len,
-            data_shards,
         )),
         MessageType::Keepalive | MessageType::Auth => Err(TransportError::InvalidChunk(
             "unsupported forwarded chunk message type".into(),
@@ -1126,8 +1047,9 @@ fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
 }
 
 /// Verify a data chunk's HMAC against `session`, selecting the v2 or v3 HMAC
-/// coverage by header version. Version 1 (unauthenticated) always returns false
-/// here; callers only reach this when auth is required (so v1 is rejected).
+/// coverage by header version. Version 1 (the removed, unauthenticated wire
+/// format) can no longer reach this function: `Chunk::from_bytes` rejects it
+/// during decode, so `chunk.header.version` is always 2 or 3 here.
 fn verify_data_chunk_hmac(session: &RelaySession, chunk: &Chunk, block_hash: &[u8; 32]) -> bool {
     match chunk.header.version {
         2 => session.verify_hmac(

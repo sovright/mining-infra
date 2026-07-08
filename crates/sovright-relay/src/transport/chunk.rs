@@ -10,7 +10,14 @@ pub const CHUNK_MAGIC: u32 = 0x5A434852;
 /// Chunk header size in bytes (version 2 with HMAC)
 pub const HEADER_SIZE: usize = 76;
 
-/// Version 1 header size (no HMAC)
+/// Common header prefix size: magic + version + type + hash + ids + payload_len.
+///
+/// This used to be the full version-1 (unauthenticated, no-HMAC) header size.
+/// Version 1 is no longer a supported wire version -- `ChunkHeader::from_bytes`
+/// rejects it -- but this constant is retained as the minimum number of bytes
+/// needed to read the common prefix (shared by every version) before the
+/// version-specific tail (HMAC, and for v3 the `data_shards` field) can be
+/// parsed, and as the size floor used when probing an unrecognized version.
 pub const HEADER_SIZE_V1: usize = 44;
 
 /// Version 2 header size (with HMAC)
@@ -47,8 +54,10 @@ pub const MAX_TOTAL_CHUNKS: u16 = 256;
 
 /// Header size for a given protocol version.
 ///
-/// Unknown versions fall back to the version-1 size; callers validate the
-/// version separately (see [`ChunkHeader::from_bytes`]).
+/// Only versions 2 and 3 are supported on the wire. Unknown/unsupported
+/// versions (including the removed version 1) fall back to the common prefix
+/// size so callers can still probe enough bytes to reach the version byte and
+/// reject via [`ChunkHeader::from_bytes`].
 pub const fn header_size_for_version(version: u8) -> usize {
     match version {
         2 => HEADER_SIZE_V2,
@@ -119,7 +128,7 @@ pub struct ChunkHeader {
     pub payload_len: u16,
     /// Per-block FEC data-shard count.
     ///
-    /// Zero for version 1/2 chunks ("not present" -- the receiver uses its
+    /// Zero for version 2 chunks ("not present" -- the receiver uses its
     /// fixed configured profile). Nonzero for version 3 (adaptive) chunks,
     /// where it carries the origin's per-block data-shard count and the parity
     /// count is `total_chunks - data_shards`.
@@ -129,7 +138,15 @@ pub struct ChunkHeader {
 }
 
 impl ChunkHeader {
-    /// Create a new chunk header for block data
+    /// Create a new, version-2-shaped chunk header for block data with a
+    /// zero-filled HMAC placeholder.
+    ///
+    /// This does not authenticate anything by itself -- it is an intermediate
+    /// form used before a real HMAC is computed and stamped in via
+    /// [`ChunkHeader::new_block_authenticated`] (or the v3 equivalent). The
+    /// unauthenticated, no-HMAC version-1 wire format this used to build has
+    /// been removed entirely; every chunk that reaches the wire is now
+    /// v2/v3-shaped.
     pub fn new_block(
         block_hash: &[u8; 32],
         chunk_id: u16,
@@ -145,7 +162,8 @@ impl ChunkHeader {
         )
     }
 
-    /// Create a new chunk header for raw block segment data
+    /// Create a new, version-2-shaped chunk header for raw block segment data
+    /// with a zero-filled HMAC placeholder (see [`ChunkHeader::new_block`]).
     pub fn new_raw_block_segment(
         object_hash: &[u8; 32],
         chunk_id: u16,
@@ -170,7 +188,7 @@ impl ChunkHeader {
     ) -> Self {
         Self {
             magic: CHUNK_MAGIC,
-            version: 1,
+            version: 2,
             msg_type,
             block_hash: *block_hash,
             chunk_id,
@@ -335,7 +353,8 @@ impl ChunkHeader {
         )
     }
 
-    /// Create a new compact-skeleton chunk header (version 1, unauthenticated).
+    /// Create a new, version-2-shaped compact-skeleton chunk header with a
+    /// zero-filled HMAC placeholder (see [`ChunkHeader::new_block`]).
     pub fn new_compact_skeleton(
         block_hash: &[u8; 32],
         chunk_id: u16,
@@ -439,7 +458,7 @@ impl ChunkHeader {
     /// Serialize header to bytes.
     ///
     /// Returns a fixed [`HEADER_SIZE_V3`]-byte buffer; callers slice it to
-    /// [`ChunkHeader::header_size`] for the wire. The version-1/2 byte layout is
+    /// [`ChunkHeader::header_size`] for the wire. The version-2 byte layout is
     /// unchanged from prior releases (magic, version, type, hash, ids, len,
     /// then a 32-byte HMAC at `[44..76]`); trailing bytes are zero. Version 3
     /// inserts `data_shards` at `[44..46]` and moves the HMAC to `[46..78]`.
@@ -483,14 +502,23 @@ impl ChunkHeader {
         }
 
         let version = buf[4];
-        if version != 1 && version != 2 && version != 3 {
+        if version != 2 && version != 3 {
+            // Covers the removed, unauthenticated version 1 as well as any
+            // other unrecognized version.
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("unsupported protocol version: {}", version),
             ));
         }
 
-        // Version 3 needs the full extended header to read data_shards + HMAC.
+        // Version 2 needs the full 76-byte header to read the HMAC; version 3
+        // needs the full extended header to read data_shards + HMAC.
+        if version == 2 && buf.len() < HEADER_SIZE_V2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "buffer too small for version 2 chunk header",
+            ));
+        }
         if version == 3 && buf.len() < HEADER_SIZE_V3 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -539,6 +567,7 @@ impl ChunkHeader {
         }
 
         // data_shards is only present (and only meaningful) in version 3.
+        // (version is guaranteed to be 2 or 3 at this point.)
         let data_shards = if version == 3 {
             let ds = u16::from_be_bytes([buf[44], buf[45]]);
             // Reject malformed/hostile adaptive headers: a v3 block always has
@@ -560,16 +589,16 @@ impl ChunkHeader {
         };
 
         // HMAC present in version 2 ([44..76]) and version 3 ([46..78]).
-        let hmac = if version == 2 && buf.len() >= HEADER_SIZE_V2 {
-            let mut h = [0u8; 32];
-            h.copy_from_slice(&buf[44..76]);
-            h
-        } else if version == 3 {
+        // Buffer length for each case was already validated above, so this
+        // cannot read out of bounds.
+        let hmac = if version == 3 {
             let mut h = [0u8; 32];
             h.copy_from_slice(&buf[46..78]);
             h
         } else {
-            [0u8; 32]
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&buf[44..76]);
+            h
         };
 
         Ok(Self {
@@ -665,7 +694,7 @@ mod tests {
         let parsed = ChunkHeader::from_bytes(&bytes).unwrap();
 
         assert_eq!(parsed.magic, CHUNK_MAGIC);
-        assert_eq!(parsed.version, 1);
+        assert_eq!(parsed.version, 2);
         assert_eq!(parsed.msg_type, MessageType::Block);
         assert_eq!(parsed.chunk_id, 5);
         assert_eq!(parsed.total_chunks, 13);
@@ -703,6 +732,53 @@ mod tests {
         bytes[4] = 99; // Invalid version
 
         let result = ChunkHeader::from_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    /// PR-0: a well-formed, hand-crafted version-1 (unauthenticated, no-HMAC,
+    /// 44-byte header) chunk must be rejected by the decode path with the same
+    /// "unsupported protocol version" error used for any other bad version.
+    /// This inverts the old `chunk_header_roundtrip`-style expectation that a
+    /// v1 header parses successfully.
+    #[test]
+    fn rejects_well_formed_v1_chunk() {
+        let mut buf = [0u8; HEADER_SIZE_V1];
+        buf[0..4].copy_from_slice(&CHUNK_MAGIC.to_be_bytes());
+        buf[4] = 1; // version 1
+        buf[5] = MessageType::Block as u8;
+        buf[6..38].copy_from_slice(&[0xaa; 32]); // block_hash
+        buf[38..40].copy_from_slice(&0u16.to_be_bytes()); // chunk_id
+        buf[40..42].copy_from_slice(&4u16.to_be_bytes()); // total_chunks
+        buf[42..44].copy_from_slice(&0u16.to_be_bytes()); // payload_len
+
+        let result = ChunkHeader::from_bytes(&buf);
+        let err = result.expect_err("well-formed v1 header must be rejected");
+        assert!(
+            err.to_string().contains("unsupported protocol version"),
+            "unexpected error: {err}"
+        );
+
+        // Also exercise the full Chunk::from_bytes path with a v1-shaped
+        // datagram (header + a small payload matching payload_len).
+        let mut payload_len_buf = buf;
+        payload_len_buf[42..44].copy_from_slice(&4u16.to_be_bytes());
+        let mut datagram = payload_len_buf.to_vec();
+        datagram.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        assert!(Chunk::from_bytes(&datagram).is_err());
+    }
+
+    /// A version-2 header claiming to be 76 bytes but truncated before the
+    /// HMAC field must be rejected, not silently accepted with a fabricated
+    /// zero HMAC. (A latent gap from when version 1's 44-byte, no-HMAC layout
+    /// was a legitimate fallback; now that v1 is gone this must be an error.)
+    #[test]
+    fn rejects_truncated_v2_header() {
+        let block_hash = [0xab; 32];
+        let header = ChunkHeader::new_block_authenticated(&block_hash, 0, 10, 100, [0xcd; 32]);
+        let bytes = header.to_bytes();
+        // 60 bytes: past the common prefix (44) but short of the full v2
+        // header (76), so the HMAC tail is missing.
+        let result = ChunkHeader::from_bytes(&bytes[..60]);
         assert!(result.is_err());
     }
 
