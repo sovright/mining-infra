@@ -27,7 +27,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let chunker = BlockChunker::new(data_shards, parity_shards)?;
     let chunks = chunker.compact_block_to_chunks(&compact, &block_hash)?;
     let socket = UdpSocket::bind(bind_addr).await?;
-    let session = RelaySession::new(socket.local_addr()?, auth_key);
+    let session = RelaySession::new(socket.local_addr()?, "probe", auth_key);
 
     let mut packets_sent = 0usize;
     for relay_addr in &relay_addrs {

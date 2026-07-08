@@ -4,9 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sovright_relay::{
-    AuthDigest, BlockChunker, BlockHash, ChunkHeader, CompactBlock, CompactBlockReconstructor,
-    EQUIHASH_K, EQUIHASH_N, ReconstructionResult, RelayConfig, RelayNode, ShortId, TestMempool,
-    TxId, WtxId, ZCASH_FULL_HEADER_SIZE,
+    AuthDigest, AuthKey, BlockChunker, BlockHash, ChunkHeader, CompactBlock,
+    CompactBlockReconstructor, EQUIHASH_K, EQUIHASH_N, ReconstructionResult, RelayConfig,
+    RelayNode, ShortId, TestMempool, TxId, WtxId, ZCASH_FULL_HEADER_SIZE,
     fec::{FecDecoder, FecEncoder},
 };
 
@@ -219,8 +219,8 @@ async fn gate_authentication() {
     let good_key = [0x42u8; 32];
     let bad_key = [0x00u8; 32];
 
-    let config =
-        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![good_key]);
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(vec![AuthKey::new("fleet", good_key)]);
 
     let node = RelayNode::new(config).unwrap();
 

@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let segments = split_raw_block(block_hash, &raw_block, segment_frame_bytes)?;
     let chunker = BlockChunker::new(data_shards, parity_shards)?;
     let socket = UdpSocket::bind(bind_addr).await?;
-    let session = RelaySession::new(socket.local_addr()?, auth_key);
+    let session = RelaySession::new(socket.local_addr()?, "probe", auth_key);
 
     let mut packets_sent = 0usize;
     for relay_addr in &relay_addrs {
@@ -177,7 +177,7 @@ mod tests {
             .raw_block_segment_to_chunks(&segment)
             .unwrap()
             .remove(0);
-        let session = RelaySession::new("127.0.0.1:0".parse().unwrap(), [0x42; 32]);
+        let session = RelaySession::new("127.0.0.1:0".parse().unwrap(), "test", [0x42; 32]);
 
         let authenticated = authenticate_raw_segment_chunk(&session, &chunk);
 

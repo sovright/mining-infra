@@ -8,6 +8,28 @@ use crate::transport::{MAX_PAYLOAD_SIZE, TransportError};
 /// Maximum total shards for Reed-Solomon (8-bit)
 const MAX_TOTAL_SHARDS: usize = 256;
 
+/// A named pre-shared relay authentication key.
+///
+/// `id` is a short, stable label used to attribute sessions and traffic to
+/// the specific invitee/fleet key that authenticated them (see the
+/// per-key-identity hardening plan, PR-A). It never appears on the wire --
+/// it is purely a relay-side bookkeeping label -- so changing it does not
+/// affect wire compatibility.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthKey {
+    /// Stable identity label for this key (e.g. `"fleet"`, `"alice"`, `"key0"`).
+    pub id: String,
+    /// The 32-byte HMAC-SHA256 pre-shared key.
+    pub key: [u8; 32],
+}
+
+impl AuthKey {
+    /// Construct a new named auth key.
+    pub fn new(id: impl Into<String>, key: [u8; 32]) -> Self {
+        Self { id: id.into(), key }
+    }
+}
+
 /// Configuration for a relay node
 #[derive(Debug, Clone)]
 pub struct RelayConfig {
@@ -23,8 +45,8 @@ pub struct RelayConfig {
     pub session_timeout: Duration,
     /// Block assembly timeout
     pub assembly_timeout: Duration,
-    /// Pre-shared keys for authorized clients
-    pub authorized_keys: Vec<[u8; 32]>,
+    /// Pre-shared, named keys for authorized clients.
+    pub authorized_keys: Vec<AuthKey>,
     /// Explicitly allow unauthenticated peers (unsafe outside tests/dev)
     pub allow_unauthenticated_peers: bool,
     /// Maximum number of active peer sessions to retain
@@ -64,7 +86,7 @@ impl RelayConfig {
     }
 
     /// Builder method: set authorized keys
-    pub fn with_authorized_keys(mut self, keys: Vec<[u8; 32]>) -> Self {
+    pub fn with_authorized_keys(mut self, keys: Vec<AuthKey>) -> Self {
         self.authorized_keys = keys;
         self
     }
@@ -301,7 +323,7 @@ mod tests {
 
     #[test]
     fn relay_config_builder() {
-        let keys = vec![[0x42; 32]];
+        let keys = vec![AuthKey::new("fleet", [0x42; 32])];
         let config = RelayConfig::new("127.0.0.1:9000".parse().unwrap())
             .with_authorized_keys(keys.clone())
             .with_fec(8, 4)

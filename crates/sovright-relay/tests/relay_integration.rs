@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sovright_relay::{
-    AuthDigest, ClientConfig, CompactBlockBuilder, RelayClient, RelayConfig, RelayNode,
+    AuthDigest, AuthKey, ClientConfig, CompactBlockBuilder, RelayClient, RelayConfig, RelayNode,
     StubPowValidator, TestMempool, TxId, WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
     split_raw_block, zcash_block_hash,
 };
@@ -167,8 +167,8 @@ async fn authenticated_relay() {
     let auth_key = [0x42; 32];
 
     // Start relay node with auth required
-    let node_config =
-        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 
@@ -219,8 +219,8 @@ async fn authenticated_relay() {
 async fn receive_only_client_registers_session_with_keepalive() {
     let auth_key = [0x42; 32];
 
-    let node_config =
-        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 
@@ -262,8 +262,8 @@ async fn receive_only_client_registers_session_with_keepalive() {
 async fn raw_block_segments_flow_client_to_client_via_relay() {
     let auth_key = [0x42; 32];
 
-    let node_config =
-        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
     let mut node = RelayNode::with_validator(node_config, StubPowValidator).unwrap();
     node.bind().await.unwrap();
 
@@ -328,8 +328,8 @@ async fn unauthenticated_client_rejected() {
     let wrong_key = [0x00; 32]; // Different key
 
     // Start relay node with auth required
-    let node_config =
-        RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+    let node_config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
     let mut node = RelayNode::new(node_config).unwrap();
     node.bind().await.unwrap();
 

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{env, fs};
 
-use sovright_relay::{ArrivalSink, RelayConfig, RelayNode, render_prometheus_text};
+use sovright_relay::{ArrivalSink, AuthKey, RelayConfig, RelayNode, render_prometheus_text};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -126,21 +126,81 @@ fn config_from_env() -> Result<RelayConfig, Box<dyn std::error::Error + Send + S
     Ok(config)
 }
 
-fn auth_keys_from_env() -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut values = Vec::new();
+/// Identity label allowed for a configured auth key: `[A-Za-z0-9_-]{1,32}`.
+fn is_valid_key_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 32
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Parse the relay's configured auth keys.
+///
+/// `SOVRIGHT_RELAY_AUTH_KEY_HEX` (singular) is the fleet key by convention
+/// and is always given the id `fleet`.
+///
+/// `SOVRIGHT_RELAY_AUTH_KEYS_HEX` is a comma-separated list where each entry
+/// is either `id:hex64` (an explicitly labeled per-invitee key) or a bare
+/// `hex64` (back-compat; an id is derived as `key<index>`, `index` being the
+/// entry's 0-based position in the list).
+///
+/// Every id must match `[A-Za-z0-9_-]{1,32}` and must be unique across both
+/// env vars combined -- both are startup errors, never silently resolved.
+fn auth_keys_from_env() -> Result<Vec<AuthKey>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut keys: Vec<AuthKey> = Vec::new();
+
     if let Ok(value) = env::var("SOVRIGHT_RELAY_AUTH_KEY_HEX") {
-        values.push(value);
-    }
-    if let Ok(value) = env::var("SOVRIGHT_RELAY_AUTH_KEYS_HEX") {
-        values.extend(value.split(',').map(str::to_owned));
+        let value = value.trim();
+        if !value.is_empty() {
+            keys.push(AuthKey::new("fleet", parse_auth_key(value)?));
+        }
     }
 
-    values
-        .into_iter()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .map(|value| parse_auth_key(&value))
-        .collect()
+    if let Ok(value) = env::var("SOVRIGHT_RELAY_AUTH_KEYS_HEX") {
+        for (index, entry) in value.split(',').enumerate() {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            keys.push(parse_named_auth_key(entry, index)?);
+        }
+    }
+
+    require_unique_key_ids(&keys)?;
+
+    Ok(keys)
+}
+
+/// Parse one `SOVRIGHT_RELAY_AUTH_KEYS_HEX` entry: `id:hex64` or bare `hex64`.
+fn parse_named_auth_key(
+    entry: &str,
+    index: usize,
+) -> Result<AuthKey, Box<dyn std::error::Error + Send + Sync>> {
+    match entry.rsplit_once(':') {
+        Some((id, hex)) => {
+            if !is_valid_key_id(id) {
+                return Err(format!(
+                    "invalid auth key id '{id}': must match [A-Za-z0-9_-]{{1,32}}"
+                )
+                .into());
+            }
+            Ok(AuthKey::new(id, parse_auth_key(hex)?))
+        }
+        None => Ok(AuthKey::new(format!("key{index}"), parse_auth_key(entry)?)),
+    }
+}
+
+fn require_unique_key_ids(
+    keys: &[AuthKey],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut seen = std::collections::HashSet::new();
+    for key in keys {
+        if !seen.insert(key.id.as_str()) {
+            return Err(format!("duplicate auth key id '{}'", key.id).into());
+        }
+    }
+    Ok(())
 }
 
 fn parse_auth_key(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
@@ -163,7 +223,7 @@ fn parse_auth_key(value: &str) -> Result<[u8; 32], Box<dyn std::error::Error + S
 /// into: previously `SOVRIGHT_RELAY_ALLOW_UNAUTHENTICATED=true` let the relay
 /// start and run key-less; that escape hatch has been removed from this
 /// binary, so a missing key is now always a hard startup error.
-fn require_auth_keys(keys: &[[u8; 32]]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn require_auth_keys(keys: &[AuthKey]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if keys.is_empty() {
         return Err("relay auth key required; unauthenticated mode removed \
              (set SOVRIGHT_RELAY_AUTH_KEY_HEX or SOVRIGHT_RELAY_AUTH_KEYS_HEX)"
@@ -253,6 +313,122 @@ mod tests {
 
     #[test]
     fn require_auth_keys_accepts_configured_key() {
-        assert!(require_auth_keys(&[[0x42; 32]]).is_ok());
+        assert!(require_auth_keys(&[AuthKey::new("fleet", [0x42; 32])]).is_ok());
+    }
+
+    fn hex64(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    #[test]
+    fn parse_named_auth_key_accepts_labeled_entry() {
+        let hex = hex64(0xaa);
+        let entry = format!("alice:{hex}");
+        let key = parse_named_auth_key(&entry, 7).unwrap();
+        assert_eq!(key.id, "alice");
+        assert_eq!(key.key, [0xaa; 32]);
+    }
+
+    #[test]
+    fn parse_named_auth_key_derives_id_for_bare_entry() {
+        let hex = hex64(0xbb);
+        let key = parse_named_auth_key(&hex, 3).unwrap();
+        assert_eq!(key.id, "key3");
+        assert_eq!(key.key, [0xbb; 32]);
+    }
+
+    #[test]
+    fn parse_named_auth_key_rejects_bad_id() {
+        let hex = hex64(0xcc);
+        let entry = format!("bad id!:{hex}");
+        let result = parse_named_auth_key(&entry, 0);
+        assert!(
+            result.is_err(),
+            "id with spaces/punctuation must be rejected"
+        );
+    }
+
+    #[test]
+    fn parse_named_auth_key_rejects_id_over_32_chars() {
+        let hex = hex64(0xdd);
+        let long_id = "a".repeat(33);
+        let entry = format!("{long_id}:{hex}");
+        assert!(parse_named_auth_key(&entry, 0).is_err());
+    }
+
+    #[test]
+    fn require_unique_key_ids_detects_duplicates() {
+        let keys = vec![
+            AuthKey::new("fleet", [0x01; 32]),
+            AuthKey::new("fleet", [0x02; 32]),
+        ];
+        let err = require_unique_key_ids(&keys).expect_err("duplicate ids must error");
+        assert!(err.to_string().contains("duplicate"));
+    }
+
+    #[test]
+    fn require_unique_key_ids_accepts_distinct_ids() {
+        let keys = vec![
+            AuthKey::new("fleet", [0x01; 32]),
+            AuthKey::new("alice", [0x02; 32]),
+        ];
+        assert!(require_unique_key_ids(&keys).is_ok());
+    }
+
+    /// Serializes tests that mutate process-wide env vars, since Rust runs
+    /// `#[test]`s in parallel by default and env vars are process-global.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn auth_keys_from_env_combines_singular_and_labeled_list() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fleet_hex = hex64(0x11);
+        let alice_hex = hex64(0x22);
+        let bare_hex = hex64(0x33);
+        unsafe {
+            env::set_var("SOVRIGHT_RELAY_AUTH_KEY_HEX", &fleet_hex);
+            env::set_var(
+                "SOVRIGHT_RELAY_AUTH_KEYS_HEX",
+                format!("alice:{alice_hex},{bare_hex}"),
+            );
+        }
+
+        let result = auth_keys_from_env();
+
+        unsafe {
+            env::remove_var("SOVRIGHT_RELAY_AUTH_KEY_HEX");
+            env::remove_var("SOVRIGHT_RELAY_AUTH_KEYS_HEX");
+        }
+
+        let keys = result.unwrap();
+        assert_eq!(keys.len(), 3);
+        assert_eq!(keys[0].id, "fleet");
+        assert_eq!(keys[0].key, [0x11; 32]);
+        assert_eq!(keys[1].id, "alice");
+        assert_eq!(keys[1].key, [0x22; 32]);
+        // Bare entry is index 1 within the SOVRIGHT_RELAY_AUTH_KEYS_HEX list.
+        assert_eq!(keys[2].id, "key1");
+        assert_eq!(keys[2].key, [0x33; 32]);
+    }
+
+    #[test]
+    fn auth_keys_from_env_errors_on_duplicate_id_across_both_vars() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let fleet_hex = hex64(0x44);
+        let dup_hex = hex64(0x55);
+        unsafe {
+            env::set_var("SOVRIGHT_RELAY_AUTH_KEY_HEX", &fleet_hex);
+            env::set_var("SOVRIGHT_RELAY_AUTH_KEYS_HEX", format!("fleet:{dup_hex}"));
+        }
+
+        let result = auth_keys_from_env();
+
+        unsafe {
+            env::remove_var("SOVRIGHT_RELAY_AUTH_KEY_HEX");
+            env::remove_var("SOVRIGHT_RELAY_AUTH_KEYS_HEX");
+        }
+
+        let err = result.expect_err("duplicate id across the two env vars must be a startup error");
+        assert!(err.to_string().contains("duplicate"));
     }
 }

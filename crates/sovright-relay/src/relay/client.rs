@@ -311,7 +311,8 @@ impl RelayClient {
     async fn send_keepalive_internal(&self, socket: &UdpSocket) -> Result<(), TransportError> {
         use crate::transport::RelaySession;
 
-        let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
+        let session =
+            RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", self.config.auth_key);
         let payload: [u8; 0] = [];
         let hmac = session.compute_hmac(&KEEPALIVE_BLOCK_HASH, 0, 0, 0, &payload);
         let chunk = Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new());
@@ -404,7 +405,8 @@ impl RelayClient {
     ) -> Result<(), TransportError> {
         // Create temporary session for HMAC computation
         use crate::transport::RelaySession;
-        let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
+        let session =
+            RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", self.config.auth_key);
 
         let mut payloads = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -597,7 +599,8 @@ impl RelayClient {
         }
         {
             use crate::transport::RelaySession;
-            let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), self.config.auth_key);
+            let session =
+                RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", self.config.auth_key);
             let authenticated = match chunk.header.version {
                 2 => session.verify_hmac(
                     &block_hash,
@@ -976,7 +979,8 @@ mod tests {
         assert!(chunks.iter().all(|c| c.header.version == 3));
         assert!(chunks.len() >= 3);
 
-        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let session =
+            crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", auth_key);
         let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
         let mut recent_delivered = HashMap::new();
         for chunk in chunks {
@@ -1046,7 +1050,8 @@ mod tests {
         );
         assert!(chunks.iter().all(|c| c.header.version == 3));
 
-        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let session =
+            crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", auth_key);
         let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
         let mut recent_delivered = HashMap::new();
         for chunk in chunks {
@@ -1106,7 +1111,8 @@ mod tests {
             .chunker
             .compact_block_to_chunks_adaptive(&compact, &block_hash)
             .unwrap();
-        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let session =
+            crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", auth_key);
 
         let mut pending: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
         let mut recent_delivered = HashMap::new();
@@ -1161,7 +1167,8 @@ mod tests {
 
         let block_hash = [0xcd; 32];
         let payload = vec![1, 2, 3, 4];
-        let session = crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), auth_key);
+        let session =
+            crate::transport::RelaySession::new("0.0.0.0:0".parse().unwrap(), "client", auth_key);
         let hmac = session.compute_hmac(&block_hash, 0, 3, payload.len() as u16, &payload);
         let header = ChunkHeader::new_raw_block_segment_authenticated(&block_hash, 0, 3, 4, hmac);
         let chunk = Chunk::new(header, payload);
