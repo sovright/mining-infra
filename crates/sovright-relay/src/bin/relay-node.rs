@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::{env, fs};
 
 use sovright_relay::{ArrivalSink, AuthKey, RelayConfig, RelayNode, render_prometheus_text};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -220,6 +220,17 @@ fn build_active_key_set(
 /// active set is left untouched and a warning is logged. The env/fleet keys
 /// passed in `env_keys` are therefore always present in every active set
 /// this task ever applies -- a bad file can never remove them.
+///
+/// This is a supervisor: it spawns the actual reload worker loop and awaits
+/// its `JoinHandle`. The worker loop is expected to run forever (it never
+/// returns on any of its own fail-safe paths). If the worker's future ever
+/// *does* resolve -- whether because it panicked or because it returned
+/// normally, which should never happen -- hot revocation has silently gone
+/// dark for the rest of the process's lifetime. That is a fail-OPEN failure
+/// mode for a security control, so the supervisor logs it loudly via
+/// `error!` instead of letting it pass unnoticed. It deliberately does NOT
+/// restart the worker: a persistently panicking task restarted in a loop
+/// would spin and mask the underlying problem instead of surfacing it.
 fn spawn_auth_keys_reload_task(
     node: Arc<RelayNode>,
     env_keys: Vec<AuthKey>,
@@ -228,57 +239,125 @@ fn spawn_auth_keys_reload_task(
     reload_secs: u64,
 ) {
     tokio::spawn(async move {
-        let mut last_good_file_keys = initial_file_keys;
-        let mut interval = tokio::time::interval(Duration::from_secs(reload_secs.max(1)));
-        // The first tick fires immediately; skip it since the initial active
-        // set was already applied at construction time via RelayNode::new.
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let file_keys = match read_auth_keys_file(&path) {
-                Ok(keys) => keys,
-                Err(error) => {
-                    warn!(
-                        %error,
-                        path = %path.display(),
-                        "Failed to read auth keys file on reload; keeping previous active key set"
-                    );
-                    continue;
-                }
-            };
+        let worker_path = path.clone();
+        let handle = tokio::spawn(auth_keys_reload_worker(
+            node,
+            env_keys,
+            initial_file_keys,
+            worker_path,
+            reload_secs,
+        ));
 
-            let active = match build_active_key_set(&env_keys, &file_keys) {
-                Ok(active) => active,
-                Err(error) => {
-                    warn!(
-                        %error,
-                        path = %path.display(),
-                        "Auth keys file failed union validation on reload; keeping previous active key set"
-                    );
-                    continue;
-                }
-            };
-
-            if file_keys == last_good_file_keys {
-                continue;
+        match handle.await {
+            Ok(()) => {
+                error!(
+                    path = %path.display(),
+                    "Auth keys hot-reload worker returned unexpectedly (it should loop forever); \
+                     hot revocation is no longer active for the rest of this process's lifetime"
+                );
             }
-
-            let old_ids: HashSet<&str> =
-                last_good_file_keys.iter().map(|k| k.id.as_str()).collect();
-            let new_ids: HashSet<&str> = file_keys.iter().map(|k| k.id.as_str()).collect();
-            let added: Vec<&str> = new_ids.difference(&old_ids).copied().collect();
-            let removed: Vec<&str> = old_ids.difference(&new_ids).copied().collect();
-
-            info!(
-                ?added,
-                ?removed,
-                path = %path.display(),
-                "Auth keys file changed; applying new active key set"
-            );
-            node.apply_active_keys(active).await;
-            last_good_file_keys = file_keys;
+            Err(join_error) => {
+                error!(
+                    panicked = join_error.is_panic(),
+                    path = %path.display(),
+                    "Auth keys hot-reload worker task stopped ({}); \
+                     hot revocation is no longer active for the rest of this process's lifetime",
+                    if join_error.is_panic() { "panicked" } else { "cancelled" }
+                );
+            }
         }
     });
+}
+
+/// The reload worker loop itself: watches `path` for changes and hot-swaps
+/// the relay's active authorized-key set (PR-B: hot revocation). Runs
+/// forever under normal operation -- see `spawn_auth_keys_reload_task` for
+/// the supervision wrapper that detects and loudly reports the case where
+/// this future ever resolves.
+///
+/// On each tick: re-read and re-parse the file, rebuild
+/// `active = env_keys UNION file_keys`, and -- only if the file's keys
+/// actually changed (order-insensitively) since the last successful reload
+/// -- apply the new active set to `node` (which also evicts sessions bound
+/// to removed keys) and log the added/removed key ids.
+async fn auth_keys_reload_worker(
+    node: Arc<RelayNode>,
+    env_keys: Vec<AuthKey>,
+    initial_file_keys: Vec<AuthKey>,
+    path: PathBuf,
+    reload_secs: u64,
+) {
+    let mut last_good_file_keys = initial_file_keys;
+    let mut interval = tokio::time::interval(Duration::from_secs(reload_secs.max(1)));
+    // The first tick fires immediately; skip it since the initial active
+    // set was already applied at construction time via RelayNode::new.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let contents = match tokio::fs::read_to_string(&path).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                warn!(
+                    %error,
+                    path = %path.display(),
+                    "Failed to read auth keys file on reload; keeping previous active key set"
+                );
+                continue;
+            }
+        };
+        let file_keys = match parse_auth_keys_file_contents(&contents) {
+            Ok(keys) => keys,
+            Err(error) => {
+                warn!(
+                    %error,
+                    path = %path.display(),
+                    "Auth keys file failed to parse on reload; keeping previous active key set"
+                );
+                continue;
+            }
+        };
+
+        let active = match build_active_key_set(&env_keys, &file_keys) {
+            Ok(active) => active,
+            Err(error) => {
+                warn!(
+                    %error,
+                    path = %path.display(),
+                    "Auth keys file failed union validation on reload; keeping previous active key set"
+                );
+                continue;
+            }
+        };
+
+        if file_key_sets_equal(&file_keys, &last_good_file_keys) {
+            continue;
+        }
+
+        let old_ids: HashSet<&str> = last_good_file_keys.iter().map(|k| k.id.as_str()).collect();
+        let new_ids: HashSet<&str> = file_keys.iter().map(|k| k.id.as_str()).collect();
+        let added: Vec<&str> = new_ids.difference(&old_ids).copied().collect();
+        let removed: Vec<&str> = old_ids.difference(&new_ids).copied().collect();
+
+        info!(
+            ?added,
+            ?removed,
+            path = %path.display(),
+            "Auth keys file changed; applying new active key set"
+        );
+        node.apply_active_keys(active).await;
+        last_good_file_keys = file_keys;
+    }
+}
+
+/// Compare two file-derived key sets for equality ignoring line order.
+///
+/// Reordering lines in the auth-keys file (same ids and keys, just a
+/// different order) must NOT be treated as a change -- only an actual
+/// addition, removal, or key-value change should trigger a reload.
+fn file_key_sets_equal(a: &[AuthKey], b: &[AuthKey]) -> bool {
+    let set_a: HashSet<(&str, [u8; 32])> = a.iter().map(|k| (k.id.as_str(), k.key)).collect();
+    let set_b: HashSet<(&str, [u8; 32])> = b.iter().map(|k| (k.id.as_str(), k.key)).collect();
+    set_a == set_b
 }
 
 fn config_from_env()
@@ -383,7 +462,7 @@ fn parse_named_auth_key(
     entry: &str,
     index: usize,
 ) -> Result<AuthKey, Box<dyn std::error::Error + Send + Sync>> {
-    match entry.rsplit_once(':') {
+    match entry.split_once(':') {
         Some((id, hex)) => {
             if !is_valid_key_id(id) {
                 return Err(format!(
@@ -560,6 +639,24 @@ mod tests {
         let long_id = "a".repeat(33);
         let entry = format!("{long_id}:{hex}");
         assert!(parse_named_auth_key(&entry, 0).is_err());
+    }
+
+    /// `entry.split_once(':')` (used since the PR #75 review nit) splits an
+    /// `"a:b:HEX"` entry into id=`"a"`, hex=`"b:HEX"` -- rejected because
+    /// `"b:HEX"` doesn't hex-decode. Under the old `rsplit_once(':')` this
+    /// same malformed input split into id=`"a:b"`, hex=`"HEX"` -- rejected
+    /// because `"a:b"` fails id validation instead. Either way the entry
+    /// must be rejected; this test pins the current (split_once) behavior
+    /// and guards against silently accepting multi-colon garbage.
+    #[test]
+    fn parse_named_auth_key_rejects_entry_with_extra_colon() {
+        let hex = hex64(0xee);
+        let entry = format!("a:b:{hex}");
+        let result = parse_named_auth_key(&entry, 0);
+        assert!(
+            result.is_err(),
+            "an entry with more than one colon must be rejected, not silently misparsed"
+        );
     }
 
     #[test]
@@ -788,6 +885,97 @@ mod tests {
             result.is_err(),
             "a file key colliding with an env key id must fail union validation"
         );
+    }
+
+    // --- Order-insensitive change detection ------------------------------
+
+    #[test]
+    fn file_key_sets_equal_ignores_line_order() {
+        let alice = AuthKey::new("alice", [0x02; 32]);
+        let bob = AuthKey::new("bob", [0x03; 32]);
+
+        let original = vec![alice.clone(), bob.clone()];
+        let reordered = vec![bob.clone(), alice.clone()];
+
+        assert!(
+            file_key_sets_equal(&original, &reordered),
+            "reordering lines with the same ids/keys must not be treated as a change"
+        );
+    }
+
+    #[test]
+    fn file_key_sets_equal_detects_real_addition_and_removal() {
+        let alice = AuthKey::new("alice", [0x02; 32]);
+        let bob = AuthKey::new("bob", [0x03; 32]);
+
+        let before = vec![alice.clone()];
+        let with_addition = vec![alice.clone(), bob.clone()];
+        let with_removal: Vec<AuthKey> = vec![];
+
+        assert!(
+            !file_key_sets_equal(&before, &with_addition),
+            "adding a key must be detected as a change"
+        );
+        assert!(
+            !file_key_sets_equal(&before, &with_removal),
+            "removing a key must be detected as a change"
+        );
+    }
+
+    #[test]
+    fn file_key_sets_equal_detects_key_value_change_for_same_id() {
+        let alice_v1 = AuthKey::new("alice", [0x02; 32]);
+        let alice_v2 = AuthKey::new("alice", [0x09; 32]);
+
+        assert!(
+            !file_key_sets_equal(&[alice_v1], &[alice_v2]),
+            "same id with a different key value must be detected as a change"
+        );
+    }
+
+    /// End-to-end version of the order-insensitivity fix: reloading with the
+    /// same key set in a different line order must not trigger
+    /// `apply_active_keys` (no eviction pass, no "file changed" log), while
+    /// an actual add/remove still must. This drives the same decision logic
+    /// `auth_keys_reload_worker` uses on each tick (read -> parse -> build
+    /// active set -> compare via `file_key_sets_equal`), without needing the
+    /// full spawned-task/interval machinery.
+    #[tokio::test]
+    async fn reload_tick_with_reordered_file_is_a_no_op_but_real_change_applies() {
+        use sovright_relay::{RelayConfig, RelayNode};
+
+        let env_keys = vec![AuthKey::new("fleet", [0x01; 32])];
+        let alice = AuthKey::new("alice", [0x02; 32]);
+        let bob = AuthKey::new("bob", [0x03; 32]);
+
+        let last_good_file_keys = vec![alice.clone(), bob.clone()];
+        let active_initial = build_active_key_set(&env_keys, &last_good_file_keys).unwrap();
+        let config =
+            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(active_initial);
+        let node = RelayNode::new(config).unwrap();
+
+        // Reordered file: same two keys, lines swapped.
+        let reordered_file_keys = vec![bob.clone(), alice.clone()];
+        assert!(file_key_sets_equal(
+            &reordered_file_keys,
+            &last_good_file_keys
+        ));
+        // A real reload tick would `continue` here rather than calling
+        // `apply_active_keys`, so both keys must remain authorized untouched.
+        assert!(node.is_authorized(&alice.key));
+        assert!(node.is_authorized(&bob.key));
+
+        // A genuine removal (bob dropped from the file) must still be
+        // detected and, once applied, revoke bob while alice remains.
+        let file_keys_after_removal = vec![alice.clone()];
+        assert!(!file_key_sets_equal(
+            &file_keys_after_removal,
+            &last_good_file_keys
+        ));
+        let active_after = build_active_key_set(&env_keys, &file_keys_after_removal).unwrap();
+        node.apply_active_keys(active_after).await;
+        assert!(node.is_authorized(&alice.key));
+        assert!(!node.is_authorized(&bob.key));
     }
 
     // --- Back-compat ------------------------------------------------------
