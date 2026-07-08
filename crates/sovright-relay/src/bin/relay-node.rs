@@ -126,10 +126,19 @@ fn config_from_env() -> Result<RelayConfig, Box<dyn std::error::Error + Send + S
     Ok(config)
 }
 
-/// Identity label allowed for a configured auth key: `[A-Za-z0-9_-]{1,32}`.
+/// Sentinel key id reserved for unauthenticated sessions. Must stay in sync
+/// with `relay::node::UNAUTHENTICATED_KEY_ID` (that const is private to the
+/// library, so it cannot be imported here). No operator-configured auth key
+/// may use this id, or it would collide with the unauthenticated-session
+/// sentinel.
+const RESERVED_UNAUTHENTICATED_KEY_ID: &str = "unauthenticated";
+
+/// Identity label allowed for a configured auth key: `[A-Za-z0-9_-]{1,32}`,
+/// excluding the reserved unauthenticated-session sentinel.
 fn is_valid_key_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 32
+        && id != RESERVED_UNAUTHENTICATED_KEY_ID
         && id
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
@@ -354,6 +363,27 @@ mod tests {
         let long_id = "a".repeat(33);
         let entry = format!("{long_id}:{hex}");
         assert!(parse_named_auth_key(&entry, 0).is_err());
+    }
+
+    #[test]
+    fn is_valid_key_id_rejects_reserved_unauthenticated_sentinel() {
+        assert!(
+            !is_valid_key_id("unauthenticated"),
+            "the reserved unauthenticated-session sentinel must not be usable as a configured key id"
+        );
+        // Ordinary ids remain valid.
+        assert!(is_valid_key_id("fleet"));
+        assert!(is_valid_key_id("alice"));
+    }
+
+    #[test]
+    fn parse_named_auth_key_rejects_reserved_unauthenticated_sentinel() {
+        let hex = hex64(0xee);
+        let entry = format!("unauthenticated:{hex}");
+        assert!(
+            parse_named_auth_key(&entry, 0).is_err(),
+            "an auth key labeled with the reserved sentinel must be a startup error"
+        );
     }
 
     #[test]

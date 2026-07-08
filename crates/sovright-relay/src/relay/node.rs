@@ -27,10 +27,12 @@ const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
 const VALIDATED_RAW_BLOCK_TTL: Duration = Duration::from_secs(120);
 
 /// Key-id sentinel bound to sessions admitted while auth is not required
-/// (`allow_unauthenticated_peers`). Never a real configured key id, since
-/// [`crate::transport::config`] identity labels are restricted to
-/// `[A-Za-z0-9_-]{1,32}` and this sentinel is intentionally outside that
-/// pattern's spirit by convention (still matches the charset, but reserved).
+/// (`allow_unauthenticated_peers`). Never a real configured key id: the
+/// `relay-node` binary's `is_valid_key_id` rejects this exact value at
+/// config-parse time, so no operator-configured auth key can collide with
+/// the sentinel. (The value happens to match the `[A-Za-z0-9_-]{1,32}`
+/// identity charset, hence the explicit reservation rather than relying on
+/// the charset check alone.)
 const UNAUTHENTICATED_KEY_ID: &str = "unauthenticated";
 
 #[derive(Clone, Copy)]
