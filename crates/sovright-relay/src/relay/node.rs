@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -91,6 +92,19 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     validated_raw_blocks: Arc<Mutex<HashMap<[u8; 32], ValidatedRawBlock>>>,
     /// Optional per-block relay arrival logger (observatory timing source)
     arrival_sink: Option<ArrivalSink>,
+    /// Live, hot-swappable authorized key set (hot-revocation, PR-B).
+    ///
+    /// Initialized from `config.authorized_keys` at construction. The receive
+    /// (hot) path reads this -- never `config.authorized_keys` directly --
+    /// by taking a short read lock, cloning the inner `Arc`, and releasing
+    /// the lock before doing any HMAC/crypto work over the cloned key list.
+    /// A reload task (spawned by the `relay-node` binary when
+    /// `SOVRIGHT_RELAY_AUTH_KEYS_FILE` is set) is the only writer, via
+    /// [`RelayNode::apply_active_keys`]. `std::sync::RwLock` is used rather
+    /// than an async lock or an external crate (e.g. arc-swap, not present
+    /// in this workspace's Cargo.lock) because critical sections here are
+    /// always short, synchronous pointer operations.
+    active_keys: StdRwLock<Arc<Vec<AuthKey>>>,
 }
 
 impl RelayNode<EquihashPowValidator> {
@@ -117,6 +131,8 @@ impl<V: PowValidator> RelayNode<V> {
             config.chunk_size,
         )?;
 
+        let active_keys = StdRwLock::new(Arc::new(config.authorized_keys.clone()));
+
         Ok(Self {
             config,
             socket: None,
@@ -127,6 +143,7 @@ impl<V: PowValidator> RelayNode<V> {
             metrics: Arc::new(RelayMetrics::new()),
             validated_raw_blocks: Arc::new(Mutex::new(HashMap::new())),
             arrival_sink: None,
+            active_keys,
         })
     }
 
@@ -145,7 +162,55 @@ impl<V: PowValidator> RelayNode<V> {
 
     /// Check if a key is authorized
     pub fn is_authorized(&self, key: &[u8; 32]) -> bool {
-        self.config.authorized_keys.iter().any(|k| &k.key == key)
+        self.active_keys().iter().any(|k| &k.key == key)
+    }
+
+    /// Read a cheap clone of the currently active authorized key set.
+    ///
+    /// Takes a short read lock on `active_keys`, clones the inner `Arc`, and
+    /// releases the lock immediately -- callers iterate over the returned
+    /// `Arc` without holding any lock across HMAC/crypto work.
+    fn active_keys(&self) -> Arc<Vec<AuthKey>> {
+        Arc::clone(&self.active_keys.read().expect("active_keys lock poisoned"))
+    }
+
+    /// Replace the active authorized key set (hot-revocation, PR-B) and evict
+    /// every live session whose bound `key_id` is no longer present in the
+    /// new set. Called by the `relay-node` binary's auth-keys reload task
+    /// each time the on-disk keys file changes in a way that rebuilds the
+    /// env-keys-union-file-keys active set.
+    ///
+    /// The caller is expected to have already validated `keys` (e.g. via
+    /// `require_unique_key_ids`) and to have applied the fail-safe rule
+    /// (never call this with a set that drops the permanent env/fleet keys)
+    /// before invoking this method -- this method itself just swaps and
+    /// evicts.
+    pub async fn apply_active_keys(&self, keys: Vec<AuthKey>) {
+        let keys = Arc::new(keys);
+        {
+            let mut guard = self.active_keys.write().expect("active_keys lock poisoned");
+            *guard = Arc::clone(&keys);
+        }
+        self.evict_sessions_not_in(&keys).await;
+    }
+
+    /// Evict every live session whose `key_id` is not present in `keys`.
+    ///
+    /// Sessions admitted while auth was not required (bound to the
+    /// [`UNAUTHENTICATED_KEY_ID`] sentinel) are never evicted by a key-set
+    /// change -- they were never bound to a revocable key in the first
+    /// place.
+    async fn evict_sessions_not_in(&self, keys: &[AuthKey]) {
+        let keep: std::collections::HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+        let mut sessions = self.sessions.write().await;
+        let before = sessions.len();
+        sessions.retain(|_, session| {
+            session.key_id() == UNAUTHENTICATED_KEY_ID || keep.contains(session.key_id())
+        });
+        let evicted = before - sessions.len();
+        if evicted > 0 {
+            info!(evicted, "Evicted sessions bound to revoked auth keys");
+        }
     }
 
     /// Get the number of active sessions
@@ -852,8 +917,9 @@ impl<V: PowValidator> RelayNode<V> {
                     // Decode already restricts `chunk.header.version` to {2, 3},
                     // so any well-formed chunk reaching here is v2 or v3 and can
                     // be checked against the authorized-key list.
+                    let active_keys = self.active_keys();
                     let mut authenticated_key: Option<AuthKey> = None;
-                    for key in &self.config.authorized_keys {
+                    for key in active_keys.iter() {
                         let temp_session = RelaySession::new(src_addr, key.id.clone(), key.key);
                         if verify_data_chunk_hmac(&temp_session, &chunk, &block_hash) {
                             authenticated_key = Some(key.clone());
@@ -971,8 +1037,9 @@ impl<V: PowValidator> RelayNode<V> {
             return Err(TransportError::AuthenticationFailed);
         }
 
+        let active_keys = self.active_keys();
         let mut authenticated_key: Option<AuthKey> = None;
-        for key in &self.config.authorized_keys {
+        for key in active_keys.iter() {
             let temp_session = RelaySession::new(src_addr, key.id.clone(), key.key);
             if temp_session.verify_hmac(
                 &chunk.header.block_hash,
@@ -1972,6 +2039,96 @@ mod tests {
         assert!(!pacing.should_delay(4, 7, &mut sent_since_delay));
         assert!(pacing.should_delay(5, 7, &mut sent_since_delay));
         assert!(!pacing.should_delay(6, 7, &mut sent_since_delay));
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_evicts_sessions_bound_to_removed_keys() {
+        // Hot-revocation, PR-B: a session bound to a key that has been
+        // dropped from the active set must be evicted immediately when the
+        // new set is applied -- it must not survive until the 300s idle
+        // session timeout.
+        let fleet_key = [0x42; 32];
+        let alice_key = [0x77; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![
+            AuthKey::new("fleet", fleet_key),
+            AuthKey::new("alice", alice_key),
+        ]);
+        let node = RelayNode::new(config).unwrap();
+
+        let fleet_addr: SocketAddr = "127.0.0.1:11111".parse().unwrap();
+        let alice_addr: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(
+                fleet_addr,
+                RelaySession::new(fleet_addr, "fleet", fleet_key),
+            );
+            sessions.insert(
+                alice_addr,
+                RelaySession::new(alice_addr, "alice", alice_key),
+            );
+        }
+
+        // Alice's (file-sourced) key is revoked; only fleet remains active.
+        node.apply_active_keys(vec![AuthKey::new("fleet", fleet_key)])
+            .await;
+
+        let sessions = node.sessions.read().await;
+        assert!(
+            sessions.contains_key(&fleet_addr),
+            "session bound to a surviving key must not be evicted"
+        );
+        assert!(
+            !sessions.contains_key(&alice_addr),
+            "session bound to a revoked key must be evicted"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_preserves_unauthenticated_sessions() {
+        let config = RelayConfig::default().with_unauthenticated_peers_allowed(true);
+        let node = RelayNode::new(config).unwrap();
+
+        let addr: SocketAddr = "127.0.0.1:33333".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(
+                addr,
+                RelaySession::new(addr, UNAUTHENTICATED_KEY_ID, [0u8; 32]),
+            );
+        }
+
+        node.apply_active_keys(vec![]).await;
+
+        let sessions = node.sessions.read().await;
+        assert!(
+            sessions.contains_key(&addr),
+            "unauthenticated sessions are never evicted by a key-set change"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_authorized_reflects_applied_active_keys() {
+        let fleet_key = [0x42; 32];
+        let new_key = [0x99; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("fleet", fleet_key)]);
+        let node = RelayNode::new(config).unwrap();
+
+        assert!(node.is_authorized(&fleet_key));
+        assert!(!node.is_authorized(&new_key));
+
+        node.apply_active_keys(vec![AuthKey::new("new", new_key)])
+            .await;
+
+        assert!(
+            !node.is_authorized(&fleet_key),
+            "revoked key must no longer authorize"
+        );
+        assert!(
+            node.is_authorized(&new_key),
+            "newly applied key must authorize"
+        );
     }
 
     #[test]
