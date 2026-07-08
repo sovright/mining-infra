@@ -44,6 +44,8 @@ pub enum EnrollError {
     ZeroKey,
     #[error("node endpoint is not a valid ip:port")]
     BadEndpoint,
+    #[error("miner id must be 1-64 chars of [A-Za-z0-9_-]")]
+    BadMinerId,
     #[error("miner id is already enrolled")]
     DuplicateMiner,
 }
@@ -62,7 +64,8 @@ impl EnrollError {
             EnrollError::BadKeyLength
             | EnrollError::BadKeyHex
             | EnrollError::ZeroKey
-            | EnrollError::BadEndpoint => 400,
+            | EnrollError::BadEndpoint
+            | EnrollError::BadMinerId => 400,
         }
     }
 }
@@ -123,6 +126,16 @@ impl std::fmt::Debug for MeshKey {
 // ---------------------------------------------------------------------------
 // Invite codes
 // ---------------------------------------------------------------------------
+
+/// Validate a miner id (also used for the `pool` label): only `[A-Za-z0-9_-]`,
+/// 1..=64 chars. Rejects control chars (e.g. a newline that would corrupt logs)
+/// and unbounded input before it is used, persisted, or logged.
+pub fn valid_ident(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
 
 /// Generate a high-entropy (256-bit) opaque invite code.
 pub fn new_invite_code() -> String {
@@ -332,7 +345,10 @@ pub fn enroll(
     now: u64,
 ) -> Result<Enrollment, EnrollError> {
     // 1. Non-mutating validation.
-    let pool = invites.check(&req.invite_code, now)?; // 401/409, no mutation
+    invites.check(&req.invite_code, now)?; // 401/409, no mutation
+    if !valid_ident(&req.miner_id) {
+        return Err(EnrollError::BadMinerId); // 400, invite untouched
+    }
     let key = MeshKey::from_hex(&req.mesh_key_hex)?; // 400
     let endpoint: SocketAddr = req
         .node_endpoint
@@ -345,8 +361,10 @@ pub fn enroll(
         return Err(EnrollError::DuplicateMiner); // 409, invite untouched
     }
 
-    // 2. Commit: consume the invite, then register the key.
-    let pool = invites.consume(&req.invite_code, now).unwrap_or(pool);
+    // 2. Commit: consume the invite, then register the key. A consume failure
+    // (e.g. a racing consumer spent it between check and here) must abort the
+    // enroll — never register a key against an unspent/invalid invite.
+    let pool = invites.consume(&req.invite_code, now)?;
     keys.register(MinerRecord {
         miner_id: req.miner_id.clone(),
         key: *key.as_bytes(),
@@ -604,6 +622,41 @@ mod tests {
         // Second invite not burned by the conflicting request.
         assert_eq!(*invites.state(&code2).unwrap(), InviteState::Issued);
         assert_eq!(keys.active_count(), 1);
+    }
+
+    #[test]
+    fn enroll_rejects_bad_miner_id_without_burning_invite() {
+        // A miner_id with a newline or over-length must be rejected (400) and
+        // must not consume the single-use invite.
+        for bad in ["evil\nid", &"x".repeat(65), "", "has space", "semi;colon"] {
+            let mut invites = InviteStore::new();
+            let mut keys = KeyStore::new();
+            let code = invites.issue(new_invite_code(), "pool-x", 0, HOUR);
+            let (_k, mut req) = build_enroll_request(&code, "placeholder", "5.6.7.8:9000");
+            req.miner_id = bad.to_string();
+
+            let err = enroll(&mut invites, &mut keys, &peers(), &req, 1).unwrap_err();
+            assert_eq!(err, EnrollError::BadMinerId, "bad id {bad:?}");
+            assert_eq!(err.http_status(), 400);
+            assert_eq!(
+                *invites.state(&code).unwrap(),
+                InviteState::Issued,
+                "bad miner_id must not burn the invite"
+            );
+            assert_eq!(keys.active_count(), 0);
+        }
+    }
+
+    #[test]
+    fn valid_ident_accepts_and_rejects() {
+        assert!(valid_ident("miner-1"));
+        assert!(valid_ident("Pool_Alpha-9"));
+        assert!(valid_ident(&"a".repeat(64)));
+        assert!(!valid_ident(""));
+        assert!(!valid_ident(&"a".repeat(65)));
+        assert!(!valid_ident("with\nnewline"));
+        assert!(!valid_ident("with space"));
+        assert!(!valid_ident("dots.not.ok"));
     }
 
     #[test]

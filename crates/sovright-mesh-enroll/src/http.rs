@@ -8,6 +8,11 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
+/// Hard cap on the request body we will buffer. The enroll payloads are a few
+/// hundred bytes; anything larger is rejected before we allocate/read it so a
+/// malicious `Content-Length` can't drive us to exhaust memory.
+pub const MAX_BODY: usize = 64 * 1024;
+
 /// Parsed request line + framing metadata (headers we care about).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestHead {
@@ -86,14 +91,34 @@ pub fn read_request(stream: &mut TcpStream) -> std::io::Result<(RequestHead, Vec
             ));
         }
     };
-    // Read the rest of the body.
+    // Reject an oversized declared body before allocating/reading it.
+    if head.content_length > MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
+    }
+    // Read the rest of the body, guarding the buffer against growing past the
+    // cap even if the peer sends more than it declared.
     let mut body = buf[body_start..].to_vec();
+    if body.len() > MAX_BODY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "request body too large",
+        ));
+    }
     while body.len() < head.content_length {
         let n = stream.read(&mut tmp)?;
         if n == 0 {
             break;
         }
         body.extend_from_slice(&tmp[..n]);
+        if body.len() > MAX_BODY {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "request body too large",
+            ));
+        }
     }
     body.truncate(head.content_length);
     Ok((head, body))

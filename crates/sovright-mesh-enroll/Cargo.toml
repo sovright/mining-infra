@@ -17,6 +17,11 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 getrandom = "0.2"
+# Constant-time ops-token comparison. Same primitives the relay transport
+# already uses (sovright-relay: sha2 + subtle); both are already in the
+# workspace lockfile, so no new dependency enters the tree.
+sha2 = { workspace = true }
+subtle = "2.5"
 
 [[bin]]
 name = "mesh-enroll-server"

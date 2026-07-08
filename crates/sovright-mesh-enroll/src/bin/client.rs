@@ -17,6 +17,28 @@ use std::process::ExitCode;
 
 use sovright_mesh_enroll::{build_enroll_request, http};
 
+/// Write the mesh key file. On Unix create it 0600 (owner-only) so the secret
+/// is never world-readable; elsewhere fall back to a plain write.
+fn write_key_file(path: &str, hex: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(hex.as_bytes())?;
+        f.flush()
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, hex)
+    }
+}
+
 struct Args {
     server: String,
     invite: String,
@@ -96,7 +118,8 @@ fn main() -> ExitCode {
 
     // Persist the key BEFORE sending, so a crash after the server registers it
     // never leaves the node unable to sign with the key the mesh now trusts.
-    if let Err(e) = std::fs::write(&args.key_out, key.to_hex()) {
+    // The file holds the node's mesh secret, so create it 0600 on Unix.
+    if let Err(e) = write_key_file(&args.key_out, &key.to_hex()) {
         eprintln!("error: could not write key to {}: {e}", args.key_out);
         return ExitCode::FAILURE;
     }

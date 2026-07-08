@@ -13,11 +13,24 @@
 use std::env;
 use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use sovright_mesh_enroll::{EnrollRequest, InviteStore, KeyStore, enroll, http, new_invite_code};
+
+/// Constant-time equality for the ops token. Both inputs are hashed to a
+/// fixed-length SHA-256 digest first (so the comparison time reveals neither
+/// the length nor the content of the secret), then compared with `subtle`'s
+/// volatile-fold constant-time equality — the same primitives the relay
+/// transport uses for its HMAC tag check.
+fn ops_token_eq(a: &str, b: &str) -> bool {
+    let da = Sha256::digest(a.as_bytes());
+    let db = Sha256::digest(b.as_bytes());
+    da.ct_eq(&db).into()
+}
 
 struct State {
     invites: InviteStore,
@@ -47,6 +60,23 @@ fn main() -> std::io::Result<()> {
         .filter_map(|s| s.trim().parse().ok())
         .collect();
 
+    // Refuse to expose the plaintext endpoint off loopback. This PoC speaks
+    // plain HTTP (no TLS in this crate); a non-loopback bind without TLS
+    // configured would broadcast invite codes and mesh key material in the
+    // clear. Treat SOVRIGHT_ENROLL_TLS_CERT being set as "TLS configured".
+    let tls_configured = env::var_os("SOVRIGHT_ENROLL_TLS_CERT").is_some();
+    if let Ok(addr) = bind.parse::<SocketAddr>()
+        && !addr.ip().is_loopback()
+        && !tls_configured
+    {
+        eprintln!(
+            "[enroll] refusing to bind {bind}: non-loopback address without TLS would \
+             expose invite codes and mesh keys in cleartext. Bind to loopback, or set \
+             SOVRIGHT_ENROLL_TLS_CERT once TLS termination is configured."
+        );
+        std::process::exit(1);
+    }
+
     let state = Arc::new(Mutex::new(State {
         invites: InviteStore::new(),
         keys: KeyStore::new(),
@@ -73,6 +103,8 @@ fn main() -> std::io::Result<()> {
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
             let mut stream = stream;
+            // Bound how long a slow/stalled client can hold a worker thread.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
             match http::read_request(&mut stream) {
                 Ok((head, body)) => {
                     let resp = handle(&state, &head.method, &head.path, &body);
@@ -118,7 +150,7 @@ fn handle(state: &Arc<Mutex<State>>, method: &str, path: &str, body: &[u8]) -> V
                 Err(e) => return reply(400, "Bad Request", json!({"error": e.to_string()})),
             };
             let mut st = state.lock().unwrap();
-            if req.ops_token != st.ops_token {
+            if !ops_token_eq(&req.ops_token, &st.ops_token) {
                 return reply(401, "Unauthorized", json!({"error":"bad ops token"}));
             }
             let code = st
@@ -154,7 +186,7 @@ fn handle(state: &Arc<Mutex<State>>, method: &str, path: &str, body: &[u8]) -> V
                 Err(e) => return reply(400, "Bad Request", json!({"error": e.to_string()})),
             };
             let mut st = state.lock().unwrap();
-            if req.ops_token != st.ops_token {
+            if !ops_token_eq(&req.ops_token, &st.ops_token) {
                 return reply(401, "Unauthorized", json!({"error":"bad ops token"}));
             }
             let revoked = st.keys.revoke(&req.miner_id);
@@ -172,14 +204,55 @@ fn reply(status: u16, reason: &str, body: serde_json::Value) -> Vec<u8> {
 }
 
 /// Render the active mesh keys + peers to the file the relays reload (§6).
+///
+/// The file holds mesh HMAC secrets, so: (a) write to a temp file in the same
+/// directory and atomically `rename` it onto the target — a crash mid-write
+/// never leaves the relays a truncated/partial keystore; (b) on Unix create the
+/// temp file 0600 before the rename so the secrets are never briefly world-
+/// readable.
 fn persist_keystore(st: &State) {
     let keys: Vec<String> = st.keys.authorized_keys().iter().map(hex::encode).collect();
     let peers: Vec<String> = st.keys.peers().iter().map(|p| p.to_string()).collect();
     let doc = json!({"authorized_keys": keys, "peers": peers});
-    if let Err(e) = std::fs::write(&st.keystore_path, doc.to_string()) {
+    if let Err(e) = write_atomic(&st.keystore_path, doc.to_string().as_bytes()) {
         eprintln!(
             "[enroll] WARN could not write keystore {}: {e}",
             st.keystore_path
         );
     }
+}
+
+/// Atomic, 0600 (Unix) file write: write a sibling temp file then rename.
+fn write_atomic(path: &str, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let target = std::path::Path::new(path);
+    let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let file_name = target
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("keystore");
+    let tmp_name = format!(".{file_name}.tmp.{}", std::process::id());
+    let tmp_path = match dir {
+        Some(d) => d.join(&tmp_name),
+        None => std::path::PathBuf::from(&tmp_name),
+    };
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp_path)?;
+    f.write_all(contents)?;
+    f.flush()?;
+    drop(f);
+
+    if let Err(e) = std::fs::rename(&tmp_path, target) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+    Ok(())
 }
