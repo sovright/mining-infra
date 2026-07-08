@@ -65,6 +65,14 @@ pub struct RelayMetrics {
     sessions_created_by_key: Mutex<HashMap<String, u64>>,
     /// Chunks forwarded to sessions, keyed by the bound auth key id.
     chunks_forwarded_by_key: Mutex<HashMap<String, u64>>,
+    /// Chunks authored by a `ReceiveOnly`-bound session and dropped instead
+    /// of relayed (role-scoped keys, the invitee-injection security gate).
+    /// A nonzero rate here means a receive-only-scoped key attempted to
+    /// inject content into the mesh.
+    pub receive_only_chunks_dropped: AtomicU64,
+    /// Same, keyed by the auth key id that authored the dropped chunks --
+    /// lets an operator see exactly which invitee key attempted injection.
+    receive_only_chunks_dropped_by_key: Mutex<HashMap<String, u64>>,
 }
 
 impl RelayMetrics {
@@ -223,6 +231,23 @@ impl RelayMetrics {
         *by_key.entry(key_id.to_string()).or_insert(0) += count;
     }
 
+    /// Record `count` chunks authored by a `ReceiveOnly`-bound session and
+    /// dropped instead of relayed (role-scoped keys security gate).
+    pub fn inc_receive_only_chunks_dropped(&self, count: u64) {
+        self.receive_only_chunks_dropped
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// Same, attributed to the specific auth key id that authored the
+    /// dropped chunks.
+    pub fn inc_receive_only_chunks_dropped_for_key(&self, key_id: &str, count: u64) {
+        let mut by_key = self
+            .receive_only_chunks_dropped_by_key
+            .lock()
+            .expect("receive_only_chunks_dropped_by_key mutex poisoned");
+        *by_key.entry(key_id.to_string()).or_insert(0) += count;
+    }
+
     /// Get snapshot of current metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -265,6 +290,10 @@ impl RelayMetrics {
             assembly_misses_near: self.assembly_misses_near.load(Ordering::Relaxed),
             sessions_created_by_key: sorted_key_counts(&self.sessions_created_by_key),
             chunks_forwarded_by_key: sorted_key_counts(&self.chunks_forwarded_by_key),
+            receive_only_chunks_dropped: self.receive_only_chunks_dropped.load(Ordering::Relaxed),
+            receive_only_chunks_dropped_by_key: sorted_key_counts(
+                &self.receive_only_chunks_dropped_by_key,
+            ),
         }
     }
 }
@@ -311,6 +340,12 @@ pub struct MetricsSnapshot {
     pub sessions_created_by_key: Vec<(String, u64)>,
     /// Chunks forwarded per auth key id, sorted by id.
     pub chunks_forwarded_by_key: Vec<(String, u64)>,
+    /// Chunks authored by a `ReceiveOnly`-bound session and dropped instead
+    /// of relayed (role-scoped keys security gate). Nonzero means an
+    /// invitee/receive-only key attempted to inject content into the mesh.
+    pub receive_only_chunks_dropped: u64,
+    /// Same, per auth key id, sorted by id.
+    pub receive_only_chunks_dropped_by_key: Vec<(String, u64)>,
 }
 
 /// Render relay metrics in Prometheus text exposition format.
@@ -512,6 +547,21 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "counter",
         &snapshot.chunks_forwarded_by_key,
     );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_receive_only_chunks_dropped_total",
+        "Total chunks authored by a ReceiveOnly-bound session and dropped instead of relayed \
+         (role-scoped keys security gate; nonzero means an injection attempt).",
+        "counter",
+        snapshot.receive_only_chunks_dropped,
+    );
+    push_labeled_metric_family(
+        &mut text,
+        "sovright_relay_relay_receive_only_chunks_dropped_by_key_total",
+        "Total dropped ReceiveOnly-authored chunks, labeled by the auth key id that authored them.",
+        "counter",
+        &snapshot.receive_only_chunks_dropped_by_key,
+    );
     text
 }
 
@@ -624,6 +674,8 @@ mod tests {
             assembly_misses_near: 3,
             sessions_created_by_key: Vec::new(),
             chunks_forwarded_by_key: Vec::new(),
+            receive_only_chunks_dropped: 0,
+            receive_only_chunks_dropped_by_key: Vec::new(),
         };
 
         let text = render_prometheus_text(&snapshot, 5);

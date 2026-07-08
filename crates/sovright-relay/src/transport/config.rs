@@ -8,6 +8,28 @@ use crate::transport::{MAX_PAYLOAD_SIZE, TransportError};
 /// Maximum total shards for Reed-Solomon (8-bit)
 const MAX_TOTAL_SHARDS: usize = 256;
 
+/// Authorization scope granted to a relay auth key (role-scoped keys, the
+/// hard security gate before opening the relay to real external invitees).
+///
+/// This is purely LOCAL relay policy -- it never appears on the wire, changes
+/// no HMAC/auth/header/payload-limit behavior, and does not affect wire
+/// compatibility. A `ReceiveOnly` peer's chunks still carry valid HMACs and
+/// are authenticated exactly like a `Full` peer's; the relay simply chooses
+/// not to fan them out to other sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyRole {
+    /// Today's behavior: receives forwards from other sessions, AND content
+    /// this key authors is relayed onward to every other live session.
+    Full,
+    /// Invitee-scoped: receives forwards from `Full` sessions same as today,
+    /// but content authenticated by this key is NOT relayed onward -- it is
+    /// authenticated and the session kept alive (so keepalives and further
+    /// receiving keep working), but its payloads are dropped after auth
+    /// instead of being fanned out. This is what lets an invitee key receive
+    /// blocks without being able to inject content into the mesh.
+    ReceiveOnly,
+}
+
 /// A named pre-shared relay authentication key.
 ///
 /// `id` is a short, stable label used to attribute sessions and traffic to
@@ -21,12 +43,27 @@ pub struct AuthKey {
     pub id: String,
     /// The 32-byte HMAC-SHA256 pre-shared key.
     pub key: [u8; 32],
+    /// Authorization scope granted to this key (role-scoped keys). Defaults
+    /// to [`KeyRole::Full`] via [`AuthKey::new`] -- back-compat for every
+    /// existing caller (env/fleet keys). Use [`AuthKey::with_role`] to opt a
+    /// key into [`KeyRole::ReceiveOnly`].
+    pub role: KeyRole,
 }
 
 impl AuthKey {
-    /// Construct a new named auth key.
+    /// Construct a new named auth key with the default `Full` role.
     pub fn new(id: impl Into<String>, key: [u8; 32]) -> Self {
-        Self { id: id.into(), key }
+        Self {
+            id: id.into(),
+            key,
+            role: KeyRole::Full,
+        }
+    }
+
+    /// Builder method: set this key's role.
+    pub fn with_role(mut self, role: KeyRole) -> Self {
+        self.role = role;
+        self
     }
 }
 

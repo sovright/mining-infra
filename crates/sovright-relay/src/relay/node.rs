@@ -16,7 +16,7 @@ use tracing::{debug, info, warn};
 use crate::fec::FecError;
 use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{
-    AuthKey, BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator,
+    AuthKey, BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, KeyRole,
     MAX_TOTAL_CHUNKS, MessageType, PowResult, PowValidator, RelayConfig, RelaySession,
     TransportError, ZCASH_FULL_HEADER_SIZE,
 };
@@ -869,7 +869,7 @@ impl<V: PowValidator> RelayNode<V> {
             )));
         }
 
-        let chunks_to_forward: Vec<ReadyChunks> = {
+        let (chunks_to_forward, source_role, source_key_id): (Vec<ReadyChunks>, KeyRole, String) = {
             let mut sessions = self.sessions.write().await;
 
             if let Some(session) = sessions.get_mut(&src_addr) {
@@ -884,7 +884,16 @@ impl<V: PowValidator> RelayNode<V> {
                     return Err(TransportError::AuthenticationFailed);
                 }
                 session.touch();
-                self.process_chunk_for_session(session, &chunk, block_hash, chunk_id, total_chunks)
+                let role = session.role();
+                let key_id = session.key_id().to_string();
+                let ready = self.process_chunk_for_session(
+                    session,
+                    &chunk,
+                    block_hash,
+                    chunk_id,
+                    total_chunks,
+                );
+                (ready, role, key_id)
             } else {
                 if sessions.len() >= self.config.max_sessions {
                     self.metrics.inc_session_limit_rejections();
@@ -906,13 +915,14 @@ impl<V: PowValidator> RelayNode<V> {
                     self.metrics
                         .inc_sessions_created_for_key(UNAUTHENTICATED_KEY_ID);
                     let session = sessions.get_mut(&src_addr).unwrap();
-                    self.process_chunk_for_session(
+                    let ready = self.process_chunk_for_session(
                         session,
                         &chunk,
                         block_hash,
                         chunk_id,
                         total_chunks,
-                    )
+                    );
+                    (ready, KeyRole::Full, UNAUTHENTICATED_KEY_ID.to_string())
                 } else {
                     // Decode already restricts `chunk.header.version` to {2, 3},
                     // so any well-formed chunk reaching here is v2 or v3 and can
@@ -928,21 +938,27 @@ impl<V: PowValidator> RelayNode<V> {
                     }
 
                     if let Some(key) = authenticated_key {
-                        info!(peer = %src_addr, key_id = %key.id, "Authenticated new session");
+                        info!(peer = %src_addr, key_id = %key.id, role = ?key.role, "Authenticated new session");
                         sessions.insert(
                             src_addr,
-                            RelaySession::new(src_addr, key.id.clone(), key.key),
+                            RelaySession::new_with_role(
+                                src_addr,
+                                key.id.clone(),
+                                key.key,
+                                key.role,
+                            ),
                         );
                         self.metrics.inc_sessions_created();
                         self.metrics.inc_sessions_created_for_key(&key.id);
                         let session = sessions.get_mut(&src_addr).unwrap();
-                        self.process_chunk_for_session(
+                        let ready = self.process_chunk_for_session(
                             session,
                             &chunk,
                             block_hash,
                             chunk_id,
                             total_chunks,
-                        )
+                        );
+                        (ready, key.role, key.id.clone())
                     } else {
                         warn!(peer = %src_addr, "Authentication failed - no matching key");
                         self.metrics.inc_auth_failures();
@@ -951,6 +967,33 @@ impl<V: PowValidator> RelayNode<V> {
                 }
             }
         };
+
+        // Role-scoped keys (the invitee-injection security gate): a session
+        // bound to a ReceiveOnly key still authenticates and assembles its
+        // chunks (so keepalives/assembly keep working and it keeps receiving
+        // forwards originated by Full sessions -- that direction is handled
+        // entirely by `forward_to_peers` iterating over destination sessions
+        // below, unaffected by this check), but content IT authored is never
+        // fanned out to other peers. Drop it here, after authentication,
+        // instead of relaying it.
+        if source_role == KeyRole::ReceiveOnly {
+            let dropped: u64 = chunks_to_forward
+                .iter()
+                .map(|r| r.chunks.len() as u64)
+                .sum();
+            if dropped > 0 {
+                self.metrics.inc_receive_only_chunks_dropped(dropped);
+                self.metrics
+                    .inc_receive_only_chunks_dropped_for_key(&source_key_id, dropped);
+                debug!(
+                    peer = %src_addr,
+                    key_id = %source_key_id,
+                    dropped,
+                    "Dropping chunks authored by a ReceiveOnly-bound session (not relayed)"
+                );
+            }
+            return Ok(());
+        }
 
         for ready in chunks_to_forward {
             self.forward_to_peers(
@@ -1055,10 +1098,10 @@ impl<V: PowValidator> RelayNode<V> {
         }
 
         if let Some(key) = authenticated_key {
-            info!(peer = %src_addr, key_id = %key.id, "Authenticated new keepalive session");
+            info!(peer = %src_addr, key_id = %key.id, role = ?key.role, "Authenticated new keepalive session");
             sessions.insert(
                 src_addr,
-                RelaySession::new(src_addr, key.id.clone(), key.key),
+                RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role),
             );
             self.metrics.inc_sessions_created();
             self.metrics.inc_sessions_created_for_key(&key.id);
@@ -1939,6 +1982,183 @@ mod tests {
                 &parsed.header.hmac,
             ));
         }
+    }
+
+    /// Build an authenticated v2 wire chunk for `block_hash` bound to `key`.
+    fn authenticated_wire_chunk(key: [u8; 32], block_hash: &[u8; 32], chunk: &Chunk) -> Vec<u8> {
+        let session = RelaySession::new("127.0.0.1:1".parse().unwrap(), "hmac-only", key);
+        let hmac = session.compute_hmac(
+            block_hash,
+            chunk.header.chunk_id,
+            chunk.header.total_chunks,
+            chunk.header.payload_len,
+            &chunk.payload,
+        );
+        let header = ChunkHeader::new_block_authenticated(
+            block_hash,
+            chunk.header.chunk_id,
+            chunk.header.total_chunks,
+            chunk.header.payload_len,
+            hmac,
+        );
+        Chunk::new(header, chunk.payload.clone()).to_bytes()
+    }
+
+    #[tokio::test]
+    async fn receive_only_session_chunks_are_not_forwarded_but_full_session_chunks_are() {
+        // THE SECURITY TEST (role-scoped keys): a chunk received from a
+        // ReceiveOnly-bound session must NOT be fanned out to other peers,
+        // while the identical content from a Full-bound session MUST be.
+        // This is the hard gate before opening the relay to real external
+        // invitees -- an invitee key must not be able to inject content the
+        // mesh will relay.
+        let fleet_key = [0x42; 32];
+        let invitee_key = [0x77; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![
+            AuthKey::new("fleet", fleet_key),
+            AuthKey::new("invitee", invitee_key).with_role(KeyRole::ReceiveOnly),
+        ]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+
+        let observer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observer_addr = observer.local_addr().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(
+                observer_addr,
+                RelaySession::new(observer_addr, "fleet", fleet_key),
+            );
+        }
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0x1111, Vec::new(), Vec::new());
+        let block_hash = *compact.header_hash().as_bytes();
+        let chunks = node
+            .chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
+
+        // The invitee (ReceiveOnly) authors the block. Its own session must
+        // be created and bound ReceiveOnly, and NOTHING must reach the
+        // observer.
+        let invitee_addr: SocketAddr = "127.0.0.1:20001".parse().unwrap();
+        for chunk in &chunks {
+            let wire = authenticated_wire_chunk(invitee_key, &block_hash, chunk);
+            node.handle_packet(&wire, invitee_addr).await.unwrap();
+        }
+
+        {
+            let sessions = node.sessions.read().await;
+            let session = sessions
+                .get(&invitee_addr)
+                .expect("invitee session created");
+            assert_eq!(session.role(), KeyRole::ReceiveOnly);
+        }
+
+        let mut buf = vec![0u8; 2048];
+        let result = timeout(Duration::from_millis(150), observer.recv_from(&mut buf)).await;
+        assert!(
+            result.is_err(),
+            "ReceiveOnly-authored chunks must NOT be forwarded to other peers"
+        );
+        assert!(
+            node.metrics().snapshot().receive_only_chunks_dropped > 0,
+            "dropped chunks must be counted"
+        );
+
+        // The fleet (Full) authors the IDENTICAL block content. It MUST be
+        // forwarded to the observer.
+        let fleet_addr: SocketAddr = "127.0.0.1:20002".parse().unwrap();
+        for chunk in &chunks {
+            let wire = authenticated_wire_chunk(fleet_key, &block_hash, chunk);
+            node.handle_packet(&wire, fleet_addr).await.unwrap();
+        }
+
+        let (len, _) = timeout(Duration::from_millis(200), observer.recv_from(&mut buf))
+            .await
+            .expect("Full-authored chunks must be forwarded to other peers")
+            .unwrap();
+        assert!(len > 0);
+    }
+
+    #[tokio::test]
+    async fn receive_only_session_still_receives_forwards_from_full_session() {
+        // Direction unaffected: a session bound ReceiveOnly still RECEIVES
+        // forwards originated by a Full session -- only content IT authors
+        // is gated from fan-out.
+        let fleet_key = [0x42; 32];
+        let invitee_key = [0x77; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("fleet", fleet_key)]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+
+        let invitee_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let invitee_addr = invitee_peer.local_addr().unwrap();
+        let sender_addr: SocketAddr = "127.0.0.1:30001".parse().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(
+                sender_addr,
+                RelaySession::new(sender_addr, "fleet", fleet_key),
+            );
+            sessions.insert(
+                invitee_addr,
+                RelaySession::new_with_role(
+                    invitee_addr,
+                    "invitee",
+                    invitee_key,
+                    KeyRole::ReceiveOnly,
+                ),
+            );
+        }
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0x2222, Vec::new(), Vec::new());
+        let block_hash = *compact.header_hash().as_bytes();
+        let chunks = node
+            .chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
+
+        for chunk in &chunks {
+            let wire = authenticated_wire_chunk(fleet_key, &block_hash, chunk);
+            node.handle_packet(&wire, sender_addr).await.unwrap();
+        }
+
+        let mut buf = vec![0u8; 2048];
+        let (len, _) = timeout(Duration::from_millis(200), invitee_peer.recv_from(&mut buf))
+            .await
+            .expect("a ReceiveOnly session must still receive forwards from a Full session")
+            .unwrap();
+        assert!(len > 0);
+    }
+
+    #[tokio::test]
+    async fn keepalive_from_receive_only_session_keeps_it_alive() {
+        let invitee_key = [0x77; 32];
+        let addr: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![
+            AuthKey::new("invitee", invitee_key).with_role(KeyRole::ReceiveOnly),
+        ]);
+        let node = RelayNode::new(config).unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            let mut session =
+                RelaySession::new_with_role(addr, "invitee", invitee_key, KeyRole::ReceiveOnly);
+            session.last_seen = Instant::now() - Duration::from_secs(200);
+            sessions.insert(addr, session);
+        }
+
+        let hmac_session = RelaySession::new(addr, "invitee", invitee_key);
+        let hmac = hmac_session.compute_hmac(&[0u8; 32], 0, 0, 0, &[]);
+        let keepalive = Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new());
+
+        node.handle_keepalive(addr, &keepalive).await.unwrap();
+
+        let sessions = node.sessions.read().await;
+        let session = sessions.get(&addr).expect("session retained");
+        assert!(!session.is_expired(Duration::from_secs(60)));
+        assert_eq!(session.role(), KeyRole::ReceiveOnly);
     }
 
     #[tokio::test]
