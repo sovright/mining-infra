@@ -15,9 +15,9 @@ use tracing::{debug, info, warn};
 use crate::fec::FecError;
 use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{
-    BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, MAX_TOTAL_CHUNKS,
-    MessageType, PowResult, PowValidator, RelayConfig, RelaySession, TransportError,
-    ZCASH_FULL_HEADER_SIZE,
+    AuthKey, BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator,
+    MAX_TOTAL_CHUNKS, MessageType, PowResult, PowValidator, RelayConfig, RelaySession,
+    TransportError, ZCASH_FULL_HEADER_SIZE,
 };
 
 use super::ArrivalSink;
@@ -25,6 +25,13 @@ use super::metrics::RelayMetrics;
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
 const VALIDATED_RAW_BLOCK_TTL: Duration = Duration::from_secs(120);
+
+/// Key-id sentinel bound to sessions admitted while auth is not required
+/// (`allow_unauthenticated_peers`). Never a real configured key id, since
+/// [`crate::transport::config`] identity labels are restricted to
+/// `[A-Za-z0-9_-]{1,32}` and this sentinel is intentionally outside that
+/// pattern's spirit by convention (still matches the charset, but reserved).
+const UNAUTHENTICATED_KEY_ID: &str = "unauthenticated";
 
 #[derive(Clone, Copy)]
 struct ValidatedRawBlock {
@@ -138,7 +145,7 @@ impl<V: PowValidator> RelayNode<V> {
 
     /// Check if a key is authorized
     pub fn is_authorized(&self, key: &[u8; 32]) -> bool {
-        self.config.authorized_keys.contains(key)
+        self.config.authorized_keys.iter().any(|k| &k.key == key)
     }
 
     /// Get the number of active sessions
@@ -475,7 +482,7 @@ impl<V: PowValidator> RelayNode<V> {
         })?;
 
         let sessions = self.sessions.read().await;
-        let mut outbound: Vec<(SocketAddr, Vec<Vec<u8>>)> = Vec::new();
+        let mut outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = Vec::new();
 
         for (peer_addr, session) in sessions.iter() {
             // Don't forward back to sender
@@ -493,6 +500,18 @@ impl<V: PowValidator> RelayNode<V> {
             // chunks carrying the same per-block data_shards, authenticated
             // with the v3 HMAC that covers data_shards, so the next hop can
             // decode them.
+            //
+            // Per-key-identity hardening (PR-A): each session is bound to a
+            // named auth key at admission time (`RelaySession::key_id`), and
+            // every chunk forwarded to it is MAC'd with THAT session's own
+            // key -- never a single global send key. For the fleet today,
+            // every live session's bound key IS the fleet key, so this is
+            // wire-identical to the old global-key broadcast; the moment an
+            // invitee session is bound to its own key instead, its forwards
+            // become independently verifiable/attributable without ever
+            // sharing the fleet key with it. Payload bytes are shared across
+            // sessions (`chunks` is built once by the caller); only the
+            // header/HMAC differs per session.
             let mut payloads: Vec<Vec<u8>> = Vec::new();
             for (chunk_id, data) in chunks.iter() {
                 let payload_len = data.len() as u16;
@@ -535,7 +554,7 @@ impl<V: PowValidator> RelayNode<V> {
                 payloads.push(chunk.to_bytes());
             }
             if !payloads.is_empty() {
-                outbound.push((*peer_addr, payloads));
+                outbound.push((*peer_addr, session.key_id().to_string(), payloads));
             }
         }
         drop(sessions);
@@ -548,7 +567,7 @@ impl<V: PowValidator> RelayNode<V> {
             self.config.forward_burst_packets,
             self.config.forward_burst_delay,
         );
-        for (peer_addr, payloads) in outbound {
+        for (peer_addr, key_id, payloads) in outbound {
             let mut chunks_sent: u64 = 0;
             let payload_count = payloads.len();
             let mut sent_since_delay = 0usize;
@@ -566,6 +585,8 @@ impl<V: PowValidator> RelayNode<V> {
             }
             if chunks_sent > 0 {
                 self.metrics.inc_packets_forwarded(chunks_sent);
+                self.metrics
+                    .inc_chunks_forwarded_for_key(&key_id, chunks_sent);
                 match msg_type {
                     MessageType::Block => {
                         self.metrics.inc_compact_block_chunks_forwarded(chunks_sent)
@@ -812,8 +833,13 @@ impl<V: PowValidator> RelayNode<V> {
                 if !self.config.auth_required() {
                     // No auth required
                     debug!(peer = %src_addr, "Creating unauthenticated session");
-                    sessions.insert(src_addr, RelaySession::new(src_addr, [0u8; 32]));
+                    sessions.insert(
+                        src_addr,
+                        RelaySession::new(src_addr, UNAUTHENTICATED_KEY_ID, [0u8; 32]),
+                    );
                     self.metrics.inc_sessions_created();
+                    self.metrics
+                        .inc_sessions_created_for_key(UNAUTHENTICATED_KEY_ID);
                     let session = sessions.get_mut(&src_addr).unwrap();
                     self.process_chunk_for_session(
                         session,
@@ -826,19 +852,23 @@ impl<V: PowValidator> RelayNode<V> {
                     // Decode already restricts `chunk.header.version` to {2, 3},
                     // so any well-formed chunk reaching here is v2 or v3 and can
                     // be checked against the authorized-key list.
-                    let mut authenticated_key: Option<[u8; 32]> = None;
+                    let mut authenticated_key: Option<AuthKey> = None;
                     for key in &self.config.authorized_keys {
-                        let temp_session = RelaySession::new(src_addr, *key);
+                        let temp_session = RelaySession::new(src_addr, key.id.clone(), key.key);
                         if verify_data_chunk_hmac(&temp_session, &chunk, &block_hash) {
-                            authenticated_key = Some(*key);
+                            authenticated_key = Some(key.clone());
                             break;
                         }
                     }
 
                     if let Some(key) = authenticated_key {
-                        info!(peer = %src_addr, "Authenticated new session");
-                        sessions.insert(src_addr, RelaySession::new(src_addr, key));
+                        info!(peer = %src_addr, key_id = %key.id, "Authenticated new session");
+                        sessions.insert(
+                            src_addr,
+                            RelaySession::new(src_addr, key.id.clone(), key.key),
+                        );
                         self.metrics.inc_sessions_created();
+                        self.metrics.inc_sessions_created_for_key(&key.id);
                         let session = sessions.get_mut(&src_addr).unwrap();
                         self.process_chunk_for_session(
                             session,
@@ -925,8 +955,13 @@ impl<V: PowValidator> RelayNode<V> {
 
         if !self.config.auth_required() {
             debug!(peer = %src_addr, "Creating unauthenticated keepalive session");
-            sessions.insert(src_addr, RelaySession::new(src_addr, [0u8; 32]));
+            sessions.insert(
+                src_addr,
+                RelaySession::new(src_addr, UNAUTHENTICATED_KEY_ID, [0u8; 32]),
+            );
             self.metrics.inc_sessions_created();
+            self.metrics
+                .inc_sessions_created_for_key(UNAUTHENTICATED_KEY_ID);
             return Ok(());
         }
 
@@ -936,9 +971,9 @@ impl<V: PowValidator> RelayNode<V> {
             return Err(TransportError::AuthenticationFailed);
         }
 
-        let mut authenticated_key: Option<[u8; 32]> = None;
+        let mut authenticated_key: Option<AuthKey> = None;
         for key in &self.config.authorized_keys {
-            let temp_session = RelaySession::new(src_addr, *key);
+            let temp_session = RelaySession::new(src_addr, key.id.clone(), key.key);
             if temp_session.verify_hmac(
                 &chunk.header.block_hash,
                 chunk.header.chunk_id,
@@ -947,15 +982,19 @@ impl<V: PowValidator> RelayNode<V> {
                 &chunk.payload,
                 &chunk.header.hmac,
             ) {
-                authenticated_key = Some(*key);
+                authenticated_key = Some(key.clone());
                 break;
             }
         }
 
         if let Some(key) = authenticated_key {
-            info!(peer = %src_addr, "Authenticated new keepalive session");
-            sessions.insert(src_addr, RelaySession::new(src_addr, key));
+            info!(peer = %src_addr, key_id = %key.id, "Authenticated new keepalive session");
+            sessions.insert(
+                src_addr,
+                RelaySession::new(src_addr, key.id.clone(), key.key),
+            );
             self.metrics.inc_sessions_created();
+            self.metrics.inc_sessions_created_for_key(&key.id);
             Ok(())
         } else {
             warn!(peer = %src_addr, "Keepalive authentication failed - no matching key");
@@ -1110,7 +1149,7 @@ mod tests {
     #[test]
     fn relay_node_creation() {
         let config = RelayConfig::new("127.0.0.1:8333".parse().unwrap())
-            .with_authorized_keys(vec![[0x42; 32]]);
+            .with_authorized_keys(vec![AuthKey::new("fleet", [0x42; 32])]);
 
         let node = RelayNode::new(config).unwrap();
 
@@ -1118,6 +1157,50 @@ mod tests {
         assert!(node.is_authorized(&[0x42; 32]));
         assert!(!node.is_authorized(&[0x00; 32]));
         assert!(!node.is_running());
+    }
+
+    #[tokio::test]
+    async fn packet_matched_by_second_key_creates_session_attributed_to_that_key() {
+        // Per-key-identity hardening (PR-A): with two named keys configured,
+        // a session must be attributed to whichever key actually matched --
+        // not always the first/fleet key.
+        let alice_key = [0x11; 32];
+        let bob_key = [0x22; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![
+            AuthKey::new("alice", alice_key),
+            AuthKey::new("bob", bob_key),
+        ]);
+        let mut node = RelayNode::new(config.clone()).unwrap();
+        node.bind().await.unwrap();
+
+        let src_addr: SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        let block_hash = [0x9a; 32];
+        let payload = vec![5u8; 10];
+        let payload_len = payload.len() as u16;
+        let total_chunks = (config.data_shards + config.parity_shards) as u16;
+        let chunk_id = 0u16;
+
+        // Build a chunk authenticated with bob's key (the SECOND configured
+        // key), so the match loop must fall through past alice's key.
+        let bob_session = RelaySession::new(src_addr, "bob", bob_key);
+        let hmac =
+            bob_session.compute_hmac(&block_hash, chunk_id, total_chunks, payload_len, &payload);
+        let header = ChunkHeader::new_block_authenticated(
+            &block_hash,
+            chunk_id,
+            total_chunks,
+            payload_len,
+            hmac,
+        );
+        let chunk = Chunk::new(header, payload);
+
+        node.handle_packet(&chunk.to_bytes(), src_addr)
+            .await
+            .unwrap();
+
+        let sessions = node.sessions.read().await;
+        let session = sessions.get(&src_addr).expect("session should be created");
+        assert_eq!(session.key_id(), "bob");
     }
 
     #[tokio::test]
@@ -1262,7 +1345,7 @@ mod tests {
             .with_unauthenticated_peers_allowed(true)
             .with_fec(224, 32);
         let node = RelayNode::with_validator(config, StubPowValidator).unwrap();
-        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), [0u8; 32]);
+        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), "test", [0u8; 32]);
         let mut ready_objects = Vec::new();
 
         for segment in &segments {
@@ -1317,7 +1400,7 @@ mod tests {
         let node = RelayNode::with_validator(config, StubPowValidator)
             .unwrap()
             .with_arrival_sink(Some(ArrivalSink::new(&arrival_path).unwrap()));
-        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), [0u8; 32]);
+        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), "test", [0u8; 32]);
 
         for segment in &segments {
             let chunks = node.chunker.raw_block_segment_to_chunks(segment).unwrap();
@@ -1357,7 +1440,7 @@ mod tests {
         let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
             .with_unauthenticated_peers_allowed(true);
         let node = RelayNode::with_validator(config, StubPowValidator).unwrap();
-        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), [0u8; 32]);
+        let mut session = RelaySession::new("127.0.0.1:12345".parse().unwrap(), "test", [0u8; 32]);
 
         let segment_one_chunks = node
             .chunker
@@ -1453,8 +1536,8 @@ mod tests {
     #[tokio::test]
     async fn forward_uses_authenticated_chunks_when_required() {
         let auth_key = [0x42; 32];
-        let config =
-            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
         let mut node = RelayNode::new(config).unwrap();
         node.bind().await.unwrap();
 
@@ -1465,8 +1548,14 @@ mod tests {
 
         {
             let mut sessions = node.sessions.write().await;
-            sessions.insert(sender_addr, RelaySession::new(sender_addr, auth_key));
-            sessions.insert(receiver_addr, RelaySession::new(receiver_addr, auth_key));
+            sessions.insert(
+                sender_addr,
+                RelaySession::new(sender_addr, "test", auth_key),
+            );
+            sessions.insert(
+                receiver_addr,
+                RelaySession::new(receiver_addr, "test", auth_key),
+            );
         }
 
         let block_hash = [0xab; 32];
@@ -1485,8 +1574,109 @@ mod tests {
         let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
 
         assert_eq!(parsed.header.version, 2);
-        let session = RelaySession::new(receiver_addr, auth_key);
+        let session = RelaySession::new(receiver_addr, "test", auth_key);
         assert!(session.verify_hmac(
+            &parsed.header.block_hash,
+            parsed.header.chunk_id,
+            parsed.header.total_chunks,
+            parsed.header.payload_len,
+            &parsed.payload,
+            &parsed.header.hmac
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_macs_each_session_with_its_own_bound_key() {
+        // Per-key-identity hardening (PR-A): forward_to_peers must MAC each
+        // outbound chunk with the RECEIVING session's own bound key, not a
+        // single global send key. Two sessions bound to different keys --
+        // "fleet" (A) and "alice" (B, an invitee key) -- must each receive
+        // chunks that verify under their own key and FAIL under the other's.
+        let fleet_key = [0x42; 32];
+        let alice_key = [0x77; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![
+            AuthKey::new("fleet", fleet_key),
+            AuthKey::new("alice", alice_key),
+        ]);
+        let mut node = RelayNode::new(config).unwrap();
+        node.bind().await.unwrap();
+
+        let fleet_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fleet_peer_addr = fleet_peer.local_addr().unwrap();
+        let alice_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let alice_peer_addr = alice_peer.local_addr().unwrap();
+        let sender_addr: SocketAddr = "127.0.0.1:23456".parse().unwrap();
+
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(
+                sender_addr,
+                RelaySession::new(sender_addr, "fleet", fleet_key),
+            );
+            sessions.insert(
+                fleet_peer_addr,
+                RelaySession::new(fleet_peer_addr, "fleet", fleet_key),
+            );
+            sessions.insert(
+                alice_peer_addr,
+                RelaySession::new(alice_peer_addr, "alice", alice_key),
+            );
+        }
+
+        let block_hash = [0xcd; 32];
+        let chunks = vec![(0u16, vec![9u8; 10])];
+
+        node.forward_to_peers(sender_addr, MessageType::Block, &block_hash, 1, 0, &chunks)
+            .await
+            .unwrap();
+
+        let mut buf = vec![0u8; 2048];
+
+        // The fleet-bound session receives a chunk MAC'd with the fleet key:
+        // it verifies under fleet_key and fails under alice_key.
+        let (len, _) = timeout(Duration::from_millis(200), fleet_peer.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for fleet forward")
+            .unwrap();
+        let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
+        let fleet_session = RelaySession::new(fleet_peer_addr, "fleet", fleet_key);
+        let alice_session = RelaySession::new(fleet_peer_addr, "alice", alice_key);
+        assert!(fleet_session.verify_hmac(
+            &parsed.header.block_hash,
+            parsed.header.chunk_id,
+            parsed.header.total_chunks,
+            parsed.header.payload_len,
+            &parsed.payload,
+            &parsed.header.hmac
+        ));
+        assert!(!alice_session.verify_hmac(
+            &parsed.header.block_hash,
+            parsed.header.chunk_id,
+            parsed.header.total_chunks,
+            parsed.header.payload_len,
+            &parsed.payload,
+            &parsed.header.hmac
+        ));
+
+        // The alice-bound (invitee) session receives a chunk MAC'd with
+        // alice's own key: it verifies under alice_key and fails under
+        // fleet_key -- the fleet key was never used toward this session.
+        let (len, _) = timeout(Duration::from_millis(200), alice_peer.recv_from(&mut buf))
+            .await
+            .expect("timeout waiting for alice forward")
+            .unwrap();
+        let parsed = Chunk::from_bytes(&buf[..len]).unwrap();
+        let alice_session = RelaySession::new(alice_peer_addr, "alice", alice_key);
+        let fleet_session = RelaySession::new(alice_peer_addr, "fleet", fleet_key);
+        assert!(alice_session.verify_hmac(
+            &parsed.header.block_hash,
+            parsed.header.chunk_id,
+            parsed.header.total_chunks,
+            parsed.header.payload_len,
+            &parsed.payload,
+            &parsed.header.hmac
+        ));
+        assert!(!fleet_session.verify_hmac(
             &parsed.header.block_hash,
             parsed.header.chunk_id,
             parsed.header.total_chunks,
@@ -1503,8 +1693,8 @@ mod tests {
         // to a peer. The forwarded datagram must remain v3, carry the same
         // per-block data_shards, and authenticate under the v3 HMAC.
         let auth_key = [0x42; 32];
-        let config =
-            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
         let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
         node.bind().await.unwrap();
 
@@ -1513,8 +1703,14 @@ mod tests {
         let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         {
             let mut sessions = node.sessions.write().await;
-            sessions.insert(sender_addr, RelaySession::new(sender_addr, auth_key));
-            sessions.insert(receiver_addr, RelaySession::new(receiver_addr, auth_key));
+            sessions.insert(
+                sender_addr,
+                RelaySession::new(sender_addr, "test", auth_key),
+            );
+            sessions.insert(
+                receiver_addr,
+                RelaySession::new(receiver_addr, "test", auth_key),
+            );
         }
 
         let compact = CompactBlock::new(vec![0xab; 2189], 0x1234, Vec::new(), Vec::new());
@@ -1558,7 +1754,7 @@ mod tests {
             .unwrap();
         }
 
-        let verify_session = RelaySession::new(receiver_addr, auth_key);
+        let verify_session = RelaySession::new(receiver_addr, "test", auth_key);
         let mut buf = vec![0u8; 2048];
         for _ in 0..chunks.len() {
             let (len, _) = timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
@@ -1586,8 +1782,8 @@ mod tests {
         // block (it carries the header) and forwarded to peers as authenticated
         // v3 CompactSkeleton chunks under its own object id.
         let auth_key = [0x42; 32];
-        let config =
-            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![auth_key]);
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("fleet", auth_key)]);
         let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
         node.bind().await.unwrap();
 
@@ -1596,8 +1792,14 @@ mod tests {
         let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         {
             let mut sessions = node.sessions.write().await;
-            sessions.insert(sender_addr, RelaySession::new(sender_addr, auth_key));
-            sessions.insert(receiver_addr, RelaySession::new(receiver_addr, auth_key));
+            sessions.insert(
+                sender_addr,
+                RelaySession::new(sender_addr, "test", auth_key),
+            );
+            sessions.insert(
+                receiver_addr,
+                RelaySession::new(receiver_addr, "test", auth_key),
+            );
         }
 
         let compact = CompactBlock::new(vec![0xab; 2189], 0xbeef, Vec::new(), Vec::new());
@@ -1649,7 +1851,7 @@ mod tests {
             .unwrap();
         }
 
-        let verify_session = RelaySession::new(receiver_addr, auth_key);
+        let verify_session = RelaySession::new(receiver_addr, "test", auth_key);
         let mut buf = vec![0u8; 2048];
         for _ in 0..chunks.len() {
             let (len, _) = timeout(Duration::from_millis(200), receiver.recv_from(&mut buf))
@@ -1682,7 +1884,10 @@ mod tests {
         let sender_addr: SocketAddr = "127.0.0.1:12345".parse().unwrap();
         {
             let mut sessions = node.sessions.write().await;
-            sessions.insert(sender_addr, RelaySession::new(sender_addr, [0u8; 32]));
+            sessions.insert(
+                sender_addr,
+                RelaySession::new(sender_addr, "test", [0u8; 32]),
+            );
         }
 
         let block_hash = [0xab; 32];
@@ -1707,7 +1912,10 @@ mod tests {
         let new_addr: SocketAddr = "127.0.0.1:12346".parse().unwrap();
         {
             let mut sessions = node.sessions.write().await;
-            sessions.insert(existing_addr, RelaySession::new(existing_addr, [0u8; 32]));
+            sessions.insert(
+                existing_addr,
+                RelaySession::new(existing_addr, "test", [0u8; 32]),
+            );
         }
 
         let keepalive = Chunk::new(

@@ -1,5 +1,7 @@
 //! Relay metrics for operational monitoring
 
+use std::collections::HashMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Relay node metrics
@@ -57,6 +59,12 @@ pub struct RelayMetrics {
     /// Of those misses, ones that had >= 90% of data_shards when dropped
     /// (marginal: a parity bump / retransmit would likely have saved them).
     pub assembly_misses_near: AtomicU64,
+    /// Sessions created, keyed by the auth key id that authenticated them
+    /// (per-key-identity hardening, PR-A). Lets an operator see per-invitee
+    /// session volume without a dedicated metrics stack.
+    sessions_created_by_key: Mutex<HashMap<String, u64>>,
+    /// Chunks forwarded to sessions, keyed by the bound auth key id.
+    chunks_forwarded_by_key: Mutex<HashMap<String, u64>>,
 }
 
 impl RelayMetrics {
@@ -196,6 +204,25 @@ impl RelayMetrics {
         self.assembly_misses_near.fetch_add(near, Ordering::Relaxed);
     }
 
+    /// Record a session created and bound to `key_id` (per-key-identity
+    /// hardening, PR-A).
+    pub fn inc_sessions_created_for_key(&self, key_id: &str) {
+        let mut by_key = self
+            .sessions_created_by_key
+            .lock()
+            .expect("sessions_created_by_key mutex poisoned");
+        *by_key.entry(key_id.to_string()).or_insert(0) += 1;
+    }
+
+    /// Record `count` chunks forwarded to a session bound to `key_id`.
+    pub fn inc_chunks_forwarded_for_key(&self, key_id: &str, count: u64) {
+        let mut by_key = self
+            .chunks_forwarded_by_key
+            .lock()
+            .expect("chunks_forwarded_by_key mutex poisoned");
+        *by_key.entry(key_id.to_string()).or_insert(0) += count;
+    }
+
     /// Get snapshot of current metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -236,12 +263,23 @@ impl RelayMetrics {
             reconstruct_latency_over_10s: self.reconstruct_latency_over_10s.load(Ordering::Relaxed),
             assembly_misses: self.assembly_misses.load(Ordering::Relaxed),
             assembly_misses_near: self.assembly_misses_near.load(Ordering::Relaxed),
+            sessions_created_by_key: sorted_key_counts(&self.sessions_created_by_key),
+            chunks_forwarded_by_key: sorted_key_counts(&self.chunks_forwarded_by_key),
         }
     }
 }
 
+/// Snapshot a `key_id -> count` map into a deterministically ordered vec
+/// (sorted by key id) so prometheus rendering and tests are stable.
+fn sorted_key_counts(map: &Mutex<HashMap<String, u64>>) -> Vec<(String, u64)> {
+    let map = map.lock().expect("key-counter mutex poisoned");
+    let mut entries: Vec<(String, u64)> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    entries
+}
+
 /// Snapshot of metrics at a point in time
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MetricsSnapshot {
     pub packets_received: u64,
     pub packets_forwarded: u64,
@@ -268,6 +306,11 @@ pub struct MetricsSnapshot {
     pub reconstruct_latency_over_10s: u64,
     pub assembly_misses: u64,
     pub assembly_misses_near: u64,
+    /// Sessions created per auth key id, sorted by id (per-key-identity
+    /// hardening, PR-A).
+    pub sessions_created_by_key: Vec<(String, u64)>,
+    /// Chunks forwarded per auth key id, sorted by id.
+    pub chunks_forwarded_by_key: Vec<(String, u64)>,
 }
 
 /// Render relay metrics in Prometheus text exposition format.
@@ -455,7 +498,55 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "counter",
         snapshot.assembly_misses_near,
     );
+    push_labeled_metric_family(
+        &mut text,
+        "sovright_relay_relay_sessions_created_by_key_total",
+        "Total relay sessions created, labeled by the auth key id that authenticated them.",
+        "counter",
+        &snapshot.sessions_created_by_key,
+    );
+    push_labeled_metric_family(
+        &mut text,
+        "sovright_relay_relay_chunks_forwarded_by_key_total",
+        "Total chunks forwarded to sessions, labeled by the bound auth key id.",
+        "counter",
+        &snapshot.chunks_forwarded_by_key,
+    );
     text
+}
+
+/// Push a `key_id`-labeled metric family (one HELP/TYPE block, one line per
+/// series). Key ids are restricted at parse time to `[A-Za-z0-9_-]{1,32}`
+/// (see `relay-node`'s auth key config parsing), so no label-value escaping
+/// is required here.
+fn push_labeled_metric_family(
+    text: &mut String,
+    name: &str,
+    help: &str,
+    metric_type: &str,
+    series: &[(String, u64)],
+) {
+    if series.is_empty() {
+        return;
+    }
+    text.push_str("# HELP ");
+    text.push_str(name);
+    text.push(' ');
+    text.push_str(help);
+    text.push('\n');
+    text.push_str("# TYPE ");
+    text.push_str(name);
+    text.push(' ');
+    text.push_str(metric_type);
+    text.push('\n');
+    for (key_id, value) in series {
+        text.push_str(name);
+        text.push_str("{key_id=\"");
+        text.push_str(key_id);
+        text.push_str("\"} ");
+        text.push_str(&value.to_string());
+        text.push('\n');
+    }
 }
 
 fn push_metric(text: &mut String, name: &str, help: &str, metric_type: &str, value: u64) {
@@ -531,6 +622,8 @@ mod tests {
             reconstruct_latency_over_10s: 1,
             assembly_misses: 7,
             assembly_misses_near: 3,
+            sessions_created_by_key: Vec::new(),
+            chunks_forwarded_by_key: Vec::new(),
         };
 
         let text = render_prometheus_text(&snapshot, 5);
@@ -578,5 +671,49 @@ mod tests {
         assert_eq!(s.reconstruct_latency_sum_ms, 300 + 2_000 + 3_500 + 25_000);
         assert_eq!(s.reconstruct_latency_over_2s, 2);
         assert_eq!(s.reconstruct_latency_over_10s, 1);
+    }
+
+    #[test]
+    fn per_key_counters_are_tracked_and_sorted_by_key_id() {
+        let metrics = RelayMetrics::new();
+        metrics.inc_sessions_created_for_key("bob");
+        metrics.inc_sessions_created_for_key("alice");
+        metrics.inc_sessions_created_for_key("alice");
+        metrics.inc_chunks_forwarded_for_key("alice", 5);
+        metrics.inc_chunks_forwarded_for_key("bob", 2);
+        metrics.inc_chunks_forwarded_for_key("alice", 3);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.sessions_created_by_key,
+            vec![("alice".to_string(), 2), ("bob".to_string(), 1)]
+        );
+        assert_eq!(
+            snapshot.chunks_forwarded_by_key,
+            vec![("alice".to_string(), 8), ("bob".to_string(), 2)]
+        );
+
+        let text = render_prometheus_text(&snapshot, 0);
+        assert!(
+            text.contains(
+                "sovright_relay_relay_sessions_created_by_key_total{key_id=\"alice\"} 2\n"
+            )
+        );
+        assert!(
+            text.contains("sovright_relay_relay_sessions_created_by_key_total{key_id=\"bob\"} 1\n")
+        );
+        assert!(
+            text.contains(
+                "sovright_relay_relay_chunks_forwarded_by_key_total{key_id=\"alice\"} 8\n"
+            )
+        );
+    }
+
+    #[test]
+    fn labeled_metric_family_omitted_when_empty() {
+        let snapshot = MetricsSnapshot::default();
+        let text = render_prometheus_text(&snapshot, 0);
+        assert!(!text.contains("sovright_relay_relay_sessions_created_by_key_total"));
+        assert!(!text.contains("sovright_relay_relay_chunks_forwarded_by_key_total"));
     }
 }

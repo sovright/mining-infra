@@ -135,6 +135,11 @@ impl BlockAssembly {
 pub struct RelaySession {
     /// Peer address
     pub peer_addr: SocketAddr,
+    /// Identity label of the auth key this session was bound with (see
+    /// per-key-identity hardening, PR-A). Every session -- authenticated or
+    /// admitted while auth is not required -- carries an id so it can be
+    /// attributed in logs/metrics; unauthenticated sessions use a sentinel id.
+    key_id: String,
     /// Pre-shared authentication key
     auth_key: [u8; 32],
     /// Last activity time
@@ -147,16 +152,25 @@ pub struct RelaySession {
 }
 
 impl RelaySession {
-    /// Create a new session
-    pub fn new(peer_addr: SocketAddr, auth_key: [u8; 32]) -> Self {
+    /// Create a new session bound to a named auth key.
+    ///
+    /// `key_id` attributes this session (and everything forwarded to it) to
+    /// the specific invitee/fleet key that authenticated it.
+    pub fn new(peer_addr: SocketAddr, key_id: impl Into<String>, auth_key: [u8; 32]) -> Self {
         Self {
             peer_addr,
+            key_id: key_id.into(),
             auth_key,
             last_seen: Instant::now(),
             pending_blocks: HashMap::new(),
             recent_chunks: HashMap::new(),
             recent_order: VecDeque::new(),
         }
+    }
+
+    /// The identity label of the key this session is bound to.
+    pub fn key_id(&self) -> &str {
+        &self.key_id
     }
 
     /// Update last seen time
@@ -398,7 +412,7 @@ mod tests {
     #[test]
     fn cleanup_counts_timed_out_incomplete_assemblies() {
         let addr = "127.0.0.1:8333".parse().unwrap();
-        let mut session = RelaySession::new(addr, [0x42; 32]);
+        let mut session = RelaySession::new(addr, "test", [0x42; 32]);
         let old = Instant::now() - Duration::from_secs(60);
         // data_shards = 10 -> near threshold = 9.
 
@@ -441,7 +455,7 @@ mod tests {
     fn session_hmac_verification() {
         let addr = "127.0.0.1:8333".parse().unwrap();
         let key = [0x42; 32];
-        let session = RelaySession::new(addr, key);
+        let session = RelaySession::new(addr, "test", key);
 
         let block_hash = [0xab; 32];
         let chunk_id = 5u16;
@@ -467,7 +481,7 @@ mod tests {
     fn session_hmac_detects_payload_tampering() {
         let addr = "127.0.0.1:8333".parse().unwrap();
         let key = [0x24; 32];
-        let session = RelaySession::new(addr, key);
+        let session = RelaySession::new(addr, "test", key);
 
         let block_hash = [0x11; 32];
         let chunk_id = 1u16;
@@ -491,7 +505,7 @@ mod tests {
     #[test]
     fn session_hmac_v3_authenticates_data_shards() {
         let addr = "127.0.0.1:8333".parse().unwrap();
-        let session = RelaySession::new(addr, [0x42; 32]);
+        let session = RelaySession::new(addr, "test", [0x42; 32]);
 
         let block_hash = [0xab; 32];
         let payload = [0x01, 0x02, 0x03];
@@ -506,7 +520,7 @@ mod tests {
     #[test]
     fn session_hmac_v3_differs_from_v2() {
         let addr = "127.0.0.1:8333".parse().unwrap();
-        let session = RelaySession::new(addr, [0x24; 32]);
+        let session = RelaySession::new(addr, "test", [0x24; 32]);
 
         let block_hash = [0x11; 32];
         let payload = [0xaa, 0xbb, 0xcc];
@@ -529,7 +543,7 @@ mod tests {
     fn session_limits_pending_blocks() {
         let addr = "127.0.0.1:8333".parse().unwrap();
         let key = [0x11; 32];
-        let mut session = RelaySession::new(addr, key);
+        let mut session = RelaySession::new(addr, "test", key);
 
         for i in 0..MAX_PENDING_BLOCKS {
             let mut hash = [0u8; 32];
@@ -546,7 +560,7 @@ mod tests {
     fn session_rejects_assembly_message_type_mismatch() {
         let addr = "127.0.0.1:8333".parse().unwrap();
         let key = [0x33; 32];
-        let mut session = RelaySession::new(addr, key);
+        let mut session = RelaySession::new(addr, "test", key);
         let hash = [0x66; 32];
 
         assert!(
@@ -565,10 +579,17 @@ mod tests {
     fn session_rejects_recent_replay() {
         let addr = "127.0.0.1:8333".parse().unwrap();
         let key = [0x22; 32];
-        let mut session = RelaySession::new(addr, key);
+        let mut session = RelaySession::new(addr, "test", key);
 
         let hash = [0x55; 32];
         assert!(session.mark_chunk_seen(hash, 1));
         assert!(!session.mark_chunk_seen(hash, 1));
+    }
+
+    #[test]
+    fn session_records_bound_key_id() {
+        let addr = "127.0.0.1:8333".parse().unwrap();
+        let session = RelaySession::new(addr, "alice", [0x99; 32]);
+        assert_eq!(session.key_id(), "alice");
     }
 }

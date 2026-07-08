@@ -14,7 +14,7 @@ pub use chunk::{
     MAX_PAYLOAD_SIZE, MAX_PAYLOAD_SIZE_V3, MAX_TOTAL_CHUNKS, MessageType, header_size_for_version,
 };
 pub use chunker::BlockChunker;
-pub use config::{ClientConfig, RelayConfig};
+pub use config::{AuthKey, ClientConfig, RelayConfig};
 pub use error::TransportError;
 pub use pow::{
     EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, PowResult, PowValidator,

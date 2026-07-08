@@ -37,10 +37,10 @@ pub use segmented_block::{
     segment_object_hash, skeleton_object_hash, split_raw_block,
 };
 pub use transport::{
-    BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig, EQUIHASH_K,
-    EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, MAX_PAYLOAD_SIZE, MessageType,
-    PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession, StubPowValidator,
-    TransportError, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+    AuthKey, BlockAssembly, BlockChunker, CHUNK_MAGIC, Chunk, ChunkHeader, ClientConfig,
+    EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, MAX_PAYLOAD_SIZE,
+    MessageType, PowResult, PowValidator, RejectAllValidator, RelayConfig, RelaySession,
+    StubPowValidator, TransportError, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
 };
 pub use tx_feed::{TxFeedError, TxFeedRecord};
 pub use types::{AuthDigest, BlockHash, ShortId, TxId, WtxId};
