@@ -11,7 +11,8 @@
 //! automatically added to the mesh" step.
 
 use std::env;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -40,11 +41,55 @@ struct State {
     keystore_path: String,
 }
 
-fn now_secs() -> u64 {
+/// Wall-clock seconds since the Unix epoch, or `None` if the system clock is
+/// before the epoch (an error the kernel should never produce, but which we
+/// must not paper over). Callers treat `None` as a hard failure rather than
+/// substituting 0: a 0 timestamp would stamp bogus `expires_at` values at issue
+/// time *and* make every existing invite look un-expired at check time
+/// (fail-open). Returning `None` keeps the failure explicit at both sites.
+fn now_secs() -> Option<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .ok()
+}
+
+/// True only if `bind` can be *proven* to be a loopback endpoint. Resolves the
+/// bind via DNS (for the socket layer, a hostname bind resolves the same way)
+/// and requires the resolution to be non-empty and every resolved address to be
+/// loopback. The literal host `localhost` is accepted directly since some
+/// resolver configs surprise us. Any resolution failure or a mix of addresses is
+/// treated as "not proven" -> caller requires TLS.
+fn bind_is_proven_loopback(bind: &str) -> bool {
+    // Treat a literal "localhost" host as loopback regardless of resolver quirks.
+    if let Some((host, _port)) = bind.rsplit_once(':')
+        && host.eq_ignore_ascii_case("localhost")
+    {
+        return true;
+    }
+    // Resolve once and collect (the iterator must not be consumed twice).
+    match bind.to_socket_addrs() {
+        Ok(addrs) => {
+            let addrs: Vec<SocketAddr> = addrs.collect();
+            !addrs.is_empty() && addrs.iter().all(|a| a.ip().is_loopback())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Max concurrent connection-handler threads. Each handler runs Equihash-free,
+/// short-lived work but spawns an OS thread; without a bound a flood of
+/// connections would spawn threads until the process exhausts memory/FDs. Excess
+/// connections are dropped (their socket closes) rather than queued.
+const MAX_CONNECTIONS: usize = 128;
+
+/// RAII guard that decrements the live-connection counter on every exit path of
+/// a handler thread (normal return, early return, or panic unwinding).
+struct ConnGuard(Arc<AtomicUsize>);
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -65,14 +110,21 @@ fn main() -> std::io::Result<()> {
     // configured would broadcast invite codes and mesh key material in the
     // clear. Treat SOVRIGHT_ENROLL_TLS_CERT being set as "TLS configured".
     let tls_configured = env::var_os("SOVRIGHT_ENROLL_TLS_CERT").is_some();
-    if let Ok(addr) = bind.parse::<SocketAddr>()
-        && !addr.ip().is_loopback()
-        && !tls_configured
-    {
+    // Fail CLOSED: a plaintext bind is only permitted if it can be PROVEN
+    // loopback. A parse-based check let a non-IP hostname (e.g.
+    // "host.example.com:8088") slip through and bind in the clear, because it
+    // failed to parse as a SocketAddr and the guard never fired. Instead resolve
+    // the bind and require the resolution to be non-empty and *every* resolved
+    // address to be loopback; the literal host "localhost" is also treated as
+    // loopback (some resolvers omit it). Anything we cannot prove is loopback is
+    // treated as non-loopback and requires TLS.
+    if !tls_configured && !bind_is_proven_loopback(&bind) {
         eprintln!(
-            "[enroll] refusing to bind {bind}: non-loopback address without TLS would \
-             expose invite codes and mesh keys in cleartext. Bind to loopback, or set \
-             SOVRIGHT_ENROLL_TLS_CERT once TLS termination is configured."
+            "[enroll] refusing to bind {bind}: address could not be proven loopback \
+             and no TLS is configured — a non-loopback bind would expose invite codes \
+             and mesh keys in cleartext. Bind to loopback (127.0.0.1:x, [::1]:x, \
+             localhost:x), or set SOVRIGHT_ENROLL_TLS_CERT once TLS termination is \
+             configured."
         );
         std::process::exit(1);
     }
@@ -92,16 +144,33 @@ fn main() -> std::io::Result<()> {
         state.lock().unwrap().keystore_path
     );
 
+    let active = Arc::new(AtomicUsize::new(0));
     for conn in listener.incoming() {
-        let stream = match conn {
+        let mut stream = match conn {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("[enroll] accept error: {e}");
                 continue;
             }
         };
+        // Enforce a global connection cap before spawning a worker. Reserve a
+        // slot with a single atomic increment; if we blew past the cap, undo the
+        // reservation, refuse the connection, and drop the stream (which closes
+        // it) without spawning a thread.
+        if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+            active.fetch_sub(1, Ordering::AcqRel);
+            let _ = std::io::Write::write_all(
+                &mut stream,
+                &reply(503, "Service Unavailable", json!({"error":"too many connections"})),
+            );
+            eprintln!("[enroll] connection cap ({MAX_CONNECTIONS}) reached; refusing connection");
+            continue;
+        }
+        let guard = ConnGuard(Arc::clone(&active));
         let state = Arc::clone(&state);
         std::thread::spawn(move || {
+            // Decrement the live-connection count on any exit path.
+            let _guard = guard;
             let mut stream = stream;
             // Bound how long a slow/stalled client can hold a worker thread.
             let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
@@ -153,9 +222,23 @@ fn handle(state: &Arc<Mutex<State>>, method: &str, path: &str, body: &[u8]) -> V
             if !ops_token_eq(&req.ops_token, &st.ops_token) {
                 return reply(401, "Unauthorized", json!({"error":"bad ops token"}));
             }
+            // Validate the pool label at ISSUE time so the stored invite (which is
+            // later logged and returned to the enrolling node) can never carry
+            // control chars or unbounded input. Mirrors the miner_id check in enroll().
+            if !sovright_mesh_enroll::valid_ident(&req.pool) {
+                return reply(
+                    400,
+                    "Bad Request",
+                    json!({"error":"pool must be 1-64 chars of [A-Za-z0-9_-]"}),
+                );
+            }
+            let now = match now_secs() {
+                Some(n) => n,
+                None => return reply(500, "Internal Server Error", json!({"error":"clock error"})),
+            };
             let code = st
                 .invites
-                .issue(new_invite_code(), &req.pool, now_secs(), req.ttl_secs);
+                .issue(new_invite_code(), &req.pool, now, req.ttl_secs);
             reply(200, "OK", json!({"invite_code": code, "pool": req.pool}))
         }
         ("POST", "/v1/enroll") => {
@@ -163,10 +246,14 @@ fn handle(state: &Arc<Mutex<State>>, method: &str, path: &str, body: &[u8]) -> V
                 Ok(r) => r,
                 Err(e) => return reply(400, "Bad Request", json!({"error": e.to_string()})),
             };
+            let now = match now_secs() {
+                Some(n) => n,
+                None => return reply(500, "Internal Server Error", json!({"error":"clock error"})),
+            };
             let mut guard = state.lock().unwrap();
             let st = &mut *guard;
             let peers = st.mesh_peers.clone();
-            match enroll(&mut st.invites, &mut st.keys, &peers, &req, now_secs()) {
+            match enroll(&mut st.invites, &mut st.keys, &peers, &req, now) {
                 Ok(enr) => {
                     persist_keystore(st);
                     eprintln!(
@@ -255,4 +342,82 @@ fn write_atomic(path: &str, contents: &[u8]) -> std::io::Result<()> {
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> Arc<Mutex<State>> {
+        Arc::new(Mutex::new(State {
+            invites: InviteStore::new(),
+            keys: KeyStore::new(),
+            mesh_peers: vec![],
+            ops_token: "tok".into(),
+            keystore_path: "/dev/null/nope".into(),
+        }))
+    }
+
+    /// Parse the numeric status out of a `handle` response (first line: "HTTP/1.1 <code> ...").
+    fn status_of(resp: &[u8]) -> u16 {
+        let text = String::from_utf8_lossy(resp);
+        text.split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn invite_rejects_bad_pool() {
+        let st = test_state();
+        // A pool label with a newline must be rejected 400 at issue time and
+        // must not issue an invite.
+        for bad in ["evil\npool", &"p".repeat(65), "", "has space", "dots.bad"] {
+            let body = json!({"ops_token":"tok","pool": bad}).to_string();
+            let resp = handle(&st, "POST", "/v1/invite", body.as_bytes());
+            assert_eq!(status_of(&resp), 400, "bad pool {bad:?} -> 400");
+        }
+    }
+
+    #[test]
+    fn invite_accepts_good_pool() {
+        let st = test_state();
+        let body = json!({"ops_token":"tok","pool":"pool-a"}).to_string();
+        let resp = handle(&st, "POST", "/v1/invite", body.as_bytes());
+        assert_eq!(status_of(&resp), 200);
+    }
+
+    #[test]
+    fn invite_bad_ops_token_still_401() {
+        let st = test_state();
+        let body = json!({"ops_token":"wrong","pool":"pool-a"}).to_string();
+        let resp = handle(&st, "POST", "/v1/invite", body.as_bytes());
+        assert_eq!(status_of(&resp), 401);
+    }
+
+    #[test]
+    fn loopback_prover_accepts_genuine_loopback() {
+        assert!(bind_is_proven_loopback("127.0.0.1:8088"));
+        assert!(bind_is_proven_loopback("[::1]:8088"));
+        assert!(bind_is_proven_loopback("localhost:8088"));
+        assert!(bind_is_proven_loopback("LOCALHOST:8088"));
+    }
+
+    #[test]
+    fn loopback_prover_rejects_non_loopback_and_unresolvable() {
+        // Public IP is not loopback.
+        assert!(!bind_is_proven_loopback("8.8.8.8:8088"));
+        assert!(!bind_is_proven_loopback("0.0.0.0:8088"));
+        // A non-IP hostname that isn't "localhost" cannot be proven loopback:
+        // either it fails to resolve or resolves to non-loopback -> false.
+        // (Uses .invalid, reserved by RFC 6761 to never resolve.)
+        assert!(!bind_is_proven_loopback("nope.invalid:8088"));
+    }
+
+    #[test]
+    fn now_secs_is_some_and_sane() {
+        // Sanity: on a healthy clock now_secs yields a plausible recent epoch.
+        let n = now_secs().expect("clock should be after epoch");
+        assert!(n > 1_600_000_000, "expected a post-2020 timestamp, got {n}");
+    }
 }
