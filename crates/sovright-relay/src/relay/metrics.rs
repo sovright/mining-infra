@@ -46,6 +46,11 @@ pub struct RelayMetrics {
     /// Sessions evicted because their bound auth key was revoked
     /// (hot-revocation, PR-B).
     pub sessions_evicted: AtomicU64,
+    /// Unix time (seconds) of the last successful auth-keys reload apply
+    /// (hot-revocation liveness, PR-B). Zero until the first successful reload.
+    /// A stale value (or one that stops advancing) signals the reload loop has
+    /// died and hot revocation is no longer being applied.
+    pub last_auth_keys_reload_unix: AtomicU64,
     /// Incoming packets rejected because the session limit was reached
     pub session_limit_rejections: AtomicU64,
     /// Raw-segment reconstructions observed (first chunk -> PoW validated).
@@ -181,6 +186,14 @@ impl RelayMetrics {
         self.sessions_evicted.fetch_add(n, Ordering::Relaxed);
     }
 
+    /// Record that an auth-keys reload was successfully applied at `unix_secs`
+    /// (hot-revocation liveness, PR-B). Operators alert on this timestamp going
+    /// stale, which means the reload loop stopped applying revocations.
+    pub fn set_last_auth_keys_reload_unix(&self, unix_secs: u64) {
+        self.last_auth_keys_reload_unix
+            .store(unix_secs, Ordering::Relaxed);
+    }
+
     /// Increment session limit rejections
     pub fn inc_session_limit_rejections(&self) {
         self.session_limit_rejections
@@ -265,6 +278,7 @@ impl RelayMetrics {
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_expired: self.sessions_expired.load(Ordering::Relaxed),
             sessions_evicted: self.sessions_evicted.load(Ordering::Relaxed),
+            last_auth_keys_reload_unix: self.last_auth_keys_reload_unix.load(Ordering::Relaxed),
             session_limit_rejections: self.session_limit_rejections.load(Ordering::Relaxed),
             reconstruct_latency_count: self.reconstruct_latency_count.load(Ordering::Relaxed),
             reconstruct_latency_sum_ms: self.reconstruct_latency_sum_ms.load(Ordering::Relaxed),
@@ -309,6 +323,9 @@ pub struct MetricsSnapshot {
     pub sessions_created: u64,
     pub sessions_expired: u64,
     pub sessions_evicted: u64,
+    /// Unix time (seconds) of the last successful auth-keys reload apply
+    /// (hot-revocation liveness, PR-B). Zero until the first successful reload.
+    pub last_auth_keys_reload_unix: u64,
     pub session_limit_rejections: u64,
     pub reconstruct_latency_count: u64,
     pub reconstruct_latency_sum_ms: u64,
@@ -465,6 +482,13 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "Total relay sessions evicted because their bound auth key was revoked.",
         "counter",
         snapshot.sessions_evicted,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_last_auth_keys_reload_unix",
+        "Unix time (seconds) of the last successful auth-keys reload apply; 0 until the first reload. Alert if this stops advancing (hot revocation disabled).",
+        "gauge",
+        snapshot.last_auth_keys_reload_unix,
     );
     push_metric(
         &mut text,
@@ -633,6 +657,7 @@ mod tests {
             sessions_created: 3,
             sessions_expired: 4,
             sessions_evicted: 16,
+            last_auth_keys_reload_unix: 1_700_000_000,
             session_limit_rejections: 6,
             reconstruct_latency_count: 20,
             reconstruct_latency_sum_ms: 8000,
@@ -674,6 +699,12 @@ mod tests {
         assert!(text.contains("sovright_relay_relay_sessions_created_total 3\n"));
         assert!(text.contains("sovright_relay_relay_sessions_expired_total 4\n"));
         assert!(text.contains("sovright_relay_relay_sessions_evicted_total 16\n"));
+        assert!(
+            text.contains("# TYPE sovright_relay_relay_last_auth_keys_reload_unix gauge")
+        );
+        assert!(
+            text.contains("sovright_relay_relay_last_auth_keys_reload_unix 1700000000\n")
+        );
         assert!(text.contains("sovright_relay_relay_session_limit_rejections_total 6\n"));
     }
 

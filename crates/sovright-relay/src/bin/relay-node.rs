@@ -6,7 +6,7 @@ use std::time::Duration;
 use std::{env, fs};
 
 use sovright_relay::{ArrivalSink, AuthKey, RelayConfig, RelayNode, render_prometheus_text};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -235,7 +235,7 @@ fn spawn_auth_keys_reload_task(
     path: PathBuf,
     reload_secs: u64,
 ) {
-    tokio::spawn(async move {
+    let reload_handle = tokio::spawn(async move {
         let mut last_good_file_keys = initial_file_keys;
         let mut interval = tokio::time::interval(Duration::from_secs(reload_secs.max(1)));
         // The first tick fires immediately; skip it since the initial active
@@ -305,6 +305,33 @@ fn spawn_auth_keys_reload_task(
             );
             node.apply_active_keys(active).await;
             last_good_file_keys = file_keys;
+            // Liveness signal: stamp the wall-clock time of this successful
+            // apply so operators can alert when the reload loop stops advancing
+            // it (which would mean hot revocation is no longer being applied).
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            node.metrics().set_last_auth_keys_reload_unix(now_unix);
+        }
+    });
+
+    // Supervisor: the reload loop above is meant to run for the entire process
+    // lifetime. If it ever returns (loop body somehow breaks) or panics, hot
+    // revocation is silently disabled -- fire-and-forget would swallow that.
+    // Await the JoinHandle and log at error! so it is alertable. We do NOT
+    // restart it: a terminating long-lived loop is a bug, and the loop's own
+    // fail-safe (keep the previous good key set on any per-tick error) means a
+    // stuck/removed keys file never reaches this point.
+    tokio::spawn(async move {
+        match reload_handle.await {
+            Ok(()) => error!(
+                "Auth keys reload task exited unexpectedly; hot revocation DISABLED for the process lifetime"
+            ),
+            Err(join_error) => error!(
+                %join_error,
+                "Auth keys reload task panicked; hot revocation DISABLED for the process lifetime"
+            ),
         }
     });
 }
