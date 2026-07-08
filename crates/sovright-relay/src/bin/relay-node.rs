@@ -194,6 +194,14 @@ fn read_auth_keys_file(
     parse_auth_keys_file_contents(&contents)
 }
 
+/// Collect auth keys into an order-insensitive set of `(id, key-bytes)` pairs
+/// for change detection. Two key lists that contain the same entries in a
+/// different order compare equal, so a mere reordering of the file's lines is
+/// not treated as a semantic change.
+fn auth_key_set(keys: &[AuthKey]) -> HashSet<(String, [u8; 32])> {
+    keys.iter().map(|k| (k.id.clone(), k.key)).collect()
+}
+
 /// Build the active key set = `env_keys` union `file_keys`, validating that
 /// every id is unique across the union (reuses `require_unique_key_ids`).
 fn build_active_key_set(
@@ -235,13 +243,30 @@ fn spawn_auth_keys_reload_task(
         interval.tick().await;
         loop {
             interval.tick().await;
-            let file_keys = match read_auth_keys_file(&path) {
-                Ok(keys) => keys,
-                Err(error) => {
+            // The fs read is blocking; run it off the async worker so a slow
+            // or stalled disk read can't hold up this runtime thread. Only the
+            // read+parse is moved -- everything else (union, diff, apply) stays
+            // on the async path. A JoinError (blocking task panicked/cancelled)
+            // is treated exactly like an IO/parse error: keep the previous good
+            // set. This preserves the fail-safe semantics.
+            let read_path = path.clone();
+            let read_result =
+                tokio::task::spawn_blocking(move || read_auth_keys_file(&read_path)).await;
+            let file_keys = match read_result {
+                Ok(Ok(keys)) => keys,
+                Ok(Err(error)) => {
                     warn!(
                         %error,
                         path = %path.display(),
                         "Failed to read auth keys file on reload; keeping previous active key set"
+                    );
+                    continue;
+                }
+                Err(join_error) => {
+                    warn!(
+                        %join_error,
+                        path = %path.display(),
+                        "Auth keys file read task failed to join on reload; keeping previous active key set"
                     );
                     continue;
                 }
@@ -259,7 +284,10 @@ fn spawn_auth_keys_reload_task(
                 }
             };
 
-            if file_keys == last_good_file_keys {
+            // Order-insensitive change detection: reordering the same
+            // (id, key-bytes) entries in the file is not a semantic change,
+            // so compare as sets rather than by Vec position.
+            if auth_key_set(&file_keys) == auth_key_set(&last_good_file_keys) {
                 continue;
             }
 

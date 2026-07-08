@@ -43,6 +43,9 @@ pub struct RelayMetrics {
     pub sessions_created: AtomicU64,
     /// Sessions expired
     pub sessions_expired: AtomicU64,
+    /// Sessions evicted because their bound auth key was revoked
+    /// (hot-revocation, PR-B).
+    pub sessions_evicted: AtomicU64,
     /// Incoming packets rejected because the session limit was reached
     pub session_limit_rejections: AtomicU64,
     /// Raw-segment reconstructions observed (first chunk -> PoW validated).
@@ -173,6 +176,11 @@ impl RelayMetrics {
         self.sessions_expired.fetch_add(count, Ordering::Relaxed);
     }
 
+    /// Add to sessions evicted count (auth key revoked, hot-revocation PR-B)
+    pub fn add_sessions_evicted(&self, n: u64) {
+        self.sessions_evicted.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// Increment session limit rejections
     pub fn inc_session_limit_rejections(&self) {
         self.session_limit_rejections
@@ -256,6 +264,7 @@ impl RelayMetrics {
             invalid_chunks: self.invalid_chunks.load(Ordering::Relaxed),
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_expired: self.sessions_expired.load(Ordering::Relaxed),
+            sessions_evicted: self.sessions_evicted.load(Ordering::Relaxed),
             session_limit_rejections: self.session_limit_rejections.load(Ordering::Relaxed),
             reconstruct_latency_count: self.reconstruct_latency_count.load(Ordering::Relaxed),
             reconstruct_latency_sum_ms: self.reconstruct_latency_sum_ms.load(Ordering::Relaxed),
@@ -299,6 +308,7 @@ pub struct MetricsSnapshot {
     pub invalid_chunks: u64,
     pub sessions_created: u64,
     pub sessions_expired: u64,
+    pub sessions_evicted: u64,
     pub session_limit_rejections: u64,
     pub reconstruct_latency_count: u64,
     pub reconstruct_latency_sum_ms: u64,
@@ -448,6 +458,13 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "Total relay sessions expired.",
         "counter",
         snapshot.sessions_expired,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_sessions_evicted_total",
+        "Total relay sessions evicted because their bound auth key was revoked.",
+        "counter",
+        snapshot.sessions_evicted,
     );
     push_metric(
         &mut text,
@@ -615,6 +632,7 @@ mod tests {
             invalid_chunks: 2,
             sessions_created: 3,
             sessions_expired: 4,
+            sessions_evicted: 16,
             session_limit_rejections: 6,
             reconstruct_latency_count: 20,
             reconstruct_latency_sum_ms: 8000,
@@ -655,6 +673,7 @@ mod tests {
         assert!(text.contains("sovright_relay_relay_invalid_chunks_total 2\n"));
         assert!(text.contains("sovright_relay_relay_sessions_created_total 3\n"));
         assert!(text.contains("sovright_relay_relay_sessions_expired_total 4\n"));
+        assert!(text.contains("sovright_relay_relay_sessions_evicted_total 16\n"));
         assert!(text.contains("sovright_relay_relay_session_limit_rejections_total 6\n"));
     }
 

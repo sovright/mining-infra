@@ -209,6 +209,7 @@ impl<V: PowValidator> RelayNode<V> {
         });
         let evicted = before - sessions.len();
         if evicted > 0 {
+            self.metrics.add_sessions_evicted(evicted as u64);
             info!(evicted, "Evicted sessions bound to revoked auth keys");
         }
     }
@@ -2081,6 +2082,14 @@ mod tests {
         assert!(
             !sessions.contains_key(&alice_addr),
             "session bound to a revoked key must be evicted"
+        );
+
+        // The eviction must be metered (exactly one session -- alice -- was
+        // evicted; the fleet session survived).
+        assert_eq!(
+            node.metrics().snapshot().sessions_evicted,
+            1,
+            "evicting a session bound to a revoked key must increment the counter"
         );
     }
 
