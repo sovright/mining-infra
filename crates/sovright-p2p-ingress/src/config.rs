@@ -10,6 +10,23 @@ use crate::wire::DEFAULT_PORT;
 /// Zcash address books, but whose blocks are not Zcash mainnet blocks.
 const DENIED_PEER_PORTS: &[u16] = &[16_125, 26_125];
 
+const DEFAULT_SUBMITBLOCK_MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
+
+/// Optional loopback JSON-RPC front door for pool-originated solved blocks.
+///
+/// The pool sends its normal `submitblock` request here. The ingress starts
+/// relay fanout and local Zebra submission concurrently, then returns Zebra's
+/// result. Both the listener and backend are loopback-only in v1 so this does
+/// not create a new unauthenticated network service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubmitBlockRpcConfig {
+    pub bind_addr: SocketAddr,
+    pub zebra_url: String,
+    pub max_block_bytes: usize,
+    pub max_requests_per_minute: usize,
+    pub relay_timeout: Duration,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub seeds: Vec<String>,
@@ -66,6 +83,7 @@ pub struct Config {
     pub relay_forward_dedup_window: Duration,
     /// Maximum bounded LRU size for the forward dedup ring. Default 64.
     pub relay_forward_dedup_capacity: usize,
+    pub submitblock_rpc: Option<SubmitBlockRpcConfig>,
 }
 
 impl Config {
@@ -134,6 +152,7 @@ impl Config {
             Duration::from_secs(env_u64("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS", 30)?);
         let relay_forward_dedup_capacity =
             env_usize("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY", 64)?;
+        let submitblock_rpc = submitblock_rpc_from_env()?;
 
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -182,8 +201,74 @@ impl Config {
             relay_raw_segment_round_delay_millis,
             relay_forward_dedup_window,
             relay_forward_dedup_capacity,
+            submitblock_rpc,
         })
     }
+}
+
+fn submitblock_rpc_from_env() -> Result<Option<SubmitBlockRpcConfig>> {
+    let Some(bind_addr) = env_optional_socket("SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR")? else {
+        return Ok(None);
+    };
+    if !bind_addr.ip().is_loopback() {
+        return Err(IngressError::Config(
+            "SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR must be loopback; put an authenticated TLS proxy in front for remote pool access"
+                .to_string(),
+        ));
+    }
+
+    let zebra_url = env::var("SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8232".to_string());
+    if !is_loopback_http_url(&zebra_url) {
+        return Err(IngressError::Config(
+            "SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL must use http:// with a loopback host".to_string(),
+        ));
+    }
+
+    let max_block_bytes = env_usize(
+        "SOVRIGHT_P2P_SUBMITBLOCK_MAX_BLOCK_BYTES",
+        DEFAULT_SUBMITBLOCK_MAX_BLOCK_BYTES,
+    )?;
+    if max_block_bytes < sovright_relay::ZCASH_FULL_HEADER_SIZE {
+        return Err(IngressError::Config(format!(
+            "SOVRIGHT_P2P_SUBMITBLOCK_MAX_BLOCK_BYTES must be at least {}",
+            sovright_relay::ZCASH_FULL_HEADER_SIZE
+        )));
+    }
+    let max_requests_per_minute = env_usize("SOVRIGHT_P2P_SUBMITBLOCK_MAX_REQUESTS_PER_MINUTE", 4)?;
+    if max_requests_per_minute == 0 || max_requests_per_minute > 120 {
+        return Err(IngressError::Config(
+            "SOVRIGHT_P2P_SUBMITBLOCK_MAX_REQUESTS_PER_MINUTE must be between 1 and 120"
+                .to_string(),
+        ));
+    }
+    let relay_timeout_millis = env_u64("SOVRIGHT_P2P_SUBMITBLOCK_RELAY_TIMEOUT_MILLIS", 1_000)?;
+    if relay_timeout_millis == 0 || relay_timeout_millis > 10_000 {
+        return Err(IngressError::Config(
+            "SOVRIGHT_P2P_SUBMITBLOCK_RELAY_TIMEOUT_MILLIS must be between 1 and 10000".to_string(),
+        ));
+    }
+
+    Ok(Some(SubmitBlockRpcConfig {
+        bind_addr,
+        zebra_url,
+        max_block_bytes,
+        max_requests_per_minute,
+        relay_timeout: Duration::from_millis(relay_timeout_millis),
+    }))
+}
+
+fn is_loopback_http_url(value: &str) -> bool {
+    let Some(authority_and_path) = value.strip_prefix("http://") else {
+        return false;
+    };
+    let authority = authority_and_path.split('/').next().unwrap_or_default();
+    authority == "localhost"
+        || authority.starts_with("localhost:")
+        || authority == "127.0.0.1"
+        || authority.starts_with("127.0.0.1:")
+        || authority == "[::1]"
+        || authority.starts_with("[::1]:")
 }
 
 pub fn default_seeds() -> Vec<String> {
@@ -391,6 +476,98 @@ mod tests {
         unsafe {
             std::env::remove_var(&key);
         }
+    }
+
+    #[test]
+    fn submitblock_rpc_defaults_off() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR", "".to_string()),
+        ]);
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.submitblock_rpc, None);
+    }
+
+    #[test]
+    fn parses_loopback_submitblock_rpc() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            (
+                "SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR",
+                "127.0.0.1:8234".to_string(),
+            ),
+            (
+                "SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL",
+                "http://127.0.0.1:8232".to_string(),
+            ),
+            (
+                "SOVRIGHT_P2P_SUBMITBLOCK_MAX_BLOCK_BYTES",
+                "2097152".to_string(),
+            ),
+        ]);
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(
+            config.submitblock_rpc,
+            Some(SubmitBlockRpcConfig {
+                bind_addr: "127.0.0.1:8234".parse().unwrap(),
+                zebra_url: "http://127.0.0.1:8232".to_string(),
+                max_block_bytes: 2_097_152,
+                max_requests_per_minute: 4,
+                relay_timeout: Duration::from_secs(1),
+            })
+        );
+    }
+
+    #[test]
+    fn rejects_non_loopback_submitblock_rpc_listener() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            (
+                "SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR",
+                "0.0.0.0:8234".to_string(),
+            ),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+
+        assert!(error.to_string().contains("must be loopback"), "{error}");
+    }
+
+    #[test]
+    fn rejects_non_loopback_submitblock_zebra_url() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            (
+                "SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR",
+                "127.0.0.1:8234".to_string(),
+            ),
+            (
+                "SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL",
+                "http://10.0.0.2:8232".to_string(),
+            ),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+
+        assert!(error.to_string().contains("loopback host"), "{error}");
+    }
+
+    #[test]
+    fn recognizes_only_explicit_loopback_http_urls() {
+        assert!(is_loopback_http_url("http://127.0.0.1:8232"));
+        assert!(is_loopback_http_url("http://localhost:8232/"));
+        assert!(is_loopback_http_url("http://[::1]:8232"));
+        assert!(!is_loopback_http_url("https://127.0.0.1:8232"));
+        assert!(!is_loopback_http_url("http://127.0.0.1.example:8232"));
+        assert!(!is_loopback_http_url("http://10.0.0.2:8232"));
     }
 
     #[test]

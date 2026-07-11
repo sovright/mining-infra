@@ -1,0 +1,504 @@
+//! Loopback-only `submitblock` JSON-RPC gateway for mining pools.
+//!
+//! A pool can send the same `submitblock` call it would send to Zebra. The
+//! gateway validates the solved block before amplification, then starts relay
+//! fanout and local Zebra submission concurrently. Zebra remains the consensus
+//! authority and its result is returned to the pool; relay failure is logged but
+//! never turns a successful local submission into a pool-visible failure.
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use jsonrpsee::RpcModule;
+use jsonrpsee::server::{ServerBuilder, ServerHandle};
+use jsonrpsee::types::ErrorObjectOwned;
+use serde_json::Value;
+use sovright_relay::ZCASH_FULL_HEADER_SIZE;
+use sovright_relay_sidecar::rpc::ZebraRpc;
+use sovright_relay_sidecar::submit::SubmitBlock;
+use tracing::{info, warn};
+use zcash_equihash_validator::{EquihashValidator, Target, compact_to_target};
+
+use crate::block::compact_block_from_raw_block;
+use crate::config::SubmitBlockRpcConfig;
+use crate::error::{IngressError, Result};
+use crate::relay_bridge::{ForwardedBlock, RelayBridge};
+use crate::tx_cache::TxCache;
+
+const BITS_OFFSET: usize = 104;
+const BASE_HEADER_BYTES: usize = 140;
+const SOLUTION_PREFIX_BYTES: usize = 3;
+const SOLUTION_BYTES: usize = 1_344;
+const JSON_OVERHEAD_BYTES: usize = 64 * 1024;
+const MAX_CONNECTIONS: u32 = 16;
+
+type RelayFuture<'a> = Pin<Box<dyn Future<Output = Result<ForwardedBlock>> + Send + 'a>>;
+
+trait RelayBlockForwarder: Send + Sync {
+    fn forward_block<'a>(
+        &'a self,
+        block: &'a [u8],
+        tx_cache: Option<&'a TxCache>,
+    ) -> RelayFuture<'a>;
+}
+
+impl RelayBlockForwarder for RelayBridge {
+    fn forward_block<'a>(
+        &'a self,
+        block: &'a [u8],
+        tx_cache: Option<&'a TxCache>,
+    ) -> RelayFuture<'a> {
+        Box::pin(async move { RelayBridge::forward_block(self, block, tx_cache).await })
+    }
+}
+
+trait SubmittedBlockValidator: Send + Sync {
+    fn validate(&self, block: &[u8]) -> std::result::Result<String, String>;
+}
+
+struct MainnetSubmittedBlockValidator {
+    max_block_bytes: usize,
+    equihash: EquihashValidator,
+}
+
+impl MainnetSubmittedBlockValidator {
+    fn new(max_block_bytes: usize) -> Self {
+        Self {
+            max_block_bytes,
+            equihash: EquihashValidator::new(),
+        }
+    }
+}
+
+impl SubmittedBlockValidator for MainnetSubmittedBlockValidator {
+    fn validate(&self, block: &[u8]) -> std::result::Result<String, String> {
+        if block.len() > self.max_block_bytes {
+            return Err(format!(
+                "block is too large: bytes={} max={}",
+                block.len(),
+                self.max_block_bytes
+            ));
+        }
+        if block.len() < ZCASH_FULL_HEADER_SIZE {
+            return Err(format!(
+                "block is shorter than the Zcash header: bytes={} minimum={ZCASH_FULL_HEADER_SIZE}",
+                block.len()
+            ));
+        }
+        if block[BASE_HEADER_BYTES..BASE_HEADER_BYTES + SOLUTION_PREFIX_BYTES] != [0xfd, 0x40, 0x05]
+        {
+            return Err("invalid Equihash solution CompactSize prefix".to_string());
+        }
+
+        // Parse every transaction and reject trailing bytes before doing the
+        // expensive Equihash check or touching the relay fanout path.
+        let compact = compact_block_from_raw_block(block).map_err(|error| error.to_string())?;
+
+        let bits = u32::from_le_bytes(
+            block[BITS_OFFSET..BITS_OFFSET + 4]
+                .try_into()
+                .expect("bits slice is four bytes"),
+        );
+        if bits & 0x0080_0000 != 0 || bits & 0x007f_ffff == 0 {
+            return Err(format!("invalid compact target bits: {bits:#010x}"));
+        }
+        let target = compact_to_target(bits);
+        if target.0 == [0u8; 32] || target > Target::max_mainnet() {
+            return Err(format!("target outside Zcash mainnet range: {bits:#010x}"));
+        }
+
+        let header = &block[..BASE_HEADER_BYTES];
+        let solution = &block[BASE_HEADER_BYTES + SOLUTION_PREFIX_BYTES..ZCASH_FULL_HEADER_SIZE];
+        debug_assert_eq!(solution.len(), SOLUTION_BYTES);
+        self.equihash
+            .verify_share(header, solution, &target.to_le_bytes())
+            .map_err(|error| format!("invalid mainnet proof of work: {error}"))?;
+
+        Ok(compact.header_hash().to_string())
+    }
+}
+
+struct SubmitBlockRpcState {
+    relay: Arc<dyn RelayBlockForwarder>,
+    zebra: Arc<dyn SubmitBlock + Send + Sync>,
+    validator: Arc<dyn SubmittedBlockValidator>,
+    tx_cache: Option<TxCache>,
+    rate_limiter: RequestRateLimiter,
+    relay_timeout: Duration,
+}
+
+#[derive(Clone)]
+struct RequestRateLimiter {
+    capacity: usize,
+    window: Duration,
+    accepted: Arc<std::sync::Mutex<VecDeque<Instant>>>,
+}
+
+impl RequestRateLimiter {
+    fn new(capacity: usize, window: Duration) -> Self {
+        Self {
+            capacity,
+            window,
+            accepted: Arc::new(std::sync::Mutex::new(VecDeque::with_capacity(capacity))),
+        }
+    }
+
+    fn allow(&self, now: Instant) -> bool {
+        let Ok(mut accepted) = self.accepted.lock() else {
+            return false;
+        };
+        while accepted
+            .front()
+            .is_some_and(|timestamp| now.duration_since(*timestamp) >= self.window)
+        {
+            accepted.pop_front();
+        }
+        if accepted.len() >= self.capacity {
+            return false;
+        }
+        accepted.push_back(now);
+        true
+    }
+}
+
+/// Start the loopback HTTP JSON-RPC server and return its lifetime handle.
+pub async fn start_submitblock_rpc(
+    config: SubmitBlockRpcConfig,
+    relay: RelayBridge,
+    tx_cache: Option<TxCache>,
+) -> Result<ServerHandle> {
+    if !config.bind_addr.ip().is_loopback() {
+        return Err(IngressError::Config(
+            "submitblock RPC listener must be loopback".to_string(),
+        ));
+    }
+
+    let zebra = ZebraRpc::new(&config.zebra_url)
+        .await
+        .map_err(|error| IngressError::Config(format!("invalid Zebra RPC URL: {error}")))?;
+    let state = SubmitBlockRpcState {
+        relay: Arc::new(relay),
+        zebra: Arc::new(zebra),
+        validator: Arc::new(MainnetSubmittedBlockValidator::new(config.max_block_bytes)),
+        tx_cache,
+        rate_limiter: RequestRateLimiter::new(
+            config.max_requests_per_minute,
+            Duration::from_secs(60),
+        ),
+        relay_timeout: config.relay_timeout,
+    };
+    let (_, handle) = start_rpc_server(&config, state).await?;
+    Ok(handle)
+}
+
+async fn start_rpc_server(
+    config: &SubmitBlockRpcConfig,
+    state: SubmitBlockRpcState,
+) -> Result<(std::net::SocketAddr, ServerHandle)> {
+    let request_body_bytes = config
+        .max_block_bytes
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(JSON_OVERHEAD_BYTES))
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or_else(|| {
+            IngressError::Config("submitblock RPC request size limit overflow".to_string())
+        })?;
+    let mut module = RpcModule::new(state);
+    module
+        .register_async_method("submitblock", |params, state, _| async move {
+            let block_hex = parse_submitblock_params(params.parse::<Vec<Value>>())?;
+            handle_submitblock(state.as_ref(), block_hex).await
+        })
+        .map_err(|error| IngressError::Config(format!("register submitblock RPC: {error}")))?;
+
+    let server = ServerBuilder::default()
+        .http_only()
+        .max_connections(MAX_CONNECTIONS)
+        .max_request_body_size(request_body_bytes)
+        .set_batch_request_config(jsonrpsee::server::BatchRequestConfig::Disabled)
+        .build(config.bind_addr)
+        .await
+        .map_err(IngressError::Io)?;
+    let local_addr = server.local_addr().map_err(IngressError::Io)?;
+    let handle = server.start(module);
+    info!(
+        %local_addr,
+        zebra_url = %config.zebra_url,
+        max_block_bytes = config.max_block_bytes,
+        max_requests_per_minute = config.max_requests_per_minute,
+        relay_timeout_millis = config.relay_timeout.as_millis(),
+        "Pool submitblock relay gateway started"
+    );
+    Ok((local_addr, handle))
+}
+
+fn parse_submitblock_params(
+    params: std::result::Result<Vec<Value>, jsonrpsee::types::ErrorObjectOwned>,
+) -> std::result::Result<String, ErrorObjectOwned> {
+    let params = params.map_err(|error| invalid_params(error.to_string()))?;
+    if params.is_empty() || params.len() > 2 {
+        return Err(invalid_params(
+            "submitblock expects the block hex and at most one ignored compatibility parameter",
+        ));
+    }
+    params[0]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| invalid_params("submitblock block parameter must be a non-empty hex string"))
+}
+
+async fn handle_submitblock(
+    state: &SubmitBlockRpcState,
+    block_hex: String,
+) -> std::result::Result<Option<String>, ErrorObjectOwned> {
+    let started = Instant::now();
+    if !state.rate_limiter.allow(started) {
+        return Err(ErrorObjectOwned::owned(
+            -32029,
+            "submitblock relay gateway rate limit exceeded",
+            None::<()>,
+        ));
+    }
+    let block = hex::decode(&block_hex)
+        .map_err(|error| invalid_params(format!("submitblock block is not valid hex: {error}")))?;
+    let block_hash = state
+        .validator
+        .validate(&block)
+        .map_err(|error| ErrorObjectOwned::owned(-32010, error, None::<()>))?;
+
+    let relay_started = Instant::now();
+    let relay_future = async {
+        let result = match tokio::time::timeout(
+            state.relay_timeout,
+            state.relay.forward_block(&block, state.tx_cache.as_ref()),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(IngressError::Timeout(format!(
+                "relay forwarding exceeded {}ms",
+                state.relay_timeout.as_millis()
+            ))),
+        };
+        (result, relay_started.elapsed())
+    };
+    let zebra_started = Instant::now();
+    let zebra_future = async {
+        let result = state.zebra.submit_block(&block_hex).await;
+        (result, zebra_started.elapsed())
+    };
+    let ((relay_result, relay_elapsed), (zebra_result, zebra_elapsed)) =
+        tokio::join!(relay_future, zebra_future);
+
+    match relay_result {
+        Ok(forwarded) => info!(
+            %block_hash,
+            relay_mode = forwarded.mode.as_str(),
+            relay_objects = forwarded.relay_objects,
+            relay_wire_bytes = forwarded.bytes,
+            relay_elapsed_ms = relay_elapsed.as_millis(),
+            "Pool submitblock forwarded directly into relay mesh"
+        ),
+        Err(error) => warn!(
+            %block_hash,
+            %error,
+            relay_elapsed_ms = relay_elapsed.as_millis(),
+            "Pool submitblock relay forwarding failed; preserving Zebra result"
+        ),
+    }
+
+    let result = zebra_result.map_err(|error| {
+        ErrorObjectOwned::owned(
+            -32603,
+            format!("local Zebra submitblock RPC failed: {error}"),
+            None::<()>,
+        )
+    })?;
+    info!(
+        %block_hash,
+        zebra_result = result.as_deref().unwrap_or("accepted"),
+        zebra_elapsed_ms = zebra_elapsed.as_millis(),
+        total_elapsed_ms = started.elapsed().as_millis(),
+        "Pool submitblock completed"
+    );
+    Ok(result)
+}
+
+fn invalid_params(message: impl Into<String>) -> ErrorObjectOwned {
+    ErrorObjectOwned::owned(-32602, message.into(), None::<()>)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use jsonrpsee::core::client::ClientT;
+    use jsonrpsee::http_client::HttpClientBuilder;
+    use jsonrpsee::rpc_params;
+    use sovright_relay_sidecar::submit::SubmitFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct AcceptValidator;
+
+    impl SubmittedBlockValidator for AcceptValidator {
+        fn validate(&self, _block: &[u8]) -> std::result::Result<String, String> {
+            Ok("test-block".to_string())
+        }
+    }
+
+    struct MockRelay {
+        calls: AtomicUsize,
+        fail: bool,
+    }
+
+    impl RelayBlockForwarder for MockRelay {
+        fn forward_block<'a>(
+            &'a self,
+            _block: &'a [u8],
+            _tx_cache: Option<&'a TxCache>,
+        ) -> RelayFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                if self.fail {
+                    Err(IngressError::Relay("relay unavailable".to_string()))
+                } else {
+                    Ok(ForwardedBlock {
+                        tx_count: 1,
+                        bytes: 128,
+                        relay_objects: 1,
+                        mode: crate::relay_bridge::ForwardMode::CompactBlock,
+                    })
+                }
+            })
+        }
+    }
+
+    struct MockZebra {
+        calls: AtomicUsize,
+        result: Option<String>,
+    }
+
+    impl SubmitBlock for MockZebra {
+        fn submit_block<'a>(&'a self, _block_hex: &'a str) -> SubmitFuture<'a> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let result = self.result.clone();
+            Box::pin(async move { Ok(result) })
+        }
+    }
+
+    fn state(relay_fails: bool, zebra_result: Option<&str>) -> SubmitBlockRpcState {
+        SubmitBlockRpcState {
+            relay: Arc::new(MockRelay {
+                calls: AtomicUsize::new(0),
+                fail: relay_fails,
+            }),
+            zebra: Arc::new(MockZebra {
+                calls: AtomicUsize::new(0),
+                result: zebra_result.map(ToOwned::to_owned),
+            }),
+            validator: Arc::new(AcceptValidator),
+            tx_cache: None,
+            rate_limiter: RequestRateLimiter::new(4, Duration::from_secs(60)),
+            relay_timeout: Duration::from_secs(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_rpc_server_accepts_standard_submitblock_call() {
+        let config = SubmitBlockRpcConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            zebra_url: "http://127.0.0.1:1".to_string(),
+            max_block_bytes: 4 * 1024 * 1024,
+            max_requests_per_minute: 4,
+            relay_timeout: Duration::from_secs(1),
+        };
+        let (addr, handle) = start_rpc_server(&config, state(false, None)).await.unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+
+        let result: Option<String> = client
+            .request("submitblock", rpc_params!["00"])
+            .await
+            .unwrap();
+
+        assert_eq!(result, None);
+        handle.stop().unwrap();
+    }
+
+    #[test]
+    fn params_accept_standard_and_compatibility_shapes() {
+        assert_eq!(
+            parse_submitblock_params(Ok(vec![Value::String("abcd".to_string())])).unwrap(),
+            "abcd"
+        );
+        assert_eq!(
+            parse_submitblock_params(Ok(vec![Value::String("abcd".to_string()), Value::Null,]))
+                .unwrap(),
+            "abcd"
+        );
+    }
+
+    #[test]
+    fn params_reject_missing_or_non_string_block() {
+        assert!(parse_submitblock_params(Ok(vec![])).is_err());
+        assert!(parse_submitblock_params(Ok(vec![Value::Bool(true)])).is_err());
+    }
+
+    #[tokio::test]
+    async fn returns_zebra_result_after_relay_forward() {
+        let state = state(false, None);
+        assert_eq!(
+            handle_submitblock(&state, "00".to_string()).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_failure_does_not_mask_zebra_acceptance() {
+        let state = state(true, None);
+        assert_eq!(
+            handle_submitblock(&state, "00".to_string()).await.unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn preserves_zebra_rejection_string() {
+        let state = state(false, Some("duplicate"));
+        assert_eq!(
+            handle_submitblock(&state, "00".to_string()).await.unwrap(),
+            Some("duplicate".to_string())
+        );
+    }
+
+    #[test]
+    fn production_validator_rejects_short_and_bad_pow_blocks() {
+        let validator = MainnetSubmittedBlockValidator::new(4 * 1024 * 1024);
+        assert!(validator.validate(&[0u8; 100]).is_err());
+
+        let mut invalid = vec![0u8; ZCASH_FULL_HEADER_SIZE];
+        invalid[BASE_HEADER_BYTES..BASE_HEADER_BYTES + SOLUTION_PREFIX_BYTES]
+            .copy_from_slice(&[0xfd, 0x40, 0x05]);
+        // A structurally minimal one-transaction block; PoW/target remain invalid.
+        invalid.push(1);
+        invalid.extend_from_slice(&1u32.to_le_bytes());
+        invalid.push(0);
+        invalid.push(0);
+        invalid.extend_from_slice(&0u32.to_le_bytes());
+        assert!(validator.validate(&invalid).is_err());
+    }
+
+    #[test]
+    fn rate_limiter_is_bounded_and_recovers_after_window() {
+        let limiter = RequestRateLimiter::new(2, Duration::from_secs(10));
+        let now = Instant::now();
+        assert!(limiter.allow(now));
+        assert!(limiter.allow(now + Duration::from_secs(1)));
+        assert!(!limiter.allow(now + Duration::from_secs(2)));
+        assert!(limiter.allow(now + Duration::from_secs(10)));
+    }
+}

@@ -8,8 +8,11 @@ repository.workspace = true
 
 [dependencies]
 sovright-relay = { path = "../sovright-relay" }
+sovright-relay-sidecar = { path = "../sovright-relay-sidecar" }
+zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 blake2b_simd = { workspace = true }
 hex = { workspace = true }
+jsonrpsee = { version = "0.24", features = ["http-client", "server"] }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
@@ -20,6 +23,3 @@ zcash_primitives = { workspace = true }
 zcash_protocol = { workspace = true }
 
 [dev-dependencies]
-# Test-only: assert the from-bytes wtxid path equals the sidecar's authoritative
-# from-Zebra-display construction byte-for-byte (guards against short_id drift).
-sovright-relay-sidecar = { path = "../sovright-relay-sidecar" }
