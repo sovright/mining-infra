@@ -246,18 +246,32 @@ your local `zebrad` and sends only `submitblock` to the gateway:
 Do **not** point your whole Zebra RPC URL at the gateway — `getblocktemplate`
 would fail, because the gateway implements `submitblock` only.
 
-If your pool software lets you configure the `submitblock` RPC endpoint
-separately from the template endpoint, set it to the gateway address and you are
-done.
+**`zcash-pool-server`** supports this directly: set the `submit` endpoint to the
+gateway while leaving the template endpoint on your local `zebrad`.
 
-> **Note for `zcash-pool-server` operators:** the bundled pool server currently
-> uses a single `[zebra] url` for both `getblocktemplate` and `submitblock`, so
-> it cannot split them by config alone yet. Until a dedicated submit-endpoint
-> option lands, front `zebrad` with a small loopback JSON-RPC router that sends
-> the `submitblock` method to the gateway (`127.0.0.1:8235`) and every other
-> method to `zebrad` (`127.0.0.1:8232`), then set `[zebra] url` to that router.
-> The gateway's own `submitblock -> zebrad` submission still makes Zebra
-> authoritative.
+```toml
+[zebra]
+# getblocktemplate (and all other RPC) stays on your local node
+url = "http://127.0.0.1:8232"
+# submitblock only -> the relay gateway (fans into the mesh + submits to zebrad)
+submit_url = "http://127.0.0.1:8235"
+```
+
+Constructing `PoolConfig` programmatically (as the examples do), this is the
+`submit_zebra_url` field:
+
+```rust
+let config = PoolConfig {
+    zebra_url: "http://127.0.0.1:8232".to_string(),
+    submit_zebra_url: Some("http://127.0.0.1:8235".to_string()),
+    ..Default::default()
+};
+```
+
+When `submit_zebra_url` is unset, `submitblock` stays on `zebra_url` — behavior
+is unchanged. Any other pool software that lets you configure the `submitblock`
+RPC endpoint separately from the template endpoint works the same way: point
+`submitblock` at the gateway address.
 
 ### 3. Verify
 
