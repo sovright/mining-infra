@@ -176,6 +176,101 @@ cargo run --release -p zcash-pool-server -- --config pool.toml
 | `max_tokens_per_client` | `10` | Max active tokens per client |
 | `coinbase_output_max_additional_size` | `256` | Max extra coinbase bytes |
 
+## Direct Block Submission to the Relay Network
+
+By default a solved block reaches the network only through your local `zebrad`
+and native Zcash P2P gossip. You can additionally fan each solved block straight
+into the Sovright relay mesh — reaching connected peers faster than native
+gossip — by routing your pool's `submitblock` call through the
+`sovright-p2p-ingress` **submitblock relay gateway**.
+
+### How it works
+
+```
+ getblocktemplate ─────────────────────────────▶  your local zebrad (unchanged)
+
+ submitblock ──▶  sovright-p2p-ingress gateway ──┬──▶  relay mesh fanout (best effort)
+                  (loopback JSON-RPC)            └──▶  your local zebrad  (authoritative)
+```
+
+- The gateway validates the block (structure, compact target, Equihash, PoW)
+  before amplification, then starts relay fanout **and** local Zebra submission
+  concurrently.
+- **Zebra remains the consensus authority.** The gateway returns Zebra's exact
+  `submitblock` result to your pool. Relay failure, timeout, or a rate-limited
+  relay is logged but **never** turns a Zebra-accepted block into a pool-visible
+  failure — a found block is never lost by using the gateway.
+- Native Zebra P2P remains active as a fallback and deduplication path, so this
+  is strictly additive.
+
+### 1. Run `sovright-p2p-ingress` with the gateway enabled
+
+Co-locate `sovright-p2p-ingress` with your pool's `zebrad` and enable the
+gateway (it is **off** unless a bind address is set). The listener must be
+loopback; for remote pools put an authenticated TLS proxy in front of it.
+
+```bash
+# Enable the loopback submitblock gateway
+export SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR=127.0.0.1:8235
+# Local zebrad the gateway submits to (default shown; loopback http only)
+export SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL=http://127.0.0.1:8232
+# Authenticated relay peers to fan blocks into (Sovright provides these)
+export SOVRIGHT_P2P_RELAY_PEERS=10.40.0.3:8333,10.40.16.2:8333
+export SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX=<key provided by Sovright>
+
+sovright-p2p-ingress
+```
+
+Gateway tuning knobs (all optional):
+
+| Env var | Default | Description |
+|---------|---------|-------------|
+| `SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR` | unset (gateway off) | Loopback address the pool sends `submitblock` to |
+| `SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL` | `http://127.0.0.1:8232` | Local `zebrad` RPC (loopback `http://` only) |
+| `SOVRIGHT_P2P_SUBMITBLOCK_MAX_BLOCK_BYTES` | `4194304` (4 MiB) | Max accepted block size |
+| `SOVRIGHT_P2P_SUBMITBLOCK_MAX_REQUESTS_PER_MINUTE` | `4` (1–120) | Bounds **relay amplification** only; over the limit the block still goes to Zebra, just without mesh fanout |
+| `SOVRIGHT_P2P_SUBMITBLOCK_RELAY_TIMEOUT_MILLIS` | `1000` (1–10000) | Max time to wait on relay fanout before falling back to the Zebra-only result |
+
+### 2. Point the pool's `submitblock` at the gateway
+
+The gateway serves **only** the `submitblock` method — it does not proxy
+`getblocktemplate` or anything else. So the integration keeps template polling on
+your local `zebrad` and sends only `submitblock` to the gateway:
+
+- **`getblocktemplate` (and all other RPC)** → your local `zebrad`
+  (`http://127.0.0.1:8232`).
+- **`submitblock`** → the gateway (`http://127.0.0.1:8235`), which validates,
+  fans the block into the mesh, submits to your `zebrad`, and returns Zebra's
+  result.
+
+Do **not** point your whole Zebra RPC URL at the gateway — `getblocktemplate`
+would fail, because the gateway implements `submitblock` only.
+
+If your pool software lets you configure the `submitblock` RPC endpoint
+separately from the template endpoint, set it to the gateway address and you are
+done.
+
+> **Note for `zcash-pool-server` operators:** the bundled pool server currently
+> uses a single `[zebra] url` for both `getblocktemplate` and `submitblock`, so
+> it cannot split them by config alone yet. Until a dedicated submit-endpoint
+> option lands, front `zebrad` with a small loopback JSON-RPC router that sends
+> the `submitblock` method to the gateway (`127.0.0.1:8235`) and every other
+> method to `zebrad` (`127.0.0.1:8232`), then set `[zebra] url` to that router.
+> The gateway's own `submitblock -> zebrad` submission still makes Zebra
+> authoritative.
+
+### 3. Verify
+
+```bash
+# The gateway logs each accepted block with its relay + Zebra outcome:
+journalctl -u sovright-p2p-ingress -f | grep "Pool submitblock"
+# "forwarded directly into relay mesh"  -> block fanned into the mesh
+# "completed" with zebra_result=accepted -> Zebra accepted (authoritative)
+```
+
+A rate-limited or failed relay logs a warning but still reports Zebra's result;
+confirm your pool sees the same `submitblock` response it did before.
+
 ## Job Declaration Support
 
 ### Coinbase-Only Mode
