@@ -7,6 +7,7 @@ mod event;
 mod hash;
 mod peer;
 mod relay_bridge;
+mod submitblock_rpc;
 mod tx_cache;
 mod tx_feed;
 mod wire;
@@ -44,6 +45,17 @@ async fn main() -> Result<()> {
             max_tx_bytes: config.tx_cache_max_tx_bytes,
         })
     });
+    let _submitblock_rpc = match config.submitblock_rpc.clone() {
+        Some(rpc_config) => {
+            let relay = relay.clone().ok_or_else(|| {
+                error::IngressError::Config(
+                    "submitblock RPC requires configured relay peers and auth key".to_string(),
+                )
+            })?;
+            Some(submitblock_rpc::start_submitblock_rpc(rpc_config, relay, tx_cache.clone()).await?)
+        }
+        None => None,
+    };
     let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
     let peers = discover_peers(&config).await;
     let crawler = Crawler::new(&config, peers);
