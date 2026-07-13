@@ -13,8 +13,14 @@ use tracing::{debug, error, info, warn};
 /// Configuration for the Template Provider
 #[derive(Debug, Clone)]
 pub struct TemplateProviderConfig {
-    /// Zebra RPC URL (e.g., "http://127.0.0.1:8232")
+    /// Zebra RPC URL (e.g., "http://127.0.0.1:8232"), used for
+    /// `getblocktemplate` and, unless `submit_url` is set, `submitblock`.
     pub zebra_url: String,
+    /// Optional separate endpoint for `submitblock` only. Point this at the
+    /// `sovright-p2p-ingress` submitblock relay gateway to fan solved blocks
+    /// into the relay mesh; `getblocktemplate` still uses `zebra_url`. When
+    /// `None`, `submitblock` goes to `zebra_url`.
+    pub submit_url: Option<String>,
     /// Poll interval in milliseconds
     pub poll_interval_ms: u64,
 }
@@ -23,6 +29,7 @@ impl Default for TemplateProviderConfig {
     fn default() -> Self {
         Self {
             zebra_url: "http://127.0.0.1:8232".to_string(),
+            submit_url: None,
             poll_interval_ms: 1000,
         }
     }
@@ -32,6 +39,9 @@ impl Default for TemplateProviderConfig {
 pub struct TemplateProvider {
     config: TemplateProviderConfig,
     rpc: Box<dyn RpcProvider>,
+    /// Separate client for `submitblock` when `config.submit_url` is set;
+    /// `None` means `submitblock` shares `rpc` (the template endpoint).
+    submit_rpc: Option<Box<dyn RpcProvider>>,
     template_id: AtomicU64,
     consensus_branch_cache: Mutex<Option<(u64, u32)>>,
     current_template: Arc<RwLock<Option<BlockTemplate>>>,
@@ -42,11 +52,19 @@ impl TemplateProvider {
     /// Create a new Template Provider
     pub fn new(config: TemplateProviderConfig) -> Result<Self> {
         let rpc = ZebraRpc::new(&config.zebra_url, None, None)?;
+        let submit_rpc = match &config.submit_url {
+            Some(url) if url != &config.zebra_url => {
+                info!("submitblock routed to separate endpoint {url}");
+                Some(Box::new(ZebraRpc::new(url, None, None)?) as Box<dyn RpcProvider>)
+            }
+            _ => None,
+        };
         let (sender, _) = broadcast::channel(16);
 
         Ok(Self {
             config,
             rpc: Box::new(rpc),
+            submit_rpc,
             template_id: AtomicU64::new(1),
             consensus_branch_cache: Mutex::new(None),
             current_template: Arc::new(RwLock::new(None)),
@@ -56,10 +74,20 @@ impl TemplateProvider {
 
     /// Create with a custom RPC provider (for testing)
     pub fn with_rpc(config: TemplateProviderConfig, rpc: Box<dyn RpcProvider>) -> Self {
+        Self::with_rpcs(config, rpc, None)
+    }
+
+    /// Create with custom template and (optional) submit RPC providers (testing).
+    pub fn with_rpcs(
+        config: TemplateProviderConfig,
+        rpc: Box<dyn RpcProvider>,
+        submit_rpc: Option<Box<dyn RpcProvider>>,
+    ) -> Self {
         let (sender, _) = broadcast::channel(16);
         Self {
             config,
             rpc,
+            submit_rpc,
             template_id: AtomicU64::new(1),
             consensus_branch_cache: Mutex::new(None),
             current_template: Arc::new(RwLock::new(None)),
@@ -84,13 +112,15 @@ impl TemplateProvider {
         self.process_template(response, consensus_branch_id)
     }
 
-    /// Submit a solved block to Zebra
+    /// Submit a solved block. Uses the dedicated submit endpoint (relay gateway)
+    /// when configured, otherwise the template endpoint.
     pub async fn submit_block(
         &self,
         block_hex: &str,
         mode: Option<rpc::SubmitMode>,
     ) -> Result<rpc::SubmitBlockResult> {
-        self.rpc.submit_block(block_hex, mode).await
+        let rpc = self.submit_rpc.as_ref().unwrap_or(&self.rpc);
+        rpc.submit_block(block_hex, mode).await
     }
 
     /// Process a getblocktemplate response into a BlockTemplate
@@ -252,6 +282,51 @@ mod tests {
         let config = TemplateProviderConfig::default();
         let provider = TemplateProvider::new(config);
         assert!(provider.is_ok());
+    }
+
+    #[tokio::test]
+    async fn submit_block_uses_separate_submit_endpoint_when_configured() {
+        use std::sync::Arc;
+        let template_rpc = Arc::new(MockZebraRpc::new());
+        let submit_rpc = Arc::new(MockZebraRpc::new());
+
+        let provider = TemplateProvider::with_rpcs(
+            TemplateProviderConfig::default(),
+            Box::new(template_rpc.clone()),
+            Some(Box::new(submit_rpc.clone())),
+        );
+
+        provider.submit_block("deadbeef", None).await.unwrap();
+
+        assert_eq!(
+            submit_rpc.submitted_blocks(),
+            vec!["deadbeef".to_string()],
+            "submitblock must go to the configured submit endpoint (the gateway)"
+        );
+        assert!(
+            template_rpc.submitted_blocks().is_empty(),
+            "the template endpoint must not receive submitblock"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_block_falls_back_to_template_endpoint_when_unset() {
+        use std::sync::Arc;
+        let template_rpc = Arc::new(MockZebraRpc::new());
+
+        let provider = TemplateProvider::with_rpcs(
+            TemplateProviderConfig::default(),
+            Box::new(template_rpc.clone()),
+            None,
+        );
+
+        provider.submit_block("cafe", None).await.unwrap();
+
+        assert_eq!(
+            template_rpc.submitted_blocks(),
+            vec!["cafe".to_string()],
+            "with no submit endpoint configured, submitblock uses the template endpoint"
+        );
     }
 
     #[tokio::test]

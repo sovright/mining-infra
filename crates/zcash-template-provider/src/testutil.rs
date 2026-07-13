@@ -108,6 +108,32 @@ impl RpcProvider for MockZebraRpc {
     }
 }
 
+/// Delegating impl so a test can pass `Box::new(mock.clone())` into a provider
+/// and still inspect the same recorded state (e.g. `submitted_blocks()`) through
+/// its retained `Arc` handle.
+#[async_trait]
+impl RpcProvider for std::sync::Arc<MockZebraRpc> {
+    async fn get_block_template(&self) -> Result<GetBlockTemplateResponse> {
+        (**self).get_block_template().await
+    }
+
+    async fn get_blockchain_info(&self) -> Result<GetBlockchainInfoResponse> {
+        (**self).get_blockchain_info().await
+    }
+
+    async fn submit_block(
+        &self,
+        block_hex: &str,
+        mode: Option<SubmitMode>,
+    ) -> Result<SubmitBlockResult> {
+        (**self).submit_block(block_hex, mode).await
+    }
+
+    async fn get_best_block_hash(&self) -> Result<String> {
+        (**self).get_best_block_hash().await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // TestTemplateFactory
 // ---------------------------------------------------------------------------

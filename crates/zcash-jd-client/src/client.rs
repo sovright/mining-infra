@@ -140,6 +140,7 @@ impl JdClient {
     pub fn new(config: JdClientConfig) -> Result<Self> {
         let template_config = TemplateProviderConfig {
             zebra_url: config.zebra_url.clone(),
+            submit_url: None,
             poll_interval_ms: config.template_poll_ms,
         };
 
