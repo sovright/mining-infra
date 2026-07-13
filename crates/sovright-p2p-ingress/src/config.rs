@@ -259,6 +259,11 @@ fn submitblock_rpc_from_env() -> Result<Option<SubmitBlockRpcConfig>> {
 }
 
 fn is_loopback_http_url(value: &str) -> bool {
+    // Case-insensitive: the scheme and `localhost` are case-insensitive per URL
+    // rules, so `http://Localhost` is as valid a loopback as `http://localhost`.
+    // IP literals are unaffected by lowercasing. This stays fail-closed for
+    // spoofs like `localhost.evil.com` or `evil.com@127.0.0.1` (still rejected).
+    let value = value.to_ascii_lowercase();
     let Some(authority_and_path) = value.strip_prefix("http://") else {
         return false;
     };
@@ -565,9 +570,15 @@ mod tests {
         assert!(is_loopback_http_url("http://127.0.0.1:8232"));
         assert!(is_loopback_http_url("http://localhost:8232/"));
         assert!(is_loopback_http_url("http://[::1]:8232"));
+        // Scheme and `localhost` are case-insensitive.
+        assert!(is_loopback_http_url("http://Localhost:8232"));
+        assert!(is_loopback_http_url("HTTP://127.0.0.1:8232"));
         assert!(!is_loopback_http_url("https://127.0.0.1:8232"));
         assert!(!is_loopback_http_url("http://127.0.0.1.example:8232"));
         assert!(!is_loopback_http_url("http://10.0.0.2:8232"));
+        // Spoofs remain fail-closed even after lowercasing.
+        assert!(!is_loopback_http_url("http://localhost.evil.com:8232"));
+        assert!(!is_loopback_http_url("http://evil.com@127.0.0.1:8232"));
     }
 
     #[test]

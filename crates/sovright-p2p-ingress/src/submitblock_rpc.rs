@@ -28,6 +28,11 @@ use crate::error::{IngressError, Result};
 use crate::relay_bridge::{ForwardedBlock, RelayBridge};
 use crate::tx_cache::TxCache;
 
+// Zcash block-header byte layout (all little-endian, contiguous from offset 0):
+//   version(4) prev(32) merkle(32) finalsaplingroot(32) time(4) bits(4) nonce(32)
+// so `bits` starts at 4+32+32+32+4 = 104 (BITS_OFFSET) and the fixed header is
+// 140 bytes (BASE_HEADER_BYTES). It is followed by CompactSize(1344) == the
+// 3-byte prefix [0xfd,0x40,0x05] then the 1344-byte Equihash solution.
 const BITS_OFFSET: usize = 104;
 const BASE_HEADER_BYTES: usize = 140;
 const SOLUTION_PREFIX_BYTES: usize = 3;
@@ -105,6 +110,12 @@ impl SubmittedBlockValidator for MainnetSubmittedBlockValidator {
         if bits & 0x0080_0000 != 0 || bits & 0x007f_ffff == 0 {
             return Err(format!("invalid compact target bits: {bits:#010x}"));
         }
+        // Anti-garbage PoW guard, NOT a consensus-difficulty check: we only
+        // require the block's PoW to meet its own stated target within the valid
+        // mainnet range (diff >= 1). Whether it clears the *current* network
+        // difficulty is Zebra's job — a block Zebra rejects for low difficulty
+        // may still be fanned into the mesh, which is acceptable given the
+        // loopback-only, trusted-pool threat model.
         let target = compact_to_target(bits);
         if target.0 == [0u8; 32] || target > Target::max_mainnet() {
             return Err(format!("target outside Zcash mainnet range: {bits:#010x}"));
@@ -256,13 +267,9 @@ async fn handle_submitblock(
     block_hex: String,
 ) -> std::result::Result<Option<String>, ErrorObjectOwned> {
     let started = Instant::now();
-    if !state.rate_limiter.allow(started) {
-        return Err(ErrorObjectOwned::owned(
-            -32029,
-            "submitblock relay gateway rate limit exceeded",
-            None::<()>,
-        ));
-    }
+    // Decode and validate BEFORE consulting the rate limiter: a malformed or
+    // invalid request must never consume the relay-amplification budget, so a
+    // client spamming garbage cannot starve a real submission.
     let block = hex::decode(&block_hex)
         .map_err(|error| invalid_params(format!("submitblock block is not valid hex: {error}")))?;
     let block_hash = state
@@ -270,45 +277,62 @@ async fn handle_submitblock(
         .validate(&block)
         .map_err(|error| ErrorObjectOwned::owned(-32010, error, None::<()>))?;
 
-    let relay_started = Instant::now();
-    let relay_future = async {
-        let result = match tokio::time::timeout(
-            state.relay_timeout,
-            state.relay.forward_block(&block, state.tx_cache.as_ref()),
-        )
-        .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(IngressError::Timeout(format!(
-                "relay forwarding exceeded {}ms",
-                state.relay_timeout.as_millis()
-            ))),
-        };
-        (result, relay_started.elapsed())
-    };
+    // The rate limiter bounds relay-mesh amplification ONLY; it must never gate
+    // consensus submission. Zebra is authoritative, so a found block is always
+    // submitted to it. When the limiter trips we skip the relay fanout but still
+    // submit to Zebra — a false rate-limit can therefore never lose a block.
+    let relay_allowed = state.rate_limiter.allow(started);
+
     let zebra_started = Instant::now();
     let zebra_future = async {
         let result = state.zebra.submit_block(&block_hex).await;
         (result, zebra_started.elapsed())
     };
-    let ((relay_result, relay_elapsed), (zebra_result, zebra_elapsed)) =
-        tokio::join!(relay_future, zebra_future);
 
-    match relay_result {
-        Ok(forwarded) => info!(
+    let (relay_report, (zebra_result, zebra_elapsed)) = if relay_allowed {
+        let relay_started = Instant::now();
+        let relay_future = async {
+            let result = match tokio::time::timeout(
+                state.relay_timeout,
+                state.relay.forward_block(&block, state.tx_cache.as_ref()),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(IngressError::Timeout(format!(
+                    "relay forwarding exceeded {}ms",
+                    state.relay_timeout.as_millis()
+                ))),
+            };
+            (result, relay_started.elapsed())
+        };
+        let (relay_pair, zebra_pair) = tokio::join!(relay_future, zebra_future);
+        (Some(relay_pair), zebra_pair)
+    } else {
+        warn!(
             %block_hash,
-            relay_mode = forwarded.mode.as_str(),
-            relay_objects = forwarded.relay_objects,
-            relay_wire_bytes = forwarded.bytes,
-            relay_elapsed_ms = relay_elapsed.as_millis(),
-            "Pool submitblock forwarded directly into relay mesh"
-        ),
-        Err(error) => warn!(
-            %block_hash,
-            %error,
-            relay_elapsed_ms = relay_elapsed.as_millis(),
-            "Pool submitblock relay forwarding failed; preserving Zebra result"
-        ),
+            "Pool submitblock rate limit reached; skipping relay amplification and still submitting to Zebra"
+        );
+        (None, zebra_future.await)
+    };
+
+    if let Some((relay_result, relay_elapsed)) = relay_report {
+        match relay_result {
+            Ok(forwarded) => info!(
+                %block_hash,
+                relay_mode = forwarded.mode.as_str(),
+                relay_objects = forwarded.relay_objects,
+                relay_wire_bytes = forwarded.bytes,
+                relay_elapsed_ms = relay_elapsed.as_millis(),
+                "Pool submitblock forwarded directly into relay mesh"
+            ),
+            Err(error) => warn!(
+                %block_hash,
+                %error,
+                relay_elapsed_ms = relay_elapsed.as_millis(),
+                "Pool submitblock relay forwarding failed; preserving Zebra result"
+            ),
+        }
     }
 
     let result = zebra_result.map_err(|error| {
@@ -490,6 +514,84 @@ mod tests {
         invalid.push(0);
         invalid.extend_from_slice(&0u32.to_le_bytes());
         assert!(validator.validate(&invalid).is_err());
+    }
+
+    struct RejectValidator;
+
+    impl SubmittedBlockValidator for RejectValidator {
+        fn validate(&self, _block: &[u8]) -> std::result::Result<String, String> {
+            Err("rejected".to_string())
+        }
+    }
+
+    fn state_parts(
+        relay_fails: bool,
+        rate_capacity: usize,
+        validator: Arc<dyn SubmittedBlockValidator>,
+    ) -> (Arc<MockRelay>, Arc<MockZebra>, SubmitBlockRpcState) {
+        let relay = Arc::new(MockRelay {
+            calls: AtomicUsize::new(0),
+            fail: relay_fails,
+        });
+        let zebra = Arc::new(MockZebra {
+            calls: AtomicUsize::new(0),
+            result: None,
+        });
+        let state = SubmitBlockRpcState {
+            relay: relay.clone(),
+            zebra: zebra.clone(),
+            validator,
+            tx_cache: None,
+            rate_limiter: RequestRateLimiter::new(rate_capacity, Duration::from_secs(60)),
+            relay_timeout: Duration::from_secs(1),
+        };
+        (relay, zebra, state)
+    }
+
+    #[tokio::test]
+    async fn rate_limit_skips_relay_but_still_submits_to_zebra() {
+        // Capacity 0 => the limiter always trips. A found block must still reach
+        // Zebra (the consensus authority); only the relay amplification is skipped.
+        let (relay, zebra, state) = state_parts(false, 0, Arc::new(AcceptValidator));
+        let out = handle_submitblock(&state, "00".to_string()).await.unwrap();
+        assert_eq!(
+            out, None,
+            "Zebra's result is still returned when rate limited"
+        );
+        assert_eq!(
+            zebra.calls.load(Ordering::SeqCst),
+            1,
+            "Zebra must be submitted to even when the relay is rate limited"
+        );
+        assert_eq!(
+            relay.calls.load(Ordering::SeqCst),
+            0,
+            "relay amplification must be skipped when rate limited"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_request_does_not_consume_relay_budget() {
+        // A rejected block must not spend a relay-amplification token, so garbage
+        // spam cannot starve a real submission. capacity 1: after a rejected
+        // request, a valid one must still be allowed to relay.
+        let (relay, zebra, state) = state_parts(false, 1, Arc::new(RejectValidator));
+        assert!(
+            handle_submitblock(&state, "00".to_string()).await.is_err(),
+            "invalid block is rejected"
+        );
+        // Swap in an accepting validator against the same limiter state and submit.
+        let state = SubmitBlockRpcState {
+            validator: Arc::new(AcceptValidator),
+            ..state
+        };
+        handle_submitblock(&state, "00".to_string()).await.unwrap();
+        assert_eq!(
+            relay.calls.load(Ordering::SeqCst),
+            1,
+            "the single relay token survived the rejected request and served the valid one"
+        );
+        assert_eq!(zebra.calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]

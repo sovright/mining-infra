@@ -5,6 +5,7 @@ use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::rpc_params;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 /// Zebra RPC client
 pub struct ZebraRpc {
@@ -124,7 +125,13 @@ pub struct RawTransaction {
 impl ZebraRpc {
     /// Create a new Zebra RPC client
     pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let client = HttpClientBuilder::default().build(url)?;
+        // Set the request timeout explicitly rather than inheriting jsonrpsee's
+        // 60s default. These are all local loopback RPCs, so 30s is ample; the
+        // shorter bound stops a stalled zebrad from pinning a connection long
+        // enough to matter under the submitblock gateway's small connection cap.
+        let client = HttpClientBuilder::default()
+            .request_timeout(Duration::from_secs(30))
+            .build(url)?;
         Ok(Self {
             client,
             request_id: AtomicU64::new(1),
@@ -149,7 +156,6 @@ impl ZebraRpc {
     }
 
     /// Submit a block to Zebra
-    #[allow(dead_code)] // Will be used when sidecar handles block submission
     pub async fn submit_block(
         &self,
         block_hex: &str,
