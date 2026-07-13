@@ -177,6 +177,7 @@ impl PoolServer {
         // shared constructor below.
         let tp_config = TemplateProviderConfig {
             zebra_url: config.zebra_url.clone(),
+            submit_url: config.submit_zebra_url.clone(),
             poll_interval_ms: config.template_poll_ms,
         };
         let template_provider = TemplateProvider::new(tp_config)
@@ -1760,6 +1761,7 @@ mod tests {
         let template_provider = TemplateProvider::with_rpc(
             TemplateProviderConfig {
                 zebra_url: config.zebra_url.clone(),
+                submit_url: config.submit_zebra_url.clone(),
                 poll_interval_ms: config.template_poll_ms,
             },
             Box::new(MockZebraRpc::new()),

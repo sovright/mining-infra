@@ -17,6 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let config = TemplateProviderConfig {
         zebra_url,
+        submit_url: None,
         poll_interval_ms: 1000,
     };
 

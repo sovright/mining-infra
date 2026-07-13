@@ -14,6 +14,13 @@ pub struct PoolConfig {
     /// Zebra RPC URL for template provider
     pub zebra_url: String,
 
+    /// Optional separate endpoint for `submitblock` only (e.g. the
+    /// `sovright-p2p-ingress` submitblock relay gateway on loopback). When set,
+    /// solved blocks are submitted here — which fans them into the relay mesh
+    /// and forwards to your local `zebrad` — while `getblocktemplate` continues
+    /// to use `zebra_url`. `None` keeps `submitblock` on `zebra_url`.
+    pub submit_zebra_url: Option<String>,
+
     /// Template polling interval in milliseconds
     pub template_poll_ms: u64,
 
@@ -333,6 +340,7 @@ impl Default for PoolConfig {
         Self {
             listen_addr: SocketAddr::from(([0, 0, 0, 0], 3333)),
             zebra_url: "http://127.0.0.1:8232".to_string(),
+            submit_zebra_url: None,
             template_poll_ms: 1000,
             validation_threads: 4,
             nonce_1_len: 4,
