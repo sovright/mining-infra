@@ -19,17 +19,25 @@ use crate::wire::{
     read_message, write_message,
 };
 
-// Zcash protocol version sent in our `version` message. NU6.2 activated
-// on mainnet at block 3,370,884 (2026-04). Zebra 5.0.0 ships 170_150 as its
-// current `protocolversion`; remote NU6.2 peers drop connections from nodes
-// reporting older versions. Keep this in sync with the latest mainnet
-// network upgrade as new ones land.
-const PROTOCOL_VERSION: i32 = 170_150;
+// Zcash protocol version sent in our `version` message. NU6.3/Ironwood activated
+// on mainnet at block 3,428,143 (2026-07-28); zebrad 6.2.3 reports 170_160 as its
+// `protocolversion`. Post-upgrade peers complete the handshake with a node
+// advertising an older version and then relay NOTHING to it -- at Ironwood this
+// silently cut block ingest to ~zero for ~6h while every service still looked
+// healthy. MUST be bumped as part of every network upgrade; the authoritative
+// value is `getnetworkinfo.protocolversion` from an upgraded zebrad, never an
+// inference from observed peer versions.
+// See advertised_protocol_version_matches_current_network_upgrade().
+const PROTOCOL_VERSION: i32 = 170_160;
 
 // Floor for accepting *remote* version messages. We stay permissive here so
 // the ingress can still ingest from slower-to-upgrade peers and from
 // post-NU5/NU6 nodes that haven't moved to NU6.2 yet.
 const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
+
+// Advertising less than we demand of peers would be incoherent; enforce at
+// compile time so a future upgrade cannot raise the floor past what we send.
+const _: () = assert!(PROTOCOL_VERSION >= MIN_ACCEPTABLE_REMOTE_VERSION);
 
 // Sub-version sent in our `version` message. Zcash mainnet currently
 // accepts any non-banned user agent; we keep this short and identifying.
@@ -442,6 +450,19 @@ mod tests {
         let mut out = [0u8; 32];
         out.copy_from_slice(&bytes);
         out
+    }
+
+    // NU6.3/Ironwood (mainnet height 3,428,143, 2026-07-28) moved the network to
+    // protocol 170_160. We advertised 170_150 through activation: peers completed
+    // the handshake and then relayed NOTHING, so block ingest went to ~zero for
+    // ~6h while every service still reported healthy. This test pins the
+    // advertised version to the current upgrade so the same silent failure cannot
+    // recur unnoticed -- when the next NU lands, this test is what fails first.
+    #[test]
+    fn advertised_protocol_version_matches_current_network_upgrade() {
+        // Authoritative source: `getnetworkinfo.protocolversion` on an upgraded
+        // zebrad (6.2.3 reports 170160). Do NOT infer this from peer counts.
+        assert_eq!(PROTOCOL_VERSION, 170_160);
     }
 
     #[test]
