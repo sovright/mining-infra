@@ -9,6 +9,12 @@ const OVERWINTERED_FLAG: u32 = 1 << 31;
 const OVERWINTER_VERSION_GROUP_ID: u32 = 0x03C4_8270;
 const SAPLING_VERSION_GROUP_ID: u32 = 0x892F_2085;
 const TX_V5_VERSION_GROUP_ID: u32 = 0x26A7_270A;
+// Transaction v6, introduced by NU6.3/Ironwood (ZIP 229). Verified against
+// mainnet: transactions at height 3,428,4xx carry version=6, overwintered=true,
+// version_group_id=0xD884B698, consensus_branch_id=0x37A5165B. NOTE this is NOT
+// the 0xFFFFFFFF that zcash_primitives <=0.28 uses for its Nu7/ZFuture "V6";
+// the on-chain constant only appears from zcash_protocol 0.10.
+const TX_V6_VERSION_GROUP_ID: u32 = 0xD884_B698;
 const BCTV14_JOINSPLIT_SIZE: usize =
     8 + 8 + 32 + (32 * 2) + (32 * 2) + 32 + 32 + (32 * 2) + (601 * 2) + 296;
 const GROTH16_JOINSPLIT_SIZE: usize =
@@ -181,6 +187,25 @@ fn skip_transaction(payload: &[u8], cursor: &mut usize) -> Result<()> {
             skip_transparent_inputs(payload, cursor)?;
             skip_transparent_outputs(payload, cursor)?;
             skip_v5_sapling(payload, cursor)?;
+            skip_orchard(payload, cursor)?;
+        }
+        (6, true) => {
+            // ZIP 229. Identical to v5 through the Sapling bundle, then TWO
+            // Orchard-format bundles: the Orchard slot followed by the Ironwood
+            // slot. Both use the same wire layout -- per zcash_primitives 0.29
+            // `read_bundle`, the bundle version changes only how the flags BYTE
+            // is interpreted (bit 2 cross-address), not any field's size -- so
+            // skip_orchard is length-correct for both. Omitting the second
+            // bundle would leave it unconsumed and mis-offset every following
+            // transaction in the block.
+            expect_u32(payload, cursor, TX_V6_VERSION_GROUP_ID, "v6 version group")?;
+            skip_bytes(payload, cursor, 4, "consensus_branch_id")?;
+            skip_bytes(payload, cursor, 4, "lock_time")?;
+            skip_bytes(payload, cursor, 4, "expiry_height")?;
+            skip_transparent_inputs(payload, cursor)?;
+            skip_transparent_outputs(payload, cursor)?;
+            skip_v5_sapling(payload, cursor)?;
+            skip_orchard(payload, cursor)?;
             skip_orchard(payload, cursor)?;
         }
         _ => {
@@ -386,6 +411,7 @@ mod tests {
     use sovright_relay::{CompactBlockReconstructor, ReconstructionResult, ShortId};
 
     const NU5_CONSENSUS_BRANCH_ID: u32 = 0xC2D6_D0B4;
+    const NU63_CONSENSUS_BRANCH_ID: u32 = 0x37A5_165B;
 
     fn push_repeated(bytes: &mut Vec<u8>, len: usize, value: u8) {
         bytes.extend(std::iter::repeat_n(value, len));
@@ -415,6 +441,58 @@ mod tests {
         crate::wire::encode_compact_size(0, &mut tx);
         crate::wire::encode_compact_size(0, &mut tx);
         tx
+    }
+
+    /// v6 (ZIP 229, NU6.3/Ironwood). Identical to v5 through the Sapling bundle,
+    /// then TWO Orchard-format bundles: the Orchard slot and the Ironwood slot.
+    /// `ironwood_actions` > 0 exercises the second bundle, which a parser that
+    /// stops after the first would silently mis-offset.
+    fn minimal_v6_tx(script_tag: u8, ironwood_actions: u64) -> Vec<u8> {
+        let mut tx = Vec::new();
+        tx.extend_from_slice(&(OVERWINTERED_FLAG | 6).to_le_bytes());
+        tx.extend_from_slice(&TX_V6_VERSION_GROUP_ID.to_le_bytes());
+        tx.extend_from_slice(&NU63_CONSENSUS_BRANCH_ID.to_le_bytes());
+        tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
+        tx.extend_from_slice(&0u32.to_le_bytes()); // expiry_height
+
+        // transparent inputs
+        crate::wire::encode_compact_size(1, &mut tx);
+        tx.extend_from_slice(&[0u8; 32]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        crate::wire::encode_compact_size(2, &mut tx);
+        tx.extend_from_slice(&[script_tag, script_tag.wrapping_add(1)]);
+        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        // transparent outputs
+        crate::wire::encode_compact_size(1, &mut tx);
+        tx.extend_from_slice(&0u64.to_le_bytes());
+        crate::wire::encode_compact_size(1, &mut tx);
+        tx.push(script_tag.wrapping_add(2));
+
+        crate::wire::encode_compact_size(0, &mut tx); // sapling spends
+        crate::wire::encode_compact_size(0, &mut tx); // sapling outputs
+        crate::wire::encode_compact_size(0, &mut tx); // orchard slot: 0 actions
+        push_orchard_bundle(&mut tx, ironwood_actions); // ironwood slot
+        tx
+    }
+
+    /// Minimal Orchard-format bundle body; `actions == 0` is just the count.
+    fn push_orchard_bundle(tx: &mut Vec<u8>, actions: u64) {
+        crate::wire::encode_compact_size(actions, tx);
+        if actions == 0 {
+            return;
+        }
+        for _ in 0..actions {
+            tx.extend_from_slice(&[7u8; ORCHARD_ACTION_SIZE]);
+        }
+        tx.push(0); // flags
+        tx.extend_from_slice(&0u64.to_le_bytes()); // value balance
+        tx.extend_from_slice(&[0u8; 32]); // anchor
+        crate::wire::encode_compact_size(2, tx); // proof
+        tx.extend_from_slice(&[1u8, 2u8]);
+        for _ in 0..actions {
+            tx.extend_from_slice(&[3u8; REDDSA_SIGNATURE_SIZE]);
+        }
+        tx.extend_from_slice(&[4u8; REDDSA_SIGNATURE_SIZE]); // binding sig
     }
 
     fn shielded_v5_tx(tag: u8) -> Vec<u8> {
@@ -630,6 +708,38 @@ mod tests {
         assert_eq!(skeleton.prefilled_txs.len(), 2);
         assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
         assert_eq!(skeleton.prefilled_txs[1].tx_data, unresolvable);
+    }
+
+    // NU6.3/Ironwood (2026-07-28, height 3,428,143) introduced transaction v6
+    // (ZIP 229, version group id 0xD884B698). The parser only knew v3/v4/v5, so
+    // every block containing a v6 transaction failed to forward: 93 of 97 blocks
+    // in the first half hour after peers resumed relaying to us.
+    #[test]
+    fn parses_v6_transaction_with_empty_ironwood_bundle() {
+        let tx = minimal_v6_tx(0x11, 0);
+        let mut cursor = 0usize;
+        skip_transaction(&tx, &mut cursor).expect("v6 must parse");
+        assert_eq!(cursor, tx.len(), "parser must consume exactly the whole tx");
+    }
+
+    #[test]
+    fn parses_v6_transaction_with_populated_ironwood_bundle() {
+        // The case that matters: a parser that stopped after the Orchard slot
+        // would leave the Ironwood bundle unconsumed and mis-offset every
+        // following transaction in the block.
+        let tx = minimal_v6_tx(0x22, 2);
+        let mut cursor = 0usize;
+        skip_transaction(&tx, &mut cursor).expect("v6 with ironwood actions must parse");
+        assert_eq!(cursor, tx.len());
+    }
+
+    #[test]
+    fn v6_rejects_wrong_version_group_id() {
+        let mut tx = minimal_v6_tx(0x33, 0);
+        // corrupt the version group id; must fail loudly rather than mis-parse
+        tx[4..8].copy_from_slice(&TX_V5_VERSION_GROUP_ID.to_le_bytes());
+        let mut cursor = 0usize;
+        assert!(skip_transaction(&tx, &mut cursor).is_err());
     }
 
     #[test]
