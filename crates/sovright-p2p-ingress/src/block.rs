@@ -733,6 +733,43 @@ mod tests {
         assert_eq!(cursor, tx.len());
     }
 
+    /// Real mainnet Ironwood transaction, captured from block 3428505
+    /// (txid 1ff3e45d12e8df4e...). Synthetic fixtures only prove the
+    /// parser is self-consistent; this proves it agrees with what Zcash actually
+    /// serialises. If a future change breaks v6 offsets, this fails.
+    const REAL_MAINNET_V6_TX_HEX: &str = "0600008098b684d85b16a5370000000099503400010000000000000000000000000000000000\
+         000000000000000000000000000000ffffffff090399503404f09fa693ffffffff0240597307\
+         000000001976a91425db9091e9786867e536f70089a5102523ab1d6a88ac20bcbe0000000000\
+         17a914c20cd5bdf7964ca61764db66bc2531b1792a084d8700000000";
+
+    #[test]
+    fn parses_a_real_mainnet_ironwood_v6_transaction() {
+        let tx = hex_to_bytes(REAL_MAINNET_V6_TX_HEX);
+        let header = u32::from_le_bytes(tx[0..4].try_into().unwrap());
+        assert_eq!(header & 0x7FFF_FFFF, 6, "fixture must be a v6 tx");
+        assert_eq!(
+            u32::from_le_bytes(tx[4..8].try_into().unwrap()),
+            TX_V6_VERSION_GROUP_ID,
+            "fixture must carry the on-chain v6 version group id"
+        );
+
+        let mut cursor = 0usize;
+        skip_transaction(&tx, &mut cursor).expect("real mainnet v6 tx must parse");
+        assert_eq!(
+            cursor,
+            tx.len(),
+            "parser must consume exactly the real transaction, no more, no less"
+        );
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        let clean: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..clean.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&clean[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn v6_rejects_wrong_version_group_id() {
         let mut tx = minimal_v6_tx(0x33, 0);
