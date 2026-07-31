@@ -16,7 +16,11 @@ initial_testnet_peers = ["172.17.0.2:18233"]
 network_name = "SovrightTestnet"
 # Standard testnet magic so the handshake with the bootstrap peer succeeds.
 # Switch to [0, 1, 0, 255] after genesis is in state.
-network_magic = [36, 233, 39, 100]
+# This is magics::TESTNET (0xfa1af9bf). It previously read [36, 233, 39, 100],
+# which is magics::MAINNET (0x24e92764) -- with_network_magic rejects the
+# reserved Mainnet and Regtest magics, so the node died at startup with
+# "network magic should be distinct from reserved network magics".
+network_magic = [250, 26, 249, 191]
 slow_start_interval = 0
 target_difficulty_limit = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
 disable_pow = true
