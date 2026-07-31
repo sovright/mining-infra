@@ -65,9 +65,14 @@ pub fn wtxid_from_tx_bytes(tx_bytes: &[u8], branch_id: BranchId) -> Option<WtxId
     if cursor.position() as usize != tx_bytes.len() {
         return None;
     }
-    // Only v5 (ZIP-244) transactions carry an auth digest; pre-v5 has none, so
-    // the sidecar cannot resolve them either -- leave them prefilled.
-    if !matches!(tx.version(), TxVersion::V5) {
+    // v5 (ZIP-244) and v6 (ZIP-229, NU6.3/Ironwood) both carry an auth digest;
+    // pre-v5 has none, so the sidecar cannot resolve those either -- leave them
+    // prefilled. This guard listed only V5 through the Ironwood activation, which
+    // silently dropped EVERY post-upgrade transaction from the wtxid path: the tx
+    // cache could not index them and compact-block short IDs could not resolve
+    // them, quietly degrading reconstruction to raw fallback. Extend this the
+    // moment a new transaction version carrying an auth digest activates.
+    if !matches!(tx.version(), TxVersion::V5 | TxVersion::V6) {
         return None;
     }
     // Both values are internal (wire) byte order; store them as-is (no reversal).
@@ -149,6 +154,43 @@ mod tests {
 
     /// A real pre-v5 (Sapling v4) transaction has no auth digest, so it must
     /// return `None` (left prefilled), matching the sidecar mempool sync.
+    /// Real mainnet Ironwood v6 transaction, block 3431330, with Zebra's own
+    /// display-order txid and authdigest as ground truth.
+    ///
+    /// v6 carries an auth digest exactly as v5 does, so a V5-only guard silently
+    /// drops every post-NU6.3 transaction from the wtxid path: the tx cache
+    /// cannot index them and compact-block short IDs cannot resolve them, which
+    /// degrades reconstruction to raw fallback rather than failing loudly.
+    const V6_TX_HEX: &str = "0600008098b684d85b16a53700000000ca5b340001fc596961b6fdf9874d076f9e9562d32e65\
+         bff1eca23c270b8e8d666a73d1b9d6000000006b483045022100bd13949d7d911d23123b7615\
+         91dfcf814288bf59aeb88bb2786200290d7689c102200315c504b3b28bbd04614e4ba8832fbd\
+         f49fc77c954570b4687668a6bf0b9ab8012103f28a3742b9927bae40d1d6fbef8c6f1b4ce535\
+         9cf25a04bee069616cbaf6ab8dffffffff01905f0100000000001976a91497dc3652e93ca575\
+         80f9792849749f4ee6c359f388ac00000000";
+    const V6_TXID_DISPLAY_HEX: &str =
+        "362f368f5361f4e9212d1f6e6c6f71fb261446c3c0ac30b873c6cf7bc5d73b0e";
+    const V6_AUTH_DISPLAY_HEX: &str =
+        "7cd2d582308fbfa9db33d59179cdec4b120c05d09b6a2790d6d80302ed50a14f";
+
+    #[test]
+    fn v6_transaction_wtxid_matches_zebra() {
+        let bytes = hex::decode(
+            V6_TX_HEX
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect::<String>(),
+        )
+        .expect("fixture is hex");
+
+        let got = wtxid_from_tx_bytes(&bytes, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)
+            .expect("v6 transactions must produce a wtxid");
+
+        // Zebra reports display order; our bytes are wire order, so reverse.
+        let want = wtxid_from_display_hex(V6_TXID_DISPLAY_HEX, V6_AUTH_DISPLAY_HEX)
+            .expect("ground-truth vector parses");
+        assert_eq!(got, want, "wtxid must match Zebra's txid/authdigest for v6");
+    }
+
     #[test]
     fn pre_v5_transaction_returns_none() {
         const V4_TX_HEX: &str = "0400008085202f89018f642996df1e93a6d79ae5baae3493f423ca6c82e99f3e8d9524fa78bcf16167000000006b483045022100b65e37229707d9cd483940d2ab8bdc0b74b12dda66d02dbdf36fd383b9602a5102204be7fd7a39a4a42dff071a5a2bc51b492d33f0bc394bc87861e1bcaaf2bac93b01210248e78bdc18f1a83110c12e4008b764026961b168fe8d5a8d947efe6af83cc88effffffff01f0f27018020000001976a914a284d0511d0e520d36f444a36c10bf54b4b017cd88ac00000000d7450400000000000000000000000100ca9a3b0000000000000000000000001331a3059e66aa6ca97a62f56ea234207568566f6971b3722ae0dd82c00399692aacb5fb12ac580ac26624a8cf0a904cd6f4bfea55625205cb58f06b1c197423280deac74eea97598c4314d899a4fd85311e046257d2d4c297f1406cf709d92a8607f7698d45fe9f41dea3a0571c5da5cfa78e18ebf580c36179d9d6e6320a348f146c407adab4cb310392a5f5b5ab283b78343ba91abc7c4bfe23a3dbaf8037c676e595a26574b1813bc2bf2d2e911f6f3abb0ba6bcac7a2901fbdce65fb07b5636017ef14dff44cdeea730477294f2f8619bd3d5e6be4898bf8d39c0e0eae5a36864625206b9a8f9940bf16650def7926eb0db43b7d7615e4774cf109482f2e807fee6c0c884e8314c67c5d85f4c229cdeab1e964cf0c1adcb47cebfc7c067a0f3c806814a285edbb624f4710629098944ac75e7c9cbc56bd0a029e1110eac60cb4077ebf108fe3e67cd061391e5d6916d5f41c02b8914c12cf605db7d959226e2e8ff71263b9af4c59b0f4db315b74ca2b0b7d25213d5293954c3e51172370fb6c35abe9ce36ef253e3a72e19dac9bd7362c44992974215c82cb90c99488dbde11963e857cea6b81b8eaae34b7cf5a97d6b60d49fdfa20f5f3c120ef382ca2469604fb0c6842c6d4fae9661665b5cbc612cef132f88fb7da393f356e3ad13fc3557980a7734231453e44079042fb432f55e751484d5d6d30fbc4f999013d5d4f2fb62f7144e8dcd2ae59546cc4379ad9f1859ef80dec66b1a9b0b7fd2c47bd38302d29c31990329a895876ed1d84db757856e75ce9a1dc7c7472bc218fb8d7c7d028bb02f10efe7fe6a8c9ce034fea66b909c8d4126251c7d6e54f4cfc778cd4f0e0bad1096176f2dd45c45cbe15e118f90ff2545f832f23698f2c9531b52655a4c0c8953559928eedfc756c365cf929b8447dcdc7d823849e02ff68b6278d7542ce0f1070bb1ad913c1a353625f5d35b14cfec84a633d7fe25256dcffe92f9a6f0fe00caaaa5b39cc2ab06768a42a5b40083cea01c96b3e68d0f6a587eaf2da6fdadc82527f186a60471ce98e27d2b11efc47998f3030a7a2e5d0b0a7eb80f6bd0e4b9c8367c6c522d9415f8caec7b0a7318d53dce391cf7e7389c9a74aa6a4c217c288519af81ba2122ca0c5840cc02cf1bcf150cd3df33c0acfd0053e668b926561b924098d97aaab57ee1113df966a422ef9b014617bceef05fb6468e330e2dece3f375e98ef03e5b18a953e2301fccec86200ae432c9c12c30775437f3629714a9fabeb53289402b7fd386cef2b1146723a89d0f81651e00caea2f3ac9eefefb868d85ed2354f530fe38fe3a3a6aab47d42dc21329e3ad1b9d06c0c8d6537456f54ad0453f444175d87ef5cdd1694662e0a1e6e3632ed7a8e76bc7b1b5a418f086d340815ec398f092e97869f5e201c22c87918f766a3532eb9a4fc9acf196cbc2d0285119a4216d2581cd2d91bcdce868c468f6f34cf49e3a56ce249a2fd8cf36b01b0f77de722bbce267e3e5521688e65222235c91c263d80e28297e929d885b7b9c1a1654b2d0b87577c9a1c725f54415dc5f52dde0695f9f6dcb4b6ee3e3ea702904c11ff92f55534c7ef98ce793d74756a45d4e320a425e982d5b372d6a8d41fb86ba5164816832a481825c8c6ad7270969859e55d2367535060f99857065170466bdb70cb93ab2f9c0e293a0a919843bbf34c2fe61b0c3e32aa7078e83d4c1929e1e1d86141cdeb18920910975db3a7626820599630c423ade233d5d60685524e8d8032b861b4aad2002a8fd17c9282b825f02d353e291379ced00ebaa3c03e01d9c59f405099d1c3432bad06358d6b1942f0baf710998d10a22d155b0fe849952893126949ff92de3a4c2eeafdf688435e325d81c2ce008cf6c76030d4d46342ac3372c73986560c4ec35a6f649ef02c11936b7039bc6f5d09438dbe476251b5964b68f02eedff7a9e0ed3e3090965a22f2c552ce3b2b474fd2fc06b50927830a05a303faffd68482d7b78538432540dd3261ab759b6582129a7f18d801c54319ca52a3c6a3db635044d625e24038ad4277f8d5bf016035165f21b070e8169d657d6ed1fa7f8ed09b4e1d9ca2e51a24da55e43b3fca9859b2408c26aacbad749ebe882c31e7205e638bb7e2bfc8a3f1c02c0ca7bb9daaab7fcbf845d8002c3de79924dcaadc24bdc0082f4a6b61876f3192a881f59a682d273685d4795c9bd7cccf49de34443a9f9cb35bbf254c50611b7c1324b11094667b6b608c39d1252cebcc4877ceea76e19b842b67f626743fab297776cc9cf79e90e8fce1001790c2e7d5c958647cca5d3397d20afcf29ba44f62a7c62e908d848d81a79fadbb370aba93b03e41d4bc49e299d6d33faf869f36371414ce646fc2ca6dcff55a6e0639d50caeb114c418c626b86715436481d1928d55a756a603e7110c3afe963c2b29a478f9d4397b885a67b093a345796219c111b7e94db390aa4bb76b66a534e5e2679b27db5f95fd09a36b05";
