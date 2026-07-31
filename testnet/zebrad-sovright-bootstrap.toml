@@ -20,9 +20,24 @@ network_magic = [36, 233, 39, 100]
 slow_start_interval = 0
 target_difficulty_limit = "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f"
 disable_pow = true
+# A configured testnet inherits the mainnet NU6.1 lockbox disbursement schedule
+# (NU6_1_LOCKBOX_DISBURSEMENTS). With NU6.1 activating at height 2 this chain has
+# an empty deferred pool, so the activation block's coinbase is rejected with
+# AddValuePool { Deferred(-7875000000000) } and the chain cannot pass height 1.
+# Clearing the schedule is required for a from-scratch Ironwood chain.
+lockbox_disbursements = []
 
 [network.testnet_parameters.activation_heights]
+# Ironwood (NU6.3) is active from the start of this chain. The intermediate
+# upgrades get explicit heights rather than relying on Zebra tolerating a gap
+# between NU5 and NU6.3. The dotted keys are serde renames on
+# ConfiguredActivationHeights, so they must be quoted in TOML; the struct is
+# deny_unknown_fields, so a misspelling is a startup failure, not a no-op.
 NU5 = 1
+NU6 = 2
+"NU6.1" = 2
+"NU6.2" = 2
+"NU6.3" = 2
 
 [rpc]
 listen_addr = "0.0.0.0:18233"
