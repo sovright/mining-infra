@@ -33,5 +33,5 @@ sha2 = "0.10"
 # Zcash transaction parsing + ZIP-244 txid/auth-digest (for short_id-ing block
 # transactions the tx cache missed). `circuits`/`multicore` (halo2 proving) are
 # not needed -- we only parse and hash, never verify proofs.
-zcash_primitives = { version = "0.28", default-features = false, features = ["std"] }
-zcash_protocol = { version = "0.9", default-features = false }
+zcash_primitives = { version = "0.29", default-features = false, features = ["std"] }
+zcash_protocol = { version = "0.10", default-features = false }

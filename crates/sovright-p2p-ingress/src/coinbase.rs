@@ -63,6 +63,44 @@ mod tests {
     const TX_V5_VERSION_GROUP_ID: u32 = 0x26A7_270A;
     const NU5_CONSENSUS_BRANCH_ID: u32 = 0xC2D6_D0B4;
 
+    /// Real mainnet Ironwood coinbase, block 3431157. Post-NU6.3 coinbases are
+    /// v6 (version_group_id 0xD884B698); zcash_primitives 0.28 defined its V6 as
+    /// 0xFFFFFFFF (a different Nu7/ZFuture format) and so REJECTED every real
+    /// coinbase. Transaction::read returned Err, coinbase_miner_script returned
+    /// None, and 1097 of 1098 orphan-ledger rows carried no miner_script -- which
+    /// is why the dashboard showed 3 orphans but an EMPTY "revenue lost by pool".
+    /// This fixture fails if that regresses.
+    const REAL_MAINNET_V6_COINBASE_HEX: &str = "0600008098b684d85b16a53700000000f55a3400010000000000000000000000000000000000\
+         000000000000000000000000000000ffffffff0903f55a3404f09fa693ffffffff02d8047607\
+         000000001976a91425db9091e9786867e536f70089a5102523ab1d6a88ac20bcbe0000000000\
+         17a914c20cd5bdf7964ca61764db66bc2531b1792a084d8700000000";
+
+    /// The largest transparent output's script, per Zebra's own parse of the same
+    /// transaction. It is ViaBTC's payout script in pool_labels.json.
+    const REAL_MAINNET_V6_MINER_SCRIPT: &str = "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac";
+
+    #[test]
+    fn extracts_miner_script_from_a_real_v6_coinbase() {
+        let cb = hex::decode(
+            REAL_MAINNET_V6_COINBASE_HEX
+                .chars()
+                .filter(|c| c.is_ascii_hexdigit())
+                .collect::<String>(),
+        )
+        .expect("fixture is hex");
+
+        // coinbase_miner_script takes a BLOCK payload: header, tx count, then txs.
+        let mut block = vec![0u8; ZCASH_FULL_HEADER_SIZE];
+        encode_compact_size(1, &mut block);
+        block.extend_from_slice(&cb);
+
+        assert_eq!(
+            coinbase_miner_script(&block).as_deref(),
+            Some(REAL_MAINNET_V6_MINER_SCRIPT),
+            "v6 coinbase must yield the miner payout script"
+        );
+    }
+
     /// Build a minimal but valid v5 coinbase transaction with two transparent
     /// outputs: a large "miner" output and a small "funding stream" output,
     /// each carrying a distinct script. `zcash_primitives::Transaction::read`
