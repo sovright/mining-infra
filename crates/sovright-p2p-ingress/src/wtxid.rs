@@ -45,7 +45,7 @@ use zcash_protocol::consensus::BranchId;
 /// BIP34 coinbase height would be pure ceremony with a maintenance burden, so we
 /// use this documented constant. Bump it at each network upgrade anyway, to keep
 /// the documented intent aligned with mainnet.
-pub const SOVRIGHT_P2P_CONSENSUS_BRANCH_ID: BranchId = BranchId::Nu6;
+pub const SOVRIGHT_P2P_CONSENSUS_BRANCH_ID: BranchId = BranchId::Nu6_3;
 
 /// Parse `tx_bytes` and, for a v5 (ZIP-244) transaction, return its relay
 /// `WtxId` = wire-order `txid (32) || auth_digest (32)`, identical to what the
