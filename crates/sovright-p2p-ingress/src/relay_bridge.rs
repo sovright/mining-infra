@@ -1079,6 +1079,7 @@ mod tests {
             rotation_cooldown: Duration::from_secs(1),
             rotation_failure_cooldown: Duration::from_secs(1),
             accept_nonstandard_ports: false,
+            excluded_peer_ips: std::collections::HashSet::new(),
             peer_scoring_enabled: false,
             peer_score_block_inv: 5,
             peer_score_block_received: 25,

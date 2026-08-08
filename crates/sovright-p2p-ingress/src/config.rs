@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::env;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -42,6 +43,11 @@ pub struct Config {
     pub rotation_cooldown: Duration,
     pub rotation_failure_cooldown: Duration,
     pub accept_nonstandard_ports: bool,
+    /// Hosts the crawler must never dial, by IP. Used to keep our own nodes out
+    /// of the peer set: they are the closest peers in every region, so without
+    /// this the ingress becomes a downstream echo of our own Zebra rather than
+    /// an independent block-acquisition path.
+    pub excluded_peer_ips: HashSet<IpAddr>,
     pub peer_scoring_enabled: bool,
     pub peer_score_block_inv: i64,
     pub peer_score_block_received: i64,
@@ -105,6 +111,7 @@ impl Config {
         let rotation_failure_cooldown =
             Duration::from_secs(env_u64("SOVRIGHT_P2P_ROTATION_FAILURE_COOLDOWN_SECS", 120)?);
         let accept_nonstandard_ports = env_bool("SOVRIGHT_P2P_ACCEPT_NONSTANDARD_PORTS", false)?;
+        let excluded_peer_ips = env_ip_csv("SOVRIGHT_P2P_EXCLUDED_PEER_IPS")?;
         let peer_scoring_enabled = env_bool("SOVRIGHT_P2P_PEER_SCORING_ENABLED", false)?;
         let peer_score_block_inv = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_INV", 5)?;
         let peer_score_block_received = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_RECEIVED", 25)?;
@@ -174,6 +181,7 @@ impl Config {
             rotation_cooldown,
             rotation_failure_cooldown,
             accept_nonstandard_ports,
+            excluded_peer_ips,
             peer_scoring_enabled,
             peer_score_block_inv,
             peer_score_block_received,
@@ -305,6 +313,25 @@ fn env_socket_csv(name: &str) -> Result<Vec<SocketAddr>> {
         .map(|value| {
             value.parse().map_err(|e| {
                 IngressError::Config(format!("invalid socket address in {name}: {value}: {e}"))
+            })
+        })
+        .collect()
+}
+
+/// Parse a comma-separated list of bare IP addresses.
+///
+/// Fails closed on a malformed entry rather than skipping it: a typo here would
+/// silently leave one of our own nodes dialable, which is the exact failure this
+/// setting exists to prevent.
+fn env_ip_csv(name: &str) -> Result<HashSet<IpAddr>> {
+    let Some(values) = env_csv(name) else {
+        return Ok(HashSet::new());
+    };
+    values
+        .into_iter()
+        .map(|value| {
+            value.parse().map_err(|e| {
+                IngressError::Config(format!("invalid IP address in {name}: {value}: {e}"))
             })
         })
         .collect()
@@ -603,6 +630,66 @@ mod tests {
 
         assert_eq!(config.relay_raw_segment_send_rounds, 3);
         assert_eq!(config.relay_raw_segment_round_delay_millis, 25);
+    }
+
+    #[test]
+    fn parses_excluded_peer_ips_env() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            (
+                "SOVRIGHT_P2P_EXCLUDED_PEER_IPS",
+                " 34.182.139.187 ,34.91.248.94,".to_string(),
+            ),
+        ]);
+
+        let config = Config::from_env().unwrap();
+
+        assert_eq!(config.excluded_peer_ips.len(), 2);
+        assert!(
+            config
+                .excluded_peer_ips
+                .contains(&"34.182.139.187".parse().unwrap())
+        );
+        assert!(
+            config
+                .excluded_peer_ips
+                .contains(&"34.91.248.94".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn excluded_peer_ips_defaults_to_empty() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_EXCLUDED_PEER_IPS", "".to_string()),
+        ]);
+
+        let config = Config::from_env().unwrap();
+
+        assert!(config.excluded_peer_ips.is_empty());
+    }
+
+    #[test]
+    fn rejects_malformed_excluded_peer_ip() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            // Fail closed: a typo must not silently leave our own node dialable.
+            (
+                "SOVRIGHT_P2P_EXCLUDED_PEER_IPS",
+                "34.182.139.187:8233".to_string(),
+            ),
+        ]);
+
+        assert!(Config::from_env().is_err());
     }
 
     #[test]

@@ -1,5 +1,5 @@
-use std::collections::{HashMap, VecDeque};
-use std::net::SocketAddr;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -16,6 +16,7 @@ pub struct Crawler {
     rotation_failure_cooldown: Duration,
     max_known_peers: usize,
     accept_nonstandard_ports: bool,
+    excluded_peer_ips: HashSet<IpAddr>,
     peer_scoring_enabled: bool,
 }
 
@@ -59,6 +60,9 @@ impl Crawler {
             if !is_accepted_peer_addr(&peer, config.accept_nonstandard_ports) {
                 continue;
             }
+            if config.excluded_peer_ips.contains(&peer.ip()) {
+                continue;
+            }
             if peers
                 .insert(
                     peer,
@@ -89,6 +93,7 @@ impl Crawler {
             rotation_failure_cooldown: config.rotation_failure_cooldown,
             max_known_peers: config.crawler_max_known_peers,
             accept_nonstandard_ports: config.accept_nonstandard_ports,
+            excluded_peer_ips: config.excluded_peer_ips.clone(),
             peer_scoring_enabled: config.peer_scoring_enabled,
         }
     }
@@ -249,6 +254,9 @@ impl Crawler {
                 if !is_accepted_peer_addr(&peer, self.accept_nonstandard_ports) {
                     continue;
                 }
+                if self.excluded_peer_ips.contains(&peer.ip()) {
+                    continue;
+                }
                 if inner.peers.len() >= self.max_known_peers {
                     break;
                 }
@@ -301,6 +309,7 @@ mod tests {
             rotation_cooldown: Duration::from_secs(0),
             rotation_failure_cooldown: Duration::from_secs(30),
             accept_nonstandard_ports: false,
+            excluded_peer_ips: HashSet::new(),
             peer_scoring_enabled: false,
             peer_score_block_inv: 5,
             peer_score_block_received: 25,
@@ -418,6 +427,54 @@ mod tests {
 
         assert_eq!(accepted, 0);
         assert_eq!(crawler.known_len(), 1);
+    }
+
+    #[test]
+    fn crawler_rejects_excluded_peer_ips() {
+        // Our own Zebra nodes became dialable when public inbound P2P was
+        // opened. They are the closest peers in every region, so the crawler
+        // connects to them and the ingress degrades into a downstream echo of
+        // our own Zebra instead of an independent acquisition path.
+        let external_peer: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let own_zebra: SocketAddr = "127.0.0.2:8233".parse().unwrap();
+        let mut cfg = config(true);
+        cfg.excluded_peer_ips = ["127.0.0.2".parse().unwrap()].into_iter().collect();
+
+        let crawler = Crawler::new(&cfg, [external_peer, own_zebra]);
+
+        assert_eq!(crawler.known_len(), 1);
+        assert_eq!(crawler.next_peer(), Some(external_peer));
+
+        let accepted = crawler
+            .add_discovered("127.0.0.9:8233", [own_zebra], &events())
+            .unwrap();
+
+        assert_eq!(accepted, 0);
+        assert_eq!(crawler.known_len(), 1);
+    }
+
+    #[test]
+    fn excluded_peer_ip_is_rejected_on_every_port() {
+        // Exclusion is per host, not per endpoint: a node we own is ours on
+        // whatever port it gossips.
+        let own_zebra_alt_port: SocketAddr = "127.0.0.2:18233".parse().unwrap();
+        let mut cfg = config(true);
+        cfg.accept_nonstandard_ports = true;
+        cfg.excluded_peer_ips = ["127.0.0.2".parse().unwrap()].into_iter().collect();
+
+        let crawler = Crawler::new(&cfg, [own_zebra_alt_port]);
+
+        assert_eq!(crawler.known_len(), 0);
+        assert_eq!(crawler.next_peer(), None);
+    }
+
+    #[test]
+    fn empty_exclusion_set_keeps_every_peer() {
+        let peer_a: SocketAddr = "127.0.0.1:8233".parse().unwrap();
+        let peer_b: SocketAddr = "127.0.0.2:8233".parse().unwrap();
+        let crawler = Crawler::new(&config(true), [peer_a, peer_b]);
+
+        assert_eq!(crawler.known_len(), 2);
     }
 
     #[test]
