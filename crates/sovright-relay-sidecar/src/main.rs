@@ -30,7 +30,7 @@ use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    handle_relay_compact_block, handle_relay_compact_block_with_gate,
+    SubmitRejectionClass, handle_relay_compact_block, handle_relay_compact_block_with_gate,
     handle_relay_compact_block_with_mempool, handle_relay_raw_block,
     handle_relay_raw_block_with_gate,
 };
@@ -1296,9 +1296,13 @@ fn log_submission_outcome(
             );
         }
         Err(error) => match error {
-            RelayBlockError::SubmitRejected(reason) => {
-                metrics.inc_submit_rejections();
-                warn!(%reason, "Relay block rejected by Zebra");
+            RelayBlockError::SubmitRejected(reason, class) => {
+                metrics.inc_submit_rejections(class);
+                warn!(
+                    %reason,
+                    rejection_class = class.as_str(),
+                    "Relay block rejected by Zebra"
+                );
             }
             RelayBlockError::SubmitFailed(error) => {
                 metrics.inc_submit_rpc_failures();
@@ -1400,6 +1404,9 @@ struct SidecarMetrics {
     relay_first_seen_to_submit_ms_count: AtomicU64,
     submit_rpc_failures: AtomicU64,
     submit_rejections: AtomicU64,
+    submit_rejections_race_lost: AtomicU64,
+    submit_rejections_invalid: AtomicU64,
+    submit_rejections_unknown: AtomicU64,
     not_submit_candidates: AtomicU64,
     /// Per-cause counters for the submit safety gate. Incremented in
     /// `handle_relay_*_block_with_gate` so the staging service can attribute
@@ -1552,8 +1559,16 @@ impl SidecarMetrics {
         self.submit_rpc_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn inc_submit_rejections(&self) {
+    fn inc_submit_rejections(&self, class: SubmitRejectionClass) {
+        // Unlabelled total kept: existing alerts and dashboards read the bare
+        // name, and it is still the right denominator-free "how many rejections".
         self.submit_rejections.fetch_add(1, Ordering::Relaxed);
+        let counter = match class {
+            SubmitRejectionClass::RaceLost => &self.submit_rejections_race_lost,
+            SubmitRejectionClass::Invalid => &self.submit_rejections_invalid,
+            SubmitRejectionClass::Unknown => &self.submit_rejections_unknown,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_not_submit_candidates(&self) {
@@ -1677,6 +1692,9 @@ impl SidecarMetrics {
             .load(Ordering::Relaxed);
         let submit_rpc_failures = self.submit_rpc_failures.load(Ordering::Relaxed);
         let submit_rejections = self.submit_rejections.load(Ordering::Relaxed);
+        let submit_rejections_race_lost = self.submit_rejections_race_lost.load(Ordering::Relaxed);
+        let submit_rejections_invalid = self.submit_rejections_invalid.load(Ordering::Relaxed);
+        let submit_rejections_unknown = self.submit_rejections_unknown.load(Ordering::Relaxed);
         let not_submit_candidates = self.not_submit_candidates.load(Ordering::Relaxed);
         let submit_gate_accepted = self.submit_gate_accepted.load(Ordering::Relaxed);
         let submit_gate_rejected_pow = self.submit_gate_rejected_pow.load(Ordering::Relaxed);
@@ -1762,6 +1780,9 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_submit_rpc_failures_total {submit_rpc_failures}\n",
                 "# TYPE sovright_relay_sidecar_relay_submit_rejections_total counter\n",
                 "sovright_relay_sidecar_relay_submit_rejections_total {submit_rejections}\n",
+                "sovright_relay_sidecar_relay_submit_rejections_total{{reason=\"race_lost\"}} {submit_rejections_race_lost}\n",
+                "sovright_relay_sidecar_relay_submit_rejections_total{{reason=\"invalid\"}} {submit_rejections_invalid}\n",
+                "sovright_relay_sidecar_relay_submit_rejections_total{{reason=\"unknown\"}} {submit_rejections_unknown}\n",
                 "# TYPE sovright_relay_sidecar_relay_not_submit_candidates_total counter\n",
                 "sovright_relay_sidecar_relay_not_submit_candidates_total {not_submit_candidates}\n",
                 "# TYPE sovright_relay_sidecar_submit_gate_accepted_total counter\n",
@@ -1832,6 +1853,9 @@ impl SidecarMetrics {
             relay_first_seen_to_submit_ms_count = relay_first_seen_to_submit_ms_count,
             submit_rpc_failures = submit_rpc_failures,
             submit_rejections = submit_rejections,
+            submit_rejections_race_lost = submit_rejections_race_lost,
+            submit_rejections_invalid = submit_rejections_invalid,
+            submit_rejections_unknown = submit_rejections_unknown,
             not_submit_candidates = not_submit_candidates,
             raw_segment_incomplete_blocks = raw_segment_incomplete_blocks,
             raw_segment_payload_bytes = raw_segment_payload_bytes,
@@ -2692,7 +2716,9 @@ mod tests {
         metrics.inc_submit_dry_run_candidates();
         metrics.inc_submit_successes();
         metrics.inc_submit_duplicates();
-        metrics.inc_submit_rejections();
+        metrics.inc_submit_rejections(SubmitRejectionClass::RaceLost);
+        metrics.inc_submit_rejections(SubmitRejectionClass::Invalid);
+        metrics.inc_submit_rejections(SubmitRejectionClass::Unknown);
         metrics.inc_tx_feed_payload(512);
         metrics.inc_tx_feed_invalid_lines();
         metrics.inc_tx_feed_cache_disabled();
@@ -2747,7 +2773,18 @@ mod tests {
         assert!(text.contains("sovright_relay_sidecar_relay_submit_dry_run_candidates_total 1"));
         assert!(text.contains("sovright_relay_sidecar_relay_submit_successes_total 1"));
         assert!(text.contains("sovright_relay_sidecar_relay_submit_duplicates_total 1"));
-        assert!(text.contains("sovright_relay_sidecar_relay_submit_rejections_total 1"));
+        // Three increments above, one per class: the unlabelled total is their sum
+        // and stays the series existing alerts and dashboards read.
+        assert!(text.contains("sovright_relay_sidecar_relay_submit_rejections_total 3"));
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_submit_rejections_total{reason=\"race_lost\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_submit_rejections_total{reason=\"invalid\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_submit_rejections_total{reason=\"unknown\"} 1"
+        ));
         assert!(text.contains("sovright_relay_sidecar_raw_segment_incomplete_blocks 2"));
         assert!(text.contains("sovright_relay_sidecar_raw_segment_payload_bytes 4096"));
         assert!(text.contains("sovright_relay_sidecar_tx_cache_entries 3"));

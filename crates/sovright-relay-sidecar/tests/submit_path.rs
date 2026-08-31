@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sovright_relay::{CompactBlock, PrefilledTx, ShortId, zcash_block_hash};
 use sovright_relay_sidecar::submit::{
-    RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    SubmitFuture, build_raw_block_submission_candidate, build_submission_candidate,
-    handle_relay_compact_block, handle_relay_raw_block,
+    BlockKnownFuture, RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode,
+    SubmitBlockStatus, SubmitFuture, SubmitRejectionClass, build_raw_block_submission_candidate,
+    build_submission_candidate, handle_relay_compact_block, handle_relay_raw_block,
 };
 
 struct CountingSubmitter {
@@ -193,9 +193,11 @@ async fn live_mode_rejects_non_duplicate_submitblock_reason() {
         .await
         .unwrap_err();
 
+    // The default SubmitBlock::block_known returns None for test doubles, so a
+    // rejection they produce is Unknown rather than misattributed to a race.
     assert_eq!(
         err,
-        RelayBlockError::SubmitRejected("bad-cb-amount".to_string())
+        RelayBlockError::SubmitRejected("bad-cb-amount".to_string(), SubmitRejectionClass::Unknown)
     );
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 1);
 }
@@ -470,4 +472,79 @@ async fn gated_raw_block_dry_run_accepts_when_gate_accepts() {
     .unwrap();
     assert!(matches!(outcome, SubmissionOutcome::DryRun(_)));
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
+}
+
+// --- rejection classification ---------------------------------------------
+//
+// In a four-relay mesh every sidecar races to submit the same block and the
+// losers get a rejection back. Zebra returns the same opaque "rejected" string
+// for that as for a genuinely invalid block -- verified against 24h of
+// production logs on two relays (520 and 336 rejections, every one
+// reason=rejected). Without this split the rejection counter cannot support a
+// threshold: the relay that loses the most races looks the most broken.
+
+struct ClassifyingSubmitter {
+    known: Option<bool>,
+}
+
+impl SubmitBlock for ClassifyingSubmitter {
+    fn submit_block<'a>(&'a self, _block_hex: &'a str) -> SubmitFuture<'a> {
+        Box::pin(async move { Ok(Some("rejected".to_string())) })
+    }
+
+    fn block_known<'a>(&'a self, _block_hash_hex: &'a str) -> BlockKnownFuture<'a> {
+        let known = self.known;
+        Box::pin(async move { known })
+    }
+}
+
+async fn classify_with(known: Option<bool>) -> SubmitRejectionClass {
+    let submitter = ClassifyingSubmitter { known };
+    let compact = CompactBlock::new(
+        header(),
+        0,
+        vec![],
+        vec![PrefilledTx {
+            index: 0,
+            tx_data: vec![0x01],
+        }],
+    );
+    match handle_relay_compact_block(&submitter, &compact, SubmitBlockMode::Live)
+        .await
+        .unwrap_err()
+    {
+        RelayBlockError::SubmitRejected(_, class) => class,
+        other => panic!("expected SubmitRejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn rejection_of_a_block_zebra_already_has_is_a_lost_race() {
+    assert_eq!(
+        classify_with(Some(true)).await,
+        SubmitRejectionClass::RaceLost
+    );
+}
+
+#[tokio::test]
+async fn rejection_of_a_block_zebra_does_not_have_is_invalid() {
+    assert_eq!(
+        classify_with(Some(false)).await,
+        SubmitRejectionClass::Invalid
+    );
+}
+
+#[tokio::test]
+async fn rejection_is_unknown_when_the_lookup_fails() {
+    // Never guess. An unattributable rejection must not be silently counted as
+    // a race loss, or a real outage hides inside the expected-noise bucket.
+    assert_eq!(classify_with(None).await, SubmitRejectionClass::Unknown);
+}
+
+#[test]
+fn rejection_class_strings_are_stable() {
+    // These become Prometheus label values; renaming one silently breaks alerts.
+    assert_eq!(SubmitRejectionClass::RaceLost.as_str(), "race_lost");
+    assert_eq!(SubmitRejectionClass::Invalid.as_str(), "invalid");
+    assert_eq!(SubmitRejectionClass::Unknown.as_str(), "unknown");
 }

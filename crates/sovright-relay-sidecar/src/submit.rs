@@ -18,17 +18,77 @@ use sovright_relay::{
 use crate::rpc::ZebraRpc;
 
 /// Future returned by submitblock implementations.
+pub type BlockKnownFuture<'a> = Pin<Box<dyn Future<Output = Option<bool>> + Send + 'a>>;
+
 pub type SubmitFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<String>, Box<dyn Error + Send + Sync>>> + Send + 'a>>;
 
 /// Minimal submitblock interface for testing and for the Zebra RPC client.
 pub trait SubmitBlock {
     fn submit_block<'a>(&'a self, block_hex: &'a str) -> SubmitFuture<'a>;
+
+    /// Does the node already have this block?
+    ///
+    /// Used only to classify a rejection. In a multi-relay mesh every sidecar
+    /// races to submit the same block and the losers get a rejection back, so
+    /// the rejection counter alone cannot distinguish "we lost the race" from
+    /// "this block is invalid" -- and Zebra returns the same opaque
+    /// `"rejected"` string for both (verified against 24h of production logs
+    /// on two relays: 520 and 336 rejections, every one `reason=rejected`).
+    ///
+    /// `Some(true)` known, `Some(false)` unknown to the node, `None` could not
+    /// be determined. Defaults to `None` so test doubles need no change.
+    fn block_known<'a>(&'a self, _block_hash_hex: &'a str) -> BlockKnownFuture<'a> {
+        Box::pin(async { None })
+    }
 }
 
 impl SubmitBlock for ZebraRpc {
     fn submit_block<'a>(&'a self, block_hex: &'a str) -> SubmitFuture<'a> {
         Box::pin(async move { ZebraRpc::submit_block(self, block_hex).await })
+    }
+
+    fn block_known<'a>(&'a self, block_hash_hex: &'a str) -> BlockKnownFuture<'a> {
+        Box::pin(async move {
+            // get_block_header already maps Zebra's -5 / "not found" to Ok(None),
+            // so a clean negative is distinguishable from an RPC failure.
+            match ZebraRpc::get_block_header(self, block_hash_hex).await {
+                Ok(Some(_)) => Some(true),
+                Ok(None) => Some(false),
+                Err(_) => None,
+            }
+        })
+    }
+}
+
+/// How a `submitblock` rejection should be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubmitRejectionClass {
+    /// Zebra already had the block: another sidecar in the mesh won the race.
+    /// Structural, expected, and not a defect.
+    RaceLost,
+    /// Zebra rejected the block and does not have it. This is the one that matters.
+    Invalid,
+    /// The follow-up lookup failed, so the rejection cannot be attributed.
+    Unknown,
+}
+
+impl SubmitRejectionClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SubmitRejectionClass::RaceLost => "race_lost",
+            SubmitRejectionClass::Invalid => "invalid",
+            SubmitRejectionClass::Unknown => "unknown",
+        }
+    }
+
+    /// Classify from the "does the node already have it" answer.
+    pub fn from_block_known(block_known: Option<bool>) -> Self {
+        match block_known {
+            Some(true) => SubmitRejectionClass::RaceLost,
+            Some(false) => SubmitRejectionClass::Invalid,
+            None => SubmitRejectionClass::Unknown,
+        }
     }
 }
 
@@ -140,7 +200,7 @@ pub enum RelayBlockError {
     RawBlockHashMismatch,
     InvalidCompactSize,
     SubmitFailed(String),
-    SubmitRejected(String),
+    SubmitRejected(String, SubmitRejectionClass),
 }
 
 impl fmt::Display for RelayBlockError {
@@ -187,7 +247,9 @@ impl fmt::Display for RelayBlockError {
                 write!(f, "invalid transaction count compactSize")
             }
             RelayBlockError::SubmitFailed(error) => write!(f, "submitblock RPC failed: {error}"),
-            RelayBlockError::SubmitRejected(reason) => write!(f, "submitblock rejected: {reason}"),
+            RelayBlockError::SubmitRejected(reason, class) => {
+                write!(f, "submitblock rejected: {reason} ({})", class.as_str())
+            }
         }
     }
 }
@@ -378,7 +440,19 @@ pub async fn handle_relay_compact_block<S: SubmitBlock + Sync>(
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status = classify_submitblock_result(result)?;
+            let status = match classify_submitblock_result(result) {
+                Ok(status) => status,
+                Err(RelayBlockError::SubmitRejected(reason, _)) => {
+                    // One extra RPC, only on the rejection path, to answer the
+                    // question the counter could never answer on its own.
+                    let known = submitter.block_known(&candidate.consensus_block_hash).await;
+                    return Err(RelayBlockError::SubmitRejected(
+                        reason,
+                        SubmitRejectionClass::from_block_known(known),
+                    ));
+                }
+                Err(other) => return Err(other),
+            };
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
     }
@@ -567,7 +641,12 @@ fn classify_submitblock_result(
     match result.as_deref() {
         None => Ok(SubmitBlockStatus::Accepted),
         Some("duplicate") => Ok(SubmitBlockStatus::Duplicate),
-        Some(reason) => Err(RelayBlockError::SubmitRejected(reason.to_owned())),
+        // Class is filled in by the caller, which still has the block hash;
+        // this function only decides accepted / duplicate / rejected.
+        Some(reason) => Err(RelayBlockError::SubmitRejected(
+            reason.to_owned(),
+            SubmitRejectionClass::Unknown,
+        )),
     }
 }
 
