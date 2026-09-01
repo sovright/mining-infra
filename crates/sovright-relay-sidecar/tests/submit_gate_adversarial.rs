@@ -111,11 +111,11 @@ fn enabled_gate_config() -> GateConfig {
 //
 // The gate compares the candidate's reported block_hash against the meta's
 // block_hash_hex. When they diverge (e.g. a mutated nonce post-construction),
-// the gate must reject with PowRecheck. This proves the gate catches
+// the gate must reject with HeaderMutated. This proves the gate catches
 // candidates whose hash was tampered between construction and gate.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn adversarial_pow_recheck_rejects_mutated_candidate_hash() {
+async fn adversarial_header_mutation_rejects_mutated_candidate_hash() {
     let submitter = NeverSubmitsSubmitter::new();
     let parent = [7u8; 32];
     let compact = compact_one_prefilled(header_bytes_with_parent(parent));
@@ -141,8 +141,8 @@ async fn adversarial_pow_recheck_rejects_mutated_candidate_hash() {
 
     assert_eq!(
         decision,
-        sovright_relay_sidecar::submit_gate::GateDecision::Reject(RejectReason::PowRecheck),
-        "mutated candidate hash must trip PowRecheck",
+        sovright_relay_sidecar::submit_gate::GateDecision::Reject(RejectReason::HeaderMutated),
+        "mutated candidate hash must trip HeaderMutated",
     );
     assert_eq!(submitter.calls.load(Ordering::SeqCst), 0);
 }

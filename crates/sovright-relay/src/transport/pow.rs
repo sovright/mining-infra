@@ -1,7 +1,20 @@
-//! Proof-of-work validation for block headers
+//! Proof-of-work validation for block headers.
 //!
-//! Provides a trait for PoW validation with a stub implementation.
-//! Real Equihash validation can be plugged in later.
+//! Two properties make a Zcash header's PoW, and BOTH are required:
+//!
+//! 1. the Equihash solution is valid for the header + nonce, and
+//! 2. the resulting solution hash is at or below the header's stated target.
+//!
+//! Only (1) was checked here until 2026-09-01, which is close to no check at
+//! all: Zcash's Equihash parameters yield roughly two valid solutions per
+//! nonce, so a valid *solution* is cheap to produce. All of the difficulty --
+//! and therefore all of the spam resistance -- lives in (2).
+//!
+//! Like the equivalent guard in `sovright-p2p-ingress::submitblock_rpc`, this
+//! is an anti-garbage check and NOT a consensus-difficulty check: it requires
+//! the header to meet its OWN stated target within the valid mainnet range.
+//! Whether that target clears the current network difficulty is the full
+//! node's job, and needs chain context this layer does not have.
 
 /// Minimum block header size in bytes for validation
 /// The basic Zcash block header (without Equihash solution) is 140 bytes
@@ -19,6 +32,58 @@ pub enum PowResult {
     Invalid,
     /// Cannot validate (e.g., header too short) - buffer until more data arrives
     Indeterminate,
+}
+
+/// Outcome of the hash-to-target half of the PoW check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetCheck {
+    Met,
+    NotMet,
+    /// nBits is malformed or outside the valid mainnet range.
+    BadTarget,
+}
+
+/// Does this header meet the target its own nBits encodes?
+///
+/// Zcash's PoW hash is the **double-SHA256** of the full 1487-byte serialized
+/// header, compared as a little-endian 256-bit integer against the target.
+///
+/// Note this deliberately does NOT use `EquihashValidator::verify_share`'s
+/// target arm. That helper hashes with BLAKE2b personalised `"ZcashBlockHash"`,
+/// which is not Zcash's block hash, and it rejects genuine mainnet headers --
+/// verified 2026-09-01 against the real header fixture below.
+fn header_meets_stated_target(header: &[u8]) -> TargetCheck {
+    use sha2::{Digest, Sha256};
+    use zcash_equihash_validator::{Target, compact_to_target};
+
+    // Zcash header: version(4) prev(32) merkle(32) commitments(32) time(4) bits(4) nonce(32),
+    // so nBits starts at 4+32+32+32+4 = 104, little-endian. Offset 100 is `time`;
+    // reading it there silently rejects every real header.
+    const BITS_OFFSET: usize = 104;
+    let bits = u32::from_le_bytes([
+        header[BITS_OFFSET],
+        header[BITS_OFFSET + 1],
+        header[BITS_OFFSET + 2],
+        header[BITS_OFFSET + 3],
+    ]);
+    // Reject the negative / zero-mantissa encodings before converting.
+    if bits & 0x0080_0000 != 0 || bits & 0x007f_ffff == 0 {
+        return TargetCheck::BadTarget;
+    }
+    let target = compact_to_target(bits);
+    if target.0 == [0u8; 32] || target > Target::max_mainnet() {
+        return TargetCheck::BadTarget;
+    }
+
+    let mut hash = [0u8; 32];
+    hash.copy_from_slice(&Sha256::digest(Sha256::digest(
+        &header[..ZCASH_FULL_HEADER_SIZE],
+    )));
+    if target.is_met_by(&hash) {
+        TargetCheck::Met
+    } else {
+        TargetCheck::NotMet
+    }
 }
 
 /// Trait for validating proof-of-work on block headers
@@ -91,9 +156,14 @@ impl PowValidator for EquihashPowValidator {
         }
         let solution = &header[solution_start..solution_start + EQUIHASH_SOLUTION_SIZE];
 
-        // Validate using equihash crate
+        // (1) Equihash solution validity.
         match equihash::is_valid_solution(EQUIHASH_N, EQUIHASH_K, input, nonce, solution) {
-            Ok(()) => PowResult::Valid,
+            Ok(()) => match header_meets_stated_target(header) {
+                // (2) Hash-to-target. Without this a valid-but-trivial solution
+                // would be forwarded into the mesh for free.
+                TargetCheck::Met => PowResult::Valid,
+                TargetCheck::NotMet | TargetCheck::BadTarget => PowResult::Invalid,
+            },
             Err(_) => PowResult::Invalid,
         }
     }
@@ -186,5 +256,44 @@ mod tests {
         let validator = EquihashPowValidator;
 
         assert_eq!(validator.validate(&header), PowResult::Valid);
+    }
+
+    #[test]
+    fn equihash_validator_rejects_header_whose_hash_misses_its_target() {
+        // Real header, nBits rewritten to the hardest encoding still inside the
+        // mainnet range. The Equihash solution is untouched and still valid, so
+        // only the hash-to-target half can reject it -- which is the half that
+        // carries all of Zcash's difficulty.
+        let mut header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+        header[104..108].copy_from_slice(&0x0300_0001u32.to_le_bytes());
+
+        assert_eq!(EquihashPowValidator.validate(&header), PowResult::Invalid);
+    }
+
+    #[test]
+    fn equihash_validator_rejects_malformed_target_bits() {
+        let mut header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+        header[104..108].copy_from_slice(&0x0000_0000u32.to_le_bytes());
+
+        assert_eq!(EquihashPowValidator.validate(&header), PowResult::Invalid);
+    }
+
+    #[test]
+    fn a_valid_equihash_solution_alone_is_not_proof_of_work() {
+        // The point of the whole change: Zcash yields ~2 valid Equihash
+        // solutions per nonce, so solution validity is cheap and carries no
+        // difficulty. Same header, same valid solution, easier stated target.
+        let header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+        let input = &header[..ZCASH_EQUIHASH_INPUT_SIZE];
+        let nonce = &header[ZCASH_EQUIHASH_INPUT_SIZE..ZCASH_HEADER_SIZE];
+        let solution =
+            &header[ZCASH_HEADER_SIZE + 3..ZCASH_HEADER_SIZE + 3 + EQUIHASH_SOLUTION_SIZE];
+        assert!(
+            equihash::is_valid_solution(EQUIHASH_N, EQUIHASH_K, input, nonce, solution).is_ok()
+        );
+
+        let mut tampered = header.clone();
+        tampered[104..108].copy_from_slice(&0x0300_0001u32.to_le_bytes());
+        assert_eq!(EquihashPowValidator.validate(&tampered), PowResult::Invalid);
     }
 }

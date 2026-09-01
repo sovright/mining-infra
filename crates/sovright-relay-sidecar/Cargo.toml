@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 sovright-relay = { path = "../sovright-relay" }
+zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 tokio = { workspace = true, features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 serde = { workspace = true }
