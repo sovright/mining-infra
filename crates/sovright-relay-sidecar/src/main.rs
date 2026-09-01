@@ -1587,7 +1587,7 @@ impl SidecarMetrics {
     /// once per `SubmissionOutcome::GateRejected` in the handler match arm.
     fn inc_submit_gate_rejected(&self, reason: sovright_relay_sidecar::submit_gate::RejectReason) {
         let counter = match reason {
-            sovright_relay_sidecar::submit_gate::RejectReason::PowRecheck => {
+            sovright_relay_sidecar::submit_gate::RejectReason::HeaderMutated => {
                 &self.submit_gate_rejected_pow
             }
             sovright_relay_sidecar::submit_gate::RejectReason::UnknownParent => {
@@ -1788,7 +1788,7 @@ impl SidecarMetrics {
                 "# TYPE sovright_relay_sidecar_submit_gate_accepted_total counter\n",
                 "sovright_relay_sidecar_submit_gate_accepted_total {submit_gate_accepted}\n",
                 "# TYPE sovright_relay_sidecar_submit_gate_rejected_total counter\n",
-                "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"pow_recheck\"}} {submit_gate_rejected_pow}\n",
+                "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"header_mutated\"}} {submit_gate_rejected_pow}\n",
                 "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"unknown_parent\"}} {submit_gate_rejected_unknown_parent}\n",
                 "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"out_of_height_window\"}} {submit_gate_rejected_out_of_window}\n",
                 "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"duplicate_submit\"}} {submit_gate_rejected_duplicate}\n",

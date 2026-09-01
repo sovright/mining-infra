@@ -19,10 +19,14 @@
 //!
 //! Decisions:
 //!
-//! - **PoW recheck** — re-verify the Equihash solution and the compact-target
-//!   on the block header. Already done in `build_submission_candidate`, but
-//!   the gate confirms the candidate has not been mutated between
-//!   construction and this point.
+//! - **Header mutation** — confirm the candidate's header still hashes to the
+//!   block hash recorded when it was built, i.e. nothing mutated it between
+//!   construction and here. This was named `pow_recheck` and documented as
+//!   re-verifying the Equihash solution and compact-target, but it never did
+//!   either: the code is a hash comparison. Renamed 2026-09-01 to say what it
+//!   is. Real proof-of-work — Equihash solution AND hash-to-target — is
+//!   verified in `sovright-relay::transport::pow` before a block reaches the
+//!   mesh, so it is not repeated here.
 //! - **Parent-known** — confirm the parent block hash exists in our local
 //!   zebra. If we don't have the parent, upstream will reject anyway, and
 //!   forwarding the block tells an attacker we don't know about it.
@@ -83,7 +87,7 @@ impl Default for GateConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RejectReason {
     /// Header failed integrity check between candidate construction and gate.
-    PowRecheck,
+    HeaderMutated,
     /// Parent block is not known locally.
     UnknownParent,
     /// Block height is outside the configured window.
@@ -95,7 +99,7 @@ pub enum RejectReason {
 impl RejectReason {
     pub fn as_str(self) -> &'static str {
         match self {
-            RejectReason::PowRecheck => "pow_recheck",
+            RejectReason::HeaderMutated => "header_mutated",
             RejectReason::UnknownParent => "unknown_parent",
             RejectReason::OutOfHeightWindow => "out_of_height_window",
             RejectReason::DuplicateSubmit => "duplicate_submit",
@@ -191,11 +195,12 @@ impl<V: ChainView> SubmitGate<V> {
             return GateDecision::Accept;
         }
 
-        // (1) PoW recheck — confirm the header bytes still match the
-        //     candidate's reported block hash. A mismatch means the candidate
-        //     was mutated between `build_submission_candidate` and here.
+        // (1) Header mutation — the candidate's header must still hash to the
+        //     block hash recorded at construction. This is a mutation guard, not
+        //     a PoW check; PoW is verified in the transport before the block
+        //     enters the mesh.
         if !meta.header_hash_matches(&candidate.block_hash) {
-            return GateDecision::Reject(RejectReason::PowRecheck);
+            return GateDecision::Reject(RejectReason::HeaderMutated);
         }
 
         // (2) Parent-known
@@ -367,7 +372,7 @@ mod tests {
         let m = meta(1001, parent, "different");
         assert_eq!(
             g.apply_now(&c, &m),
-            GateDecision::Reject(RejectReason::PowRecheck),
+            GateDecision::Reject(RejectReason::HeaderMutated),
         );
     }
 
