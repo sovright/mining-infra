@@ -50,6 +50,17 @@ pub struct Config {
     pub excluded_peer_ips: HashSet<IpAddr>,
     pub peer_scoring_enabled: bool,
     pub peer_score_block_inv: i64,
+    /// Rank-weighted awards. Being FIRST to announce a block is the signal the
+    /// relay is built to win; a flat per-delivery credit cannot see it, because
+    /// every connected peer eventually delivers every block. Defaults mirror
+    /// the offline scorecard (scripts/p2p/summarize_peer_scorecard.py), which
+    /// has always scored this way while the binary did not.
+    pub peer_score_block_first: i64,
+    pub peer_score_block_second: i64,
+    pub peer_score_block_third: i64,
+    /// Half-life for score decay. Without decay the score is a lifetime counter
+    /// and ranking degenerates into connection age.
+    pub peer_score_half_life: Duration,
     pub peer_score_block_received: i64,
     pub peer_score_relay_forwarded: i64,
     pub peer_score_error: i64,
@@ -114,6 +125,11 @@ impl Config {
         let excluded_peer_ips = env_ip_csv("SOVRIGHT_P2P_EXCLUDED_PEER_IPS")?;
         let peer_scoring_enabled = env_bool("SOVRIGHT_P2P_PEER_SCORING_ENABLED", false)?;
         let peer_score_block_inv = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_INV", 5)?;
+        let peer_score_block_first = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_FIRST", 100)?;
+        let peer_score_block_second = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_SECOND", 50)?;
+        let peer_score_block_third = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_THIRD", 25)?;
+        let peer_score_half_life =
+            Duration::from_secs(env_u64("SOVRIGHT_P2P_PEER_SCORE_HALF_LIFE_SECS", 3600)?);
         let peer_score_block_received = env_i64("SOVRIGHT_P2P_PEER_SCORE_BLOCK_RECEIVED", 25)?;
         let peer_score_relay_forwarded = env_i64("SOVRIGHT_P2P_PEER_SCORE_FORGE_FORWARDED", 10)?;
         let peer_score_error = env_i64("SOVRIGHT_P2P_PEER_SCORE_ERROR", -50)?;
@@ -184,6 +200,10 @@ impl Config {
             excluded_peer_ips,
             peer_scoring_enabled,
             peer_score_block_inv,
+            peer_score_block_first,
+            peer_score_block_second,
+            peer_score_block_third,
+            peer_score_half_life,
             peer_score_block_received,
             peer_score_relay_forwarded,
             peer_score_error,

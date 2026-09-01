@@ -148,12 +148,11 @@ pub async fn run_peer(
                         }
                         let display = inventory_hash_to_display(&inv.hash);
                         events.p2p_block_inv(&peer, &display)?;
-                        crawler.score_peer(
-                            peer_addr,
-                            config.peer_score_block_inv,
-                            "block_inv",
-                            &events,
-                        )?;
+                        // Rank-weighted: the Nth distinct peer to announce this
+                        // hash earns the Nth-place award. A flat per-delivery
+                        // credit cannot separate a peer that is first from one
+                        // half a second late, since both deliver every block.
+                        crawler.score_block_announcement(peer_addr, inv.hash, &events)?;
                         if requested.insert(inv.hash) {
                             pending_block_responses.push_back(inv.hash);
                             block_requests.push(inv);
