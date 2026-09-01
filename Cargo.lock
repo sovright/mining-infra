@@ -3341,6 +3341,7 @@ dependencies = [
  "tokio-test",
  "tracing",
  "tracing-subscriber",
+ "zcash-equihash-validator",
 ]
 
 [[package]]
@@ -3359,6 +3360,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "zcash-equihash-validator",
 ]
 
 [[package]]
