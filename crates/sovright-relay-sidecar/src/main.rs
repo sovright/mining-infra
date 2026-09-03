@@ -4,7 +4,7 @@ use clap::Parser;
 use sovright_relay::{
     ArrivalSink, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
     TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
-    reassemble_raw_block, zcash_block_hash,
+    ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -642,6 +642,18 @@ fn spawn_relay_block_handler<M>(
                             if let (true, Some(gate), Some(chain_view)) =
                                 (use_gate, &gate, &chain_view)
                             {
+                                // Check the shared dedup ring before gated submit,
+                                // so a raw-segment completion that submitted first
+                                // blocks this path too.
+                                let header_hash = hex::encode(zcash_block_hash(&compact.header));
+                                if fast_path_dedup.contains(&header_hash, Instant::now()) {
+                                    metrics.inc_full_block_deduplicated();
+                                    debug!(
+                                        block_hash = %header_hash,
+                                        "gated compact block already submitted; skipping duplicate"
+                                    );
+                                    continue;
+                                }
                                 let parent_height = if compact.header.len() >= 36 {
                                     let mut prev_hash = [0u8; 32];
                                     prev_hash.copy_from_slice(&compact.header[4..36]);
@@ -675,6 +687,9 @@ fn spawn_relay_block_handler<M>(
                                         | Ok(SubmissionOutcome::Submitted { .. })
                                 ) {
                                     metrics.inc_submit_gate_accepted();
+                                    // Record in the shared dedup ring so the raw-segment
+                                    // path won't also submit the same block.
+                                    fast_path_dedup.record(header_hash, Instant::now());
                                 }
                                 log_submission_outcome(outcome, metrics.as_ref(), None);
                             } else {
@@ -745,16 +760,28 @@ fn spawn_relay_block_handler<M>(
                                     metrics.inc_raw_segment_sets_completed();
                                     raw_segments.update_metrics(metrics.as_ref());
                                     let completed_segments = segments.len();
-                                    match reassemble_raw_block(&segments) {
-                                        Ok(raw_block) => {
-                                            info!(
-                                                block_hash = %hex::encode(block_hash),
-                                                segment_count = completed_segments,
-                                                raw_block_bytes = raw_block.len(),
-                                                "Relay raw block segments complete"
-                                            );
-                                            let raw_outcome = if let (Some(gate), Some(chain_view)) =
-                                                (&gate, &chain_view)
+                                     match reassemble_raw_block(&segments) {
+                                         Ok(raw_block) => {
+                                             info!(
+                                                 block_hash = %hex::encode(block_hash),
+                                                 segment_count = completed_segments,
+                                                 raw_block_bytes = raw_block.len(),
+                                                 "Relay raw block segments complete"
+                                             );
+                                             // Dedup against compact/skeleton paths: the
+                                             // consensus block hash is the shared key.
+                                             let raw_block_hash =
+                                                 hex::encode(zcash_block_hash(&raw_block[..ZCASH_FULL_HEADER_SIZE]));
+                                             if fast_path_dedup.contains(&raw_block_hash, Instant::now())
+                                             {
+                                                 debug!(
+                                                     block_hash = %raw_block_hash,
+                                                     "raw segment already submitted by compact path; skipping duplicate"
+                                                 );
+                                                 continue;
+                                             }
+                                             let raw_outcome = if let (Some(gate), Some(chain_view)) =
+                                                 (&gate, &chain_view)
                                             {
                                                 let parent_height = if raw_block.len() >= 36 {
                                                     let mut prev_hash = [0u8; 32];
@@ -796,12 +823,21 @@ fn spawn_relay_block_handler<M>(
                                             {
                                                 metrics.inc_submit_gate_accepted();
                                             }
-                                            // Relay-internal latency from the first raw
-                                            // segment chunk of this block arriving to the
-                                            // submit decision (mesh-receive → reassemble →
-                                            // gate → submit).
+                                             // Relay-internal latency from the first raw
+                                             // segment chunk of this block arriving to the
+                                             // submit decision (mesh-receive → reassemble →
+                                             // gate → submit).
                                             let first_seen_to_submit_ms =
                                                 first_seen.elapsed().as_millis() as u64;
+                                            if matches!(
+                                                raw_outcome,
+                                                Ok(SubmissionOutcome::Submitted { .. })
+                                                    | Ok(SubmissionOutcome::DryRun(_))
+                                            ) {
+                                                // Record in shared dedup ring so compact-block
+                                                // paths won't also submit this consensus block.
+                                                fast_path_dedup.record(raw_block_hash, Instant::now());
+                                            }
                                             if matches!(
                                                 raw_outcome,
                                                 Ok(SubmissionOutcome::Submitted { .. })
