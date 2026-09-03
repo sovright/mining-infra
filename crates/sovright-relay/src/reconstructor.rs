@@ -148,6 +148,39 @@ impl<'a, M: MempoolProvider> CompactBlockReconstructor<'a, M> {
             // path's entire latency advantage to learn something knowable
             // locally. Returning Invalid falls back to getblocktxn / raw block.
             if !crate::merkle::transactions_match_merkle_root(&compact.header, &filled) {
+                // Emit enough to identify the offending slot offline. The block
+                // is on-chain moments later, so logging the consensus hash plus
+                // our own per-slot txids makes the failure joinable against
+                // `getblock <hash> 1`: whichever index disagrees is the
+                // transaction we substituted, and the counter alone can never
+                // say which one that was.
+                //
+                // Prefilled slots are excluded: their bytes come from the
+                // compact block itself, so they cannot be the substitution.
+                let prefilled_positions = prefilled_positions(compact);
+                let expected = crate::merkle::header_merkle_root(&compact.header)
+                    .map(|root| crate::merkle::display_hex(&root))
+                    .unwrap_or_else(|| "short-header".to_string());
+                let txids: Vec<[u8; 32]> = filled
+                    .iter()
+                    .map(|tx| crate::merkle::txid_from_tx_bytes(tx))
+                    .collect();
+                let computed = crate::merkle::merkle_root(&txids)
+                    .map(|root| crate::merkle::display_hex(&root))
+                    .unwrap_or_else(|| "no-transactions".to_string());
+                tracing::warn!(
+                    consensus_block_hash =
+                        %crate::consensus_block_hash_display(&compact.header),
+                    expected_merkle_root = %expected,
+                    computed_merkle_root = %computed,
+                    tx_count = filled.len(),
+                    prefilled_count = prefilled_positions.len(),
+                    mempool_slots = %crate::merkle::mempool_slot_digest(
+                        &filled,
+                        &prefilled_positions,
+                    ),
+                    "Reconstruction merkle mismatch; slots listed are mempool-resolved"
+                );
                 return ReconstructionResult::Invalid {
                     reason: "merkle root mismatch".into(),
                 };
@@ -165,11 +198,28 @@ impl<'a, M: MempoolProvider> CompactBlockReconstructor<'a, M> {
     }
 }
 
+/// Block indexes a compact block prefills, decoding BIP-152 differential
+/// indexes the same way `reconstruct` does.
+///
+/// Kept beside the decoder it mirrors: if one changes, the diagnostic that
+/// names the guilty slot must change with it, or it will point at the wrong
+/// transaction.
+fn prefilled_positions(compact: &CompactBlock) -> Vec<usize> {
+    let mut positions = Vec::with_capacity(compact.prefilled_txs.len());
+    let mut cumulative_offset = 0usize;
+    for prefilled in &compact.prefilled_txs {
+        let position = cumulative_offset + prefilled.index as usize;
+        positions.push(position);
+        cumulative_offset = position + 1;
+    }
+    positions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::builder::CompactBlockBuilder;
-    use crate::compact_block::CompactBlock;
+    use crate::compact_block::{CompactBlock, PrefilledTx};
     use crate::mempool::TestMempool;
     use crate::types::{AuthDigest, ShortId, TxId};
 
@@ -459,6 +509,95 @@ mod tests {
                 assert_eq!(reason, "merkle root mismatch");
             }
             other => panic!("expected a substituted transaction to be invalid: {other:?}"),
+        }
+    }
+
+    /// The diagnostic names a guilty slot by index, so its decoding of the
+    /// BIP-152 differential prefill indexes must agree with `reconstruct`'s.
+    /// If these drift apart the log points at an innocent transaction, which is
+    /// worse than no log at all.
+    #[test]
+    fn prefilled_positions_matches_the_decoder() {
+        // Differential indexes [0, 1, 0] decode to absolute positions [0, 2, 3].
+        let compact = CompactBlock::new(
+            vec![0u8; 2189],
+            0,
+            vec![],
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: vec![1],
+                },
+                PrefilledTx {
+                    index: 1,
+                    tx_data: vec![2],
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: vec![3],
+                },
+            ],
+        );
+        assert_eq!(prefilled_positions(&compact), vec![0, 2, 3]);
+    }
+
+    /// Cross-check against the real decoder rather than against my arithmetic:
+    /// every position the helper reports must be a slot `reconstruct` actually
+    /// filled from the compact block, not from the mempool.
+    #[test]
+    fn reported_prefilled_positions_are_the_slots_reconstruct_prefills() {
+        let nonce = 7u64;
+        let coinbase_data = vec![0xc0];
+        let mempool_data = vec![0xa1];
+        let trailing_data = vec![0xa2];
+        let header = header_committing_to(&[
+            coinbase_data.clone(),
+            mempool_data.clone(),
+            trailing_data.clone(),
+        ]);
+
+        let mempool_wtxid = make_wtxid(9);
+        let mut receiver = TestMempool::new();
+        receiver.insert(mempool_wtxid, mempool_data.clone());
+        let short_id = ShortId::compute(&mempool_wtxid, &crate::zcash_block_hash(&header), nonce);
+
+        // Slots 0 and 2 prefilled (differential 0 then 1), slot 1 short-id'd.
+        let compact = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: coinbase_data.clone(),
+                },
+                PrefilledTx {
+                    index: 1,
+                    tx_data: trailing_data.clone(),
+                },
+            ],
+        );
+
+        assert_eq!(prefilled_positions(&compact), vec![0, 2]);
+
+        let mut reconstructor = CompactBlockReconstructor::new(&receiver);
+        reconstructor.prepare(&crate::zcash_block_hash(&header), nonce);
+        match reconstructor.reconstruct(&compact) {
+            ReconstructionResult::Complete { transactions } => {
+                assert_eq!(
+                    transactions[0], coinbase_data,
+                    "slot 0 came from the prefill"
+                );
+                assert_eq!(
+                    transactions[1], mempool_data,
+                    "slot 1 came from the mempool"
+                );
+                assert_eq!(
+                    transactions[2], trailing_data,
+                    "slot 2 came from the prefill"
+                );
+            }
+            other => panic!("expected a complete reconstruction: {other:?}"),
         }
     }
 }

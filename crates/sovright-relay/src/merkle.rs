@@ -272,3 +272,67 @@ mod tests {
         assert!(!transactions_match_merkle_root(&header, &txs));
     }
 }
+
+/// A 32-byte hash in DISPLAY (reversed) hex, matching Zebra's RPC and block
+/// explorers -- so a logged value can be pasted straight into `getblock` /
+/// `getrawtransaction` when joining a diagnostic against the real chain.
+pub fn display_hex(hash: &[u8; 32]) -> String {
+    let mut reversed = *hash;
+    reversed.reverse();
+    hex::encode(reversed)
+}
+
+/// Which slots a reconstruction filled from the local mempool, as
+/// `index:txid_display` pairs joined by commas.
+///
+/// Prefilled slots are deliberately omitted: their bytes arrive inside the
+/// compact block itself, so they are whatever the sender sent and cannot be the
+/// source of a merkle mismatch. Only mempool-resolved slots can substitute the
+/// wrong transaction, so those are the only ones worth carrying into a log line
+/// that has to be joined against the real block.
+pub fn mempool_slot_digest(transactions: &[Vec<u8>], prefilled_positions: &[usize]) -> String {
+    let mut parts = Vec::new();
+    for (index, tx) in transactions.iter().enumerate() {
+        if prefilled_positions.contains(&index) {
+            continue;
+        }
+        parts.push(format!("{index}:{}", display_hex(&txid_from_tx_bytes(tx))));
+    }
+    parts.join(",")
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn display_hex_reverses_wire_order() {
+        let mut wire = [0u8; 32];
+        wire[0] = 0xaa;
+        wire[31] = 0xbb;
+        let shown = display_hex(&wire);
+        assert!(shown.starts_with("bb"));
+        assert!(shown.ends_with("aa"));
+    }
+
+    /// The digest must skip prefilled slots -- they cannot be wrong -- and
+    /// report the surviving ones under their real block index, not a
+    /// renumbering, or the join against the real block lines up the wrong rows.
+    #[test]
+    fn digest_skips_prefilled_and_keeps_real_indexes() {
+        let txs = vec![vec![0x01], vec![0x02], vec![0x03], vec![0x04]];
+        let digest = mempool_slot_digest(&txs, &[0, 2]);
+        let indexes: Vec<&str> = digest
+            .split(',')
+            .map(|p| p.split(':').next().unwrap())
+            .collect();
+        assert_eq!(indexes, vec!["1", "3"]);
+        assert!(digest.contains(&display_hex(&txid_from_tx_bytes(&txs[1]))));
+    }
+
+    #[test]
+    fn digest_is_empty_when_everything_was_prefilled() {
+        let txs = vec![vec![0x01], vec![0x02]];
+        assert_eq!(mempool_slot_digest(&txs, &[0, 1]), "");
+    }
+}
