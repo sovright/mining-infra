@@ -18,6 +18,8 @@ use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
 };
+use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
+use sovright_relay::WtxId;
 
 // Zcash protocol version sent in our `version` message. NU6.3/Ironwood activated
 // on mainnet at block 3,428,143 (2026-07-28); zebrad 6.2.3 reports 170_160 as its
@@ -250,8 +252,9 @@ pub async fn run_peer(
                 if !saw_verack {
                     continue;
                 }
-                if let Some(key) = pending_tx_responses.pop_front() {
-                    let wtxid = key.to_wtxid();
+                if let Some(wtxid) = wtxid_for_received_tx(&mut pending_tx_responses, &msg.payload)
+                {
+                    let key = TxInventoryKey::from_wtxid(&wtxid);
                     if let Some(cache) = &tx_cache {
                         let outcome = cache.insert(wtxid, msg.payload.clone());
                         events.p2p_tx_received(
@@ -282,8 +285,11 @@ pub async fn run_peer(
                         }
                     }
                 } else if tx_cache.is_some() || tx_feed.is_some() {
+                    // Pre-v5 or malformed: no derivable wtxid, so there is no
+                    // honest key. Caching it under the queue's guess is what
+                    // corrupted the cache in the first place.
                     events
-                        .p2p_peer_error(&peer, "received tx without pending transaction request")?;
+                        .p2p_peer_error(&peer, "received tx with no derivable wtxid; not cached")?;
                 }
             }
             _ => {}
@@ -345,6 +351,54 @@ fn pong_nonce(payload: &[u8]) -> Option<u64> {
     } else {
         None
     }
+}
+
+/// The wtxid to cache an incoming `tx` payload under.
+///
+/// The P2P protocol makes NO promise that a peer answers `getdata` in request
+/// order: it may reorder freely, and it may silently omit a transaction it no
+/// longer holds (with or without `notfound`). Popping the front of the pending
+/// queue therefore assumes something the wire never guarantees, and a single
+/// reorder or omission desynchronises the queue PERMANENTLY -- every later
+/// transaction is then cached under some earlier request's wtxid.
+///
+/// That is not hypothetical: it put ~74% of compact reconstructions on the
+/// wrong transactions, because the short_ids resolved perfectly to wtxids whose
+/// cached bytes belonged to a different transaction entirely.
+///
+/// So derive the key from the payload itself, exactly as the block path already
+/// does with the header hash. The queue then only records that a request is
+/// outstanding; it never decides identity.
+///
+/// Returns `None` for pre-v5 transactions (no auth digest, so no derivable
+/// wtxid) and for anything malformed. Those are NOT cached: a guessed key is
+/// worse than a cache miss, which merely costs a getblocktxn round trip. The
+/// sidecar's own mempool sync skips pre-v5 for the same reason.
+fn wtxid_for_received_tx(
+    pending_tx_responses: &mut VecDeque<TxInventoryKey>,
+    payload: &[u8],
+) -> Option<WtxId> {
+    let derived = wtxid_from_tx_bytes(payload, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)?;
+
+    if let Some(index) = pending_tx_responses
+        .iter()
+        .position(|key| key.to_wtxid() == derived)
+    {
+        pending_tx_responses.remove(index);
+        if index != 0 {
+            warn!(
+                pending_index = index,
+                "Received requested transaction out of order"
+            );
+        }
+    } else {
+        // Unsolicited, or the request already fell out of the queue. The
+        // payload still identifies itself, so it is safe to cache -- and
+        // dropping it would discard a transaction we may need.
+        warn!("Received transaction matching no pending request");
+    }
+
+    Some(derived)
 }
 
 fn received_block_display_hash(
@@ -635,5 +689,102 @@ mod tests {
         assert_eq!(row["max_tx_bytes"], 512);
 
         let _ = fs::remove_file(path);
+    }
+
+    /// A real NU6.3 v6 mainnet transaction, so the wtxid is derived by the same
+    /// ZIP-244/229 path production uses rather than a stand-in.
+    const V6_TX_HEX: &str = include_str!("../tests/fixtures/mainnet_v6_tx.hex");
+
+    fn v6_tx() -> Vec<u8> {
+        hex::decode(V6_TX_HEX.trim()).expect("v6 fixture hex")
+    }
+
+    fn v6_wtxid() -> WtxId {
+        wtxid_from_tx_bytes(&v6_tx(), SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).expect("v6 resolves")
+    }
+
+    /// THE regression. A peer answered an earlier request out of order (or
+    /// never answered it), so the front of the queue is some other
+    /// transaction. Keying by the queue cached this payload under THAT wtxid --
+    /// which is how ~74% of compact reconstructions ended up assembling the
+    /// wrong transactions while every short_id resolved cleanly.
+    #[test]
+    fn a_tx_is_keyed_by_its_own_payload_not_the_front_of_the_queue() {
+        let other = TxInventoryKey::tx([0x77; 32]);
+        let mut pending = VecDeque::from(vec![other, TxInventoryKey::from_wtxid(&v6_wtxid())]);
+
+        let keyed = wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
+
+        assert_eq!(keyed, v6_wtxid(), "payload must decide the key");
+        assert_ne!(
+            keyed,
+            other.to_wtxid(),
+            "the queue front must not decide it"
+        );
+    }
+
+    /// The out-of-order response must consume ITS OWN queue entry, leaving the
+    /// still-outstanding request in place. Popping the front instead is what
+    /// desynchronised the queue permanently.
+    #[test]
+    fn an_out_of_order_tx_removes_its_own_pending_entry() {
+        let still_outstanding = TxInventoryKey::tx([0x77; 32]);
+        let mut pending = VecDeque::from(vec![
+            still_outstanding,
+            TxInventoryKey::from_wtxid(&v6_wtxid()),
+        ]);
+
+        wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
+
+        assert_eq!(
+            pending.iter().copied().collect::<Vec<_>>(),
+            vec![still_outstanding],
+            "only the matching request should be consumed"
+        );
+    }
+
+    /// A peer that silently omits one transaction used to shift every
+    /// subsequent payload onto the wrong key forever. Now the omission simply
+    /// leaves its request outstanding and the next payload is keyed correctly.
+    #[test]
+    fn a_skipped_response_does_not_desynchronise_later_ones() {
+        let never_answered = TxInventoryKey::tx([0x99; 32]);
+        let mut pending = VecDeque::from(vec![
+            never_answered,
+            TxInventoryKey::from_wtxid(&v6_wtxid()),
+        ]);
+
+        let keyed = wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
+
+        assert_eq!(keyed, v6_wtxid());
+        assert_eq!(pending.len(), 1, "the unanswered request stays outstanding");
+    }
+
+    /// Pre-v5 has no auth digest, so no wtxid can be derived. Caching it under
+    /// the queue's guess is precisely the bug; a cache miss costs one
+    /// getblocktxn round trip, a wrong key costs a whole block.
+    #[test]
+    fn a_pre_v5_payload_is_not_cached_under_a_guess() {
+        let mut pending = VecDeque::from(vec![TxInventoryKey::tx([0x77; 32])]);
+        // v4 transaction prefix: parses, but carries no auth digest.
+        let v4 = vec![0x04, 0x00, 0x00, 0x80, 0x01, 0x02, 0x03];
+        assert!(wtxid_for_received_tx(&mut pending, &v4).is_none());
+        assert_eq!(pending.len(), 1, "the request stays outstanding");
+    }
+
+    #[test]
+    fn a_malformed_payload_is_not_cached_under_a_guess() {
+        let mut pending = VecDeque::from(vec![TxInventoryKey::tx([0x77; 32])]);
+        assert!(wtxid_for_received_tx(&mut pending, &[0xff, 0xff, 0xff]).is_none());
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// An unsolicited transaction still identifies itself, so it is cached
+    /// rather than discarded -- we may need it, and its key cannot be wrong.
+    #[test]
+    fn an_unsolicited_tx_is_still_keyed_by_its_payload() {
+        let mut pending = VecDeque::new();
+        let keyed = wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
+        assert_eq!(keyed, v6_wtxid());
     }
 }

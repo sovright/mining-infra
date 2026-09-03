@@ -45,6 +45,12 @@ impl TxInventoryKey {
         }
     }
 
+    /// The `MSG_WTX` key naming `wtxid`, for logging a transaction identified
+    /// by its own payload rather than by a queued request.
+    pub fn from_wtxid(wtxid: &WtxId) -> Self {
+        Self::wtx(*wtxid.txid().as_bytes(), *wtxid.auth_digest().as_bytes())
+    }
+
     pub fn to_wtxid(self) -> WtxId {
         WtxId::new(
             TxId::from_bytes(self.hash),
