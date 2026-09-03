@@ -440,19 +440,9 @@ pub async fn handle_relay_compact_block<S: SubmitBlock + Sync>(
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status = match classify_submitblock_result(result) {
-                Ok(status) => status,
-                Err(RelayBlockError::SubmitRejected(reason, _)) => {
-                    // One extra RPC, only on the rejection path, to answer the
-                    // question the counter could never answer on its own.
-                    let known = submitter.block_known(&candidate.consensus_block_hash).await;
-                    return Err(RelayBlockError::SubmitRejected(
-                        reason,
-                        SubmitRejectionClass::from_block_known(known),
-                    ));
-                }
-                Err(other) => return Err(other),
-            };
+            let status =
+                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
+                    .await?;
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
     }
@@ -503,7 +493,9 @@ where
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status = classify_submitblock_result(result)?;
+            let status =
+                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
+                    .await?;
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
     }
@@ -524,7 +516,9 @@ pub async fn handle_relay_raw_block<S: SubmitBlock + Sync>(
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status = classify_submitblock_result(result)?;
+            let status =
+                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
+                    .await?;
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
     }
@@ -573,7 +567,9 @@ where
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status = classify_submitblock_result(result)?;
+            let status =
+                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
+                    .await?;
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
     }
@@ -629,9 +625,41 @@ where
                 .submit_block(&candidate.block_hex)
                 .await
                 .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status = classify_submitblock_result(result)?;
+            let status =
+                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
+                    .await?;
             Ok(SubmissionOutcome::Submitted { candidate, status })
         }
+    }
+}
+
+/// Submit-result classification WITH the follow-up lookup, for every submit path.
+///
+/// There are five places that call `submit_block`. When rejection classification
+/// was added in #88 only one of them was wired up, so the other four -- including
+/// the raw-segment path, which carries almost all traffic -- left the class at
+/// `Unknown`. The result was 119 rejections fleet-wide on 2026-09-03, every one
+/// labelled `unknown` and none classified: a feature that shipped, looked
+/// healthy, and told us nothing.
+///
+/// Keeping this in one place is the point. A per-call-site version is what
+/// allowed four of five paths to be missed.
+async fn classify_submitblock_outcome<S: SubmitBlock + ?Sized>(
+    result: Option<String>,
+    submitter: &S,
+    consensus_block_hash: &str,
+) -> Result<SubmitBlockStatus, RelayBlockError> {
+    match classify_submitblock_result(result) {
+        Ok(status) => Ok(status),
+        Err(RelayBlockError::SubmitRejected(reason, _)) => {
+            // One extra RPC, only on the rejection path.
+            let known = submitter.block_known(consensus_block_hash).await;
+            Err(RelayBlockError::SubmitRejected(
+                reason,
+                SubmitRejectionClass::from_block_known(known),
+            ))
+        }
+        Err(other) => Err(other),
     }
 }
 

@@ -548,3 +548,47 @@ fn rejection_class_strings_are_stable() {
     assert_eq!(SubmitRejectionClass::Invalid.as_str(), "invalid");
     assert_eq!(SubmitRejectionClass::Unknown.as_str(), "unknown");
 }
+
+// --- every submit path classifies its rejections -------------------------
+//
+// Rejection classification was added in #88 but wired into only ONE of the five
+// places that call submit_block. The raw-segment path -- which carries almost
+// all traffic -- was not among them, so on 2026-09-03 the fleet showed 119
+// rejections, every single one labelled `unknown`, with race_lost and invalid
+// both at zero. The labels existed and classified nothing.
+
+#[test]
+fn no_submit_path_classifies_by_hand() {
+    // A per-call-site classification is what let four of five paths be missed.
+    // Every site must go through the one shared helper.
+    let src = include_str!("../src/submit.rs");
+
+    assert!(
+        !src.contains("classify_submitblock_result(result)?"),
+        "a submit path is classifying without the block_known lookup"
+    );
+    assert_eq!(
+        src.matches("classify_submitblock_outcome(result, submitter")
+            .count(),
+        5,
+        "expected all five submit_block call sites to use the shared classifier"
+    );
+}
+
+#[tokio::test]
+async fn the_raw_block_path_classifies_a_rejection() {
+    // The path that carries the traffic, and the one that was missed.
+    let submitter = ClassifyingSubmitter { known: Some(true) };
+    let raw = raw_block();
+
+    let err = handle_relay_raw_block(&submitter, &raw, None, SubmitBlockMode::Live)
+        .await
+        .unwrap_err();
+
+    match err {
+        RelayBlockError::SubmitRejected(_, class) => {
+            assert_eq!(class, SubmitRejectionClass::RaceLost);
+        }
+        other => panic!("expected SubmitRejected, got {other:?}"),
+    }
+}
