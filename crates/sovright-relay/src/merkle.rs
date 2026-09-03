@@ -91,7 +91,7 @@ pub fn merkle_root(txids: &[[u8; 32]]) -> Option<[u8; 32]> {
             level.push(last);
         }
         let mut next = Vec::with_capacity(level.len() / 2);
-        for pair in level.chunks_exact(2) {
+        for pair in level.as_chunks::<2>().0 {
             let mut buf = [0u8; 64];
             buf[..32].copy_from_slice(&pair[0]);
             buf[32..].copy_from_slice(&pair[1]);
