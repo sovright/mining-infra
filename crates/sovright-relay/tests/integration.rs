@@ -20,12 +20,24 @@ fn header_hash_from_header(header: &[u8]) -> [u8; 32] {
 #[test]
 fn full_round_trip_synchronized_mempools() {
     // Setup: A block with coinbase + 10 transactions
-    let header = vec![0xab; 2189];
     let nonce = 0xdeadbeef_u64;
 
     let coinbase = make_wtxid(0);
     let txs: Vec<_> = (1..=10).map(make_wtxid).collect();
     let tx_data: Vec<Vec<u8>> = (0..=10).map(|i| vec![i as u8; 100]).collect();
+
+    // Reconstruction verifies the header's merkle commitment, so the header
+    // must commit to this transaction set; filler bytes would be rejected
+    // before the round trip under test could run.
+    let header = {
+        let mut h = vec![0xab; 2189];
+        let txids: Vec<[u8; 32]> = tx_data
+            .iter()
+            .map(|t| sovright_relay::txid_from_tx_bytes(t))
+            .collect();
+        h[36..68].copy_from_slice(&sovright_relay::merkle_root(&txids).unwrap());
+        h
+    };
 
     // Sender's view: receiver has all transactions
     let mut sender_view = TestMempool::new();

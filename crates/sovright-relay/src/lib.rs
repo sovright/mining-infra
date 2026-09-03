@@ -9,6 +9,7 @@ pub mod error;
 pub mod fec;
 pub mod hash;
 pub mod mempool;
+pub mod merkle;
 pub mod messages;
 pub mod reconstructor;
 pub mod relay;
@@ -25,6 +26,9 @@ pub use hash::{consensus_block_hash, consensus_block_hash_display, zcash_block_h
 pub use mempool::{
     MempoolError, MempoolProvider, TestMempool, TxCache, TxCacheConfig, TxCacheInsertOutcome,
     TxCacheSnapshot,
+};
+pub use merkle::{
+    header_merkle_root, merkle_root, transactions_match_merkle_root, txid_from_tx_bytes,
 };
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
