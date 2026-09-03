@@ -231,3 +231,47 @@ mod tests {
         assert_eq!(wtxid_from_tx_bytes(half, BranchId::Nu5), None);
     }
 }
+
+#[cfg(test)]
+mod v6_equivalence {
+    use super::*;
+    use sovright_relay_sidecar::mempool_sync::wtxid_from_display_hex;
+
+    /// A real NU6.3 **v6** mainnet transaction (block 3470793), with the
+    /// txid/authdigest Zebra reports for it in display order.
+    ///
+    /// This is the asymmetry production actually runs and no test covered: the
+    /// ORIGIN short_ids a transaction by hashing its bytes with
+    /// `zcash_primitives`, while the RECEIVER caches it under the wtxid built
+    /// from Zebra's reported txid/authdigest. If those two disagree for v6, the
+    /// short_id never resolves on the receiver. The equivalence was proven only
+    /// against a v5 (NU5) vector -- v6 has its own ZIP-229 auth digest and was
+    /// never checked.
+    const V6_TX_HEX: &str = include_str!("../tests/fixtures/mainnet_v6_tx.hex");
+    const V6_TXID_DISPLAY: &str =
+        "b5e84a20ed799a4242f9f98a65f5654f02ab0e7dcd5ee6d5f54bee2d11affa63";
+    const V6_AUTHDIGEST_DISPLAY: &str =
+        "de6c0a19ff76d161cc6dc514faf51992b10b7078b5f2524d2a0b4bb9c4447ce4";
+
+    #[test]
+    fn v6_from_bytes_equals_v6_from_zebra_display_fields() {
+        let tx_bytes = hex::decode(V6_TX_HEX.trim()).expect("v6 fixture hex");
+        assert_eq!(&tx_bytes[..4], &[0x06, 0x00, 0x00, 0x80], "fixture is v6");
+
+        let from_bytes = wtxid_from_tx_bytes(&tx_bytes, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)
+            .expect("a real v6 transaction must resolve to a wtxid");
+        let from_zebra = wtxid_from_display_hex(V6_TXID_DISPLAY, V6_AUTHDIGEST_DISPLAY)
+            .expect("Zebra's display fields must build a wtxid");
+
+        assert_eq!(
+            from_bytes.txid().as_bytes(),
+            from_zebra.txid().as_bytes(),
+            "v6 txid disagrees between the origin and the receiver"
+        );
+        assert_eq!(
+            from_bytes.auth_digest().as_bytes(),
+            from_zebra.auth_digest().as_bytes(),
+            "v6 auth digest disagrees between the origin and the receiver"
+        );
+    }
+}
