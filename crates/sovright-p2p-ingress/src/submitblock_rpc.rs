@@ -125,8 +125,26 @@ impl SubmittedBlockValidator for MainnetSubmittedBlockValidator {
         let solution = &block[BASE_HEADER_BYTES + SOLUTION_PREFIX_BYTES..ZCASH_FULL_HEADER_SIZE];
         debug_assert_eq!(solution.len(), SOLUTION_BYTES);
         self.equihash
-            .verify_share(header, solution, &target.to_le_bytes())
+            .verify_solution(header, solution)
             .map_err(|error| format!("invalid mainnet proof of work: {error}"))?;
+
+        // Deliberately NOT `EquihashValidator::verify_share`, whose target arm
+        // hashes with BLAKE2b personalised "ZcashBlockHash". That value is the
+        // relay's INTERNAL object id (see sovright_relay::hash), not Zcash's
+        // block hash, so comparing it to an nBits-derived target rejected every
+        // genuine mainnet block -- proven by
+        // `production_validator_accepts_a_real_mainnet_block`.
+        //
+        // Zcash's PoW hash is the double-SHA256 of the full 1487-byte
+        // serialized header, compared as a little-endian 256-bit integer. The
+        // relay transport path already reaches the same conclusion in
+        // sovright_relay::transport::pow::header_meets_stated_target.
+        let pow_hash = sovright_relay::consensus_block_hash(&block[..ZCASH_FULL_HEADER_SIZE]);
+        if !target.is_met_by(&pow_hash) {
+            return Err(format!(
+                "proof of work does not meet the block's stated target: bits={bits:#010x}"
+            ));
+        }
 
         Ok(compact.header_hash().to_string())
     }
@@ -496,6 +514,86 @@ mod tests {
         assert_eq!(
             handle_submitblock(&state, "00".to_string()).await.unwrap(),
             Some("duplicate".to_string())
+        );
+    }
+
+    /// Mainnet block 3470793: the 1487-byte header on line 1, then its 7
+    /// transactions. Reused from the sovright-relay fixtures rather than
+    /// duplicated, so both crates judge the same real bytes.
+    const MAINNET_BLOCK_FIXTURE: &str =
+        include_str!("../../sovright-relay/tests/fixtures/mainnet_block_3470793.txt");
+
+    fn real_mainnet_block() -> Vec<u8> {
+        let mut lines = MAINNET_BLOCK_FIXTURE
+            .lines()
+            .filter(|line| !line.trim().is_empty());
+        let header = hex::decode(lines.next().expect("header line").trim()).expect("header hex");
+        assert_eq!(header.len(), ZCASH_FULL_HEADER_SIZE);
+        let txs: Vec<Vec<u8>> = lines
+            .map(|line| hex::decode(line.trim()).expect("tx hex"))
+            .collect();
+
+        let mut block = header;
+        crate::wire::encode_compact_size(txs.len() as u64, &mut block);
+        for tx in &txs {
+            block.extend_from_slice(tx);
+        }
+        block
+    }
+
+    /// THE regression. Every prior test here only proved that GARBAGE is
+    /// rejected, so nothing established that a genuine solved block is
+    /// ACCEPTED -- which is exactly how this survived.
+    ///
+    /// The gateway validated PoW with `EquihashValidator::verify_share`, whose
+    /// target arm hashes with BLAKE2b personalised "ZcashBlockHash". That is
+    /// the relay's INTERNAL object id, not Zcash's block hash. Zcash's PoW hash
+    /// is the double-SHA256 of the full 1487-byte serialized header, so the
+    /// guard rejected every real block a pool could submit.
+    #[test]
+    fn production_validator_accepts_a_real_mainnet_block() {
+        let validator = MainnetSubmittedBlockValidator::new(4 * 1024 * 1024);
+        let block = real_mainnet_block();
+        assert!(
+            validator.validate(&block).is_ok(),
+            "a genuine mainnet block must pass the anti-garbage PoW guard: {:?}",
+            validator.validate(&block)
+        );
+    }
+
+    /// Pins the digest itself, so a refactor cannot quietly reintroduce the
+    /// BLAKE2b value. The double-SHA256 of this header is the block hash Zebra
+    /// and every explorer report, and it meets the target the header's own
+    /// nBits encodes; the BLAKE2b digest does not.
+    #[test]
+    fn pow_hash_is_double_sha256_not_blake2b() {
+        let block = real_mainnet_block();
+        let header = &block[..ZCASH_FULL_HEADER_SIZE];
+
+        let bits = u32::from_le_bytes(
+            header[BITS_OFFSET..BITS_OFFSET + 4]
+                .try_into()
+                .expect("bits slice is four bytes"),
+        );
+        let target = compact_to_target(bits);
+
+        let consensus = sovright_relay::consensus_block_hash(header);
+        assert_eq!(
+            sovright_relay::consensus_block_hash_display(header),
+            "000000000030976123e65211bdfb288b21b4492f56bb1a42710588ca6b8c0d98",
+            "fixture must be the block Zebra reports under this hash"
+        );
+        assert!(
+            target.is_met_by(&consensus),
+            "a real mined block must meet the target its own nBits encodes"
+        );
+
+        let blake = sovright_relay::zcash_block_hash(header);
+        assert_ne!(consensus, blake, "the two digests must not be conflated");
+        assert!(
+            !target.is_met_by(&blake),
+            "the BLAKE2b object id does NOT meet the target -- using it here is \
+             what rejected genuine blocks"
         );
     }
 
