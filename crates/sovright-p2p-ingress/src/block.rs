@@ -870,3 +870,146 @@ mod tests {
         assert!(err.to_string().contains("trailing bytes"));
     }
 }
+
+#[cfg(test)]
+mod real_block_round_trip {
+    use super::*;
+    use crate::tx_cache::TxCacheConfig;
+    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
+
+    /// Mainnet block 3470793: header on line 1, then its 7 transactions in
+    /// block order. Five are v6 (ZIP-229, NU6.3) and two are v4.
+    const FIXTURE: &str =
+        include_str!("../../sovright-relay/tests/fixtures/mainnet_block_3470793.txt");
+
+    fn fixture() -> (Vec<u8>, Vec<Vec<u8>>) {
+        let mut lines = FIXTURE.lines().filter(|l| !l.trim().is_empty());
+        let header = hex::decode(lines.next().unwrap().trim()).unwrap();
+        let txs = lines.map(|l| hex::decode(l.trim()).unwrap()).collect();
+        (header, txs)
+    }
+
+    fn raw_block(header: &[u8], txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut block = header.to_vec();
+        crate::wire::encode_compact_size(txs.len() as u64, &mut block);
+        for tx in txs {
+            block.extend_from_slice(tx);
+        }
+        block
+    }
+
+    /// End-to-end on real mainnet bytes: build the compact block the ingress
+    /// would send, reconstruct it exactly as a relay does, and require the
+    /// result to be the block we started from.
+    ///
+    /// Every previous round-trip test used synthetic transactions, which parse
+    /// as neither v5 nor v6 -- so nothing exercised a real NU6.3 block through
+    /// this path, and the merkle check that now guards it had nothing real to
+    /// judge.
+    #[test]
+    fn real_mainnet_block_round_trips_through_compact_reconstruction() {
+        let (header, txs) = fixture();
+        let block = raw_block(&header, &txs);
+
+        // Receiver holds every non-coinbase transaction it can key by wtxid --
+        // the best case for reconstruction. v4 transactions have no auth digest
+        // so they stay prefilled, exactly as in production.
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 64,
+            max_bytes: 1 << 20,
+            max_tx_bytes: 1 << 16,
+        });
+        for tx in txs.iter().skip(1) {
+            if let Some(wtxid) = wtxid_from_tx_bytes(tx, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID) {
+                cache.insert(wtxid, tx.clone());
+            }
+        }
+
+        let compact = compact_block_from_raw_block_with_tx_cache(&block, &cache).unwrap();
+        assert_eq!(compact.tx_count(), txs.len());
+
+        let header_hash = sovright_relay::zcash_block_hash(&header);
+        let mut reconstructor = CompactBlockReconstructor::new(&cache);
+        reconstructor.prepare(&header_hash, compact.nonce);
+
+        match reconstructor.reconstruct(&compact) {
+            ReconstructionResult::Complete { transactions } => {
+                assert_eq!(transactions, txs, "reconstructed a different block");
+            }
+            ReconstructionResult::Invalid { reason } => {
+                panic!("real block failed reconstruction: {reason}");
+            }
+            ReconstructionResult::Incomplete {
+                missing_wtxids,
+                unresolved_short_ids,
+                ..
+            } => {
+                panic!(
+                    "real block incomplete: {} missing wtxids, {} unresolved short ids",
+                    missing_wtxids.len(),
+                    unresolved_short_ids.len()
+                );
+            }
+        }
+    }
+
+    /// Same real block through the SKELETON path -- the fast-path object that
+    /// is actually failing in production (skeleton_incomplete/submit errors on
+    /// every relay). The origin short_ids v5/v6 by hashing bytes; the receiver
+    /// must resolve those against its own mempool.
+    #[test]
+    fn real_mainnet_block_round_trips_through_the_skeleton_path() {
+        let (header, txs) = fixture();
+        let block = raw_block(&header, &txs);
+
+        // Origin cache is EMPTY: the skeleton is meant to short_id v5/v6 by
+        // hashing raw bytes even for transactions it never saw on the P2P.
+        let origin = TxCache::new(TxCacheConfig {
+            max_entries: 64,
+            max_bytes: 1 << 20,
+            max_tx_bytes: 1 << 16,
+        });
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &origin).unwrap();
+
+        // Receiver holds every transaction the origin could short_id.
+        let receiver = TxCache::new(TxCacheConfig {
+            max_entries: 64,
+            max_bytes: 1 << 20,
+            max_tx_bytes: 1 << 16,
+        });
+        for tx in txs.iter().skip(1) {
+            if let Some(wtxid) = wtxid_from_tx_bytes(tx, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID) {
+                receiver.insert(wtxid, tx.clone());
+            }
+        }
+
+        let header_hash = sovright_relay::zcash_block_hash(&header);
+        let mut reconstructor = CompactBlockReconstructor::new(&receiver);
+        reconstructor.prepare(&header_hash, skeleton.nonce);
+
+        match reconstructor.reconstruct(&skeleton) {
+            ReconstructionResult::Complete { transactions } => {
+                assert_eq!(
+                    transactions, txs,
+                    "skeleton reconstructed a different block"
+                );
+            }
+            ReconstructionResult::Invalid { reason } => {
+                panic!("real block failed skeleton reconstruction: {reason}");
+            }
+            ReconstructionResult::Incomplete {
+                missing_wtxids,
+                unresolved_short_ids,
+                ..
+            } => {
+                panic!(
+                    "skeleton incomplete: {} missing wtxids, {} unresolved short ids, {} short_ids sent, {} prefilled",
+                    missing_wtxids.len(),
+                    unresolved_short_ids.len(),
+                    skeleton.short_ids.len(),
+                    skeleton.prefilled_txs.len(),
+                );
+            }
+        }
+    }
+}
