@@ -592,8 +592,12 @@ async fn submit_compact_fast_path<S, M>(
         }
         Ok(SubmissionOutcome::GateRejected { .. }) => {}
         Err(_) => {
+            // NOT "incomplete": this arm is a submit failure or rejection, not
+            // a missing transaction. Counting it as incomplete made a storm of
+            // Zebra rejections read as ordinary mempool misses, hiding the
+            // defect for as long as anyone looked only at the metric.
             if is_skeleton {
-                metrics.inc_skeleton_incomplete();
+                metrics.inc_skeleton_submit_errors();
             }
         }
     }
@@ -1363,6 +1367,13 @@ fn classify_reconstruction_invalid(reason: &str) -> &'static str {
         "duplicate_prefilled"
     } else if reason.contains("out of bounds") {
         "prefilled_out_of_bounds"
+    } else if reason.contains("merkle root mismatch") {
+        // The reconstructor now verifies the header commitment, so this is the
+        // expected label for a short-id collision or a stale mempool copy --
+        // failures that previously reached Zebra as a submit rejection instead
+        // of being caught locally. It needs its own bucket precisely because it
+        // is the one we expect to see.
+        "merkle_mismatch"
     } else {
         "other"
     }
@@ -1441,6 +1452,7 @@ struct SidecarMetrics {
     compact_reconstruction_invalids: AtomicU64,
     compact_reconstruction_invalids_duplicate_prefilled: AtomicU64,
     compact_reconstruction_invalids_out_of_bounds: AtomicU64,
+    compact_reconstruction_invalids_merkle_mismatch: AtomicU64,
     compact_reconstruction_invalids_other: AtomicU64,
     compact_reconstruction_errors: AtomicU64,
     compact_reconstruction_missing_wtxids: AtomicU64,
@@ -1455,6 +1467,9 @@ struct SidecarMetrics {
     /// Skeletons that could not fully reconstruct (an unresolved short_id), so
     /// the sidecar dropped them and waited for the full compact block.
     skeleton_incomplete: AtomicU64,
+    /// Skeleton submissions that failed or were rejected -- distinct from a
+    /// skeleton we simply could not complete from the mempool.
+    skeleton_submit_errors: AtomicU64,
     /// Skeletons dropped because the block was already submitted (the full
     /// compact block won the race first).
     skeleton_deduplicated: AtomicU64,
@@ -1551,6 +1566,7 @@ impl SidecarMetrics {
         match kind {
             "duplicate_prefilled" => &self.compact_reconstruction_invalids_duplicate_prefilled,
             "prefilled_out_of_bounds" => &self.compact_reconstruction_invalids_out_of_bounds,
+            "merkle_mismatch" => &self.compact_reconstruction_invalids_merkle_mismatch,
             _ => &self.compact_reconstruction_invalids_other,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -1587,6 +1603,10 @@ impl SidecarMetrics {
 
     fn inc_skeleton_incomplete(&self) {
         self.skeleton_incomplete.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_skeleton_submit_errors(&self) {
+        self.skeleton_submit_errors.fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_skeleton_deduplicated(&self) {
@@ -1747,6 +1767,9 @@ impl SidecarMetrics {
         let cri_out_of_bounds = self
             .compact_reconstruction_invalids_out_of_bounds
             .load(Ordering::Relaxed);
+        let cri_merkle_mismatch = self
+            .compact_reconstruction_invalids_merkle_mismatch
+            .load(Ordering::Relaxed);
         let cri_other = self
             .compact_reconstruction_invalids_other
             .load(Ordering::Relaxed);
@@ -1767,6 +1790,7 @@ impl SidecarMetrics {
         let skeleton_received = self.skeleton_received.load(Ordering::Relaxed);
         let skeleton_submit_successes = self.skeleton_submit_successes.load(Ordering::Relaxed);
         let skeleton_incomplete = self.skeleton_incomplete.load(Ordering::Relaxed);
+        let skeleton_submit_errors = self.skeleton_submit_errors.load(Ordering::Relaxed);
         let skeleton_deduplicated = self.skeleton_deduplicated.load(Ordering::Relaxed);
         let full_block_deduplicated = self.full_block_deduplicated.load(Ordering::Relaxed);
         let raw_segments_received = self.raw_segments_received.load(Ordering::Relaxed);
@@ -1835,6 +1859,7 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total {compact_reconstruction_invalids}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"duplicate_prefilled\"}} {cri_duplicate_prefilled}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"prefilled_out_of_bounds\"}} {cri_out_of_bounds}\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"merkle_mismatch\"}} {cri_merkle_mismatch}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"other\"}} {cri_other}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_errors_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_errors_total {compact_reconstruction_errors}\n",
@@ -1852,6 +1877,8 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_skeleton_submit_successes_total {skeleton_submit_successes}\n",
                 "# TYPE sovright_relay_sidecar_skeleton_incomplete_total counter\n",
                 "sovright_relay_sidecar_skeleton_incomplete_total {skeleton_incomplete}\n",
+                "# TYPE sovright_relay_sidecar_skeleton_submit_errors_total counter\n",
+                "sovright_relay_sidecar_skeleton_submit_errors_total {skeleton_submit_errors}\n",
                 "# TYPE sovright_relay_sidecar_skeleton_deduplicated_total counter\n",
                 "sovright_relay_sidecar_skeleton_deduplicated_total {skeleton_deduplicated}\n",
                 "# TYPE sovright_relay_sidecar_skeleton_full_block_deduplicated_total counter\n",
@@ -1930,6 +1957,7 @@ impl SidecarMetrics {
             compact_reconstruction_invalids = compact_reconstruction_invalids,
             cri_duplicate_prefilled = cri_duplicate_prefilled,
             cri_out_of_bounds = cri_out_of_bounds,
+            cri_merkle_mismatch = cri_merkle_mismatch,
             cri_other = cri_other,
             compact_reconstruction_errors = compact_reconstruction_errors,
             compact_reconstruction_missing_wtxids = compact_reconstruction_missing_wtxids,
@@ -1942,6 +1970,7 @@ impl SidecarMetrics {
             skeleton_received = skeleton_received,
             skeleton_submit_successes = skeleton_submit_successes,
             skeleton_incomplete = skeleton_incomplete,
+            skeleton_submit_errors = skeleton_submit_errors,
             skeleton_deduplicated = skeleton_deduplicated,
             full_block_deduplicated = full_block_deduplicated,
             raw_segments_received = raw_segments_received,
@@ -2047,6 +2076,22 @@ mod tests {
         )
     }
 
+    /// A test header that actually commits to `txs`.
+    ///
+    /// Reconstruction verifies the header's merkle root, so filler bytes are
+    /// now (correctly) rejected before any of these paths run. Committing
+    /// properly keeps each test about the behaviour it names.
+    fn header_committing_to(txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut header = vec![0xcd; sovright_relay::ZCASH_FULL_HEADER_SIZE];
+        let txids: Vec<[u8; 32]> = txs
+            .iter()
+            .map(|t| sovright_relay::txid_from_tx_bytes(t))
+            .collect();
+        let root = sovright_relay::merkle_root(&txids).expect("tests commit to >=1 tx");
+        header[36..68].copy_from_slice(&root);
+        header
+    }
+
     fn buffer_config(
         max_incomplete_blocks: usize,
         max_total_payload_bytes: usize,
@@ -2129,10 +2174,10 @@ mod tests {
         let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
         let now = Instant::now();
 
-        let header = vec![0xab; 2189];
         let nonce = 9;
         let coinbase = vec![0x01, 0x02];
         let tx1 = vec![0x03, 0x04, 0x05];
+        let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
         let wtxid = make_wtxid(0x11);
         let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
         let skeleton = CompactBlock::new(
@@ -2613,12 +2658,12 @@ mod tests {
 
     #[tokio::test]
     async fn relay_compact_handler_uses_injected_mempool_for_short_ids() {
-        let header = vec![0xcd; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let nonce = 42;
         let coinbase_wtxid = make_wtxid(0x01);
         let tx1_wtxid = make_wtxid(0x02);
         let coinbase = vec![0x01, 0x02];
         let tx1 = vec![0x03, 0x04, 0x05];
+        let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
         builder.add_transaction(coinbase_wtxid, coinbase.clone());
         builder.add_transaction(tx1_wtxid, tx1.clone());
@@ -3000,11 +3045,32 @@ mod tests {
     #[test]
     fn an_unrecognised_reason_is_kept_as_other_not_dropped() {
         // A new failure mode must land somewhere countable rather than vanish.
+        assert_eq!(classify_reconstruction_invalid("no such failure"), "other");
+        assert_eq!(classify_reconstruction_invalid(""), "other");
+    }
+
+    /// The reconstructor verifies the header commitment, so this reason is now
+    /// produced for real -- by a short-id collision or a stale mempool copy --
+    /// and needs its own bucket instead of being swept into `other`.
+    #[test]
+    fn a_merkle_mismatch_gets_its_own_bucket() {
         assert_eq!(
             classify_reconstruction_invalid("merkle root mismatch"),
-            "other"
+            "merkle_mismatch"
         );
-        assert_eq!(classify_reconstruction_invalid(""), "other");
+        let m = SidecarMetrics::default();
+        m.inc_compact_reconstruction_invalids("merkle_mismatch");
+        assert_eq!(
+            m.compact_reconstruction_invalids_merkle_mismatch
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            m.compact_reconstruction_invalids_other
+                .load(Ordering::Relaxed),
+            0,
+            "a merkle mismatch must not also land in other"
+        );
     }
 
     #[test]

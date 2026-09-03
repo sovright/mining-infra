@@ -14,6 +14,21 @@ fn header_hash(header: &[u8]) -> [u8; 32] {
     zcash_block_hash(header)
 }
 
+/// A test header that actually commits to `txs`.
+///
+/// Reconstruction verifies the header's merkle root, so a filler header is now
+/// rejected before the BIP-152 short-id behaviour these tests cover can run.
+fn header_committing_to(fill: u8, txs: &[Vec<u8>]) -> Vec<u8> {
+    let mut header = vec![fill; 2189];
+    let txids: Vec<[u8; 32]> = txs
+        .iter()
+        .map(|t| sovright_relay::txid_from_tx_bytes(t))
+        .collect();
+    let root = sovright_relay::merkle_root(&txids).expect("tests commit to >=1 tx");
+    header[36..68].copy_from_slice(&root);
+    header
+}
+
 /// Helper: create a deterministic WtxId from a seed byte
 fn make_wtxid(seed: u8) -> WtxId {
     WtxId::new(
@@ -28,7 +43,7 @@ fn make_wtxid(seed: u8) -> WtxId {
 /// in their mempool. Receiver reconstructs the complete block in correct order.
 #[test]
 fn test_simple_roundtrip() {
-    let header = vec![0xab_u8; 2189];
+    let header = header_committing_to(0xab, &[vec![0xc0; 50], vec![0xa1; 80], vec![0xa2; 90]]);
     let nonce = 0xdeadbeef_u64;
 
     let coinbase = make_wtxid(0);
@@ -76,7 +91,7 @@ fn test_simple_roundtrip() {
 /// Test 2: Coinbase-only block roundtrip (no short IDs needed).
 #[test]
 fn test_empty_block_roundtrip() {
-    let header = vec![0x42_u8; 2189];
+    let header = header_committing_to(0x42, &[vec![0xff; 30]]);
     let nonce = 99u64;
 
     let coinbase = make_wtxid(0);

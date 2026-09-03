@@ -580,10 +580,21 @@ mod tests {
 
     #[test]
     fn cached_non_coinbase_transactions_become_short_ids() {
-        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
         let tx0 = minimal_v5_tx(0x11);
         let tx1 = minimal_v5_tx(0x22);
         let tx2 = minimal_v5_tx(0x33);
+        // Reconstruction verifies the header's merkle commitment, so this
+        // header has to commit to these three transactions; filler bytes would
+        // be rejected before the short-id resolution under test ever runs.
+        let header = {
+            let mut h = vec![0xab; ZCASH_FULL_HEADER_SIZE];
+            let txids: Vec<[u8; 32]> = [&tx0, &tx1, &tx2]
+                .iter()
+                .map(|t| sovright_relay::txid_from_tx_bytes(t))
+                .collect();
+            h[36..68].copy_from_slice(&sovright_relay::merkle_root(&txids).unwrap());
+            h
+        };
 
         let mut block = header.clone();
         crate::wire::encode_compact_size(3, &mut block);

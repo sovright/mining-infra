@@ -838,11 +838,23 @@ mod tests {
 
     #[test]
     fn submission_candidate_reconstructs_short_ids_from_mempool() {
-        let header = vec![0xcd; 2189];
         let nonce = 42;
         let coinbase = vec![0x01, 0x02];
         let tx1 = vec![0x03, 0x04, 0x05];
         let tx1_wtxid = make_wtxid(0x11);
+        // Reconstruction verifies the header's merkle commitment, so the test
+        // header has to actually commit to these two transactions. An arbitrary
+        // filler header would now (correctly) be rejected before this path is
+        // reached, and the test would prove nothing about short-id resolution.
+        let header = {
+            let mut h = vec![0xcd; 2189];
+            let txids: Vec<[u8; 32]> = [&coinbase, &tx1]
+                .iter()
+                .map(|t| sovright_relay::txid_from_tx_bytes(t))
+                .collect();
+            h[36..68].copy_from_slice(&sovright_relay::merkle_root(&txids).unwrap());
+            h
+        };
         let header_hash = zcash_block_hash(&header);
         let short_id = ShortId::compute(&tx1_wtxid, &header_hash, nonce);
         let compact = CompactBlock::new(

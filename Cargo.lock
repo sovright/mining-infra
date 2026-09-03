@@ -3342,6 +3342,8 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zcash-equihash-validator",
+ "zcash_primitives",
+ "zcash_protocol",
 ]
 
 [[package]]

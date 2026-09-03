@@ -135,8 +135,25 @@ impl<'a, M: MempoolProvider> CompactBlockReconstructor<'a, M> {
 
         // Check if reconstruction is complete
         if transactions.iter().all(|t| t.is_some()) {
+            let filled: Vec<Vec<u8>> = transactions.into_iter().map(|t| t.unwrap()).collect();
+            // Every slot being filled means only that reconstruction ran out of
+            // holes. A 6-byte short id is not a commitment: it can collide, and
+            // our mempool copy of a transaction can differ from the one the
+            // miner actually included. The header's merkle root IS the
+            // commitment, so it is the only thing that can promise this is the
+            // block the header describes.
+            //
+            // Without this the sidecar submitted unverified assemblies and let
+            // Zebra be the validator, which rejected them -- spending the fast
+            // path's entire latency advantage to learn something knowable
+            // locally. Returning Invalid falls back to getblocktxn / raw block.
+            if !crate::merkle::transactions_match_merkle_root(&compact.header, &filled) {
+                return ReconstructionResult::Invalid {
+                    reason: "merkle root mismatch".into(),
+                };
+            }
             ReconstructionResult::Complete {
-                transactions: transactions.into_iter().map(|t| t.unwrap()).collect(),
+                transactions: filled,
             }
         } else {
             ReconstructionResult::Incomplete {
@@ -163,10 +180,28 @@ mod tests {
         )
     }
 
+    /// A synthetic header that actually commits to `txs`.
+    ///
+    /// Reconstruction now verifies the merkle root, so a test using an
+    /// all-zero header would only ever prove that the check rejects garbage.
+    /// Committing properly keeps these tests about slot filling, which is what
+    /// they are for; real headers and real ZIP-244 txids are covered by the
+    /// mainnet block fixture in `crate::merkle`.
+    fn header_committing_to(txs: &[Vec<u8>]) -> Vec<u8> {
+        let mut header = vec![0u8; 2189];
+        let txids: Vec<[u8; 32]> = txs
+            .iter()
+            .map(|t| crate::merkle::txid_from_tx_bytes(t))
+            .collect();
+        let root = crate::merkle::merkle_root(&txids).expect("tests commit to >=1 tx");
+        header[36..68].copy_from_slice(&root);
+        header
+    }
+
     #[test]
     fn reconstruct_complete_block() {
         // Sender side: build compact block
-        let header = vec![0u8; 2189];
+        let header = header_committing_to(&[vec![10], vec![11], vec![12]]);
         let nonce = 12345u64;
 
         let coinbase = make_wtxid(0);
@@ -285,7 +320,7 @@ mod tests {
 
     #[test]
     fn reconstruct_coinbase_only_block() {
-        let header = vec![0u8; 2189];
+        let header = header_committing_to(&[vec![10]]);
         let nonce = 12345u64;
 
         let coinbase = make_wtxid(0);
@@ -321,7 +356,9 @@ mod tests {
 
     #[test]
     fn reconstruct_large_block() {
-        let header = vec![0u8; 2189];
+        let mut block_txs: Vec<Vec<u8>> = vec![vec![0; 100]];
+        block_txs.extend((1u8..=200).map(|i| vec![i; 100]));
+        let header = header_committing_to(&block_txs);
         let nonce = 12345u64;
 
         let coinbase = make_wtxid(0);
@@ -376,17 +413,52 @@ mod tests {
 
         let compact = CompactBlock::new(vec![0u8; 2189], 0, vec![], vec![]);
 
-        let result = reconstructor.reconstruct(&compact);
-        match result {
-            ReconstructionResult::Complete { transactions } => {
-                assert!(transactions.is_empty());
-            }
+        // A zero-transaction block cannot exist on mainnet -- every block has a
+        // coinbase -- and nothing commits to it, so there is no root to check
+        // against. This used to reconstruct "successfully" into an empty block;
+        // it is now rejected rather than handed to submit.
+        match reconstructor.reconstruct(&compact) {
             ReconstructionResult::Invalid { reason } => {
-                panic!("Unexpected invalid reconstruction: {}", reason);
+                assert_eq!(reason, "merkle root mismatch");
             }
-            ReconstructionResult::Incomplete { .. } => {
-                panic!("Expected complete reconstruction");
+            other => panic!("expected a zero-transaction block to be invalid: {other:?}"),
+        }
+    }
+
+    /// The defect this check exists for: every slot fills, but one transaction
+    /// is not the one the header commits to. Before the merkle check this
+    /// returned Complete and the sidecar submitted it to Zebra, which rejected
+    /// it as invalid ~0.5s later -- after the fast path's advantage was spent.
+    #[test]
+    fn reconstruct_rejects_a_substituted_transaction() {
+        let nonce = 12345u64;
+        let header = header_committing_to(&[vec![10], vec![11]]);
+
+        let coinbase = make_wtxid(0);
+        let tx1 = make_wtxid(1);
+
+        let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
+        builder.add_transaction(coinbase, vec![10]);
+        builder.add_transaction(tx1, vec![11]);
+
+        let mut sender_view = TestMempool::new();
+        sender_view.insert(tx1, vec![11]);
+        let compact = builder.build(&sender_view);
+
+        // The receiver holds a DIFFERENT transaction under the same wtxid --
+        // what a short-id collision or a stale mempool copy looks like.
+        let mut receiver_mempool = TestMempool::new();
+        receiver_mempool.insert(tx1, vec![99]);
+
+        let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
+        let header_hash = crate::zcash_block_hash(&header);
+        reconstructor.prepare(&header_hash, nonce);
+
+        match reconstructor.reconstruct(&compact) {
+            ReconstructionResult::Invalid { reason } => {
+                assert_eq!(reason, "merkle root mismatch");
             }
+            other => panic!("expected a substituted transaction to be invalid: {other:?}"),
         }
     }
 }
