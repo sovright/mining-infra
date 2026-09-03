@@ -1352,6 +1352,22 @@ fn log_submission_outcome(
     }
 }
 
+/// Bucket a reconstruction failure reason into a stable metric label.
+///
+/// The reason string is human-readable and carries the detail an operator needs;
+/// the label is what makes the failure countable without reading logs. Anything
+/// unrecognised lands in `other` rather than being dropped, so a new failure
+/// mode still shows up somewhere.
+fn classify_reconstruction_invalid(reason: &str) -> &'static str {
+    if reason.contains("duplicate prefilled") {
+        "duplicate_prefilled"
+    } else if reason.contains("out of bounds") {
+        "prefilled_out_of_bounds"
+    } else {
+        "other"
+    }
+}
+
 fn record_compact_reconstruction_outcome(
     outcome: &Result<SubmissionOutcome, RelayBlockError>,
     metrics: &SidecarMetrics,
@@ -1394,10 +1410,25 @@ fn record_compact_reconstruction_outcome(
                 unresolved_short_ids.len(),
             );
         }
-        Err(RelayBlockError::ReconstructionInvalid { .. }) => {
-            metrics.inc_compact_reconstruction_invalids();
+        Err(RelayBlockError::ReconstructionInvalid { reason }) => {
+            // The reason used to be discarded by a `{ .. }` pattern. It is the
+            // only thing that says WHY reconstruction failed, and without it 66
+            // fleet-wide failures produced no diagnostic trail at all.
+            let kind = classify_reconstruction_invalid(reason);
+            metrics.inc_compact_reconstruction_invalids(kind);
+            warn!(
+                reason = %reason,
+                kind,
+                "Compact block reconstruction produced an invalid block"
+            );
         }
-        Err(_) => metrics.inc_compact_reconstruction_invalids(),
+        Err(error) => {
+            // Previously folded into the invalid counter, which made "invalid"
+            // a catch-all that overstated true reconstruction invalidity and
+            // left everything else with no signal of its own.
+            metrics.inc_compact_reconstruction_errors();
+            warn!(%error, "Compact block path failed before reconstruction could judge it");
+        }
     }
 }
 
@@ -1408,6 +1439,10 @@ struct SidecarMetrics {
     compact_reconstruction_completes: AtomicU64,
     compact_reconstruction_incompletes: AtomicU64,
     compact_reconstruction_invalids: AtomicU64,
+    compact_reconstruction_invalids_duplicate_prefilled: AtomicU64,
+    compact_reconstruction_invalids_out_of_bounds: AtomicU64,
+    compact_reconstruction_invalids_other: AtomicU64,
+    compact_reconstruction_errors: AtomicU64,
     compact_reconstruction_missing_wtxids: AtomicU64,
     compact_reconstruction_unresolved_short_ids: AtomicU64,
     compact_reconstruction_getblocktxn_requests: AtomicU64,
@@ -1507,7 +1542,18 @@ impl SidecarMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn inc_compact_reconstruction_invalids(&self) {
+    fn inc_compact_reconstruction_errors(&self) {
+        self.compact_reconstruction_errors
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_compact_reconstruction_invalids(&self, kind: &str) {
+        match kind {
+            "duplicate_prefilled" => &self.compact_reconstruction_invalids_duplicate_prefilled,
+            "prefilled_out_of_bounds" => &self.compact_reconstruction_invalids_out_of_bounds,
+            _ => &self.compact_reconstruction_invalids_other,
+        }
+        .fetch_add(1, Ordering::Relaxed);
         self.compact_reconstruction_invalids
             .fetch_add(1, Ordering::Relaxed);
     }
@@ -1695,6 +1741,17 @@ impl SidecarMetrics {
             .load(Ordering::Relaxed);
         let compact_reconstruction_invalids =
             self.compact_reconstruction_invalids.load(Ordering::Relaxed);
+        let cri_duplicate_prefilled = self
+            .compact_reconstruction_invalids_duplicate_prefilled
+            .load(Ordering::Relaxed);
+        let cri_out_of_bounds = self
+            .compact_reconstruction_invalids_out_of_bounds
+            .load(Ordering::Relaxed);
+        let cri_other = self
+            .compact_reconstruction_invalids_other
+            .load(Ordering::Relaxed);
+        let compact_reconstruction_errors =
+            self.compact_reconstruction_errors.load(Ordering::Relaxed);
         let compact_reconstruction_missing_wtxids = self
             .compact_reconstruction_missing_wtxids
             .load(Ordering::Relaxed);
@@ -1776,6 +1833,11 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_compact_reconstruction_incompletes_total {compact_reconstruction_incompletes}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_invalids_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total {compact_reconstruction_invalids}\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"duplicate_prefilled\"}} {cri_duplicate_prefilled}\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"prefilled_out_of_bounds\"}} {cri_out_of_bounds}\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"other\"}} {cri_other}\n",
+                "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_errors_total counter\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_errors_total {compact_reconstruction_errors}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_missing_wtxids_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_missing_wtxids_total {compact_reconstruction_missing_wtxids}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_unresolved_short_ids_total counter\n",
@@ -1866,6 +1928,10 @@ impl SidecarMetrics {
             compact_reconstruction_completes = compact_reconstruction_completes,
             compact_reconstruction_incompletes = compact_reconstruction_incompletes,
             compact_reconstruction_invalids = compact_reconstruction_invalids,
+            cri_duplicate_prefilled = cri_duplicate_prefilled,
+            cri_out_of_bounds = cri_out_of_bounds,
+            cri_other = cri_other,
+            compact_reconstruction_errors = compact_reconstruction_errors,
             compact_reconstruction_missing_wtxids = compact_reconstruction_missing_wtxids,
             compact_reconstruction_unresolved_short_ids =
                 compact_reconstruction_unresolved_short_ids,
@@ -2742,7 +2808,8 @@ mod tests {
         metrics.inc_compact_reconstruction_attempts();
         metrics.inc_compact_reconstruction_completes();
         metrics.inc_compact_reconstruction_incompletes();
-        metrics.inc_compact_reconstruction_invalids();
+        metrics.inc_compact_reconstruction_invalids("duplicate_prefilled");
+        metrics.inc_compact_reconstruction_errors();
         metrics.add_compact_reconstruction_missing_detail(2, 3);
         metrics.add_compact_reconstruction_getblocktxn_request(4);
         metrics.inc_raw_segments_received();
@@ -2905,5 +2972,68 @@ mod tests {
 
         assert_eq!(buffer.entries.len(), 1);
         assert!(buffer.entries.contains_key(&[0x05; 32]));
+    }
+
+    // --- reconstruction failure attribution ---------------------------------
+    //
+    // Measured 2026-09-03: 92 compact reconstruction attempts across the fleet,
+    // 26 complete, 66 counted "invalid" -- 72% failure, and 94% on
+    // relay-asia-east1-1. missing_wtxids and unresolved_short_ids were ZERO on
+    // every host, so the tx cache held everything reconstruction asked for; the
+    // failures are not cache misses. We could not say more than that, because
+    // the handler matched `ReconstructionInvalid { .. }` and threw the reason
+    // string away, and an `Err(_)` arm folded every other error into the same
+    // counter. 66 failures, zero diagnostic trail.
+
+    #[test]
+    fn invalid_reasons_are_classified_for_metrics() {
+        assert_eq!(
+            classify_reconstruction_invalid("duplicate prefilled position 7"),
+            "duplicate_prefilled"
+        );
+        assert_eq!(
+            classify_reconstruction_invalid("prefilled index 12 out of bounds for 9 txs"),
+            "prefilled_out_of_bounds"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_reason_is_kept_as_other_not_dropped() {
+        // A new failure mode must land somewhere countable rather than vanish.
+        assert_eq!(
+            classify_reconstruction_invalid("merkle root mismatch"),
+            "other"
+        );
+        assert_eq!(classify_reconstruction_invalid(""), "other");
+    }
+
+    #[test]
+    fn non_reconstruction_errors_are_not_counted_as_invalid() {
+        // The old `Err(_) => inc_invalids()` arm made "invalid" a catch-all, so
+        // the number overstated true reconstruction invalidity and no separate
+        // signal existed for anything else going wrong.
+        let m = SidecarMetrics::default();
+        record_compact_reconstruction_outcome(&Err(RelayBlockError::EmptyTransactions), &m);
+        assert_eq!(m.compact_reconstruction_invalids.load(Ordering::Relaxed), 0);
+        assert_eq!(m.compact_reconstruction_errors.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn invalid_reconstruction_counts_and_labels_its_reason() {
+        let m = SidecarMetrics::default();
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::ReconstructionInvalid {
+                reason: "duplicate prefilled position 3".to_string(),
+            }),
+            &m,
+        );
+        assert_eq!(m.compact_reconstruction_invalids.load(Ordering::Relaxed), 1);
+        let text = m.render_prometheus_text();
+        assert!(text.contains(
+            "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{reason=\"duplicate_prefilled\"} 1"
+        ), "{text}");
+        assert!(
+            text.contains("sovright_relay_sidecar_relay_compact_reconstruction_errors_total 0")
+        );
     }
 }
