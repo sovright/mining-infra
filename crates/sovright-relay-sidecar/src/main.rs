@@ -28,6 +28,7 @@ use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
 use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
 use sovright_relay_sidecar::rpc::ZebraRpc;
+use sovright_relay_sidecar::submission_timing::TimedSubmitter;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
     SubmitRejectionClass, handle_relay_compact_block, handle_relay_compact_block_with_gate,
@@ -558,14 +559,20 @@ async fn submit_compact_fast_path<S, M>(
         return;
     }
 
+    let timed = TimedSubmitter::new(
+        submitter,
+        now,
+        &compact.header,
+        if is_skeleton { "skeleton" } else { "compact" },
+    );
     let outcome = if is_skeleton {
         metrics.inc_skeleton_received();
         // A skeleton submits ONLY on complete mempool reconstruction; it never
         // sends getblocktxn (the full compact block is the push fallback).
-        handle_relay_compact_block_with_mempool(submitter, compact, mode, mempool).await
+        handle_relay_compact_block_with_mempool(&timed, compact, mode, mempool).await
     } else {
         handle_relay_compact_payload(
-            submitter,
+            &timed,
             compact,
             mode,
             compact_reconstruction_enabled,
@@ -601,7 +608,11 @@ async fn submit_compact_fast_path<S, M>(
             }
         }
     }
-    log_submission_outcome(outcome, metrics, None);
+    let timing = timed.finish(&outcome);
+    if matches!(&outcome, Ok(SubmissionOutcome::Submitted { .. })) {
+        metrics.observe_first_seen_to_submit_ms(timing.receive_to_outcome_ms);
+    }
+    log_submission_outcome(outcome, metrics, Some(timing.receive_to_outcome_ms));
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -658,6 +669,7 @@ fn spawn_relay_block_handler<M>(
                                     );
                                     continue;
                                 }
+                                let timed = TimedSubmitter::new(rpc.as_ref(), Instant::now(), &compact.header, "gated_compact");
                                 let parent_height = if compact.header.len() >= 36 {
                                     let mut prev_hash = [0u8; 32];
                                     prev_hash.copy_from_slice(&compact.header[4..36]);
@@ -673,7 +685,7 @@ fn spawn_relay_block_handler<M>(
                                 let outcome = {
                                     let mut gate_guard = gate.lock().await;
                                     handle_relay_compact_block_with_gate(
-                                        rpc.as_ref(),
+                                        &timed,
                                         &compact,
                                         mode,
                                         &mut gate_guard,
@@ -695,7 +707,11 @@ fn spawn_relay_block_handler<M>(
                                     // path won't also submit the same block.
                                     fast_path_dedup.record(header_hash, Instant::now());
                                 }
-                                log_submission_outcome(outcome, metrics.as_ref(), None);
+                                let timing = timed.finish(&outcome);
+                                if matches!(&outcome, Ok(SubmissionOutcome::Submitted { .. })) {
+                                    metrics.observe_first_seen_to_submit_ms(timing.receive_to_outcome_ms);
+                                }
+                                log_submission_outcome(outcome, metrics.as_ref(), Some(timing.receive_to_outcome_ms));
                             } else {
                                 // Non-gated fast path: reconstruct + submit with
                                 // block-hash dedup, so a skeleton and the full
@@ -784,6 +800,7 @@ fn spawn_relay_block_handler<M>(
                                                  );
                                                  continue;
                                              }
+                                             let timed = TimedSubmitter::new(rpc.as_ref(), first_seen, &raw_block[..ZCASH_FULL_HEADER_SIZE], "raw");
                                              let raw_outcome = if let (Some(gate), Some(chain_view)) =
                                                  (&gate, &chain_view)
                                             {
@@ -801,7 +818,7 @@ fn spawn_relay_block_handler<M>(
                                                 };
                                                 let mut gate_guard = gate.lock().await;
                                                 handle_relay_raw_block_with_gate(
-                                                    rpc.as_ref(),
+                                                    &timed,
                                                     &raw_block,
                                                     Some(block_hash),
                                                     mode,
@@ -811,7 +828,7 @@ fn spawn_relay_block_handler<M>(
                                                 .await
                                             } else {
                                                 handle_relay_raw_block(
-                                                    rpc.as_ref(),
+                                                    &timed,
                                                     &raw_block,
                                                     Some(block_hash),
                                                     mode,
@@ -832,7 +849,7 @@ fn spawn_relay_block_handler<M>(
                                              // submit decision (mesh-receive → reassemble →
                                              // gate → submit).
                                             let first_seen_to_submit_ms =
-                                                first_seen.elapsed().as_millis() as u64;
+                                                timed.finish(&raw_outcome).receive_to_outcome_ms;
                                             if matches!(
                                                 raw_outcome,
                                                 Ok(SubmissionOutcome::Submitted { .. })
@@ -2227,6 +2244,13 @@ mod tests {
             "block must never be submitted twice"
         );
         assert_eq!(metrics.full_block_deduplicated.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics
+                .relay_first_seen_to_submit_ms_count
+                .load(Ordering::Relaxed),
+            1,
+            "the skeleton is timed once and the deduped full block adds no latency sample"
+        );
     }
 
     #[tokio::test]
