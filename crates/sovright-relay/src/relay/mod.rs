@@ -6,6 +6,7 @@ mod arrival;
 mod client;
 mod metrics;
 mod node;
+mod ratelimit;
 
 pub use arrival::ArrivalSink;
 pub use client::{BlockReceiver, BlockSender, RelayClient, RelayPayload};

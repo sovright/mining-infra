@@ -93,6 +93,17 @@ pub struct RelayConfig {
     pub forward_burst_packets: usize,
     /// Optional delay after each forwarded packet burst.
     pub forward_burst_delay: Duration,
+    /// Sustained per-source limit, in packets per second, on traffic from
+    /// sources with no established session. Zero disables limiting.
+    ///
+    /// Authenticating an unknown source costs one HMAC per configured key
+    /// (a trial-verify scan), so this is the cost an internet-exposed relay
+    /// pays to anyone who can send it UDP. Established sessions are never
+    /// limited, so a legitimate peer is unaffected after it authenticates.
+    pub unauth_rate_limit_per_sec: f64,
+    /// Instantaneous burst allowed per source before the sustained rate
+    /// applies. Sized so a new peer can authenticate promptly under loss.
+    pub unauth_rate_limit_burst: f64,
 }
 
 impl Default for RelayConfig {
@@ -109,6 +120,11 @@ impl Default for RelayConfig {
             max_sessions: 4096,
             forward_burst_packets: 0,
             forward_burst_delay: Duration::ZERO,
+            // On by default: the relay is reachable from the public internet
+            // and this is the only bound on trial-verify CPU cost. Generous
+            // enough that a legitimate peer authenticates on first contact.
+            unauth_rate_limit_per_sec: 5.0,
+            unauth_rate_limit_burst: 20.0,
         }
     }
 }
@@ -131,6 +147,15 @@ impl RelayConfig {
     /// Builder method: explicitly allow unauthenticated peers
     pub fn with_unauthenticated_peers_allowed(mut self, allowed: bool) -> Self {
         self.allow_unauthenticated_peers = allowed;
+        self
+    }
+
+    /// Builder method: set the per-source unauthenticated packet rate limit.
+    ///
+    /// `rate_per_sec` of zero disables limiting.
+    pub fn with_unauth_rate_limit(mut self, rate_per_sec: f64, burst: f64) -> Self {
+        self.unauth_rate_limit_per_sec = rate_per_sec;
+        self.unauth_rate_limit_burst = burst;
         self
     }
 

@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::fec::FecError;
+use crate::relay::ratelimit::UnauthRateLimiter;
 use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{
     AuthKey, BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, KeyRole,
@@ -92,6 +93,11 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     validated_raw_blocks: Arc<Mutex<HashMap<[u8; 32], ValidatedRawBlock>>>,
     /// Optional per-block relay arrival logger (observatory timing source)
     arrival_sink: Option<ArrivalSink>,
+    /// Per-source rate limiter for traffic from sources with no established
+    /// session. Guards the trial-verify HMAC scan, which is the CPU cost an
+    /// internet-exposed relay pays to any sender. Established sessions are
+    /// never consulted against it.
+    unauth_limiter: UnauthRateLimiter,
     /// Live, hot-swappable authorized key set (hot-revocation, PR-B).
     ///
     /// Initialized from `config.authorized_keys` at construction. The receive
@@ -132,6 +138,10 @@ impl<V: PowValidator> RelayNode<V> {
         )?;
 
         let active_keys = StdRwLock::new(Arc::new(config.authorized_keys.clone()));
+        let unauth_limiter = UnauthRateLimiter::new(
+            config.unauth_rate_limit_per_sec,
+            config.unauth_rate_limit_burst,
+        );
 
         Ok(Self {
             config,
@@ -143,6 +153,7 @@ impl<V: PowValidator> RelayNode<V> {
             metrics: Arc::new(RelayMetrics::new()),
             validated_raw_blocks: Arc::new(Mutex::new(HashMap::new())),
             arrival_sink: None,
+            unauth_limiter,
             active_keys,
         })
     }
@@ -806,6 +817,22 @@ fn evict_oldest_validated_raw_block(validated: &mut HashMap<[u8; 32], ValidatedR
 }
 
 impl<V: PowValidator> RelayNode<V> {
+    /// Gate an unknown (sessionless) source before it can make the relay
+    /// perform a trial-verify HMAC scan across every active key.
+    ///
+    /// Only reached when the source has no established session, so an
+    /// authenticated peer never pays this check.
+    fn admit_unknown_source(&self, src_addr: SocketAddr) -> Result<(), TransportError> {
+        if self.unauth_limiter.allow(src_addr.ip()) {
+            return Ok(());
+        }
+        self.metrics.inc_unauth_rate_limited();
+        debug!(peer = %src_addr, "Unknown source rate limited before key trial-verify");
+        Err(TransportError::ConnectionRefused(
+            "unauthenticated source rate limited".into(),
+        ))
+    }
+
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
         self.metrics.inc_packets_received();
 
@@ -927,6 +954,7 @@ impl<V: PowValidator> RelayNode<V> {
                     // Decode already restricts `chunk.header.version` to {2, 3},
                     // so any well-formed chunk reaching here is v2 or v3 and can
                     // be checked against the authorized-key list.
+                    self.admit_unknown_source(src_addr)?;
                     let active_keys = self.active_keys();
                     let mut authenticated_key: Option<AuthKey> = None;
                     for key in active_keys.iter() {
@@ -1080,6 +1108,7 @@ impl<V: PowValidator> RelayNode<V> {
             return Err(TransportError::AuthenticationFailed);
         }
 
+        self.admit_unknown_source(src_addr)?;
         let active_keys = self.active_keys();
         let mut authenticated_key: Option<AuthKey> = None;
         for key in active_keys.iter() {
