@@ -15,6 +15,7 @@ path = "src/lib.rs"
 
 [dependencies]
 sovright-relay = { path = "../sovright-relay" }
+zcash-pool-common = { path = "../zcash-pool-common" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 tokio = { workspace = true, features = ["full"] }
 clap = { version = "4", features = ["derive"] }
@@ -30,4 +31,5 @@ toml = "0.8"
 jsonrpsee = { version = "0.24", features = ["http-client"] }
 
 [dev-dependencies]
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
 tempfile = "3"

@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use blake2b_simd::Params as Blake2bParams;
 use rand::Rng;
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
@@ -567,29 +566,25 @@ fn build_nonce(nonce_1: &[u8], nonce_2_len: usize, index: u64) -> [u8; 32] {
     nonce
 }
 
-/// Compute the block hash: BLAKE2b-256 of header(140) || compact_size(1344) || solution(1344)
-/// with personalization "ZcashBlockHash\0\0" (16 bytes, null-padded).
+/// Compute Zcash's proof-of-work hash: the double-SHA256 of
+/// header(140) || compact_size(1344) || solution(1344), in internal byte order.
+///
+/// The worker uses it twice: to pick which solutions clear the pool's share
+/// target and get submitted, and to count solutions that also clear the job's
+/// nBits target. Both depend on this being the hash the pool checks with in
+/// `EquihashValidator::verify_share`, which is also the block hash ZIP 301
+/// miners compare against the target. A share selected with a different hash
+/// than the pool checks it with is accepted only by coincidence.
+///
+/// It is NOT the BLAKE2b-256 digest personalised "ZcashBlockHash": that value
+/// is the relay's internal object id (see `sovright_relay::hash`), not Zcash's
+/// block hash.
+///
+/// The rule itself lives in `zcash_pool_common::block_hash`, the single
+/// implementation the validator and the relay also use, so the miner cannot
+/// select shares by a different hash than the pool checks them with.
 fn compute_block_hash(header: &[u8; 140], solution: &[u8]) -> [u8; 32] {
-    // Compact size encoding for 1344: 0xfd followed by 1344 as u16 LE
-    // 1344 = 0x0540
-    let compact_size: [u8; 3] = [0xfd, 0x40, 0x05];
-
-    let mut personalization = [0u8; 16];
-    personalization[..14].copy_from_slice(b"ZcashBlockHash");
-    // bytes 14 and 15 are already 0
-
-    let hash = Blake2bParams::new()
-        .hash_length(32)
-        .personal(&personalization)
-        .to_state()
-        .update(header)
-        .update(&compact_size)
-        .update(solution)
-        .finalize();
-
-    let mut result = [0u8; 32];
-    result.copy_from_slice(hash.as_bytes());
-    result
+    zcash_pool_common::consensus_block_hash_parts(header, solution)
 }
 
 /// Compare a hash against a target in little-endian 256-bit representation.
@@ -782,5 +777,36 @@ mod tests {
         let cs: [u8; 3] = [0xfd, 0x40, 0x05];
         let val = u16::from_le_bytes([cs[1], cs[2]]);
         assert_eq!(val, 1344);
+    }
+
+    // Mainnet block 3470793 comes from the shared fixture in
+    // `zcash-pool-common`, so the miner is pinned to the same real bytes, by
+    // the same loader, as the validator and the relay.
+    use zcash_pool_common::fixtures::{
+        MAINNET_BLOCK_3470793_HASH_DISPLAY, mainnet_header_and_solution,
+    };
+
+    #[test]
+    fn compute_block_hash_is_the_consensus_block_hash() {
+        // Regression: this computed BLAKE2b "ZcashBlockHash" while the chain,
+        // and now the pool's verify_share, use double-SHA256. The validator
+        // pins the same block to the same value, so the two cannot drift apart
+        // again without one of them failing.
+        let (header, solution) = mainnet_header_and_solution();
+        let mut display = compute_block_hash(&header, &solution);
+        display.reverse();
+        assert_eq!(hex::encode(display), MAINNET_BLOCK_3470793_HASH_DISPLAY);
+    }
+
+    #[test]
+    fn a_real_mainnet_block_meets_its_own_nbits_target() {
+        // Exercises the worker's own nbits_to_target and hash_le_target on real
+        // data, not only compute_block_hash.
+        let (header, solution) = mainnet_header_and_solution();
+        let nbits = u32::from_le_bytes(header[104..108].try_into().expect("4 bytes"));
+        assert!(hash_le_target(
+            &compute_block_hash(&header, &solution),
+            &nbits_to_target(nbits)
+        ));
     }
 }

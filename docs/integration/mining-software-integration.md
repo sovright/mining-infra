@@ -140,19 +140,18 @@ Updates share difficulty:
 ```rust
 struct SetTarget {
     channel_id: u32,
-    max_target: [u8; 32],     // Maximum hash value for valid share
+    target: [u8; 32],         // Highest hash value still accepted as a share,
+                              // little-endian (index 31 is the most
+                              // significant byte)
 }
 ```
 
-Convert target to difficulty:
-```rust
-fn target_to_difficulty(target: &[u8; 32]) -> f64 {
-    // Zcash uses big-endian for difficulty comparison
-    let target_u256 = U256::from_be_bytes(*target);
-    let max_target = U256::from(0xFFFF) << 208; // Equihash base
-    (max_target / target_u256).as_f64()
-}
-```
+`target` is the authoritative gate: compare your solution's hash against it with
+`hash_meets_target` (see [Equihash (200,9) Solving](#equihash-2009-solving)), not
+with `<=` on the raw arrays.
+
+Difficulty is a separate, informational value the pool derives from the same
+target for reporting and payout accounting. Do not gate submissions on it.
 
 ### NewPrevHash (0x20)
 
@@ -231,7 +230,8 @@ fn build_nonce(extranonce_prefix: &[u8], nonce2: u64) -> [u8; 32] {
 ### Equihash (200,9) Solving
 
 ```rust
-// Pseudocode for Equihash solving
+// Pseudocode for Equihash solving. `sha256` stands for any SHA-256
+// implementation; the byte layout and the comparison below are exact.
 fn mine(header: &[u8; 140], target: &[u8; 32]) -> Option<(Nonce, Solution)> {
     for nonce2 in 0..u64::MAX {
         let nonce = build_nonce(&extranonce_prefix, nonce2);
@@ -240,13 +240,47 @@ fn mine(header: &[u8; 140], target: &[u8; 32]) -> Option<(Nonce, Solution)> {
         // Try to find Equihash solution
         if let Some(solution) = solve_equihash_200_9(&header_with_nonce) {
             // Check if meets target
-            let hash = blake2b_256(&header_with_nonce, &solution);
-            if hash <= target {
+            let hash = block_pow_hash(&header_with_nonce, &solution);
+            if hash_meets_target(&hash, target) {
                 return Some((nonce, solution));
             }
         }
     }
     None
+}
+
+/// Zcash's proof-of-work hash is the double-SHA256 of the FULL 1487-byte
+/// serialized header: the 140-byte header, the CompactSize length of the
+/// solution, then the 1344-byte solution -- in internal byte order.
+///
+/// This is the block id Zebra reports and explorers display (as its byte
+/// reversal). It is NOT a BLAKE2b-256 digest personalised "ZcashBlockHash";
+/// that value is an internal object id, and comparing it against an
+/// nBits-derived target accepts a genuine block only by coincidence.
+fn block_pow_hash(header_with_nonce: &[u8; 140], solution: &[u8; 1344]) -> [u8; 32] {
+    let mut serialized = Vec::with_capacity(1487);
+    serialized.extend_from_slice(header_with_nonce);
+    serialized.extend_from_slice(&[0xfd, 0x40, 0x05]); // CompactSize(1344)
+    serialized.extend_from_slice(solution);
+    sha256(&sha256(&serialized))
+}
+
+/// Both values are little-endian 256-bit integers: index 31 is the MOST
+/// significant byte, index 0 the least.
+///
+/// A plain `hash <= target` on `[u8; 32]` is WRONG. Rust compares arrays
+/// lexicographically starting at index 0, which reads these numbers from the
+/// wrong end: as little-endian arrays, `255 <= 256` evaluates to `false`.
+fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
+    for i in (0..32).rev() {
+        if hash[i] < target[i] {
+            return true;
+        }
+        if hash[i] > target[i] {
+            return false;
+        }
+    }
+    true // equal meets the target
 }
 ```
 

@@ -10,10 +10,18 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+hex = { workspace = true, optional = true }
+
+[features]
+# Real-chain test fixtures for downstream crates. The mainnet block lives here,
+# inside a package root every crate can depend on, rather than in one crate's
+# tests/ directory that the others reached by relative path.
+test-support = ["dep:hex"]
 
 [dev-dependencies]
 proptest = "1.4"
 criterion = { version = "0.5", features = ["html_reports"] }
+hex = { workspace = true }
 
 [[bench]]
 name = "compact_size_bench"

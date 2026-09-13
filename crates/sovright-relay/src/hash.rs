@@ -1,7 +1,6 @@
 //! Zcash block hash helpers.
 
 use blake2b_simd::Params;
-use sha2::{Digest, Sha256};
 
 /// Compute the relay's internal BLAKE2b-256 block object id for a serialized
 /// block header, using the `ZcashBlockHash` personalization.
@@ -27,12 +26,11 @@ pub fn zcash_block_hash(header: &[u8]) -> [u8; 32] {
 ///
 /// This is the block id Zebra and the P2P network use; explorers and
 /// `getblockhash` display its byte reversal (see [`consensus_block_hash_display`]).
+///
+/// Delegates to `zcash_pool_common::block_hash`, the single implementation of
+/// this rule, which the validator and the test miner also use.
 pub fn consensus_block_hash(header: &[u8]) -> [u8; 32] {
-    let first = Sha256::digest(header);
-    let second = Sha256::digest(first);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&second);
-    out
+    zcash_pool_common::consensus_block_hash(header)
 }
 
 /// The Zcash consensus block hash in DISPLAY (big-endian) hex, matching Zebra's

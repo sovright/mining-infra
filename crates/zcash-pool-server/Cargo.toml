@@ -33,6 +33,7 @@ default = ["relay"]
 relay = ["dep:sovright-relay"]
 
 [dev-dependencies]
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tracing-subscriber.workspace = true
 zcash-template-provider = { path = "../zcash-template-provider", features = ["test-support"] }

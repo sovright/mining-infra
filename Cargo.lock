@@ -3314,6 +3314,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zcash-equihash-validator",
+ "zcash-pool-common",
  "zcash_primitives",
  "zcash_protocol",
 ]
@@ -3342,6 +3343,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zcash-equihash-validator",
+ "zcash-pool-common",
  "zcash_primitives",
  "zcash_protocol",
 ]
@@ -3363,6 +3365,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zcash-equihash-validator",
+ "zcash-pool-common",
 ]
 
 [[package]]
@@ -4593,7 +4596,6 @@ dependencies = [
 name = "zcash-equihash-validator"
 version = "0.1.0"
 dependencies = [
- "blake2b_simd",
  "equihash 0.2.2",
  "hex",
  "proptest",
@@ -4670,6 +4672,7 @@ name = "zcash-pool-common"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "hex",
  "proptest",
  "serde",
  "serde_json",
@@ -4725,7 +4728,6 @@ dependencies = [
 name = "zcash-test-miner"
 version = "0.1.0"
 dependencies = [
- "blake2b_simd",
  "clap",
  "equihash 0.2.2",
  "hex",
@@ -4737,6 +4739,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zcash-mining-protocol",
+ "zcash-pool-common",
 ]
 
 [[package]]

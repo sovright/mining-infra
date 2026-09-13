@@ -3,8 +3,8 @@
 //! Tests the critical path: share meets block target -> block serialization -> submit to Zebra.
 //! Uses the Zcash mainnet genesis block as a real test vector with a known-valid Equihash solution.
 
-use zcash_equihash_validator::EquihashValidator;
-use zcash_mining_protocol::messages::{NewEquihashJob, SubmitEquihashShare};
+use zcash_equihash_validator::{EquihashValidator, compact_to_target};
+use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult, SubmitEquihashShare};
 use zcash_pool_common::write_compact_size;
 use zcash_pool_server::{InMemoryDuplicateDetector, ShareProcessor};
 use zcash_template_provider::types::{BlockTemplate, EquihashHeader, Hash256, TemplateTransaction};
@@ -216,23 +216,16 @@ fn test_block_hash_target_discrimination() {
         err
     );
 
-    // Verify the hash has specific non-trivial properties:
-    // A moderately hard target (leading zero byte + 0x10 second byte) should still be met
-    // by the genesis hash, confirming it's a real proof-of-work hash.
-    // First, let's inspect the hash to set a meaningful threshold.
-    let mut moderate_target = [0xff; 32];
-    // The hash should meet a target where the most significant bytes allow some zeros.
-    // Set the MSB (index 31 in LE) to a moderate value. If the genesis hash has leading
-    // zeros (common for PoW), this should pass.
-    moderate_target[31] = 0x10;
-    let moderate_result = validator.verify_share(&header, &solution, &moderate_target);
-    // We just verify the hash is non-zero and was returned successfully with easy target;
-    // the moderate target test is informational (genesis was very easy difficulty).
-    // The critical assertion is the easy/impossible discrimination above.
-    if moderate_result.is_ok() {
-        // Good -- the genesis hash has some PoW quality
-    }
-    // Either way, the key tests (easy passes, impossible fails) are the important ones.
+    // A "moderate" target was probed here and its result discarded, in an
+    // `if moderate_result.is_ok() { }` with no assertion. What stayed asserted
+    // were the two extremes, and those cannot discriminate: all-0xff accepts
+    // every digest and all-0x00 rejects every non-zero one, so both pass
+    // whichever hash function is in use. That is how the BLAKE2b/double-SHA256
+    // mix-up survived here.
+    //
+    // A target placed between two candidate hashes does tell them apart, which
+    // is what `is_block_tracks_the_real_block_target` below does: a real solved
+    // block, its own nBits target, and the boundary at its consensus hash.
 }
 
 /// Verify that validate_share_with_job correctly distinguishes between
@@ -478,4 +471,150 @@ fn test_corrupted_solution_not_block() {
 
     assert!(!result.accepted, "Corrupted solution must not be accepted");
     assert!(!result.is_block, "Corrupted solution must not be a block");
+}
+
+// ---------------------------------------------------------------------------
+// Mainnet block 3470793, at the gate that triggers submit_block
+// ---------------------------------------------------------------------------
+//
+// Every other target test in this file uses all-`0xff` ("easy") and all-`0x00`
+// ("impossible") targets. The first accepts every digest, the second rejects
+// every non-zero one, so neither can tell one hash function from another --
+// which is how `is_block`, the value that decides whether the pool calls
+// submit_block, stayed uncovered while it was computed from the wrong hash.
+//
+// These use a real solved block, the target its own nBits encodes, and its
+// known consensus hash.
+
+/// A job whose `build_header` reproduces block 3470793's header exactly, with
+/// the nonce split 4 / 28 the way the pool hands it out.
+///
+/// The SHARE target is easy on purpose: the share is then always accepted, so
+/// the only thing that moves between the scenarios below is the BLOCK target.
+fn mainnet_job() -> NewEquihashJob {
+    let (header, _) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+
+    NewEquihashJob {
+        channel_id: 1,
+        job_id: 1,
+        future_job: false,
+        version: u32::from_le_bytes(header[0..4].try_into().unwrap()),
+        prev_hash: header[4..36].try_into().unwrap(),
+        merkle_root: header[36..68].try_into().unwrap(),
+        block_commitments: header[68..100].try_into().unwrap(),
+        nonce_1: header[108..112].to_vec(),
+        nonce_2_len: 28,
+        time: u32::from_le_bytes(header[100..104].try_into().unwrap()),
+        bits: u32::from_le_bytes(header[104..108].try_into().unwrap()),
+        target: [0xff; 32],
+        clean_jobs: false,
+    }
+}
+
+/// The miner-controlled tail of the real nonce.
+fn mainnet_nonce_2() -> Vec<u8> {
+    let (header, _) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+    header[112..140].to_vec()
+}
+
+fn mainnet_share() -> SubmitEquihashShare {
+    let (_, solution) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+    SubmitEquihashShare {
+        channel_id: 1,
+        sequence_number: 1,
+        job_id: 1,
+        nonce_2: mainnet_nonce_2(),
+        // share.rs rejects timestamps outside [job.time - 60, job.time + 7200].
+        time: mainnet_job().time,
+        solution: solution.try_into().expect("1344-byte solution"),
+    }
+}
+
+/// The consensus hash of block 3470793 in internal byte order.
+fn mainnet_consensus_hash() -> [u8; 32] {
+    let mut hash: [u8; 32] =
+        hex::decode(zcash_pool_common::fixtures::MAINNET_BLOCK_3470793_HASH_DISPLAY)
+            .expect("hash hex")
+            .try_into()
+            .expect("32 bytes");
+    hash.reverse();
+    hash
+}
+
+/// `value - 1` for a little-endian 256-bit integer.
+fn minus_one(mut value: [u8; 32]) -> [u8; 32] {
+    for byte in value.iter_mut() {
+        if *byte == 0 {
+            *byte = 0xff;
+        } else {
+            *byte -= 1;
+            return value;
+        }
+    }
+    panic!("minus_one called on zero");
+}
+
+/// Without this, the scenarios below would be measuring a header of our own
+/// construction rather than the one the chain accepted.
+#[test]
+fn mainnet_job_rebuilds_the_real_header() {
+    let job = mainnet_job();
+    let nonce = job
+        .build_nonce(&mainnet_nonce_2())
+        .expect("nonce_1 + nonce_2 must be 32 bytes");
+    let (expected, _) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+    assert_eq!(
+        job.build_header(&nonce),
+        expected,
+        "the reconstructed job must produce the real header byte for byte"
+    );
+}
+
+/// THE regression at the pool's own gate. Block 3470793 is on mainnet, so it
+/// meets the target its own nBits encodes; `is_block` must say so, and must
+/// stop saying so one step below the block's consensus hash.
+///
+/// Each scenario gets a FRESH duplicate detector. `validate_share_with_job`
+/// returns early with `Rejected(Duplicate)` and `is_block: false` before it
+/// ever compares a target, so a shared detector would make the negative case
+/// pass for entirely the wrong reason. Asserting acceptance, and not merely
+/// `is_block`, is what keeps that visible.
+#[test]
+fn is_block_tracks_the_real_block_target() {
+    let job = mainnet_job();
+    let share = mainnet_share();
+    let processor = ShareProcessor::new();
+
+    let at_hash = mainnet_consensus_hash();
+    let scenarios: [(&str, [u8; 32], bool); 3] = [
+        (
+            "the block's own nBits target",
+            compact_to_target(job.bits).to_le_bytes(),
+            true,
+        ),
+        ("a target equal to the block hash", at_hash, true),
+        (
+            "a target one below the block hash",
+            minus_one(at_hash),
+            false,
+        ),
+    ];
+
+    for (label, block_target, expect_block) in scenarios {
+        let detector = InMemoryDuplicateDetector::new();
+        let result = processor
+            .validate_share_with_job(&share, &job, &detector, &block_target)
+            .expect("validation must not error");
+
+        assert!(result.accepted, "{label}: the share must be accepted");
+        assert!(
+            matches!(result.result, ShareResult::Accepted),
+            "{label}: expected Accepted, got {:?}",
+            result.result
+        );
+        assert_eq!(
+            result.is_block, expect_block,
+            "{label}: is_block should be {expect_block}"
+        );
+    }
 }

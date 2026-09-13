@@ -16,9 +16,12 @@
 //! Whether that target clears the current network difficulty is the full
 //! node's job, and needs chain context this layer does not have.
 
-/// Minimum block header size in bytes for validation
-/// The basic Zcash block header (without Equihash solution) is 140 bytes
-const MIN_HEADER_SIZE: usize = 140;
+/// Minimum block header size in bytes for validation.
+///
+/// The basic Zcash block header (without the Equihash solution) is 140 bytes.
+/// Derived from the shared layout rather than restated, so a layout change
+/// cannot update the shared constant and silently miss this one.
+const MIN_HEADER_SIZE: usize = zcash_pool_common::BASE_HEADER_BYTES;
 
 /// Number of bytes in the Equihash input before the 32-byte nonce.
 const ZCASH_EQUIHASH_INPUT_SIZE: usize = 108;
@@ -48,18 +51,23 @@ enum TargetCheck {
 /// Zcash's PoW hash is the **double-SHA256** of the full 1487-byte serialized
 /// header, compared as a little-endian 256-bit integer against the target.
 ///
-/// Note this deliberately does NOT use `EquihashValidator::verify_share`'s
-/// target arm. That helper hashes with BLAKE2b personalised `"ZcashBlockHash"`,
-/// which is not Zcash's block hash, and it rejects genuine mainnet headers --
-/// verified 2026-09-01 against the real header fixture below.
+/// This deliberately does not call `EquihashValidator::verify_share`, which
+/// bundles the Equihash check and the target check into a single call. The two
+/// are kept apart here: this is an anti-garbage guard on the transport path
+/// with its own `BadTarget` outcome, and callers verify the solution itself
+/// separately.
+///
+/// `verify_share` computes the same consensus hash as this function. That
+/// agreement is pinned by
+/// `zcash-equihash-validator/tests/consensus_pow_hash.rs`, so the two cannot
+/// drift apart unnoticed.
 fn header_meets_stated_target(header: &[u8]) -> TargetCheck {
-    use sha2::{Digest, Sha256};
     use zcash_equihash_validator::{Target, compact_to_target};
 
-    // Zcash header: version(4) prev(32) merkle(32) commitments(32) time(4) bits(4) nonce(32),
-    // so nBits starts at 4+32+32+32+4 = 104, little-endian. Offset 100 is `time`;
-    // reading it there silently rejects every real header.
-    const BITS_OFFSET: usize = 104;
+    // nBits is at offset 104, little-endian: version(4) prev(32) merkle(32)
+    // commitments(32) time(4). Offset 100 is `time`; reading it there silently
+    // rejects every real header. The offset comes from the shared layout.
+    use zcash_pool_common::BITS_OFFSET;
     let bits = u32::from_le_bytes([
         header[BITS_OFFSET],
         header[BITS_OFFSET + 1],
@@ -75,10 +83,7 @@ fn header_meets_stated_target(header: &[u8]) -> TargetCheck {
         return TargetCheck::BadTarget;
     }
 
-    let mut hash = [0u8; 32];
-    hash.copy_from_slice(&Sha256::digest(Sha256::digest(
-        &header[..ZCASH_FULL_HEADER_SIZE],
-    )));
+    let hash = crate::consensus_block_hash(&header[..ZCASH_FULL_HEADER_SIZE]);
     if target.is_met_by(&hash) {
         TargetCheck::Met
     } else {
@@ -120,14 +125,14 @@ impl PowValidator for RejectAllValidator {
 pub const EQUIHASH_N: u32 = 200;
 pub const EQUIHASH_K: u32 = 9;
 
-/// Zcash block header size (without Equihash solution)
-pub const ZCASH_HEADER_SIZE: usize = 140;
-
-/// Equihash solution size for n=200, k=9
-pub const EQUIHASH_SOLUTION_SIZE: usize = 1344;
-
-/// Full Zcash block header size (with Equihash solution)
-pub const ZCASH_FULL_HEADER_SIZE: usize = ZCASH_HEADER_SIZE + 3 + EQUIHASH_SOLUTION_SIZE; // 3 bytes for compactSize
+/// The serialized header layout, re-exported under the names this crate
+/// already publishes from its single definition in
+/// `zcash_pool_common::block_hash`. Redeclaring the layout per crate is how it
+/// came to exist in three independent copies.
+pub use zcash_pool_common::{
+    BASE_HEADER_BYTES as ZCASH_HEADER_SIZE, SOLUTION_BYTES as EQUIHASH_SOLUTION_SIZE,
+    ZCASH_FULL_HEADER_SIZE,
+};
 
 /// Validator using real Equihash proof-of-work verification
 ///

@@ -102,7 +102,7 @@ impl EquihashValidator {
         self.verify_solution(header, solution)?;
 
         // Compute the hash of header + solution
-        let hash = self.compute_solution_hash(header, solution)?;
+        let hash = self.compute_solution_hash(header, solution);
 
         // Check if hash meets target (hash <= target, little-endian comparison)
         if !self.meets_target(&hash, target) {
@@ -112,26 +112,21 @@ impl EquihashValidator {
         Ok(hash)
     }
 
-    /// Compute the double SHA-256 hash of the block header + solution
-    /// (This is what gets compared against the target)
-    fn compute_solution_hash(&self, header: &[u8], solution: &[u8]) -> Result<[u8; 32]> {
-        use blake2b_simd::Params;
-
-        // Zcash uses BLAKE2b for block hashing
-        // The block hash is BLAKE2b-256 of the full header including solution
-        let mut data = Vec::with_capacity(header.len() + 3 + solution.len());
-        data.extend_from_slice(header);
-        zcash_pool_common::write_compact_size(solution.len() as u64, &mut data);
-        data.extend_from_slice(solution);
-
-        let hash = Params::new()
-            .hash_length(32)
-            .personal(b"ZcashBlockHash\0\0")
-            .hash(&data);
-
-        let mut result = [0u8; 32];
-        result.copy_from_slice(hash.as_bytes());
-        Ok(result)
+    /// Compute Zcash's proof-of-work hash: the double-SHA256 of the full
+    /// 1487-byte serialized header, in internal byte order.
+    ///
+    /// This is the value the target must be compared against, and the block id
+    /// Zebra reports (explorers display its byte reversal). It is deliberately
+    /// NOT the BLAKE2b-256 digest personalised `"ZcashBlockHash"`, which is the
+    /// relay's internal object id over the same bytes; comparing that digest to
+    /// an nBits-derived target accepts a genuine block only by coincidence.
+    ///
+    /// The rule itself lives in `zcash_pool_common::block_hash`, which is the
+    /// single implementation shared with the test miner and the relay.
+    /// `tests/consensus_pow_hash.rs` pins the result against mainnet block
+    /// 3470793.
+    fn compute_solution_hash(&self, header: &[u8], solution: &[u8]) -> [u8; 32] {
+        zcash_pool_common::consensus_block_hash_parts(header, solution)
     }
 
     /// Check if a hash meets the target (hash <= target, little-endian)

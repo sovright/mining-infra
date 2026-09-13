@@ -10,6 +10,7 @@ repository.workspace = true
 sovright-relay = { path = "../sovright-relay" }
 sovright-relay-sidecar = { path = "../sovright-relay-sidecar" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
+zcash-pool-common = { path = "../zcash-pool-common" }
 blake2b_simd = { workspace = true }
 hex = { workspace = true }
 jsonrpsee = { version = "0.24", features = ["http-client", "server"] }
@@ -23,3 +24,4 @@ zcash_primitives = { workspace = true }
 zcash_protocol = { workspace = true }
 
 [dev-dependencies]
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }

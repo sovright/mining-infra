@@ -104,7 +104,8 @@ Default configuration targets 5 shares/minute per miner, suitable for Equihash A
 ## Dependencies
 
 - `equihash` crate (zcash-hackworks) for core verification
-- `blake2b_simd` for block hashing
+- `zcash-pool-common` for the double-SHA256 proof-of-work hash, shared with the
+  test miner and the relay so the rule has one implementation
 
 ## License
 

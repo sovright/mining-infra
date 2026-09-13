@@ -691,33 +691,24 @@ fn classify_submitblock_result(
     }
 }
 
+/// Length in bytes of `count` once CompactSize-encoded.
+///
+/// Asks the shared encoder rather than restating its boundaries, so this
+/// cannot drift away from what `encode_compact_size` actually writes. Used
+/// only to pre-size buffers.
 fn compact_size_len(count: usize) -> usize {
-    if count < 253 {
-        1
-    } else if u16::try_from(count).is_ok() {
-        3
-    } else if u32::try_from(count).is_ok() {
-        5
-    } else {
-        9
-    }
+    zcash_pool_common::encode_compact_size(count as u64).1
 }
 
+/// Append a CompactSize-encoded count to `out`.
+///
+/// Delegates to `zcash_pool_common::write_compact_size`, the workspace's single
+/// implementation of this encoding. The signature and the `TooManyTransactions`
+/// error are preserved: on a target where `usize` does not fit in `u64` the
+/// conversion fails and nothing is written to `out`, exactly as before.
 fn encode_compact_size(count: usize, out: &mut Vec<u8>) -> Result<(), RelayBlockError> {
-    if count < 253 {
-        out.push(count as u8);
-    } else if let Ok(count) = u16::try_from(count) {
-        out.push(0xfd);
-        out.extend_from_slice(&count.to_le_bytes());
-    } else if let Ok(count) = u32::try_from(count) {
-        out.push(0xfe);
-        out.extend_from_slice(&count.to_le_bytes());
-    } else if let Ok(count) = u64::try_from(count) {
-        out.push(0xff);
-        out.extend_from_slice(&count.to_le_bytes());
-    } else {
-        return Err(RelayBlockError::TooManyTransactions { count });
-    }
+    let value = u64::try_from(count).map_err(|_| RelayBlockError::TooManyTransactions { count })?;
+    zcash_pool_common::write_compact_size(value, out);
     Ok(())
 }
 

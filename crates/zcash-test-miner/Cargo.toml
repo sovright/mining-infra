@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 zcash-mining-protocol = { path = "../zcash-mining-protocol" }
+zcash-pool-common = { path = "../zcash-pool-common" }
 sovright-noise = { path = "../sovright-noise" }
 equihash = { workspace = true, features = ["solver"] }
 tokio = { workspace = true }
@@ -18,7 +19,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 rand = "0.8"
-blake2b_simd = { workspace = true }
 serde_json = { workspace = true }
 serde = { workspace = true }
 hex = { workspace = true }
+
+[dev-dependencies]
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }

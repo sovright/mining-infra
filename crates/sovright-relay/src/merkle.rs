@@ -139,15 +139,15 @@ mod tests {
     /// fetched from Zebra (`getblock <hash> 0` / `getrawtransaction`). Five are
     /// v6 (ZIP-229, version group 0x98b684d8) and two are v4, so this fixture
     /// exercises BOTH txid rules. Synthetic bytes cannot: they parse as neither.
-    const BLOCK_FIXTURE: &str = include_str!("../tests/fixtures/mainnet_block_3470793.txt");
-
+    ///
+    /// The bytes live in `zcash-pool-common` behind its `test-support` feature,
+    /// where every crate that needs them can reach them through the dependency
+    /// graph instead of by relative path.
     fn fixture() -> (Vec<u8>, Vec<Vec<u8>>) {
-        let mut lines = BLOCK_FIXTURE.lines().filter(|l| !l.trim().is_empty());
-        let header = hex::decode(lines.next().expect("header line").trim()).expect("header hex");
-        let txs = lines
-            .map(|l| hex::decode(l.trim()).expect("tx hex"))
-            .collect();
-        (header, txs)
+        (
+            zcash_pool_common::fixtures::mainnet_serialized_header(),
+            zcash_pool_common::fixtures::mainnet_transactions(),
+        )
     }
 
     /// The load-bearing test: a real block's real transactions reproduce the

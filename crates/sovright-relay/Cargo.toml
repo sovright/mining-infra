@@ -8,6 +8,7 @@ repository = "https://github.com/sovright/mining-infra"
 
 [dependencies]
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
+zcash-pool-common = { path = "../zcash-pool-common" }
 thiserror = { workspace = true }
 hex = { workspace = true }
 blake2b_simd = { workspace = true }
@@ -31,6 +32,7 @@ arbitrary = ["dep:arbitrary"]
 generate-corpus = []
 
 [dev-dependencies]
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
 proptest = "1.4"
 tokio-test = "0.4"
 rand = "0.8"

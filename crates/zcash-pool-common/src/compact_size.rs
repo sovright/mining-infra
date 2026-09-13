@@ -71,20 +71,39 @@ pub fn read_compact_size(data: &[u8], cursor: &mut usize) -> Result<u64, Compact
     }
 }
 
+/// The widest CompactSize encoding: an `0xff` prefix and a little-endian `u64`.
+pub const MAX_COMPACT_SIZE_LEN: usize = 9;
+
+/// Encode a CompactSize integer into a stack buffer, returning the buffer and
+/// the number of bytes written. The encoding is `buf[..len]`.
+///
+/// This is the crate's only CompactSize encoder; [`write_compact_size`] appends
+/// its output to a `Vec`. Callers on a hot path that must not allocate -- such
+/// as hashing a serialized block header -- stream `buf[..len]` directly.
+pub fn encode_compact_size(value: u64) -> ([u8; MAX_COMPACT_SIZE_LEN], usize) {
+    let mut buf = [0u8; MAX_COMPACT_SIZE_LEN];
+    if value < 0xfd {
+        buf[0] = value as u8;
+        (buf, 1)
+    } else if value <= 0xffff {
+        buf[0] = 0xfd;
+        buf[1..3].copy_from_slice(&(value as u16).to_le_bytes());
+        (buf, 3)
+    } else if value <= 0xffff_ffff {
+        buf[0] = 0xfe;
+        buf[1..5].copy_from_slice(&(value as u32).to_le_bytes());
+        (buf, 5)
+    } else {
+        buf[0] = 0xff;
+        buf[1..9].copy_from_slice(&value.to_le_bytes());
+        (buf, 9)
+    }
+}
+
 /// Write a CompactSize-encoded integer to `out`.
 pub fn write_compact_size(value: u64, out: &mut Vec<u8>) {
-    if value < 0xfd {
-        out.push(value as u8);
-    } else if value <= 0xffff {
-        out.push(0xfd);
-        out.extend_from_slice(&(value as u16).to_le_bytes());
-    } else if value <= 0xffff_ffff {
-        out.push(0xfe);
-        out.extend_from_slice(&(value as u32).to_le_bytes());
-    } else {
-        out.push(0xff);
-        out.extend_from_slice(&value.to_le_bytes());
-    }
+    let (buf, len) = encode_compact_size(value);
+    out.extend_from_slice(&buf[..len]);
 }
 
 #[cfg(test)]
@@ -111,6 +130,42 @@ mod tests {
             let decoded = read_compact_size(&buf, &mut cursor).unwrap();
             assert_eq!(val, decoded, "roundtrip failed for value {}", val);
             assert_eq!(cursor, buf.len(), "cursor not at end for value {}", val);
+        }
+    }
+
+    /// Literal expected bytes at every width boundary.
+    ///
+    /// `test_write_read_roundtrip` runs an encoder against its matching
+    /// decoder, so a bug present in both would survive it. These pin the bytes
+    /// themselves. They cover `write_compact_size` too, which now delegates to
+    /// `encode_compact_size` -- the delegation is what the existing callers of
+    /// the writer depend on.
+    #[test]
+    fn test_encoding_width_boundaries() {
+        let cases: &[(u64, &[u8])] = &[
+            (0, &[0x00]),
+            (252, &[0xfc]),
+            (253, &[0xfd, 0xfd, 0x00]),
+            (65535, &[0xfd, 0xff, 0xff]),
+            (65536, &[0xfe, 0x00, 0x00, 0x01, 0x00]),
+            (u32::MAX as u64, &[0xfe, 0xff, 0xff, 0xff, 0xff]),
+            (
+                u32::MAX as u64 + 1,
+                &[0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00],
+            ),
+            (
+                u64::MAX,
+                &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff],
+            ),
+        ];
+
+        for &(value, expected) in cases {
+            let (buf, len) = encode_compact_size(value);
+            assert_eq!(&buf[..len], expected, "encode_compact_size({value})");
+
+            let mut out = Vec::new();
+            write_compact_size(value, &mut out);
+            assert_eq!(out, expected, "write_compact_size({value})");
         }
     }
 

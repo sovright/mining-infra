@@ -21,6 +21,7 @@ use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::SubmitBlock;
 use tracing::{info, warn};
 use zcash_equihash_validator::{EquihashValidator, Target, compact_to_target};
+use zcash_pool_common::{BASE_HEADER_BYTES, BITS_OFFSET, SOLUTION_BYTES, SOLUTION_PREFIX_BYTES};
 
 use crate::block::compact_block_from_raw_block;
 use crate::config::SubmitBlockRpcConfig;
@@ -28,15 +29,10 @@ use crate::error::{IngressError, Result};
 use crate::relay_bridge::{ForwardedBlock, RelayBridge};
 use crate::tx_cache::TxCache;
 
-// Zcash block-header byte layout (all little-endian, contiguous from offset 0):
-//   version(4) prev(32) merkle(32) finalsaplingroot(32) time(4) bits(4) nonce(32)
-// so `bits` starts at 4+32+32+32+4 = 104 (BITS_OFFSET) and the fixed header is
-// 140 bytes (BASE_HEADER_BYTES). It is followed by CompactSize(1344) == the
-// 3-byte prefix [0xfd,0x40,0x05] then the 1344-byte Equihash solution.
-const BITS_OFFSET: usize = 104;
-const BASE_HEADER_BYTES: usize = 140;
-const SOLUTION_PREFIX_BYTES: usize = 3;
-const SOLUTION_BYTES: usize = 1_344;
+// The Zcash block-header byte layout -- BITS_OFFSET, BASE_HEADER_BYTES,
+// SOLUTION_PREFIX_BYTES, SOLUTION_BYTES -- is imported above from
+// `zcash_pool_common::block_hash`, which defines it once and documents it.
+// This file used to declare its own copy of all four.
 const JSON_OVERHEAD_BYTES: usize = 64 * 1024;
 const MAX_CONNECTIONS: u32 = 16;
 
@@ -128,16 +124,17 @@ impl SubmittedBlockValidator for MainnetSubmittedBlockValidator {
             .verify_solution(header, solution)
             .map_err(|error| format!("invalid mainnet proof of work: {error}"))?;
 
-        // Deliberately NOT `EquihashValidator::verify_share`, whose target arm
-        // hashes with BLAKE2b personalised "ZcashBlockHash". That value is the
-        // relay's INTERNAL object id (see sovright_relay::hash), not Zcash's
-        // block hash, so comparing it to an nBits-derived target rejected every
-        // genuine mainnet block -- proven by
-        // `production_validator_accepts_a_real_mainnet_block`.
+        // Deliberately NOT `EquihashValidator::verify_share`: that call bundles
+        // the Equihash check with the target check, and this path needs them
+        // apart. `verify_solution` above reports an invalid solution; the check
+        // below reports a target miss. They are different failures and get
+        // different messages.
         //
         // Zcash's PoW hash is the double-SHA256 of the full 1487-byte
-        // serialized header, compared as a little-endian 256-bit integer. The
-        // relay transport path already reaches the same conclusion in
+        // serialized header, compared as a little-endian 256-bit integer.
+        // `verify_share` computes that same hash -- pinned by
+        // `zcash-equihash-validator/tests/consensus_pow_hash.rs` -- and the
+        // relay transport path reaches it too, in
         // sovright_relay::transport::pow::header_meets_stated_target.
         let pow_hash = sovright_relay::consensus_block_hash(&block[..ZCASH_FULL_HEADER_SIZE]);
         if !target.is_met_by(&pow_hash) {
@@ -517,39 +514,23 @@ mod tests {
         );
     }
 
-    /// Mainnet block 3470793: the 1487-byte header on line 1, then its 7
-    /// transactions. Reused from the sovright-relay fixtures rather than
-    /// duplicated, so both crates judge the same real bytes.
-    const MAINNET_BLOCK_FIXTURE: &str =
-        include_str!("../../sovright-relay/tests/fixtures/mainnet_block_3470793.txt");
-
+    /// Mainnet block 3470793: the 1487-byte header, then its 7 transactions.
+    /// Assembled by the shared loader in `zcash-pool-common`, so every crate
+    /// judges the same real bytes parsed the same way.
     fn real_mainnet_block() -> Vec<u8> {
-        let mut lines = MAINNET_BLOCK_FIXTURE
-            .lines()
-            .filter(|line| !line.trim().is_empty());
-        let header = hex::decode(lines.next().expect("header line").trim()).expect("header hex");
-        assert_eq!(header.len(), ZCASH_FULL_HEADER_SIZE);
-        let txs: Vec<Vec<u8>> = lines
-            .map(|line| hex::decode(line.trim()).expect("tx hex"))
-            .collect();
-
-        let mut block = header;
-        crate::wire::encode_compact_size(txs.len() as u64, &mut block);
-        for tx in &txs {
-            block.extend_from_slice(tx);
-        }
-        block
+        zcash_pool_common::fixtures::mainnet_raw_block()
     }
 
     /// THE regression. Every prior test here only proved that GARBAGE is
     /// rejected, so nothing established that a genuine solved block is
     /// ACCEPTED -- which is exactly how this survived.
     ///
-    /// The gateway validated PoW with `EquihashValidator::verify_share`, whose
-    /// target arm hashes with BLAKE2b personalised "ZcashBlockHash". That is
-    /// the relay's INTERNAL object id, not Zcash's block hash. Zcash's PoW hash
-    /// is the double-SHA256 of the full 1487-byte serialized header, so the
-    /// guard rejected every real block a pool could submit.
+    /// This gateway once validated PoW with `EquihashValidator::verify_share`,
+    /// which at the time hashed with BLAKE2b personalised "ZcashBlockHash" --
+    /// the relay's INTERNAL object id, not Zcash's block hash -- so the guard
+    /// rejected every real block a pool could submit. Both sides are fixed
+    /// now: this path uses `consensus_block_hash`, and `verify_share` computes
+    /// the same double-SHA256 of the full 1487-byte serialized header.
     #[test]
     fn production_validator_accepts_a_real_mainnet_block() {
         let validator = MainnetSubmittedBlockValidator::new(4 * 1024 * 1024);
@@ -580,7 +561,7 @@ mod tests {
         let consensus = sovright_relay::consensus_block_hash(header);
         assert_eq!(
             sovright_relay::consensus_block_hash_display(header),
-            "000000000030976123e65211bdfb288b21b4492f56bb1a42710588ca6b8c0d98",
+            zcash_pool_common::fixtures::MAINNET_BLOCK_3470793_HASH_DISPLAY,
             "fixture must be the block Zebra reports under this hash"
         );
         assert!(

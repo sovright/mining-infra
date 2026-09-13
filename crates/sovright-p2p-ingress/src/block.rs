@@ -878,15 +878,13 @@ mod real_block_round_trip {
     use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
 
     /// Mainnet block 3470793: header on line 1, then its 7 transactions in
-    /// block order. Five are v6 (ZIP-229, NU6.3) and two are v4.
-    const FIXTURE: &str =
-        include_str!("../../sovright-relay/tests/fixtures/mainnet_block_3470793.txt");
-
+    /// block order. Five are v6 (ZIP-229, NU6.3) and two are v4. Loaded from
+    /// the shared fixture in `zcash-pool-common`.
     fn fixture() -> (Vec<u8>, Vec<Vec<u8>>) {
-        let mut lines = FIXTURE.lines().filter(|l| !l.trim().is_empty());
-        let header = hex::decode(lines.next().unwrap().trim()).unwrap();
-        let txs = lines.map(|l| hex::decode(l.trim()).unwrap()).collect();
-        (header, txs)
+        (
+            zcash_pool_common::fixtures::mainnet_serialized_header(),
+            zcash_pool_common::fixtures::mainnet_transactions(),
+        )
     }
 
     fn raw_block(header: &[u8], txs: &[Vec<u8>]) -> Vec<u8> {

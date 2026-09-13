@@ -308,14 +308,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
-    /// A real mainnet block header (line 1 of the fixture), so the consensus
-    /// hash path is exercised against bytes Zebra actually produced rather than
-    /// a synthetic header that could hide an offset or byte-order bug.
-    const BLOCK_FIXTURE: &str =
-        include_str!("../../sovright-relay/tests/fixtures/mainnet_block_3470793.txt");
-
+    /// A real mainnet block header (line 1 of the shared fixture in
+    /// `zcash-pool-common`), so the consensus hash path is exercised against
+    /// bytes Zebra actually produced rather than a synthetic header that could
+    /// hide an offset or byte-order bug.
     fn real_header_hex() -> String {
-        BLOCK_FIXTURE.lines().next().unwrap().trim().to_string()
+        zcash_pool_common::fixtures::mainnet_header_hex().to_string()
     }
 
     #[derive(Default)]
@@ -531,15 +529,9 @@ mod tests {
         );
 
         // A real mainnet block: header plus its transactions, as the raw path
-        // receives it.
-        let mut lines = BLOCK_FIXTURE.lines().filter(|l| !l.trim().is_empty());
-        let header = hex::decode(lines.next().unwrap().trim()).unwrap();
-        let txs: Vec<Vec<u8>> = lines.map(|l| hex::decode(l.trim()).unwrap()).collect();
-        let mut raw = header.clone();
-        raw.push(txs.len() as u8);
-        for tx in &txs {
-            raw.extend_from_slice(tx);
-        }
+        // receives it. Assembled by the shared loader, which writes the
+        // transaction count as CompactSize rather than a bare byte.
+        let raw = zcash_pool_common::fixtures::mainnet_raw_block();
 
         let outcome = handle_relay_raw_block(&dual, &raw, None, SubmitBlockMode::Live)
             .await

@@ -111,22 +111,14 @@ fn parse_command(bytes: &[u8]) -> Result<String> {
         .map_err(|e| IngressError::Wire(format!("invalid command utf8: {e}")))
 }
 
+/// Append a CompactSize-encoded integer to `out`.
+///
+/// Delegates to `zcash_pool_common::write_compact_size`, the workspace's single
+/// implementation of this encoding. The name and signature are unchanged, and
+/// `decode_compact_size` below stays local, so callers keep using `crate::wire`
+/// for both directions.
 pub fn encode_compact_size(value: u64, out: &mut Vec<u8>) {
-    match value {
-        0..=252 => out.push(value as u8),
-        253..=0xffff => {
-            out.push(0xfd);
-            out.extend_from_slice(&(value as u16).to_le_bytes());
-        }
-        0x1_0000..=0xffff_ffff => {
-            out.push(0xfe);
-            out.extend_from_slice(&(value as u32).to_le_bytes());
-        }
-        _ => {
-            out.push(0xff);
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
+    zcash_pool_common::write_compact_size(value, out);
 }
 
 pub fn decode_compact_size(payload: &[u8], cursor: &mut usize) -> Result<u64> {
