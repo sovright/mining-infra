@@ -74,10 +74,23 @@ impl Ord for Target {
 ///
 /// The compact format is: mantissa * 256^(exponent-3)
 /// where exponent is the first byte and mantissa is the next 3 bytes
+///
+/// Returns the all-zero target for encodings that are not valid: a set sign
+/// bit, or a zero mantissa. All-zero is the established "invalid" signal here
+/// -- no hash can meet it, and every caller either rejects it explicitly or
+/// fails closed on it -- so the invalid case needs no separate return type.
 pub fn compact_to_target(compact: u32) -> Target {
     let bytes = compact.to_be_bytes();
     let exponent = bytes[0] as usize;
     let mantissa = ((bytes[1] as u32) << 16) | ((bytes[2] as u32) << 8) | (bytes[3] as u32);
+
+    // The mantissa's high bit is a sign flag, not magnitude. Decoding a
+    // negative encoding as though it were positive yields a larger, easier
+    // target, so an unguarded caller would accept solutions it must reject.
+    // Fail closed rather than trusting every caller to pre-screen.
+    if mantissa & 0x0080_0000 != 0 {
+        return Target([0u8; 32]);
+    }
 
     let mut target = [0u8; 32];
 
@@ -184,6 +197,54 @@ fn f64_to_target(mut value: f64) -> Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_to_target_rejects_the_sign_bit() {
+        // The mantissa's high bit is the compact format's sign flag. A
+        // negative target is not a valid encoding, and decoding it as if the
+        // bit were magnitude yields a LARGER (easier) target -- the fail-open
+        // direction. It must decode to the all-zero "invalid" target instead.
+        let negative = 0x1d80_0000_u32;
+        assert_eq!(
+            compact_to_target(negative).to_le_bytes(),
+            [0u8; 32],
+            "a sign-bit-set nBits must not decode to a usable target"
+        );
+    }
+
+    #[test]
+    fn sign_bit_target_cannot_be_met() {
+        // The consequence that matters at the call sites: without the guard,
+        // 0x1d800000 decodes to a target with 0x80 at byte 28, so this hash
+        // sits just under it and reports as a block solution.
+        let negative = 0x1d80_0000_u32;
+        let mut hash = [0u8; 32];
+        hash[28] = 0x7f;
+        assert!(
+            !compact_to_target(negative).is_met_by(&hash),
+            "no hash may meet the target decoded from a negative nBits"
+        );
+    }
+
+    #[test]
+    fn compact_to_target_preserves_valid_encodings() {
+        // Regression guard: the sign-bit check must not disturb ordinary
+        // encodings. 0x1d00ffff -> exponent 29, mantissa 0x00ffff, so the
+        // mantissa lands at bytes 26..=28 little-endian.
+        let mut expected = [0u8; 32];
+        expected[26] = 0xff;
+        expected[27] = 0xff;
+        expected[28] = 0x00;
+        assert_eq!(compact_to_target(0x1d00_ffff).to_le_bytes(), expected);
+    }
+
+    #[test]
+    fn zero_mantissa_is_the_invalid_target() {
+        // Callers already treat the all-zero target as "invalid" (see
+        // pow.rs and submitblock_rpc.rs), which is why the sign-bit case can
+        // reuse it rather than change the signature. Lock that convention in.
+        assert_eq!(compact_to_target(0x1d00_0000).to_le_bytes(), [0u8; 32]);
+    }
 
     #[test]
     fn test_target_comparison() {
