@@ -159,3 +159,81 @@ pub struct BlockTemplate {
     /// Total fees available
     pub total_fees: i64,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An asymmetric value, so the two byte orders cannot coincide: internal bytes
+    // 00 01 02 .. 1f.
+    const INTERNAL_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const DISPLAY_HEX: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
+
+    fn internal_bytes() -> [u8; 32] {
+        let mut bytes = [0u8; 32];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = i as u8;
+        }
+        bytes
+    }
+
+    #[test]
+    fn from_hex_reverses_display_order_into_internal_order() {
+        assert_eq!(Hash256::from_hex(DISPLAY_HEX).unwrap().0, internal_bytes());
+    }
+
+    #[test]
+    fn from_hex_le_reads_internal_order_verbatim() {
+        assert_eq!(
+            Hash256::from_hex_le(INTERNAL_HEX).unwrap().0,
+            internal_bytes()
+        );
+    }
+
+    #[test]
+    fn to_hex_writes_display_order() {
+        assert_eq!(Hash256(internal_bytes()).to_hex(), DISPLAY_HEX);
+    }
+
+    /// Weaker than the three checks above: a round trip also passes when both
+    /// directions share the same mistake. Kept only as a consistency check.
+    #[test]
+    fn from_hex_inverts_to_hex() {
+        let hash = Hash256(internal_bytes());
+        assert_eq!(Hash256::from_hex(&hash.to_hex()).unwrap(), hash);
+    }
+
+    /// One case per `hex::FromHexError` variant `decode_to_slice` can return.
+    #[test]
+    fn malformed_hex_is_rejected_by_both_parsers() {
+        type Parser = fn(&str) -> Result<Hash256, hex::FromHexError>;
+        let parsers: [(&str, Parser); 2] = [
+            ("from_hex", Hash256::from_hex),
+            ("from_hex_le", Hash256::from_hex_le),
+        ];
+        let bad_char = format!("g{}", "0".repeat(63));
+
+        for (name, parse) in parsers {
+            assert_eq!(
+                parse(&"0".repeat(63)),
+                Err(hex::FromHexError::OddLength),
+                "{name}: 63 chars"
+            );
+            assert_eq!(
+                parse(&"0".repeat(62)),
+                Err(hex::FromHexError::InvalidStringLength),
+                "{name}: 62 chars"
+            );
+            assert_eq!(
+                parse(&"0".repeat(66)),
+                Err(hex::FromHexError::InvalidStringLength),
+                "{name}: 66 chars"
+            );
+            assert_eq!(
+                parse(&bad_char),
+                Err(hex::FromHexError::InvalidHexCharacter { c: 'g', index: 0 }),
+                "{name}: non-hex character"
+            );
+        }
+    }
+}

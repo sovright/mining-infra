@@ -228,6 +228,48 @@ mod tests {
         assert_eq!(merkle_root(&[txid]).unwrap(), txid);
     }
 
+    /// sovright/mining-infra#103, cross-checked without zcash-template-provider. The
+    /// coinbase in Zebra v6.2.0's own `getblocktemplate` snapshot
+    /// (`get_block_template_basic@mainnet_10.snap`) is a v5 transaction. Its ZIP-244 txid,
+    /// computed here with zcash_primitives, is the byte reversal of the `merkleroot` Zebra
+    /// sent -- so that field is display order. Constants copied from the snapshot.
+    #[test]
+    fn zebra_template_merkle_root_is_the_display_order_zip244_txid() {
+        const COINBASE_HEX: [&str; 7] = [
+            "050000800a27a726b4d0d6c20000000041be1900010000000000000000000000",
+            "000000000000000000000000000000000000000000ffffffff090341be1904f0",
+            "9fa693ffffffff0480b2e60e0000000017a9147e7e7e7e7e7e7e7e7e7e7e7e7e",
+            "7e7e7e7e7e7e7e87286bee000000000017a914d45cb1adffb5215a42720532a0",
+            "76f02c7c778c908738c94d010000000017a91469a9f95a98fe581b6eb52841ef",
+            "4806dc4402eb908740787d010000000017a914931fec54c1fea86e574462cc32",
+            "013f5400b8912987000000",
+        ];
+        const MERKLE_ROOT_DISPLAY: &str =
+            "0dd4c87d6aba52431fef01079578826b547a22e444af986368c507918f893e8a";
+
+        let tx = hex::decode(COINBASE_HEX.concat()).expect("coinbase hex");
+        let txid = txid_from_tx_bytes(&tx);
+        assert_eq!(
+            merkle_root(&[txid]).unwrap(),
+            txid,
+            "a one-tx root is the txid"
+        );
+
+        let mut display = txid;
+        display.reverse();
+        assert_eq!(hex::encode(display), MERKLE_ROOT_DISPLAY);
+
+        // Negative control: the double-SHA256 of the same bytes, the txid rule for v4 and
+        // earlier, is a different value. A v5 coinbase's txid is not recoverable that way.
+        let mut double_sha = sha256d(&tx);
+        double_sha.reverse();
+        assert_eq!(
+            hex::encode(double_sha),
+            "f96ec1f0b0b8732dc3fc81bc629bfe6ef437d704f03ef884359ddcb7044f0613"
+        );
+        assert_ne!(hex::encode(double_sha), MERKLE_ROOT_DISPLAY);
+    }
+
     #[test]
     fn odd_level_duplicates_the_last_node() {
         let a = [1u8; 32];
