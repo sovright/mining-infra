@@ -691,16 +691,13 @@ fn classify_submitblock_result(
     }
 }
 
+/// Length in bytes of `count` once CompactSize-encoded.
+///
+/// Asks the shared encoder rather than restating its boundaries, so this
+/// cannot drift away from what `encode_compact_size` actually writes. Used
+/// only to pre-size buffers.
 fn compact_size_len(count: usize) -> usize {
-    if count < 253 {
-        1
-    } else if u16::try_from(count).is_ok() {
-        3
-    } else if u32::try_from(count).is_ok() {
-        5
-    } else {
-        9
-    }
+    zcash_pool_common::encode_compact_size(count as u64).1
 }
 
 /// Append a CompactSize-encoded count to `out`.
