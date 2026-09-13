@@ -7,8 +7,10 @@ use serde::Deserialize;
 pub struct Hash256(pub [u8; 32]);
 
 impl Hash256 {
-    /// Parse from display-order hex (big-endian, as used by `previousblockhash`).
-    /// Reverses bytes to convert from display order to internal little-endian order.
+    /// Parse from display-order hex: the internal bytes, reversed, as Zebra and
+    /// zcashd print hashes. Every 32-byte hash in `getblocktemplate` --
+    /// `previousblockhash` and the four `defaultroots` -- is in this order, and so
+    /// is `target`, which is a big-endian integer.
     pub fn from_hex(s: &str) -> Result<Self, hex::FromHexError> {
         let mut bytes = [0u8; 32];
         hex::decode_to_slice(s, &mut bytes)?;
@@ -16,9 +18,10 @@ impl Hash256 {
         Ok(Self(bytes))
     }
 
-    /// Parse from internal-order hex (little-endian, as used by Zebra's
-    /// `merkleroot`, `chainhistoryroot`, `authdataroot`, `blockcommitmentshash`).
-    /// Does NOT reverse bytes -- hex is already in internal byte order.
+    /// Parse from internal-order hex, without reversing.
+    ///
+    /// Only for hex that is already in internal byte order. No `getblocktemplate`
+    /// field is: Zebra sends those in display order, which `from_hex` reads.
     pub fn from_hex_le(s: &str) -> Result<Self, hex::FromHexError> {
         let mut bytes = [0u8; 32];
         hex::decode_to_slice(s, &mut bytes)?;

@@ -150,9 +150,8 @@ impl TemplateProvider {
     ) -> Result<BlockTemplate> {
         let header = assemble_header(&response)?;
         let target = parse_target(&response.target)?;
-        let chain_history_root =
-            Hash256::from_hex_le(&response.default_roots.chain_history_root)
-                .map_err(|e| Error::InvalidTemplate(format!("invalid chainhistoryroot: {}", e)))?;
+        let chain_history_root = Hash256::from_hex(&response.default_roots.chain_history_root)
+            .map_err(|e| Error::InvalidTemplate(format!("invalid chainhistoryroot: {}", e)))?;
 
         let total_fees: i64 = response.transactions.iter().map(|tx| tx.fee).sum();
 
@@ -346,7 +345,7 @@ mod tests {
 
         assert_eq!(
             template.chain_history_root,
-            Hash256::from_hex_le(chain_history_root).unwrap()
+            Hash256::from_hex(chain_history_root).unwrap()
         );
         assert_eq!(template.consensus_branch_id, 0xc8e7_1055);
     }

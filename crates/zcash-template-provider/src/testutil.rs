@@ -237,7 +237,7 @@ impl TestTemplateFactory {
         self
     }
 
-    /// Set the chain history root (64-char internal-order hex).
+    /// Set the chain history root (64-char hex, display/big-endian order).
     pub fn chain_history_root(mut self, h: &str) -> Self {
         self.chain_history_root = h.to_string();
         self
