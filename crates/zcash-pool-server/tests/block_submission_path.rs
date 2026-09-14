@@ -716,3 +716,47 @@ fn mainnet_parsed_target_is_met_by_the_block_hash() {
         "a real block's hash must meet the target parsed from its own template"
     );
 }
+
+/// #103's actual effect, end to end: a target parsed from the block's own template must
+/// make `is_block` fire for that block's share.
+///
+/// The two halves of this were already covered separately and never joined.
+/// `mainnet_parsed_target_is_met_by_the_block_hash` stops at `is_met_by`, and
+/// `is_block_tracks_the_real_block_target` builds its target with
+/// `compact_to_target(job.bits)`, bypassing the template parse. Neither would notice if
+/// `parse_target`'s output stopped reaching the block gate in the right byte order.
+///
+/// `server.rs` stores this value at `current_block_target` and passes it to
+/// `validate_share_with_job`; this feeds it the same way, which is as far as the gate can
+/// be driven without standing up the server.
+#[test]
+fn mainnet_template_target_makes_is_block_fire() {
+    let template = mainnet_template();
+    let parsed = parse_target(&template.target).expect("valid target hex");
+
+    let job = mainnet_job();
+    let share = mainnet_share();
+    let processor = ShareProcessor::new();
+
+    // The old behaviour, reconstructed without depending on `from_hex_le`: reading the
+    // hex without reversing is exactly the reversal of reading it with. #103 was this
+    // value reaching the gate, which rejects every real block.
+    let mut unreversed = parsed.0;
+    unreversed.reverse();
+
+    for (label, block_target, expect_block) in [
+        ("the template's own target", parsed.0, true),
+        ("the target read in the wrong byte order", unreversed, false),
+    ] {
+        let detector = InMemoryDuplicateDetector::new();
+        let result = processor
+            .validate_share_with_job(&share, &job, &detector, &block_target)
+            .expect("validation must not error");
+
+        assert!(result.accepted, "{label}: the share must still be accepted");
+        assert_eq!(
+            result.is_block, expect_block,
+            "{label}: is_block should be {expect_block}"
+        );
+    }
+}
