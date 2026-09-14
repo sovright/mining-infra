@@ -3,11 +3,15 @@
 //! Tests the critical path: share meets block target -> block serialization -> submit to Zebra.
 //! Uses the Zcash mainnet genesis block as a real test vector with a known-valid Equihash solution.
 
-use zcash_equihash_validator::{EquihashValidator, compact_to_target};
+use zcash_equihash_validator::{EquihashValidator, Target, compact_to_target};
 use zcash_mining_protocol::messages::{NewEquihashJob, ShareResult, SubmitEquihashShare};
 use zcash_pool_common::write_compact_size;
 use zcash_pool_server::{InMemoryDuplicateDetector, ShareProcessor};
-use zcash_template_provider::types::{BlockTemplate, EquihashHeader, Hash256, TemplateTransaction};
+use zcash_template_provider::types::{
+    BlockTemplate, DefaultRoots, EquihashHeader, GetBlockTemplateResponse, Hash256,
+    TemplateTransaction,
+};
+use zcash_template_provider::{assemble_header, parse_target};
 
 // ---------------------------------------------------------------------------
 // Zcash mainnet genesis block test vectors
@@ -612,6 +616,144 @@ fn is_block_tracks_the_real_block_target() {
             "{label}: expected Accepted, got {:?}",
             result.result
         );
+        assert_eq!(
+            result.is_block, expect_block,
+            "{label}: is_block should be {expect_block}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #103: block 3470793's getblocktemplate, encoded the way Zebra encodes it
+// ---------------------------------------------------------------------------
+//
+// Zebra sends the five hash fields in display order (internal bytes reversed) and
+// `target` as a big-endian integer. These build that response for the real block and
+// check that the template provider turns it back into the block.
+
+// What Zebra would send for block 3470793, in display order: each is the reversal of the
+// corresponding header bytes in the pool-common fixture.
+const MAINNET_PREVIOUS_BLOCK_HASH_DISPLAY: &str =
+    "00000000001380045e6c366dfe888cd5085a20660e4524f59dd813c4f05a5707";
+const MAINNET_MERKLE_ROOT_DISPLAY: &str =
+    "d4b0800733ccdbb9655face8d28622530f3ec855e32c7eb1633854190a09ade8";
+const MAINNET_BLOCK_COMMITMENTS_HASH_DISPLAY: &str =
+    "9bca25817433262c45ea7c8deec73181b136819a1d05eaf2db2a2b502ea4e7b4";
+/// The big-endian expansion of the block's nBits, 0x1c00a48e.
+const MAINNET_TARGET_DISPLAY: &str =
+    "0000000000a48e00000000000000000000000000000000000000000000000000";
+
+/// Block 3470793's getblocktemplate response.
+///
+/// `chainhistoryroot` and `authdataroot` are empty. That is NOT a valid Zebra response --
+/// both fields are mandatory -- but a device to reach `assemble_header`'s
+/// `blockcommitmentshash` fallback, because the fixture carries this block's commitments
+/// hash and not the two roots it was computed from. The recompute path is covered with
+/// Zebra's own template in zcash-template-provider's tests.
+fn mainnet_template() -> GetBlockTemplateResponse {
+    GetBlockTemplateResponse {
+        version: 4,
+        previous_block_hash: MAINNET_PREVIOUS_BLOCK_HASH_DISPLAY.to_string(),
+        default_roots: DefaultRoots {
+            merkle_root: MAINNET_MERKLE_ROOT_DISPLAY.to_string(),
+            chain_history_root: String::new(),
+            auth_data_root: String::new(),
+            block_commitments_hash: MAINNET_BLOCK_COMMITMENTS_HASH_DISPLAY.to_string(),
+        },
+        transactions: Vec::new(),
+        coinbase_txn: Default::default(),
+        target: MAINNET_TARGET_DISPLAY.to_string(),
+        height: 3_470_793,
+        bits: "1c00a48e".to_string(),
+        cur_time: 1_788_462_019,
+    }
+}
+
+/// #103, header half. Block 3470793's own template must rebuild block 3470793's header
+/// byte for byte. The regions are compared separately so that a failure names the field;
+/// version, previous hash, time, bits and nonce must match before and after the fix alike.
+#[test]
+fn mainnet_template_rebuilds_the_real_header() {
+    let (expected, _) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+    let mut header = assemble_header(&mainnet_template()).expect("valid template");
+    // assemble_header zeroes the nonce; the miner supplies it.
+    header.nonce.copy_from_slice(&expected[108..140]);
+    let rebuilt = header.serialize();
+
+    assert_eq!(rebuilt[0..4], expected[0..4], "version");
+    assert_eq!(rebuilt[4..36], expected[4..36], "previous block hash");
+    assert_eq!(rebuilt[36..68], expected[36..68], "merkle root");
+    assert_eq!(
+        rebuilt[68..100],
+        expected[68..100],
+        "block commitments hash"
+    );
+    assert_eq!(rebuilt[100..140], expected[100..140], "time, bits, nonce");
+}
+
+/// #103, target half. Parsed, the big-endian target must be the little-endian integer
+/// 0xa48e * 256^25: bytes 8e a4 at indices 25 and 26. The second assertion is a cross-check
+/// only: it ties the parsed value to `compact_to_target(bits)`, which is the block target
+/// `is_block_tracks_the_real_block_target` feeds to `is_block`.
+#[test]
+fn mainnet_target_parses_to_little_endian_bytes() {
+    let mut expected = [0u8; 32];
+    expected[25] = 0x8e;
+    expected[26] = 0xa4;
+    let parsed = parse_target(MAINNET_TARGET_DISPLAY).expect("valid target hex");
+    assert_eq!(parsed.0, expected);
+    assert_eq!(parsed.0, compact_to_target(0x1c00_a48e).to_le_bytes());
+}
+
+/// The parsed target must be met by the block's own consensus hash. This checks the target
+/// value only. It does not run `is_block`, the pool server's `handle_new_template` (where
+/// the parsed target is stored), or `submit_block`.
+#[test]
+fn mainnet_parsed_target_is_met_by_the_block_hash() {
+    let parsed = parse_target(MAINNET_TARGET_DISPLAY).expect("valid target hex");
+    assert!(
+        Target::from_le_bytes(parsed.0).is_met_by(&mainnet_consensus_hash()),
+        "a real block's hash must meet the target parsed from its own template"
+    );
+}
+
+/// #103's actual effect, end to end: a target parsed from the block's own template must
+/// make `is_block` fire for that block's share.
+///
+/// The two halves of this were already covered separately and never joined.
+/// `mainnet_parsed_target_is_met_by_the_block_hash` stops at `is_met_by`, and
+/// `is_block_tracks_the_real_block_target` builds its target with
+/// `compact_to_target(job.bits)`, bypassing the template parse. Neither would notice if
+/// `parse_target`'s output stopped reaching the block gate in the right byte order.
+///
+/// `server.rs` stores this value at `current_block_target` and passes it to
+/// `validate_share_with_job`; this feeds it the same way, which is as far as the gate can
+/// be driven without standing up the server.
+#[test]
+fn mainnet_template_target_makes_is_block_fire() {
+    let template = mainnet_template();
+    let parsed = parse_target(&template.target).expect("valid target hex");
+
+    let job = mainnet_job();
+    let share = mainnet_share();
+    let processor = ShareProcessor::new();
+
+    // The old behaviour, reconstructed without depending on `from_hex_le`: reading the
+    // hex without reversing is exactly the reversal of reading it with. #103 was this
+    // value reaching the gate, which rejects every real block.
+    let mut unreversed = parsed.0;
+    unreversed.reverse();
+
+    for (label, block_target, expect_block) in [
+        ("the template's own target", parsed.0, true),
+        ("the target read in the wrong byte order", unreversed, false),
+    ] {
+        let detector = InMemoryDuplicateDetector::new();
+        let result = processor
+            .validate_share_with_job(&share, &job, &detector, &block_target)
+            .expect("validation must not error");
+
+        assert!(result.accepted, "{label}: the share must still be accepted");
         assert_eq!(
             result.is_block, expect_block,
             "{label}: is_block should be {expect_block}"

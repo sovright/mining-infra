@@ -150,9 +150,8 @@ impl TemplateProvider {
     ) -> Result<BlockTemplate> {
         let header = assemble_header(&response)?;
         let target = parse_target(&response.target)?;
-        let chain_history_root =
-            Hash256::from_hex_le(&response.default_roots.chain_history_root)
-                .map_err(|e| Error::InvalidTemplate(format!("invalid chainhistoryroot: {}", e)))?;
+        let chain_history_root = Hash256::from_hex(&response.default_roots.chain_history_root)
+            .map_err(|e| Error::InvalidTemplate(format!("invalid chainhistoryroot: {}", e)))?;
 
         let total_fees: i64 = response.transactions.iter().map(|tx| tx.fee).sum();
 
@@ -346,8 +345,41 @@ mod tests {
 
         assert_eq!(
             template.chain_history_root,
-            Hash256::from_hex_le(chain_history_root).unwrap()
+            Hash256::from_hex(chain_history_root).unwrap()
         );
         assert_eq!(template.consensus_branch_id, 0xc8e7_1055);
+    }
+
+    /// `process_template` parses `chainhistoryroot` a second time, for the JD context,
+    /// and parses `target` for the pool's block target. Both must land in internal byte
+    /// order. Zebra v6.2.0's own template and literal expectations, so this does not
+    /// depend on the parser it covers.
+    #[tokio::test]
+    async fn fetch_template_parses_zebras_chain_history_root_and_target_in_internal_order() {
+        let snapshot: GetBlockTemplateResponse = serde_json::from_str(include_str!(
+            "../tests/fixtures/zebra-6.2.0-getblocktemplate-mainnet_10.json"
+        ))
+        .expect("Zebra v6.2.0 snapshot deserialises");
+        let rpc = MockZebraRpc::new();
+        rpc.enqueue_template(snapshot);
+        rpc.enqueue_blockchain_info("c8e71055");
+
+        let provider = TemplateProvider::with_rpc(TemplateProviderConfig::default(), Box::new(rpc));
+        let template = provider.fetch_template().await.unwrap();
+
+        // chainhistoryroot 94470fa6...e0b5 as Zebra sent it, reversed.
+        let expected_root: [u8; 32] =
+            hex::decode("b5e0475805444c7faa715e13423ade144f20f3a35a9a10db5f1abd6ea60f4794")
+                .unwrap()
+                .try_into()
+                .unwrap();
+        assert_eq!(template.chain_history_root.0, expected_root);
+
+        // target 0x055554 * 256^28: bytes 54 55 05 at little-endian indices 28..=30.
+        let mut expected_target = [0u8; 32];
+        expected_target[28] = 0x54;
+        expected_target[29] = 0x55;
+        expected_target[30] = 0x05;
+        assert_eq!(template.target.0, expected_target);
     }
 }

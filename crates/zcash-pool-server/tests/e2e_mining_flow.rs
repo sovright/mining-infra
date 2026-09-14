@@ -41,7 +41,7 @@ fn response_to_template(
         target,
         transactions: response.transactions.clone(),
         coinbase,
-        chain_history_root: zcash_template_provider::types::Hash256::from_hex_le(
+        chain_history_root: zcash_template_provider::types::Hash256::from_hex(
             &response.default_roots.chain_history_root,
         )
         .expect("chainhistoryroot should be valid"),
