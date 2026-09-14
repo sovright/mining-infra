@@ -439,9 +439,26 @@ fn config_from_env()
     let default_forward_burst_packets = config.forward_burst_packets;
     let default_forward_burst_delay_micros = micros_from_duration(config.forward_burst_delay)?;
 
+    let default_unauth_rate_limit_per_sec = config.unauth_rate_limit_per_sec;
+    let default_unauth_rate_limit_burst = config.unauth_rate_limit_burst;
+
     let auth_keys_resolution = resolve_auth_keys()?;
     config = config
         .with_authorized_keys(auth_keys_resolution.active.clone())
+        // Per-source cap on traffic from sources with no established session.
+        // Set PER_SEC to 0 to disable (not advised while the relay is exposed
+        // to the public internet -- it is the only bound on the cost of the
+        // trial-verify key scan).
+        .with_unauth_rate_limit(
+            env_f64(
+                "SOVRIGHT_RELAY_UNAUTH_RATE_LIMIT_PER_SEC",
+                default_unauth_rate_limit_per_sec,
+            )?,
+            env_f64(
+                "SOVRIGHT_RELAY_UNAUTH_RATE_LIMIT_BURST",
+                default_unauth_rate_limit_burst,
+            )?,
+        )
         .with_fec(
             env_usize("SOVRIGHT_RELAY_DATA_SHARDS", default_data_shards)?,
             env_usize("SOVRIGHT_RELAY_PARITY_SHARDS", default_parity_shards)?,
@@ -592,6 +609,14 @@ fn env_usize(
 }
 
 fn env_u64(name: &str, default: u64) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    match env::var(name) {
+        Ok(value) => Ok(value.parse()?),
+        Err(_) => Ok(default),
+    }
+}
+
+/// Parse an `f64` env var, falling back to `default` when unset.
+fn env_f64(name: &str, default: f64) -> Result<f64, Box<dyn std::error::Error + Send + Sync>> {
     match env::var(name) {
         Ok(value) => Ok(value.parse()?),
         Err(_) => Ok(default),

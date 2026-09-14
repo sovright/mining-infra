@@ -45,6 +45,10 @@ pub struct RelayMetrics {
     pub sessions_expired: AtomicU64,
     /// Incoming packets rejected because the session limit was reached
     pub session_limit_rejections: AtomicU64,
+    /// Packets from an unknown source dropped by the per-source rate limiter
+    /// before paying the trial-verify HMAC scan. Sustained nonzero means the
+    /// relay is being probed or flooded from the public internet.
+    pub unauth_rate_limited: AtomicU64,
     /// Raw-segment reconstructions observed (first chunk -> PoW validated).
     pub reconstruct_latency_count: AtomicU64,
     /// Sum of reconstruction latencies, milliseconds (with count -> average).
@@ -212,6 +216,11 @@ impl RelayMetrics {
         self.assembly_misses_near.fetch_add(near, Ordering::Relaxed);
     }
 
+    /// Record a packet dropped by the unauthenticated per-source rate limiter.
+    pub fn inc_unauth_rate_limited(&self) {
+        self.unauth_rate_limited.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a session created and bound to `key_id` (per-key-identity
     /// hardening, PR-A).
     pub fn inc_sessions_created_for_key(&self, key_id: &str) {
@@ -282,6 +291,7 @@ impl RelayMetrics {
             sessions_created: self.sessions_created.load(Ordering::Relaxed),
             sessions_expired: self.sessions_expired.load(Ordering::Relaxed),
             session_limit_rejections: self.session_limit_rejections.load(Ordering::Relaxed),
+            unauth_rate_limited: self.unauth_rate_limited.load(Ordering::Relaxed),
             reconstruct_latency_count: self.reconstruct_latency_count.load(Ordering::Relaxed),
             reconstruct_latency_sum_ms: self.reconstruct_latency_sum_ms.load(Ordering::Relaxed),
             reconstruct_latency_over_2s: self.reconstruct_latency_over_2s.load(Ordering::Relaxed),
@@ -329,6 +339,7 @@ pub struct MetricsSnapshot {
     pub sessions_created: u64,
     pub sessions_expired: u64,
     pub session_limit_rejections: u64,
+    pub unauth_rate_limited: u64,
     pub reconstruct_latency_count: u64,
     pub reconstruct_latency_sum_ms: u64,
     pub reconstruct_latency_over_2s: u64,
@@ -490,6 +501,13 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "Total incoming packets rejected because the relay session limit was reached.",
         "counter",
         snapshot.session_limit_rejections,
+    );
+    push_metric(
+        &mut text,
+        "sovright_relay_relay_unauth_rate_limited_total",
+        "Total packets from unknown sources dropped by the per-source rate limiter.",
+        "counter",
+        snapshot.unauth_rate_limited,
     );
     push_metric(
         &mut text,
@@ -666,6 +684,7 @@ mod tests {
             sessions_created: 3,
             sessions_expired: 4,
             session_limit_rejections: 6,
+            unauth_rate_limited: 0,
             reconstruct_latency_count: 20,
             reconstruct_latency_sum_ms: 8000,
             reconstruct_latency_over_2s: 2,
