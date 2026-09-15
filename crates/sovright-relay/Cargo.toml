@@ -7,6 +7,7 @@ description = "Fast block relay protocol for the Sovright Zcash mining network"
 repository = "https://github.com/sovright/mining-infra"
 
 [dependencies]
+serde_json = { workspace = true }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 thiserror = { workspace = true }

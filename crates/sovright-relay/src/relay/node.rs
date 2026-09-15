@@ -14,6 +14,7 @@ use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use crate::fec::FecError;
+use crate::relay::ratelimit::UnauthRateLimiter;
 use crate::segmented_block::{RawBlockSegment, segment_object_hash};
 use crate::transport::{
     AuthKey, BlockAssembly, BlockChunker, Chunk, ChunkHeader, EquihashPowValidator, KeyRole,
@@ -22,6 +23,7 @@ use crate::transport::{
 };
 
 use super::ArrivalSink;
+use super::forwarding::ForwardOrder;
 use super::metrics::RelayMetrics;
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
@@ -92,6 +94,11 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     validated_raw_blocks: Arc<Mutex<HashMap<[u8; 32], ValidatedRawBlock>>>,
     /// Optional per-block relay arrival logger (observatory timing source)
     arrival_sink: Option<ArrivalSink>,
+    /// Per-source rate limiter for traffic from sources with no established
+    /// session. Guards the trial-verify HMAC scan, which is the CPU cost an
+    /// internet-exposed relay pays to any sender. Established sessions are
+    /// never consulted against it.
+    unauth_limiter: UnauthRateLimiter,
     /// Live, hot-swappable authorized key set (hot-revocation, PR-B).
     ///
     /// Initialized from `config.authorized_keys` at construction. The receive
@@ -132,6 +139,10 @@ impl<V: PowValidator> RelayNode<V> {
         )?;
 
         let active_keys = StdRwLock::new(Arc::new(config.authorized_keys.clone()));
+        let unauth_limiter = UnauthRateLimiter::new(
+            config.unauth_rate_limit_per_sec,
+            config.unauth_rate_limit_burst,
+        );
 
         Ok(Self {
             config,
@@ -143,6 +154,7 @@ impl<V: PowValidator> RelayNode<V> {
             metrics: Arc::new(RelayMetrics::new()),
             validated_raw_blocks: Arc::new(Mutex::new(HashMap::new())),
             arrival_sink: None,
+            unauth_limiter,
             active_keys,
         })
     }
@@ -388,14 +400,25 @@ impl<V: PowValidator> RelayNode<V> {
     }
 
     fn validate_raw_block_segment(&self, assembly: &BlockAssembly) -> Option<bool> {
+        self.validate_raw_block_segment_with_identity(assembly)
+            .map(|(valid, _)| valid)
+    }
+
+    fn validate_raw_block_segment_with_identity(
+        &self,
+        assembly: &BlockAssembly,
+    ) -> Option<(bool, Option<String>)> {
         let segment = self.decode_raw_segment_from_assembly(assembly)?;
         let expected_object_hash = segment_object_hash(segment.block_hash, segment.segment_index);
         if expected_object_hash != assembly.block_hash {
-            return Some(false);
+            return Some((false, None));
         }
 
         if segment.segment_index != 0 {
-            return Some(self.raw_segment_matches_validated_segment_zero(&segment));
+            return Some((
+                self.raw_segment_matches_validated_segment_zero(&segment),
+                None,
+            ));
         }
 
         if segment.payload.len() < ZCASH_FULL_HEADER_SIZE {
@@ -403,21 +426,20 @@ impl<V: PowValidator> RelayNode<V> {
         }
         let header = &segment.payload[..ZCASH_FULL_HEADER_SIZE];
         if raw_block_header_hash(header) != segment.block_hash {
-            return Some(false);
+            return Some((false, None));
         }
 
         match self.validator.validate(header) {
             PowResult::Valid => {
                 self.record_validated_raw_block(&segment);
-                // First moment this region's relay holds a PoW-valid block via
-                // the relay path: log its consensus block hash so the observatory
-                // can join it against native-P2P arrivals for the same block.
-                if let Some(sink) = &self.arrival_sink {
-                    sink.relay_block_received(&crate::hash::consensus_block_hash_display(header));
-                }
-                Some(true)
+                Some((
+                    true,
+                    self.arrival_sink
+                        .as_ref()
+                        .map(|_| crate::hash::consensus_block_hash_display(header)),
+                ))
             }
-            PowResult::Invalid => Some(false),
+            PowResult::Invalid => Some((false, None)),
             PowResult::Indeterminate => None,
         }
     }
@@ -632,26 +654,41 @@ impl<V: PowValidator> RelayNode<V> {
             self.config.forward_burst_packets,
             self.config.forward_burst_delay,
         );
-        for (peer_addr, key_id, payloads) in outbound {
-            let mut chunks_sent: u64 = 0;
-            let payload_count = payloads.len();
-            let mut sent_since_delay = 0usize;
-            for (idx, data) in payloads.into_iter().enumerate() {
-                match socket.send_to(&data, peer_addr).await {
-                    Ok(_) => chunks_sent += 1,
-                    Err(error) => {
-                        self.metrics.inc_packet_send_errors();
-                        warn!(peer = %peer_addr, %error, "Failed to forward relay packet");
-                    }
-                }
-                if pacing.should_delay(idx, payload_count, &mut sent_since_delay) {
-                    sleep(pacing.delay).await;
+        let packet_count: usize = outbound.iter().map(|(_, _, p)| p.len()).sum();
+        let order = ForwardOrder::new(
+            outbound.iter().map(|(_, _, p)| p.len()).collect(),
+            self.config.forward_round_robin,
+        );
+        let mut sent = vec![0u64; outbound.len()];
+        let mut sent_since_delay = 0usize;
+        for (global_idx, (peer_idx, packet_idx)) in order.enumerate() {
+            let (peer_addr, _, payloads) = &outbound[peer_idx];
+            if !self.config.forward_round_robin && packet_idx == 0 {
+                sent_since_delay = 0;
+            }
+            match socket.send_to(&payloads[packet_idx], peer_addr).await {
+                Ok(_) => sent[peer_idx] += 1,
+                Err(error) => {
+                    self.metrics.inc_packet_send_errors();
+                    warn!(peer = %peer_addr, %error, "Failed to forward relay packet");
                 }
             }
+            // One budget across ALL peers for round-robin; parallel per-peer
+            // sleeps would silently multiply the configured egress burst rate.
+            let (idx, count) = if self.config.forward_round_robin {
+                (global_idx, packet_count)
+            } else {
+                (packet_idx, payloads.len())
+            };
+            if pacing.should_delay(idx, count, &mut sent_since_delay) {
+                sleep(pacing.delay).await;
+            }
+        }
+        for ((_, key_id, _), chunks_sent) in outbound.iter().zip(sent) {
             if chunks_sent > 0 {
                 self.metrics.inc_packets_forwarded(chunks_sent);
                 self.metrics
-                    .inc_chunks_forwarded_for_key(&key_id, chunks_sent);
+                    .inc_chunks_forwarded_for_key(key_id, chunks_sent);
                 match msg_type {
                     MessageType::Block => {
                         self.metrics.inc_compact_block_chunks_forwarded(chunks_sent)
@@ -659,11 +696,7 @@ impl<V: PowValidator> RelayNode<V> {
                     MessageType::RawBlockSegment => {
                         self.metrics.inc_raw_segment_chunks_forwarded(chunks_sent)
                     }
-                    // Skeleton chunk forwarding is not counted under a dedicated
-                    // node metric (skeleton observability lives on the sidecar,
-                    // which reports fast-path wins); forwarding still happens.
-                    MessageType::CompactSkeleton => {}
-                    MessageType::Keepalive | MessageType::Auth => {}
+                    MessageType::CompactSkeleton | MessageType::Keepalive | MessageType::Auth => {}
                 }
             }
         }
@@ -691,6 +724,7 @@ impl<V: PowValidator> RelayNode<V> {
             }
             return Vec::new();
         }
+        let mut arrival = None;
         {
             let Some(assembly) = session.get_or_create_assembly_for_message(
                 block_hash,
@@ -727,7 +761,18 @@ impl<V: PowValidator> RelayNode<V> {
             // `pow_validated` state (false) and suppress forwarding until a future
             // chunk provides enough data to decide.
             if is_new && !assembly.pow_validated {
-                match self.validate_pow_from_assembly(assembly, chunk.header.msg_type) {
+                let validation = if chunk.header.msg_type == MessageType::RawBlockSegment {
+                    self.validate_raw_block_segment_with_identity(assembly)
+                        .map(|(valid, hash)| {
+                            arrival = hash.map(|hash| {
+                                (hash, assembly.started_at.elapsed().as_millis() as u64)
+                            });
+                            valid
+                        })
+                } else {
+                    self.validate_pow_from_assembly(assembly, chunk.header.msg_type)
+                };
+                match validation {
                     Some(valid) => {
                         if chunk.header.msg_type == MessageType::RawBlockSegment {
                             if valid {
@@ -748,6 +793,19 @@ impl<V: PowValidator> RelayNode<V> {
                     }
                 }
             }
+        }
+
+        if let (Some(sink), Some((hash, elapsed))) = (&self.arrival_sink, arrival) {
+            sink.relay_header_received(
+                &hash,
+                session.key_id(),
+                match session.role() {
+                    KeyRole::Full => "full",
+                    KeyRole::ReceiveOnly => "receive_only",
+                },
+                self.config.auth_required() && session.key_id() != UNAUTHENTICATED_KEY_ID,
+                elapsed,
+            );
         }
 
         if chunk.header.msg_type == MessageType::RawBlockSegment {
@@ -806,6 +864,22 @@ fn evict_oldest_validated_raw_block(validated: &mut HashMap<[u8; 32], ValidatedR
 }
 
 impl<V: PowValidator> RelayNode<V> {
+    /// Gate an unknown (sessionless) source before it can make the relay
+    /// perform a trial-verify HMAC scan across every active key.
+    ///
+    /// Only reached when the source has no established session, so an
+    /// authenticated peer never pays this check.
+    fn admit_unknown_source(&self, src_addr: SocketAddr) -> Result<(), TransportError> {
+        if self.unauth_limiter.allow(src_addr.ip()) {
+            return Ok(());
+        }
+        self.metrics.inc_unauth_rate_limited();
+        debug!(peer = %src_addr, "Unknown source rate limited before key trial-verify");
+        Err(TransportError::ConnectionRefused(
+            "unauthenticated source rate limited".into(),
+        ))
+    }
+
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
         self.metrics.inc_packets_received();
 
@@ -927,6 +1001,7 @@ impl<V: PowValidator> RelayNode<V> {
                     // Decode already restricts `chunk.header.version` to {2, 3},
                     // so any well-formed chunk reaching here is v2 or v3 and can
                     // be checked against the authorized-key list.
+                    self.admit_unknown_source(src_addr)?;
                     let active_keys = self.active_keys();
                     let mut authenticated_key: Option<AuthKey> = None;
                     for key in active_keys.iter() {
@@ -1080,6 +1155,7 @@ impl<V: PowValidator> RelayNode<V> {
             return Err(TransportError::AuthenticationFailed);
         }
 
+        self.admit_unknown_source(src_addr)?;
         let active_keys = self.active_keys();
         let mut authenticated_key: Option<AuthKey> = None;
         for key in active_keys.iter() {
@@ -2361,6 +2437,157 @@ mod tests {
             assert!(!pacing.should_delay(0, 3, &mut sent_since_delay));
             assert!(!pacing.should_delay(1, 3, &mut sent_since_delay));
             assert!(!pacing.should_delay(2, 3, &mut sent_since_delay));
+        }
+    }
+    #[tokio::test]
+    async fn attribution_requires_authentication_and_records_immediate_peer() {
+        let path =
+            std::env::temp_dir().join(format!("relay-attribution-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let key = [0x42; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("pool", key)]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator)
+            .unwrap()
+            .with_arrival_sink(Some(ArrivalSink::new(&path).unwrap()));
+        node.bind().await.unwrap();
+        let mut raw = vec![0xab; ZCASH_FULL_HEADER_SIZE + 256];
+        raw[0] = 4;
+        let hash = raw_block_header_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
+        let segments = split_raw_block(hash, &raw, 2_000).unwrap();
+        let source = "127.0.0.1:12349".parse().unwrap();
+        let signing = RelaySession::new(source, "pool", key);
+        for segment in segments {
+            for chunk in node.chunker.raw_block_segment_to_chunks(&segment).unwrap() {
+                let h = &chunk.header;
+                let mac = signing.compute_hmac(
+                    &h.block_hash,
+                    h.chunk_id,
+                    h.total_chunks,
+                    h.payload_len,
+                    &chunk.payload,
+                );
+                let header = authenticated_data_header(
+                    h.msg_type,
+                    &h.block_hash,
+                    h.chunk_id,
+                    h.total_chunks,
+                    h.payload_len,
+                    mac,
+                )
+                .unwrap();
+                let wire = Chunk::new(header, chunk.payload).to_bytes();
+                let mut tampered = wire.clone();
+                *tampered.last_mut().unwrap() ^= 1;
+                assert!(node.handle_packet(&tampered, source).await.is_err());
+                node.handle_packet(&wire, source).await.unwrap();
+                // Retransmission must not create another arrival.
+                node.handle_packet(&wire, source).await.unwrap();
+            }
+        }
+        let content = std::fs::read_to_string(&path).unwrap();
+        let records: Vec<serde_json::Value> = content
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        let r = &records[0];
+        assert_eq!(r["source_key_id"], "pool");
+        assert_eq!(r["source_role"], "full");
+        assert_eq!(r["authenticated"], true);
+        assert_eq!(r["stage"], "header_pow_validated");
+        assert_eq!(
+            r["hash"],
+            crate::hash::consensus_block_hash_display(&raw[..ZCASH_FULL_HEADER_SIZE])
+        );
+        assert!(r.get("peer").is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// Real UDP loopback benchmark. Not a WAN or complete consensus-block
+    /// benchmark: completion here means the final packet of one object batch.
+    #[tokio::test]
+    #[ignore = "operator benchmark; prints observed scheduling tradeoffs"]
+    async fn benchmark_forward_scheduling() {
+        for peers in [4usize, 8] {
+            for round_robin in [false, true] {
+                for trial in 0..3 {
+                    let packets = 64usize;
+                    let mut config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+                        .with_forward_pacing(16, Duration::from_millis(1))
+                        .with_authorized_keys(vec![AuthKey::new("benchmark", [1; 32])]);
+                    config.forward_round_robin = round_robin;
+                    let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+                    node.bind().await.unwrap();
+                    let started = Instant::now();
+                    let mut receivers = Vec::new();
+                    for peer in 0..peers {
+                        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                        let addr = socket.local_addr().unwrap();
+                        let key = [peer as u8 + 1; 32];
+                        node.sessions
+                            .write()
+                            .await
+                            .insert(addr, RelaySession::new(addr, format!("peer{peer}"), key));
+                        receivers.push(tokio::spawn(async move {
+                            let verifier = RelaySession::new(addr, "verify", key);
+                            let mut first = None;
+                            let mut last = 0u128;
+                            let mut seen = std::collections::HashSet::new();
+                            for _ in 0..packets {
+                                let mut buf = [0u8; 2048];
+                                let (n, _) =
+                                    timeout(Duration::from_secs(3), socket.recv_from(&mut buf))
+                                        .await
+                                        .unwrap()
+                                        .unwrap();
+                                let arrival = started.elapsed().as_micros();
+                                first.get_or_insert(arrival);
+                                last = arrival;
+                                let c = Chunk::from_bytes(&buf[..n]).unwrap();
+                                let h = &c.header;
+                                assert!(verifier.verify_hmac(
+                                    &h.block_hash,
+                                    h.chunk_id,
+                                    h.total_chunks,
+                                    h.payload_len,
+                                    &c.payload,
+                                    &h.hmac
+                                ));
+                                assert!(seen.insert(h.chunk_id));
+                            }
+                            (first.unwrap(), last)
+                        }));
+                    }
+                    let setup_us = started.elapsed().as_micros();
+                    let chunks = (0..packets)
+                        .map(|i| (i as u16, vec![i as u8; 512]))
+                        .collect::<Vec<_>>();
+                    node.forward_to_peers(
+                        "127.0.0.1:1".parse().unwrap(),
+                        MessageType::Block,
+                        &[7; 32],
+                        packets as u16,
+                        0,
+                        &chunks,
+                    )
+                    .await
+                    .unwrap();
+                    let mut times = Vec::new();
+                    for r in receivers {
+                        let (a, b) = r.await.unwrap();
+                        times.push((a.saturating_sub(setup_us), b.saturating_sub(setup_us)));
+                    }
+                    assert_eq!(
+                        node.metrics().snapshot().packets_forwarded,
+                        (peers * packets) as u64
+                    );
+                    println!(
+                        "BENCH {}",
+                        serde_json::json!({"peers":peers,"packets_per_peer":packets,"round_robin":round_robin,"trial":trial,"first_packet_us":times.iter().map(|(a,_)|a).collect::<Vec<_>>(),"batch_complete_us":times.iter().map(|(_,b)|b).collect::<Vec<_>>() })
+                    );
+                }
+            }
         }
     }
 }
