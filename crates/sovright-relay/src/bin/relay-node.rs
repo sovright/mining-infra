@@ -487,6 +487,12 @@ fn config_from_env()
                 default_forward_burst_delay_micros,
             )?),
         );
+    config.forward_round_robin = match std::env::var("SOVRIGHT_RELAY_FORWARD_ROUND_ROBIN") {
+        Err(std::env::VarError::NotPresent) => false,
+        Ok(value) if value == "true" || value == "1" => true,
+        Ok(value) if value == "false" || value == "0" => false,
+        _ => return Err("SOVRIGHT_RELAY_FORWARD_ROUND_ROBIN must be true, false, 1 or 0".into()),
+    };
     config.chunk_size = env_usize("SOVRIGHT_RELAY_CHUNK_SIZE", default_chunk_size)?;
 
     Ok((config, auth_keys_resolution))

@@ -38,6 +38,35 @@ impl ArrivalSink {
         })
     }
 
+    /// Immediate authenticated peer for a validated segment-zero HEADER.
+    /// This is not a claim that this peer mined the block, that the complete
+    /// block arrived, or that forwarding/destination acceptance succeeded.
+    pub fn relay_header_received(
+        &self,
+        consensus_hash_display: &str,
+        source_key_id: &str,
+        source_role: &str,
+        authenticated: bool,
+        assembly_elapsed_ms: u64,
+    ) {
+        let observed = now_unix_ms();
+        let record = serde_json::json!({
+            "event": "relay_block_received",
+            "hash": consensus_hash_display,
+            "observed_at_unix_ms": observed,
+            "stage": "header_pow_validated",
+            "source_key_id": source_key_id,
+            "source_role": source_role,
+            "authenticated": authenticated,
+            "assembly_elapsed_ms": assembly_elapsed_ms,
+            "assembly_started_at_unix_ms_estimate": observed.saturating_sub(assembly_elapsed_ms as u128),
+        });
+        if let Ok(mut file) = self.file.lock() {
+            use std::io::Write;
+            let _ = writeln!(file, "{record}");
+        }
+    }
+
     /// Record that the relay reconstructed a PoW-valid block whose Zcash
     /// consensus block hash (display/big-endian hex) is `consensus_hash_display`.
     ///
@@ -119,5 +148,19 @@ mod tests {
         assert_eq!(contents.lines().count(), 2, "got: {contents}");
 
         let _ = fs::remove_file(path);
+    }
+    #[test]
+    fn attribution_escapes_identity_and_does_not_claim_full_block_acceptance() {
+        let path = temp_path("attribution");
+        let sink = ArrivalSink::new(&path).unwrap();
+        sink.relay_header_received("abcd", "pool\"\n", "receive_only", true, 12);
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1);
+        let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(v["source_key_id"], "pool\"\n");
+        assert_eq!(v["stage"], "header_pow_validated");
+        assert!(v.get("accepted").is_none());
+        assert_eq!(v["assembly_elapsed_ms"], 12);
+        fs::remove_file(path).unwrap();
     }
 }

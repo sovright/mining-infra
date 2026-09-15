@@ -3333,6 +3333,7 @@ dependencies = [
  "proptest",
  "rand 0.8.5",
  "reed-solomon-erasure",
+ "serde_json",
  "sha2 0.10.9",
  "siphasher",
  "socket2 0.5.10",

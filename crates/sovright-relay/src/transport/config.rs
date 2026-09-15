@@ -93,6 +93,8 @@ pub struct RelayConfig {
     pub forward_burst_packets: usize,
     /// Optional delay after each forwarded packet burst.
     pub forward_burst_delay: Duration,
+    /// Experimental packet round-robin with one aggregate pacing budget.
+    pub forward_round_robin: bool,
     /// Sustained per-source limit, in packets per second, on traffic from
     /// sources with no established session. Zero disables limiting.
     ///
@@ -120,6 +122,7 @@ impl Default for RelayConfig {
             max_sessions: 4096,
             forward_burst_packets: 0,
             forward_burst_delay: Duration::ZERO,
+            forward_round_robin: false,
             // On by default: the relay is reachable from the public internet
             // and this is the only bound on trial-verify CPU cost. Generous
             // enough that a legitimate peer authenticates on first contact.
