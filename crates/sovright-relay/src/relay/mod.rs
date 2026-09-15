@@ -3,8 +3,8 @@
 //! Provides async networking for FIBRE-style block relay.
 
 mod arrival;
-mod forwarding;
 mod client;
+mod forwarding;
 mod metrics;
 mod node;
 mod ratelimit;

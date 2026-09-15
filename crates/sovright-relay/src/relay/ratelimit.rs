@@ -156,7 +156,10 @@ mod tests {
         for i in 0..3 {
             assert!(limiter.allow_at(peer, later), "refilled token {i}");
         }
-        assert!(!limiter.allow_at(peer, later), "only 3 tokens were refilled");
+        assert!(
+            !limiter.allow_at(peer, later),
+            "only 3 tokens were refilled"
+        );
     }
 
     #[test]
