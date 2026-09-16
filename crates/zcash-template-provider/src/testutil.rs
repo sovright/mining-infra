@@ -184,17 +184,32 @@ impl TestTemplateFactory {
             00000000"
             .to_string();
 
+        // Every hash field is asymmetric, so a parser that forgets to reverse
+        // produces a different value and the test notices. They are also mutually
+        // distinct, so swapping two fields is caught as well.
+        //
+        // These defaults used to be "0".repeat(64). A reversed palindrome is
+        // itself, which is why the whole suite stayed green through #103 -- the
+        // byte-order defect that stopped the pool recognising any block it mined.
+        // Do not reintroduce a symmetric default here. See #106.
         Self {
             height: 1_000_000,
             version: 5,
             time: 1_700_000_000,
             bits: "2007ffff".to_string(),
-            prev_hash: "0".repeat(64),
-            merkle_root: "0".repeat(64),
-            chain_history_root: "0".repeat(64),
-            auth_data_root: "0".repeat(64),
-            block_commitments_hash: "0".repeat(64),
-            target: "0".repeat(64),
+            prev_hash: "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+                .to_string(),
+            merkle_root: "2122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f40"
+                .to_string(),
+            chain_history_root: "4142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60"
+                .to_string(),
+            auth_data_root: "6162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f80"
+                .to_string(),
+            block_commitments_hash:
+                "8182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0".to_string(),
+            // The big-endian expansion of mainnet nBits 0x1c00a48e: asymmetric, and a
+            // real difficulty, so no test meets it by accident and flips `is_block`.
+            target: "0000000000a48e00000000000000000000000000000000000000000000000000".to_string(),
             transactions: Vec::new(),
             coinbase_hex,
         }
@@ -278,6 +293,41 @@ impl TestTemplateFactory {
 mod tests {
     use super::*;
     use crate::header::assemble_header;
+
+    /// The factory's defaults must reach the header in internal byte order.
+    ///
+    /// Without this, the asymmetric defaults are inert: every other test built on
+    /// the factory asserts something else, or compares parser output to parser
+    /// output, so none of them would notice the bytes arriving reversed. Measured
+    /// -- with `from_hex` stripped of its reversal, swapping the defaults from
+    /// `"0".repeat(64)` to asymmetric values changed the failure count not at all
+    /// until this test existed.
+    ///
+    /// Expectations are literals decoded with `hex::decode`, never with the
+    /// parser under test, so they cannot share a bug with it. See #106.
+    #[test]
+    fn factory_defaults_land_in_internal_order() {
+        let header = assemble_header(&TestTemplateFactory::new().build())
+            .expect("assemble_header should succeed");
+
+        let internal = |s: &str| -> [u8; 32] {
+            hex::decode(s)
+                .expect("literal hex")
+                .try_into()
+                .expect("32 bytes")
+        };
+
+        assert_eq!(
+            header.prev_hash.0,
+            internal("201f1e1d1c1b1a191817161514131211100f0e0d0c0b0a090807060504030201"),
+            "prev_hash"
+        );
+        assert_eq!(
+            header.merkle_root.0,
+            internal("403f3e3d3c3b3a393837363534333231302f2e2d2c2b2a292827262524232221"),
+            "merkle_root"
+        );
+    }
 
     #[test]
     fn factory_produces_valid_header() {
