@@ -34,29 +34,35 @@ pub fn build_compact_block(
         tx_data: coinbase_data,
     }];
 
-    // Build short IDs for transactions
-    let short_ids: Vec<ShortId> = template
-        .transactions
-        .iter()
-        .filter_map(|tx| {
-            match hex::decode(&tx.hash) {
-                Ok(hash_bytes) if hash_bytes.len() == 32 => {
-                    let mut txid_bytes = [0u8; 32];
-                    txid_bytes.copy_from_slice(&hash_bytes);
-                    // Zebra returns little-endian hash, reverse for txid
-                    txid_bytes.reverse();
-                    let txid = TxId::from_bytes(txid_bytes);
-                    // Zcash v4 transactions don't have auth digest
-                    let wtxid = WtxId::new(txid, AuthDigest::from_bytes([0u8; 32]));
-                    Some(ShortId::compute(&wtxid, &header_hash, nonce))
-                }
-                _ => {
-                    warn!(tx_hash = %tx.hash, "Failed to decode transaction hash, skipping");
-                    None
-                }
+    // Short IDs for the template's transactions. Receivers key a transaction by
+    // its wtxid: the txid plus the auth digest Zebra reports for it (ZIP-244 for
+    // v5 and later, a placeholder before that), both in display order.
+    let mut short_ids = Vec::with_capacity(template.transactions.len());
+    for tx in &template.transactions {
+        let txid = match hex::decode(&tx.hash) {
+            Ok(hash_bytes) if hash_bytes.len() == 32 => {
+                let mut txid_bytes = [0u8; 32];
+                txid_bytes.copy_from_slice(&hash_bytes);
+                // Zebra reports the txid in display order; the wtxid holds it
+                // in internal order.
+                txid_bytes.reverse();
+                txid_bytes
             }
-        })
-        .collect();
+            _ => {
+                warn!(tx_hash = %tx.hash, "Failed to decode transaction hash, skipping");
+                continue;
+            }
+        };
+        // A template without the field keeps the all-zero digest this code has
+        // always used. A malformed one is an error: falling back to zero would
+        // hide exactly the mismatch the digest is there to prevent.
+        let auth_digest = match tx.authdigest.as_deref() {
+            Some(display) => decode_display_32("authdigest", display)?,
+            None => [0u8; 32],
+        };
+        let wtxid = WtxId::new(TxId::from_bytes(txid), AuthDigest::from_bytes(auth_digest));
+        short_ids.push(ShortId::compute(&wtxid, &header_hash, nonce));
+    }
 
     Ok(CompactBlock::new(header_bytes, nonce, short_ids, prefilled))
 }
@@ -68,42 +74,30 @@ fn build_header(template: &BlockTemplate) -> Result<Vec<u8>, CompactBlockError> 
     // Version (4 bytes, little-endian)
     header.extend_from_slice(&template.version.to_le_bytes());
 
-    // Previous block hash (32 bytes)
-    let prev_hash = hex::decode(&template.previous_block_hash)
-        .map_err(|_| CompactBlockError::InvalidHex("previous_block_hash".into()))?;
-    if prev_hash.len() != 32 {
-        return Err(CompactBlockError::InvalidLength(
-            "previous_block_hash".into(),
-        ));
-    }
+    // Previous block hash (32 bytes). Zebra reports it in display order.
+    let prev_hash = decode_display_32("previous_block_hash", &template.previous_block_hash)?;
     header.extend_from_slice(&prev_hash);
 
-    // Merkle root (32 bytes)
-    let merkle_root = template
-        .default_roots
-        .as_ref()
-        .map(|r| hex::decode(&r.merkle_root))
-        .transpose()
-        .map_err(|_| CompactBlockError::InvalidHex("merkle_root".into()))?
-        .unwrap_or_else(|| vec![0u8; 32]);
-    if merkle_root.len() != 32 {
-        return Err(CompactBlockError::InvalidLength("merkle_root".into()));
-    }
+    // Merkle root (32 bytes), display order; zeros when the template has no roots.
+    let merkle_root = match template.default_roots.as_ref() {
+        Some(roots) => decode_display_32("merkle_root", &roots.merkle_root)?,
+        None => [0u8; 32],
+    };
     header.extend_from_slice(&merkle_root);
 
-    // Reserved field / final sapling root (32 bytes) - use chain history root or zeros
-    let reserved = template
+    // hashBlockCommitments (32 bytes). In the NU5+ header this code builds, the
+    // field holds Zebra's `blockcommitmentshash` (display order); the chain
+    // history root is only one of its inputs. Zeros when it is absent, as for
+    // the other roots.
+    let block_commitments = match template
         .default_roots
         .as_ref()
-        .and_then(|r| r.chain_history_root.as_ref())
-        .map(hex::decode)
-        .transpose()
-        .map_err(|_| CompactBlockError::InvalidHex("chain_history_root".into()))?
-        .unwrap_or_else(|| vec![0u8; 32]);
-    if reserved.len() != 32 {
-        return Err(CompactBlockError::InvalidLength("reserved".into()));
-    }
-    header.extend_from_slice(&reserved);
+        .and_then(|roots| roots.block_commitments_hash.as_deref())
+    {
+        Some(display) => decode_display_32("block_commitments_hash", display)?,
+        None => [0u8; 32],
+    };
+    header.extend_from_slice(&block_commitments);
 
     // Time (4 bytes, little-endian)
     if template.cur_time > u32::MAX as u64 {
@@ -114,12 +108,14 @@ fn build_header(template: &BlockTemplate) -> Result<Vec<u8>, CompactBlockError> 
     }
     header.extend_from_slice(&(template.cur_time as u32).to_le_bytes());
 
-    // Bits (4 bytes)
-    let bits =
+    // nBits (4 bytes). Zebra reports it as a big-endian hex word; the header
+    // stores it little-endian.
+    let mut bits =
         hex::decode(&template.bits).map_err(|_| CompactBlockError::InvalidHex("bits".into()))?;
     if bits.len() != 4 {
         return Err(CompactBlockError::InvalidLength("bits".into()));
     }
+    bits.reverse();
     header.extend_from_slice(&bits);
 
     // Nonce (32 bytes) - placeholder for mining
@@ -136,6 +132,19 @@ fn build_header(template: &BlockTemplate) -> Result<Vec<u8>, CompactBlockError> 
 /// Compute the Zcash header hash.
 fn compute_header_hash(header: &[u8]) -> [u8; 32] {
     zcash_block_hash(header)
+}
+
+/// Decode a 32-byte hash that Zebra reports in display order (the internal
+/// bytes, reversed) into internal order. Bad hex is `InvalidHex(field)`; any
+/// other length is `InvalidLength(field)`.
+fn decode_display_32(field: &str, display_hex: &str) -> Result<[u8; 32], CompactBlockError> {
+    let bytes =
+        hex::decode(display_hex).map_err(|_| CompactBlockError::InvalidHex(field.into()))?;
+    let mut internal: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| CompactBlockError::InvalidLength(field.into()))?;
+    internal.reverse();
+    Ok(internal)
 }
 
 #[derive(Debug)]
@@ -203,6 +212,7 @@ mod tests {
             transactions: vec![crate::rpc::TemplateTransaction {
                 data: "deadbeef".to_string(),
                 hash: "aa".repeat(32),
+                authdigest: None,
                 fee: 1000,
             }],
             coinbase_txn: Some(CoinbaseTxn {

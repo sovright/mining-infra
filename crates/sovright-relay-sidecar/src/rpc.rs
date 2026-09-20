@@ -19,8 +19,12 @@ pub struct TemplateTransaction {
     /// Transaction data (hex)
     #[allow(dead_code)] // Part of API, used for full block reconstruction
     pub data: String,
-    /// Transaction hash (hex, little-endian)
+    /// Transaction ID (hex, display order: the internal bytes reversed)
     pub hash: String,
+    /// Auth digest (hex, display order): ZIP-244 for v5 and later, a
+    /// placeholder for older versions. `None` when the template has no field.
+    #[serde(default)]
+    pub authdigest: Option<String>,
     /// Transaction fee in zatoshis
     #[allow(dead_code)] // Part of API, used for fee calculations
     #[serde(default)]
@@ -59,11 +63,10 @@ pub struct CoinbaseTxn {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DefaultRoots {
-    /// Merkle root (hex)
+    /// Merkle root (hex, display order)
     #[serde(rename = "merkleroot")]
     pub merkle_root: String,
-    /// Block commitments hash (hex)
-    #[allow(dead_code)] // Part of Zebra API response
+    /// Block commitments hash (hex, display order): the header's hashBlockCommitments
     #[serde(rename = "blockcommitmentshash")]
     pub block_commitments_hash: Option<String>,
     /// Chain history root (hex)
