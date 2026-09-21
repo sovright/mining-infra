@@ -1,4 +1,6 @@
-use sovright_relay::{AuthDigest, TxId, WtxId};
+use sovright_relay::WtxId;
+#[cfg(test)]
+use sovright_relay::{AuthDigest, TxId};
 pub use sovright_relay::{TxCache, TxCacheConfig};
 
 use crate::wire::{Inventory, MSG_TX, MSG_WTX};
@@ -51,6 +53,7 @@ impl TxInventoryKey {
         Self::wtx(*wtxid.txid().as_bytes(), *wtxid.auth_digest().as_bytes())
     }
 
+    #[cfg(test)]
     pub fn to_wtxid(self) -> WtxId {
         WtxId::new(
             TxId::from_bytes(self.hash),

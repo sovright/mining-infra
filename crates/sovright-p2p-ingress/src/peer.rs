@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::hash::Hash;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,6 +46,96 @@ const _: () = assert!(PROTOCOL_VERSION >= MIN_ACCEPTABLE_REMOTE_VERSION);
 // accepts any non-banned user agent; we keep this short and identifying.
 const USER_AGENT: &str = "/sovright-p2p-ingress:0.2.0/";
 
+/// A bounded insertion-order cache. Duplicate sightings do not allocate an
+/// extra queue entry or keep an old item alive indefinitely.
+struct RecentInventory<K> {
+    keys: HashSet<K>,
+    order: VecDeque<K>,
+    limit: usize,
+}
+
+impl<K: Copy + Eq + Hash> RecentInventory<K> {
+    fn new(limit: usize) -> Self {
+        Self {
+            keys: HashSet::new(),
+            order: VecDeque::new(),
+            limit,
+        }
+    }
+
+    fn insert(&mut self, key: K) -> bool {
+        if self.keys.contains(&key) {
+            return false;
+        }
+        if self.limit > 0 {
+            if self.order.len() == self.limit {
+                self.keys
+                    .remove(&self.order.pop_front().expect("nonempty cache"));
+            }
+            self.keys.insert(key);
+            self.order.push_back(key);
+        }
+        true
+    }
+}
+
+/// Per-connection request state. Rejected inventories are never queued, and
+/// only completed requests enter the bounded recent cache. A timeout or
+/// notfound therefore permits retry without leaving lifetime history behind.
+struct RequestWindow<K> {
+    pending: VecDeque<(K, Instant)>,
+    recent: RecentInventory<K>,
+    limit: usize,
+    timeout: Duration,
+}
+
+impl<K: Copy + Eq + Hash> RequestWindow<K> {
+    fn new(limit: usize, recent_limit: usize, timeout: Duration) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            recent: RecentInventory::new(recent_limit),
+            limit,
+            timeout,
+        }
+    }
+
+    fn admit(&mut self, key: K, now: Instant) -> bool {
+        if self.pending.len() >= self.limit
+            || self.recent.keys.contains(&key)
+            || self.pending.iter().any(|(pending, _)| *pending == key)
+        {
+            return false;
+        }
+        self.pending.push_back((key, now + self.timeout));
+        true
+    }
+
+    fn remove(&mut self, key: K) -> Option<usize> {
+        let index = self
+            .pending
+            .iter()
+            .position(|(pending, _)| *pending == key)?;
+        self.pending.remove(index);
+        Some(index)
+    }
+
+    fn complete(&mut self, key: K) -> Option<usize> {
+        let index = self.remove(key)?;
+        self.recent.insert(key);
+        Some(index)
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.pending.front().map(|(_, deadline)| *deadline)
+    }
+
+    fn expire(&mut self, now: Instant) {
+        while self.deadline().is_some_and(|deadline| deadline <= now) {
+            self.pending.pop_front();
+        }
+    }
+}
+
 pub async fn run_peer(
     peer_addr: SocketAddr,
     config: Config,
@@ -73,17 +164,41 @@ pub async fn run_peer(
     let handshake_started = Instant::now();
     let mut ping_nonce = None;
     let mut ping_started = None;
-    let mut seen_inv = HashSet::new();
-    let mut requested = HashSet::new();
-    let mut pending_block_responses = VecDeque::new();
-    let mut seen_tx_inv = HashSet::new();
-    let mut requested_tx = HashSet::new();
-    let mut pending_tx_responses = VecDeque::new();
+    let limits = &config.inventory_limits;
+    let mut seen_inv = RecentInventory::new(limits.recent_entries);
+    let mut blocks = RequestWindow::new(limits.blocks, limits.recent_entries, limits.timeout);
+    let mut transactions =
+        RequestWindow::new(limits.transactions, limits.recent_entries, limits.timeout);
 
     loop {
-        let msg = timeout(Duration::from_secs(90), read_message(&mut reader))
-            .await
-            .map_err(|_| IngressError::Timeout(format!("read from {peer}")))??;
+        // Keep the same read future alive across expiry. Cancelling a partial
+        // frame read on each deadline would desynchronise the wire decoder.
+        let read = timeout(Duration::from_secs(90), read_message(&mut reader));
+        tokio::pin!(read);
+        let msg = loop {
+            let deadline = blocks
+                .deadline()
+                .into_iter()
+                .chain(transactions.deadline())
+                .min();
+            tokio::select! {
+                result = &mut read => break result
+                    .map_err(|_| IngressError::Timeout(format!("read from {peer}")))??,
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let now = Instant::now();
+                    blocks.expire(now);
+                    transactions.expire(now);
+                }
+            }
+        };
+        let now = Instant::now();
+        blocks.expire(now);
+        transactions.expire(now);
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
         match msg.command.as_str() {
@@ -145,18 +260,14 @@ pub async fn run_peer(
                 let mut tx_requests = Vec::new();
                 for inv in invs {
                     if inv.is_block() {
-                        if !seen_inv.insert(inv.hash) {
-                            continue;
+                        if seen_inv.insert(inv.hash) {
+                            let display = inventory_hash_to_display(&inv.hash);
+                            events.p2p_block_inv(&peer, &display)?;
+                            // Announcement rank remains independent of request
+                            // capacity; the crawler also deduplicates awards.
+                            crawler.score_block_announcement(peer_addr, inv.hash, &events)?;
                         }
-                        let display = inventory_hash_to_display(&inv.hash);
-                        events.p2p_block_inv(&peer, &display)?;
-                        // Rank-weighted: the Nth distinct peer to announce this
-                        // hash earns the Nth-place award. A flat per-delivery
-                        // credit cannot separate a peer that is first from one
-                        // half a second late, since both deliver every block.
-                        crawler.score_block_announcement(peer_addr, inv.hash, &events)?;
-                        if requested.insert(inv.hash) {
-                            pending_block_responses.push_back(inv.hash);
+                        if blocks.admit(inv.hash, now) {
                             block_requests.push(inv);
                         }
                     } else if inv.is_transaction()
@@ -164,10 +275,9 @@ pub async fn run_peer(
                             inv,
                             tx_cache.is_some() || tx_feed.is_some(),
                             config.tx_request_limit_per_inv,
-                            &mut seen_tx_inv,
-                            &mut requested_tx,
-                            &mut pending_tx_responses,
+                            &mut transactions,
                             &mut tx_requests,
+                            now,
                         )
                     {
                         events.p2p_tx_inv(&peer, key.kind(), &key.display_hash())?;
@@ -196,12 +306,23 @@ pub async fn run_peer(
                     }
                 }
             }
+            "notfound" => {
+                if !saw_verack {
+                    continue;
+                }
+                for inv in parse_inventory(&msg.payload)? {
+                    if inv.is_block() {
+                        blocks.remove(inv.hash);
+                    } else if let Some(key) = TxInventoryKey::from_inventory(&inv) {
+                        transactions.remove(key);
+                    }
+                }
+            }
             "block" => {
                 if !saw_verack {
                     continue;
                 }
-                let display =
-                    received_block_display_hash(&mut pending_block_responses, &msg.payload)?;
+                let display = received_block_display_hash(&mut blocks, &msg.payload)?;
                 let consensus_hash = msg
                     .payload
                     .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
@@ -254,8 +375,7 @@ pub async fn run_peer(
                 if !saw_verack {
                     continue;
                 }
-                if let Some(wtxid) = wtxid_for_received_tx(&mut pending_tx_responses, &msg.payload)
-                {
+                if let Some(wtxid) = wtxid_for_received_tx(&mut transactions, &msg.payload) {
                     let key = TxInventoryKey::from_wtxid(&wtxid);
                     if let Some(cache) = &tx_cache {
                         let outcome = cache.insert(wtxid, msg.payload.clone());
@@ -317,20 +437,15 @@ fn queue_tx_request(
     inv: Inventory,
     tx_cache_enabled: bool,
     request_limit: usize,
-    seen: &mut HashSet<TxInventoryKey>,
-    requested: &mut HashSet<TxInventoryKey>,
-    pending: &mut VecDeque<TxInventoryKey>,
+    window: &mut RequestWindow<TxInventoryKey>,
     requests: &mut Vec<Inventory>,
+    now: Instant,
 ) -> Option<TxInventoryKey> {
     if !tx_cache_enabled || requests.len() >= request_limit {
         return None;
     }
     let key = TxInventoryKey::from_inventory(&inv)?;
-    if !seen.insert(key) {
-        return None;
-    }
-    if requested.insert(key) {
-        pending.push_back(key);
+    if window.admit(key, now) {
         requests.push(key.to_inventory());
         Some(key)
     } else {
@@ -377,16 +492,16 @@ fn pong_nonce(payload: &[u8]) -> Option<u64> {
 /// worse than a cache miss, which merely costs a getblocktxn round trip. The
 /// sidecar's own mempool sync skips pre-v5 for the same reason.
 fn wtxid_for_received_tx(
-    pending_tx_responses: &mut VecDeque<TxInventoryKey>,
+    pending_tx_responses: &mut RequestWindow<TxInventoryKey>,
     payload: &[u8],
 ) -> Option<WtxId> {
     let derived = wtxid_from_tx_bytes(payload, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)?;
 
-    if let Some(index) = pending_tx_responses
-        .iter()
-        .position(|key| key.to_wtxid() == derived)
-    {
-        pending_tx_responses.remove(index);
+    let wtx_match = pending_tx_responses.complete(TxInventoryKey::from_wtxid(&derived));
+    // MSG_TX names only the txid. The payload-derived wtxid still supplies the
+    // cache identity, but also satisfies a request made using that older form.
+    let tx_match = pending_tx_responses.complete(TxInventoryKey::tx(*derived.txid().as_bytes()));
+    if let Some(index) = wtx_match.or(tx_match) {
         if index != 0 {
             warn!(
                 pending_index = index,
@@ -404,16 +519,12 @@ fn wtxid_for_received_tx(
 }
 
 fn received_block_display_hash(
-    pending_block_responses: &mut VecDeque<[u8; 32]>,
+    pending_block_responses: &mut RequestWindow<[u8; 32]>,
     block_payload: &[u8],
 ) -> Result<String> {
     let actual_inventory_hash = raw_hash_from_header(block_payload)?;
     let actual_hash = inventory_hash_to_display(&actual_inventory_hash);
-    if let Some(index) = pending_block_responses
-        .iter()
-        .position(|hash| *hash == actual_inventory_hash)
-    {
-        pending_block_responses.remove(index);
+    if let Some(index) = pending_block_responses.complete(actual_inventory_hash) {
         if index != 0 {
             warn!(
                 actual_hash,
@@ -424,7 +535,7 @@ fn received_block_display_hash(
         return Ok(actual_hash);
     }
 
-    if let Some(hash) = pending_block_responses.front() {
+    if let Some((hash, _)) = pending_block_responses.pending.front() {
         let requested_hash = inventory_hash_to_display(hash);
         warn!(
             requested_hash,
@@ -507,6 +618,14 @@ mod tests {
         out
     }
 
+    fn request_window<K: Copy + Eq + Hash>(keys: impl IntoIterator<Item = K>) -> RequestWindow<K> {
+        let mut window = RequestWindow::new(8, 16, Duration::from_secs(30));
+        for key in keys {
+            assert!(window.admit(key, Instant::now()));
+        }
+        window
+    }
+
     // NU6.3/Ironwood (mainnet height 3,428,143, 2026-07-28) moved the network to
     // protocol 170_160. We advertised 170_150 through activation: peers completed
     // the handshake and then relayed NOTHING, so block ingest went to ~zero for
@@ -549,41 +668,40 @@ mod tests {
 
     #[test]
     fn received_block_display_uses_actual_header_hash_when_pending_mismatches() {
-        let mut pending = VecDeque::new();
+        let mut pending = request_window([]);
         let mut hash = [0u8; 32];
         hash[0] = 0x5c;
         hash[31] = 0x01;
-        pending.push_back(hash);
+        assert!(pending.admit(hash, Instant::now()));
         let block_payload = vec![0u8; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let expected = display_hash_from_header(&block_payload).unwrap();
 
         let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
 
         assert_eq!(display, expected);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0], hash);
+        assert_eq!(pending.pending.len(), 1);
+        assert_eq!(pending.pending[0].0, hash);
     }
 
     #[test]
     fn received_block_display_removes_matching_out_of_order_pending_hash() {
-        let mut pending = VecDeque::new();
-        pending.push_back([0x5c; 32]);
+        let mut pending = request_window([[0x5c; 32]]);
 
         let block_payload = vec![0u8; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let actual_display = display_hash_from_header(&block_payload).unwrap();
         let actual_inventory = inventory_hash_from_display(&actual_display);
-        pending.push_back(actual_inventory);
+        assert!(pending.admit(actual_inventory, Instant::now()));
 
         let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
 
         assert_eq!(display, actual_display);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0], [0x5c; 32]);
+        assert_eq!(pending.pending.len(), 1);
+        assert_eq!(pending.pending[0].0, [0x5c; 32]);
     }
 
     #[test]
     fn received_block_display_falls_back_to_payload_header_hash_without_pending_request() {
-        let mut pending = VecDeque::new();
+        let mut pending = request_window([]);
         let block_payload = vec![0u8; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let expected = display_hash_from_header(&block_payload).unwrap();
 
@@ -606,26 +724,15 @@ mod tests {
             hash: [0x11; 32],
             auth_digest: Some([0x22; 32]),
         };
-        let mut seen = HashSet::new();
-        let mut requested = HashSet::new();
-        let mut pending = VecDeque::new();
+        let mut window = request_window([]);
         let mut requests = Vec::new();
 
-        let queued = queue_tx_request(
-            inv,
-            true,
-            1,
-            &mut seen,
-            &mut requested,
-            &mut pending,
-            &mut requests,
-        );
+        let queued = queue_tx_request(inv, true, 1, &mut window, &mut requests, Instant::now());
 
         let key = TxInventoryKey::wtx([0x11; 32], [0x22; 32]);
         assert_eq!(queued, Some(key));
-        assert!(seen.contains(&key));
-        assert!(requested.contains(&key));
-        assert_eq!(pending.pop_front(), Some(key));
+        assert_eq!(window.pending.len(), 1);
+        assert_eq!(window.pending[0].0, key);
         assert_eq!(requests, vec![inv]);
     }
 
@@ -636,33 +743,15 @@ mod tests {
             hash: [0x33; 32],
             auth_digest: None,
         };
-        let mut seen = HashSet::new();
-        let mut requested = HashSet::new();
-        let mut pending = VecDeque::new();
+        let mut window = request_window([]);
         let mut requests = Vec::new();
 
         assert_eq!(
-            queue_tx_request(
-                inv,
-                false,
-                1,
-                &mut seen,
-                &mut requested,
-                &mut pending,
-                &mut requests,
-            ),
+            queue_tx_request(inv, false, 1, &mut window, &mut requests, Instant::now(),),
             None
         );
         assert_eq!(
-            queue_tx_request(
-                inv,
-                true,
-                0,
-                &mut seen,
-                &mut requested,
-                &mut pending,
-                &mut requests,
-            ),
+            queue_tx_request(inv, true, 0, &mut window, &mut requests, Instant::now(),),
             None
         );
     }
@@ -713,7 +802,7 @@ mod tests {
     #[test]
     fn a_tx_is_keyed_by_its_own_payload_not_the_front_of_the_queue() {
         let other = TxInventoryKey::tx([0x77; 32]);
-        let mut pending = VecDeque::from(vec![other, TxInventoryKey::from_wtxid(&v6_wtxid())]);
+        let mut pending = request_window([other, TxInventoryKey::from_wtxid(&v6_wtxid())]);
 
         let keyed = wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
 
@@ -731,15 +820,17 @@ mod tests {
     #[test]
     fn an_out_of_order_tx_removes_its_own_pending_entry() {
         let still_outstanding = TxInventoryKey::tx([0x77; 32]);
-        let mut pending = VecDeque::from(vec![
-            still_outstanding,
-            TxInventoryKey::from_wtxid(&v6_wtxid()),
-        ]);
+        let mut pending =
+            request_window([still_outstanding, TxInventoryKey::from_wtxid(&v6_wtxid())]);
 
         wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
 
         assert_eq!(
-            pending.iter().copied().collect::<Vec<_>>(),
+            pending
+                .pending
+                .iter()
+                .map(|(key, _)| *key)
+                .collect::<Vec<_>>(),
             vec![still_outstanding],
             "only the matching request should be consumed"
         );
@@ -751,15 +842,16 @@ mod tests {
     #[test]
     fn a_skipped_response_does_not_desynchronise_later_ones() {
         let never_answered = TxInventoryKey::tx([0x99; 32]);
-        let mut pending = VecDeque::from(vec![
-            never_answered,
-            TxInventoryKey::from_wtxid(&v6_wtxid()),
-        ]);
+        let mut pending = request_window([never_answered, TxInventoryKey::from_wtxid(&v6_wtxid())]);
 
         let keyed = wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
 
         assert_eq!(keyed, v6_wtxid());
-        assert_eq!(pending.len(), 1, "the unanswered request stays outstanding");
+        assert_eq!(
+            pending.pending.len(),
+            1,
+            "the unanswered request stays outstanding"
+        );
     }
 
     /// Pre-v5 has no auth digest, so no wtxid can be derived. Caching it under
@@ -767,26 +859,443 @@ mod tests {
     /// getblocktxn round trip, a wrong key costs a whole block.
     #[test]
     fn a_pre_v5_payload_is_not_cached_under_a_guess() {
-        let mut pending = VecDeque::from(vec![TxInventoryKey::tx([0x77; 32])]);
+        let mut pending = request_window([TxInventoryKey::tx([0x77; 32])]);
         // v4 transaction prefix: parses, but carries no auth digest.
         let v4 = vec![0x04, 0x00, 0x00, 0x80, 0x01, 0x02, 0x03];
         assert!(wtxid_for_received_tx(&mut pending, &v4).is_none());
-        assert_eq!(pending.len(), 1, "the request stays outstanding");
+        assert_eq!(pending.pending.len(), 1, "the request stays outstanding");
     }
 
     #[test]
     fn a_malformed_payload_is_not_cached_under_a_guess() {
-        let mut pending = VecDeque::from(vec![TxInventoryKey::tx([0x77; 32])]);
+        let mut pending = request_window([TxInventoryKey::tx([0x77; 32])]);
         assert!(wtxid_for_received_tx(&mut pending, &[0xff, 0xff, 0xff]).is_none());
-        assert_eq!(pending.len(), 1);
+        assert_eq!(pending.pending.len(), 1);
     }
 
     /// An unsolicited transaction still identifies itself, so it is cached
     /// rather than discarded -- we may need it, and its key cannot be wrong.
     #[test]
     fn an_unsolicited_tx_is_still_keyed_by_its_payload() {
-        let mut pending = VecDeque::new();
+        let mut pending = request_window([]);
         let keyed = wtxid_for_received_tx(&mut pending, &v6_tx()).expect("v6 keys");
         assert_eq!(keyed, v6_wtxid());
+    }
+
+    fn peer_test_config() -> Config {
+        Config {
+            seeds: Vec::new(),
+            peers: Vec::new(),
+            max_peers: 1,
+            connect_timeout: Duration::from_secs(5),
+            peer_runtime: Duration::ZERO,
+            crawler_enabled: false,
+            crawler_max_known_peers: 1,
+            crawler_max_addr_per_message: 1,
+            crawler_drain_interval: Duration::from_secs(1),
+            rotation_enabled: false,
+            rotation_cooldown: Duration::ZERO,
+            rotation_failure_cooldown: Duration::ZERO,
+            accept_nonstandard_ports: true,
+            excluded_peer_ips: HashSet::new(),
+            peer_scoring_enabled: false,
+            peer_score_block_inv: 5,
+            peer_score_block_first: 100,
+            peer_score_block_second: 50,
+            peer_score_block_third: 25,
+            peer_score_half_life: Duration::from_secs(3600),
+            peer_score_block_received: 25,
+            peer_score_relay_forwarded: 10,
+            peer_score_error: -50,
+            tx_cache_enabled: true,
+            tx_cache_max_entries: 8,
+            tx_cache_max_bytes: 4096,
+            tx_cache_max_tx_bytes: 4096,
+            tx_feed_addr: None,
+            tx_request_limit_per_inv: 256,
+            inventory_limits: Default::default(),
+            event_log: None,
+            relay_peers: Vec::new(),
+            relay_bind_addr: "127.0.0.1:0".parse().unwrap(),
+            relay_auth_key: None,
+            relay_data_shards: 10,
+            relay_parity_shards: 3,
+            relay_adaptive_fec: false,
+            relay_send_burst_packets: 0,
+            relay_send_burst_delay_micros: 0,
+            relay_compact_from_tx_cache: false,
+            relay_skeleton_first: false,
+            relay_raw_fallback_with_tx_cache: false,
+            relay_raw_segment_send_rounds: 1,
+            relay_raw_segment_round_delay_millis: 0,
+            relay_forward_dedup_window: Duration::from_secs(30),
+            relay_forward_dedup_capacity: 64,
+            submitblock_rpc: None,
+        }
+    }
+
+    struct TestPeer {
+        stream: TcpStream,
+        task: tokio::task::JoinHandle<Result<()>>,
+        log: std::path::PathBuf,
+    }
+
+    impl Drop for TestPeer {
+        fn drop(&mut self) {
+            self.task.abort();
+            let _ = fs::remove_file(&self.log);
+        }
+    }
+
+    impl TestPeer {
+        async fn start(name: &str, config: Config) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let log = temp_log_path(name);
+            let events = EventSink::new(Some(log.clone())).unwrap();
+            let crawler = Crawler::new(&config, [address]);
+            let cache = TxCache::new(crate::tx_cache::TxCacheConfig {
+                max_entries: 8,
+                max_bytes: 4096,
+                max_tx_bytes: 4096,
+            });
+            let task = tokio::spawn(run_peer(
+                address,
+                config,
+                events,
+                None,
+                Some(cache),
+                None,
+                crawler,
+            ));
+            let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
+                .await
+                .unwrap()
+                .unwrap();
+            stream.set_nodelay(true).unwrap();
+            assert_eq!(read_message(&mut stream).await.unwrap().command, "version");
+            write_message(&mut stream, "version", &version_payload(address))
+                .await
+                .unwrap();
+            write_message(&mut stream, "verack", &[]).await.unwrap();
+            let mut peer = Self { stream, task, log };
+            assert!(peer.barrier().await.is_empty());
+            peer
+        }
+
+        // The pong is ordered after processing all preceding messages, so a
+        // missing getdata is observable without a timing-dependent sleep.
+        async fn barrier(&mut self) -> Vec<Inventory> {
+            write_message(&mut self.stream, "ping", &42u64.to_le_bytes())
+                .await
+                .unwrap();
+            timeout(Duration::from_secs(5), async {
+                let mut requests = Vec::new();
+                loop {
+                    let message = read_message(&mut self.stream).await.unwrap();
+                    match message.command.as_str() {
+                        "getdata" => requests.extend(parse_inventory(&message.payload).unwrap()),
+                        "pong" => return requests,
+                        _ => {}
+                    }
+                }
+            })
+            .await
+            .unwrap()
+        }
+
+        async fn announce(&mut self, items: &[Inventory]) -> Vec<Inventory> {
+            write_message(&mut self.stream, "inv", &encode_inventory(items))
+                .await
+                .unwrap();
+            self.barrier().await
+        }
+    }
+
+    fn numbered_inventory(inv_type: u32, number: u64) -> Inventory {
+        let mut hash = [0; 32];
+        hash[..8].copy_from_slice(&number.to_le_bytes());
+        Inventory {
+            inv_type,
+            hash,
+            auth_digest: (inv_type == MSG_WTX).then_some([0x42; 32]),
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_block_inventory_without_responses_has_a_per_peer_bound() {
+        let mut peer = TestPeer::start("block-flood", peer_test_config()).await;
+        let mut requested = 0;
+        for batch in 0..8 {
+            let invs: Vec<_> = (0..256)
+                .map(|n| numbered_inventory(crate::wire::MSG_BLOCK, batch * 256 + n))
+                .collect();
+            requested += peer.announce(&invs).await.len();
+            assert!(
+                requested <= 128,
+                "unanswered block requests grew to {requested}"
+            );
+        }
+        assert_eq!(requested, 128);
+    }
+
+    #[tokio::test]
+    async fn fresh_transaction_inventory_without_responses_has_a_per_peer_bound() {
+        let mut peer = TestPeer::start("tx-flood", peer_test_config()).await;
+        let mut requested = 0;
+        for batch in 0..8 {
+            let invs: Vec<_> = (0..256)
+                .map(|n| numbered_inventory(MSG_WTX, batch * 256 + n))
+                .collect();
+            requested += peer.announce(&invs).await.len();
+            assert!(
+                requested <= 1024,
+                "unanswered tx requests grew to {requested}"
+            );
+        }
+        assert_eq!(requested, 1024);
+    }
+
+    #[tokio::test]
+    async fn notfound_releases_block_and_transaction_requests_for_retry() {
+        let mut peer = TestPeer::start("notfound", peer_test_config()).await;
+        let invs = [
+            numbered_inventory(crate::wire::MSG_BLOCK, 1),
+            numbered_inventory(MSG_WTX, 2),
+        ];
+        assert_eq!(peer.announce(&invs).await, invs);
+        assert!(
+            peer.announce(&invs).await.is_empty(),
+            "duplicates must not request twice"
+        );
+        write_message(&mut peer.stream, "notfound", &encode_inventory(&invs))
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.announce(&invs).await,
+            invs,
+            "notfound must release all correlated request state"
+        );
+    }
+
+    #[test]
+    fn floods_do_not_retain_rejected_inventory_or_grow_recent_caches() {
+        // Exercise the same window for both block hashes and transaction keys.
+        fn check<K: Copy + Eq + Hash>(key: impl Fn(u64) -> K) {
+            let now = Instant::now();
+            let mut window = RequestWindow::new(2, 3, Duration::from_secs(30));
+            let mut announcements = RecentInventory::new(3);
+            for n in 0..10_000 {
+                announcements.insert(key(n));
+                assert_eq!(window.admit(key(n), now), n < 2);
+                assert!(window.pending.len() <= 2);
+                assert!(announcements.keys.len() <= 3);
+                assert!(announcements.order.len() <= 3);
+            }
+            assert!(
+                window.recent.keys.is_empty(),
+                "rejected requests leave no history"
+            );
+            assert!(window.recent.order.is_empty());
+            assert_eq!(window.remove(key(0)), Some(0));
+            assert_eq!(window.remove(key(1)), Some(0));
+            for n in 0..10_000 {
+                assert!(window.admit(key(n), now));
+                assert_eq!(window.complete(key(n)), Some(0));
+                assert!(
+                    !window.admit(key(n), now),
+                    "completed duplicates stay suppressed"
+                );
+                assert!(window.recent.keys.len() <= 3);
+                assert!(window.recent.order.len() <= 3);
+            }
+            assert!(
+                window.admit(key(0), now),
+                "old completed history is evicted"
+            );
+        }
+        check(|n| numbered_inventory(crate::wire::MSG_BLOCK, n).hash);
+        check(|n| TxInventoryKey::from_inventory(&numbered_inventory(MSG_WTX, n)).unwrap());
+    }
+
+    #[test]
+    fn duplicate_inventory_does_not_extend_deadlines_or_consume_capacity() {
+        let now = Instant::now();
+        let mut window = RequestWindow::new(2, 1, Duration::from_secs(30));
+        assert!(window.admit(1, now));
+        for _ in 0..10_000 {
+            assert!(!window.admit(1, now + Duration::from_secs(29)));
+        }
+        assert!(window.admit(2, now + Duration::from_secs(1)));
+        window.expire(now + Duration::from_secs(29));
+        assert_eq!(window.pending.len(), 2);
+        window.expire(now + Duration::from_secs(30));
+        assert_eq!(window.pending.len(), 1);
+        assert_eq!(window.pending[0].0, 2);
+        assert!(window.admit(1, now + Duration::from_secs(30)));
+        assert!(!window.admit(3, now + Duration::from_secs(30)));
+        window.expire(now + Duration::from_secs(31));
+        assert!(window.admit(3, now + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn zero_request_and_recent_limits_do_not_retain_state() {
+        let now = Instant::now();
+        let mut disabled = RequestWindow::new(0, 0, Duration::from_secs(30));
+        assert!(!disabled.admit(1, now));
+        assert!(disabled.pending.is_empty());
+        let mut uncached = RequestWindow::new(1, 0, Duration::from_secs(30));
+        assert!(uncached.admit(1, now));
+        uncached.complete(1);
+        assert!(uncached.recent.keys.is_empty());
+        assert!(uncached.recent.order.is_empty());
+        assert!(uncached.admit(1, now));
+    }
+
+    #[test]
+    fn tx_response_releases_both_inventory_forms_without_guessing_identity() {
+        let derived = v6_wtxid();
+        let tx = TxInventoryKey::tx(*derived.txid().as_bytes());
+        let wtx = TxInventoryKey::from_wtxid(&derived);
+        let unrelated = TxInventoryKey::tx([0x88; 32]);
+        let mut window = request_window([unrelated, tx, wtx]);
+        assert_eq!(wtxid_for_received_tx(&mut window, &v6_tx()), Some(derived));
+        assert_eq!(window.pending.len(), 1);
+        assert_eq!(window.pending[0].0, unrelated);
+        assert!(!window.admit(tx, Instant::now()));
+        assert!(!window.admit(wtx, Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn responses_and_notfound_release_only_matching_slots() {
+        let mut config = peer_test_config();
+        config.inventory_limits.blocks = 2;
+        config.inventory_limits.transactions = 2;
+        let mut peer = TestPeer::start("matching-slots", config).await;
+        let payload = vec![0; sovright_relay::ZCASH_FULL_HEADER_SIZE];
+        let block = Inventory {
+            inv_type: crate::wire::MSG_BLOCK,
+            hash: raw_hash_from_header(&payload).unwrap(),
+            auth_digest: None,
+        };
+        let tx = TxInventoryKey::from_wtxid(&v6_wtxid()).to_inventory();
+        let unanswered = [
+            numbered_inventory(crate::wire::MSG_BLOCK, 7),
+            numbered_inventory(MSG_WTX, 8),
+        ];
+        let answered = [block, tx];
+        assert_eq!(peer.announce(&unanswered).await, unanswered);
+        assert_eq!(peer.announce(&answered).await, answered);
+        let fresh = [
+            numbered_inventory(crate::wire::MSG_BLOCK, 9),
+            numbered_inventory(MSG_WTX, 10),
+        ];
+        assert!(peer.announce(&fresh).await.is_empty());
+        write_message(&mut peer.stream, "notfound", &encode_inventory(&fresh))
+            .await
+            .unwrap();
+        assert!(
+            peer.announce(&fresh).await.is_empty(),
+            "unsolicited notfound must not free a slot"
+        );
+        write_message(&mut peer.stream, "block", &payload)
+            .await
+            .unwrap();
+        write_message(&mut peer.stream, "tx", &v6_tx())
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.announce(&fresh).await,
+            fresh,
+            "out-of-order responses must free their own slots"
+        );
+        assert!(peer.announce(&unanswered).await.is_empty());
+        write_message(&mut peer.stream, "notfound", &encode_inventory(&fresh))
+            .await
+            .unwrap();
+        assert!(
+            peer.announce(&answered).await.is_empty(),
+            "recently completed responses stay deduplicated"
+        );
+        assert_eq!(peer.announce(&fresh).await, fresh);
+    }
+
+    #[tokio::test]
+    async fn expiry_during_partial_frame_keeps_decoder_and_both_request_windows_usable() {
+        use tokio::io::AsyncWriteExt;
+        let mut config = peer_test_config();
+        config.inventory_limits.blocks = 1;
+        config.inventory_limits.transactions = 1;
+        config.inventory_limits.timeout = Duration::from_millis(50);
+        let mut peer = TestPeer::start("partial-expiry", config).await;
+        let invs = [
+            numbered_inventory(crate::wire::MSG_BLOCK, 1),
+            numbered_inventory(MSG_WTX, 2),
+        ];
+        assert_eq!(peer.announce(&invs).await, invs);
+        let mut frame = Vec::new();
+        write_message(&mut frame, "inv", &encode_inventory(&invs))
+            .await
+            .unwrap();
+        peer.stream.write_all(&frame[..25]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        peer.stream.write_all(&frame[25..]).await.unwrap();
+        assert_eq!(
+            peer.barrier().await,
+            invs,
+            "expiry must release both requests without cancelling a partial read"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnect_discards_request_state_before_a_new_connection() {
+        use tokio::io::AsyncWriteExt;
+        let config = peer_test_config();
+        let invs = [
+            numbered_inventory(crate::wire::MSG_BLOCK, 1),
+            numbered_inventory(MSG_WTX, 2),
+        ];
+        let mut first = TestPeer::start("disconnect-first", config.clone()).await;
+        assert_eq!(first.announce(&invs).await, invs);
+        first.stream.shutdown().await.unwrap();
+        assert!(
+            timeout(Duration::from_secs(5), &mut first.task)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        let mut second = TestPeer::start("disconnect-second", config).await;
+        assert_eq!(second.announce(&invs).await, invs);
+    }
+
+    #[tokio::test]
+    async fn full_request_window_preserves_announcement_scoring() {
+        let mut config = peer_test_config();
+        config.inventory_limits.blocks = 1;
+        config.peer_scoring_enabled = true;
+        let mut peer = TestPeer::start("score-full-window", config).await;
+        let invs = [
+            numbered_inventory(crate::wire::MSG_BLOCK, 1),
+            numbered_inventory(crate::wire::MSG_BLOCK, 2),
+        ];
+        assert_eq!(peer.announce(&invs).await, invs[..1]);
+        assert!(peer.announce(&invs).await.is_empty());
+        let rows: Vec<serde_json::Value> = fs::read_to_string(&peer.log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let scores: Vec<_> = rows
+            .iter()
+            .filter(|row| row["event"] == "p2p_peer_score")
+            .collect();
+        assert_eq!(
+            scores.len(),
+            2,
+            "both announcements earn their rank award, duplicates earn none"
+        );
+        assert_eq!(scores[0]["score"], 100);
+        assert_eq!(scores[1]["score"], 200);
     }
 }

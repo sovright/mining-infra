@@ -13,6 +13,27 @@ const DENIED_PEER_PORTS: &[u16] = &[16_125, 26_125];
 
 const DEFAULT_SUBMITBLOCK_MAX_BLOCK_BYTES: usize = 4 * 1024 * 1024;
 
+/// Per-peer inventory memory and response deadlines. Requests beyond these
+/// limits are dropped and can be reconsidered on a later announcement.
+#[derive(Debug, Clone)]
+pub struct InventoryLimits {
+    pub blocks: usize,
+    pub transactions: usize,
+    pub recent_entries: usize,
+    pub timeout: Duration,
+}
+
+impl Default for InventoryLimits {
+    fn default() -> Self {
+        Self {
+            blocks: 128,
+            transactions: 1024,
+            recent_entries: 4096,
+            timeout: Duration::from_secs(30),
+        }
+    }
+}
+
 /// Optional loopback JSON-RPC front door for pool-originated solved blocks.
 ///
 /// The pool sends its normal `submitblock` request here. The ingress starts
@@ -70,6 +91,7 @@ pub struct Config {
     pub tx_cache_max_tx_bytes: usize,
     pub tx_feed_addr: Option<SocketAddr>,
     pub tx_request_limit_per_inv: usize,
+    pub inventory_limits: InventoryLimits,
     pub event_log: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
@@ -139,6 +161,26 @@ impl Config {
         let tx_cache_max_tx_bytes = env_usize("SOVRIGHT_P2P_TX_CACHE_MAX_TX_BYTES", 2_097_152)?;
         let tx_feed_addr = env_optional_socket("SOVRIGHT_P2P_TX_FEED_ADDR")?;
         let tx_request_limit_per_inv = env_usize("SOVRIGHT_P2P_TX_REQUEST_LIMIT_PER_INV", 256)?;
+        let defaults = InventoryLimits::default();
+        let inventory_limits = InventoryLimits {
+            blocks: env_usize("SOVRIGHT_P2P_MAX_PENDING_BLOCKS", defaults.blocks)?,
+            transactions: env_usize("SOVRIGHT_P2P_MAX_PENDING_TXS", defaults.transactions)?,
+            recent_entries: env_usize(
+                "SOVRIGHT_P2P_RECENT_INVENTORY_ENTRIES",
+                defaults.recent_entries,
+            )?,
+            timeout: Duration::from_secs(env_u64(
+                "SOVRIGHT_P2P_REQUEST_TIMEOUT_SECS",
+                defaults.timeout.as_secs(),
+            )?),
+        };
+        if inventory_limits.timeout.is_zero()
+            || inventory_limits.timeout > Duration::from_secs(3600)
+        {
+            return Err(IngressError::Config(
+                "SOVRIGHT_P2P_REQUEST_TIMEOUT_SECS must be between 1 and 3600".to_string(),
+            ));
+        }
         let event_log = env::var("SOVRIGHT_P2P_EVENT_LOG").ok().map(PathBuf::from);
         let relay_peers = env_socket_csv("SOVRIGHT_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("SOVRIGHT_P2P_RELAY_BIND_ADDR")
@@ -213,6 +255,7 @@ impl Config {
             tx_cache_max_tx_bytes,
             tx_feed_addr,
             tx_request_limit_per_inv,
+            inventory_limits,
             event_log,
             relay_peers,
             relay_bind_addr,
@@ -474,6 +517,40 @@ mod tests {
     fn seed_socket_adds_default_port() {
         assert_eq!(seed_socket("dnsseed.z.cash"), "dnsseed.z.cash:8233");
         assert_eq!(seed_socket("127.0.0.1:8233"), "127.0.0.1:8233");
+    }
+
+    #[test]
+    fn parses_per_peer_inventory_limits() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_MAX_PENDING_BLOCKS", "3".to_string()),
+            ("SOVRIGHT_P2P_MAX_PENDING_TXS", "7".to_string()),
+            ("SOVRIGHT_P2P_RECENT_INVENTORY_ENTRIES", "11".to_string()),
+            ("SOVRIGHT_P2P_REQUEST_TIMEOUT_SECS", "13".to_string()),
+        ]);
+        let limits = Config::from_env().unwrap().inventory_limits;
+        assert_eq!(limits.blocks, 3);
+        assert_eq!(limits.transactions, 7);
+        assert_eq!(limits.recent_entries, 11);
+        assert_eq!(limits.timeout, Duration::from_secs(13));
+    }
+
+    #[test]
+    fn rejects_invalid_inventory_request_timeouts() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for timeout in ["0", "3601", "18446744073709551615"] {
+            let _guard = EnvGuard::set(&[
+                ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+                ("SOVRIGHT_P2P_REQUEST_TIMEOUT_SECS", timeout.to_string()),
+            ]);
+            assert!(
+                Config::from_env()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("SOVRIGHT_P2P_REQUEST_TIMEOUT_SECS")
+            );
+        }
     }
 
     #[test]

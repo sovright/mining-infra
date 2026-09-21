@@ -501,6 +501,7 @@ mod tests {
             tx_cache_max_tx_bytes: 2_097_152,
             tx_feed_addr: None,
             tx_request_limit_per_inv: 256,
+            inventory_limits: Default::default(),
             event_log: None::<PathBuf>,
             relay_peers: Vec::new(),
             relay_bind_addr: "0.0.0.0:0".parse().unwrap(),
