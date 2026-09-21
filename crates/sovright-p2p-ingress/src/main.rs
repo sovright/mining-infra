@@ -100,14 +100,25 @@ async fn main() -> Result<()> {
                 let _ = handle.await;
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
-            return Ok(());
+            return Err(peers_exhausted(&crawler));
         }
 
         tokio::time::sleep(config.crawler_drain_interval).await;
     }
 
     tokio::time::sleep(Duration::from_secs(5)).await;
-    Ok(())
+    Err(peers_exhausted(&crawler))
+}
+
+/// The ingress reaches this only when no peer task is left and none can be
+/// started. That is a failure of the daemon's one job, so it must not look like
+/// a successful run: under a process supervisor an exit status of 0 is reported
+/// as a normal completion, which hides the outage from anything watching.
+fn peers_exhausted(crawler: &Crawler) -> error::IngressError {
+    error::IngressError::PeersExhausted(format!(
+        "no peer connection remains out of {} known peers",
+        crawler.known_len()
+    ))
 }
 
 fn spawn_peer(

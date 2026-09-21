@@ -16,6 +16,9 @@ pub enum IngressError {
 
     #[error("relay error: {0}")]
     Relay(String),
+
+    #[error("peers exhausted: {0}")]
+    PeersExhausted(String),
 }
 
 pub type Result<T> = std::result::Result<T, IngressError>;
