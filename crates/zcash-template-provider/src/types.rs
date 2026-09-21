@@ -18,16 +18,6 @@ impl Hash256 {
         Ok(Self(bytes))
     }
 
-    /// Parse from internal-order hex, without reversing.
-    ///
-    /// Only for hex that is already in internal byte order. No `getblocktemplate`
-    /// field is: Zebra sends those in display order, which `from_hex` reads.
-    pub fn from_hex_le(s: &str) -> Result<Self, hex::FromHexError> {
-        let mut bytes = [0u8; 32];
-        hex::decode_to_slice(s, &mut bytes)?;
-        Ok(Self(bytes))
-    }
-
     /// Encode as display-order hex (big-endian, reversed from internal).
     pub fn to_hex(&self) -> String {
         let mut bytes = self.0;
@@ -167,9 +157,8 @@ pub struct BlockTemplate {
 mod tests {
     use super::*;
 
-    // An asymmetric value, so the two byte orders cannot coincide: internal bytes
-    // 00 01 02 .. 1f.
-    const INTERNAL_HEX: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    // An asymmetric value, so the two byte orders cannot coincide. The internal
+    // bytes are 00 01 02 .. 1f; this is their display-order hex.
     const DISPLAY_HEX: &str = "1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100";
 
     fn internal_bytes() -> [u8; 32] {
@@ -183,14 +172,6 @@ mod tests {
     #[test]
     fn from_hex_reverses_display_order_into_internal_order() {
         assert_eq!(Hash256::from_hex(DISPLAY_HEX).unwrap().0, internal_bytes());
-    }
-
-    #[test]
-    fn from_hex_le_reads_internal_order_verbatim() {
-        assert_eq!(
-            Hash256::from_hex_le(INTERNAL_HEX).unwrap().0,
-            internal_bytes()
-        );
     }
 
     #[test]
@@ -208,35 +189,26 @@ mod tests {
 
     /// One case per `hex::FromHexError` variant `decode_to_slice` can return.
     #[test]
-    fn malformed_hex_is_rejected_by_both_parsers() {
-        type Parser = fn(&str) -> Result<Hash256, hex::FromHexError>;
-        let parsers: [(&str, Parser); 2] = [
-            ("from_hex", Hash256::from_hex),
-            ("from_hex_le", Hash256::from_hex_le),
-        ];
-        let bad_char = format!("g{}", "0".repeat(63));
-
-        for (name, parse) in parsers {
-            assert_eq!(
-                parse(&"0".repeat(63)),
-                Err(hex::FromHexError::OddLength),
-                "{name}: 63 chars"
-            );
-            assert_eq!(
-                parse(&"0".repeat(62)),
-                Err(hex::FromHexError::InvalidStringLength),
-                "{name}: 62 chars"
-            );
-            assert_eq!(
-                parse(&"0".repeat(66)),
-                Err(hex::FromHexError::InvalidStringLength),
-                "{name}: 66 chars"
-            );
-            assert_eq!(
-                parse(&bad_char),
-                Err(hex::FromHexError::InvalidHexCharacter { c: 'g', index: 0 }),
-                "{name}: non-hex character"
-            );
-        }
+    fn malformed_hex_is_rejected() {
+        assert_eq!(
+            Hash256::from_hex(&"0".repeat(63)),
+            Err(hex::FromHexError::OddLength),
+            "63 chars"
+        );
+        assert_eq!(
+            Hash256::from_hex(&"0".repeat(62)),
+            Err(hex::FromHexError::InvalidStringLength),
+            "62 chars"
+        );
+        assert_eq!(
+            Hash256::from_hex(&"0".repeat(66)),
+            Err(hex::FromHexError::InvalidStringLength),
+            "66 chars"
+        );
+        assert_eq!(
+            Hash256::from_hex(&format!("g{}", "0".repeat(63))),
+            Err(hex::FromHexError::InvalidHexCharacter { c: 'g', index: 0 }),
+            "non-hex character"
+        );
     }
 }

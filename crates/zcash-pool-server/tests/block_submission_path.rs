@@ -738,9 +738,9 @@ fn mainnet_template_target_makes_is_block_fire() {
     let share = mainnet_share();
     let processor = ShareProcessor::new();
 
-    // The old behaviour, reconstructed without depending on `from_hex_le`: reading the
-    // hex without reversing is exactly the reversal of reading it with. #103 was this
-    // value reaching the gate, which rejects every real block.
+    // The old behaviour: reading the hex without reversing is exactly the reversal of
+    // reading it with. #103 was this value reaching the gate, which rejects every real
+    // block. Written out rather than calling the old parser, which no longer exists.
     let mut unreversed = parsed.0;
     unreversed.reverse();
 
