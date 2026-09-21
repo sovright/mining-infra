@@ -114,7 +114,7 @@ struct Args {
     #[arg(long, default_value = "128")]
     raw_segment_max_incomplete_blocks: usize,
 
-    /// Maximum total raw segment payload bytes to hold in memory
+    /// Raw segment buffer byte budget, including payloads, slots and entries
     #[arg(long, default_value = "67108864")]
     raw_segment_max_payload_bytes: usize,
 
@@ -397,7 +397,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Duration::from_micros(send_burst_delay_micros),
     )?;
     relay.init().await?;
-    if receive_relay_blocks {
+    let relay_block_handler = if receive_relay_blocks {
         let receiver = relay.start_with_receiver().await?;
         let mode = if enable_submitblock {
             SubmitBlockMode::Live
@@ -425,7 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             (None, None)
         };
 
-        spawn_relay_block_handler(
+        Some(spawn_relay_block_handler(
             receiver,
             Arc::clone(&rpc),
             Arc::clone(&submitter),
@@ -436,16 +436,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::clone(&mempool),
             gate,
             chain_view,
-        );
+        ))
     } else {
         relay.start().await?;
-    }
+        None
+    };
+    // A stopped receive/submit task must not leave an apparently healthy sidecar.
+    let handler_exit = async move {
+        match relay_block_handler {
+            Some(handler) => match handler.await {
+                Ok(()) => std::io::Error::other("relay block handler stopped"),
+                Err(error) => std::io::Error::other(error),
+            },
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(handler_exit);
     let relay = Arc::new(relay);
 
     if !announce_templates {
         info!("Template announcements disabled; sidecar running relay receive only");
-        std::future::pending::<()>().await;
-        return Ok(());
+        return Err(handler_exit.await.into());
     }
 
     // Create template channel
@@ -465,7 +476,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     );
 
     // Main loop: receive template updates and announce
-    while let Some(update) = rx.recv().await {
+    loop {
+        let update = tokio::select! {
+            update = rx.recv() => match update {
+                Some(update) => update,
+                None => break,
+            },
+            error = &mut handler_exit => return Err(error.into()),
+        };
         match build_compact_block(&update.template, 0) {
             Ok(compact) => {
                 let tx_count = compact.tx_count();
@@ -667,7 +685,8 @@ fn spawn_relay_block_handler<M>(
     mempool: Arc<M>,
     gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
     chain_view: Option<Arc<ZebraChainView>>,
-) where
+) -> tokio::task::JoinHandle<()>
+where
     M: MempoolProvider + Send + Sync + 'static,
 {
     tokio::spawn(async move {
@@ -818,6 +837,11 @@ fn spawn_relay_block_handler<M>(
                                     let completed_segments = segments.len();
                                      match reassemble_raw_block(&segments) {
                                          Ok(raw_block) => {
+                                             let Some(header) = raw_block.get(..ZCASH_FULL_HEADER_SIZE) else {
+                                                 metrics.inc_raw_segment_reassembly_failures();
+                                                 warn!(raw_block_bytes = raw_block.len(), "Relay raw block is shorter than its header");
+                                                 continue;
+                                             };
                                              info!(
                                                  block_hash = %hex::encode(block_hash),
                                                  segment_count = completed_segments,
@@ -827,7 +851,7 @@ fn spawn_relay_block_handler<M>(
                                              // Dedup against compact/skeleton paths: the
                                              // consensus block hash is the shared key.
                                              let raw_block_hash =
-                                                 hex::encode(zcash_block_hash(&raw_block[..ZCASH_FULL_HEADER_SIZE]));
+                                                 hex::encode(zcash_block_hash(header));
                                              if fast_path_dedup.contains(&raw_block_hash, Instant::now())
                                              {
                                                  debug!(
@@ -938,7 +962,7 @@ fn spawn_relay_block_handler<M>(
                 }
             }
         }
-    });
+    })
 }
 
 #[derive(Clone)]
@@ -1144,6 +1168,7 @@ impl RawSegmentBufferConfig {
 struct RawSegmentEntry {
     first_seen: Instant,
     bytes: usize,
+    buffered_bytes: usize,
     segments: Vec<Option<RawBlockSegment>>,
 }
 
@@ -1151,6 +1176,9 @@ struct RawSegmentBuffer {
     config: RawSegmentBufferConfig,
     entries: HashMap<[u8; 32], RawSegmentEntry>,
     total_payload_bytes: usize,
+    // Charge payload capacities plus slot and entry sizes. Allocator bookkeeping
+    // and HashMap spare capacity remain bounded overhead outside this budget.
+    total_buffered_bytes: usize,
 }
 
 enum RawSegmentInsert {
@@ -1170,6 +1198,7 @@ impl RawSegmentBuffer {
             config,
             entries: HashMap::new(),
             total_payload_bytes: 0,
+            total_buffered_bytes: 0,
         }
     }
 
@@ -1180,15 +1209,43 @@ impl RawSegmentBuffer {
         let segment_count = segment.segment_count as usize;
         let segment_index = segment.segment_index as usize;
         if segment_count == 0 || segment_index >= segment_count {
+            self.remove_entry(&block_hash);
             return RawSegmentInsert::Dropped {
                 reason: "invalid segment metadata",
             };
         }
-        if segment.payload.len() > self.config.max_total_payload_bytes {
+        // These are untrusted object declarations, independent of the size of
+        // this authenticated frame. Bound them before allocating any slots.
+        let raw_len = match usize::try_from(segment.raw_block_len) {
+            Ok(len) if len <= self.config.max_total_payload_bytes => len,
+            _ => {
+                self.remove_entry(&block_hash);
+                return RawSegmentInsert::Dropped {
+                    reason: "raw block length exceeds raw segment byte limit",
+                };
+            }
+        };
+        if segment_count > raw_len.max(1) || segment.payload.len() > raw_len {
+            self.remove_entry(&block_hash);
             return RawSegmentInsert::Dropped {
-                reason: "segment payload exceeds raw segment byte limit",
+                reason: "invalid raw block length or segment count",
             };
         }
+        let metadata_bytes = segment_count
+            .checked_mul(std::mem::size_of::<Option<RawBlockSegment>>())
+            .and_then(|slots| {
+                slots.checked_add(std::mem::size_of::<([u8; 32], RawSegmentEntry)>())
+            });
+        let Some(metadata_bytes) = metadata_bytes.filter(|bytes| {
+            bytes
+                .checked_add(segment.payload.capacity())
+                .is_some_and(|total| total <= self.config.max_total_payload_bytes)
+        }) else {
+            self.remove_entry(&block_hash);
+            return RawSegmentInsert::Dropped {
+                reason: "raw segment metadata exceeds byte limit",
+            };
+        };
 
         if !self.entries.contains_key(&block_hash) {
             self.evict_oldest_until_below_block_limit();
@@ -1197,14 +1254,35 @@ impl RawSegmentBuffer {
                     reason: "raw segment block limit exhausted",
                 };
             }
+            if self
+                .total_buffered_bytes
+                .checked_add(metadata_bytes)
+                .and_then(|bytes| bytes.checked_add(segment.payload.capacity()))
+                .is_none_or(|bytes| bytes > self.config.max_total_payload_bytes)
+            {
+                return RawSegmentInsert::Dropped {
+                    reason: "raw segment byte limit exhausted",
+                };
+            }
+            let mut slots = Vec::new();
+            if slots.try_reserve_exact(segment_count).is_err()
+                || self.entries.try_reserve(1).is_err()
+            {
+                return RawSegmentInsert::Dropped {
+                    reason: "raw segment allocation failed",
+                };
+            }
+            slots.resize_with(segment_count, || None);
             self.entries.insert(
                 block_hash,
                 RawSegmentEntry {
                     first_seen: now,
                     bytes: 0,
-                    segments: vec![None; segment_count],
+                    buffered_bytes: metadata_bytes,
+                    segments: slots,
                 },
             );
+            self.total_buffered_bytes += metadata_bytes;
         }
 
         let Some(entry) = self.entries.get_mut(&block_hash) else {
@@ -1212,27 +1290,39 @@ impl RawSegmentBuffer {
                 reason: "raw segment entry unavailable",
             };
         };
-        if entry.segments.len() != segment_count {
+        if entry.segments.len() != segment_count
+            || entry.segments.iter().flatten().next().is_some_and(|first| {
+                first.raw_block_len != segment.raw_block_len
+                    || first.raw_block_digest != segment.raw_block_digest
+            })
+        {
             self.remove_entry(&block_hash);
             return RawSegmentInsert::Dropped {
-                reason: "inconsistent raw segment count",
+                reason: "inconsistent raw segment metadata",
             };
         }
         if entry.segments[segment_index].is_some() {
             return RawSegmentInsert::Pending;
         }
         let next_total = self
-            .total_payload_bytes
-            .saturating_add(segment.payload.len());
-        if next_total > self.config.max_total_payload_bytes {
+            .total_buffered_bytes
+            .checked_add(segment.payload.capacity());
+        if next_total.is_none_or(|total| total > self.config.max_total_payload_bytes)
+            || entry
+                .bytes
+                .checked_add(segment.payload.len())
+                .is_none_or(|bytes| bytes > raw_len)
+        {
             self.remove_entry(&block_hash);
             return RawSegmentInsert::Dropped {
                 reason: "raw segment byte limit exhausted",
             };
         }
 
-        entry.bytes = entry.bytes.saturating_add(segment.payload.len());
-        self.total_payload_bytes = next_total;
+        entry.bytes += segment.payload.len();
+        entry.buffered_bytes += segment.payload.capacity();
+        self.total_payload_bytes += segment.payload.len();
+        self.total_buffered_bytes = next_total.expect("checked admission budget");
         entry.segments[segment_index] = Some(segment);
 
         if self
@@ -1242,11 +1332,13 @@ impl RawSegmentBuffer {
         {
             let entry = self.remove_entry(&block_hash).expect("entry exists");
             let first_seen = entry.first_seen;
-            let segments = entry
-                .segments
-                .into_iter()
-                .map(|segment| segment.expect("complete segment set"))
-                .collect();
+            let mut segments = Vec::new();
+            if segments.try_reserve_exact(segment_count).is_err() {
+                return RawSegmentInsert::Dropped {
+                    reason: "raw segment allocation failed",
+                };
+            }
+            segments.extend(entry.segments.into_iter().flatten());
             RawSegmentInsert::Complete {
                 segments,
                 first_seen,
@@ -1291,6 +1383,9 @@ impl RawSegmentBuffer {
     fn remove_entry(&mut self, block_hash: &[u8; 32]) -> Option<RawSegmentEntry> {
         let entry = self.entries.remove(block_hash)?;
         self.total_payload_bytes = self.total_payload_bytes.saturating_sub(entry.bytes);
+        self.total_buffered_bytes = self
+            .total_buffered_bytes
+            .saturating_sub(entry.buffered_bytes);
         Some(entry)
     }
 
@@ -2150,6 +2245,222 @@ mod tests {
         ttl: Duration,
     ) -> RawSegmentBufferConfig {
         RawSegmentBufferConfig::new(max_incomplete_blocks, max_total_payload_bytes, ttl).unwrap()
+    }
+
+    #[test]
+    fn raw_segment_rejects_unbounded_declarations_before_buffering() {
+        for (raw_len, count) in [(u64::MAX, 1), (1025, 2), (2, u16::MAX)] {
+            let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+            let mut segment = split_raw_block([1; 32], &[1], 1024).unwrap().remove(0);
+            segment.raw_block_len = raw_len;
+            segment.segment_count = count;
+            assert!(
+                matches!(
+                    buffer.insert(segment, Instant::now()),
+                    RawSegmentInsert::Dropped { .. }
+                ),
+                "admitted raw length {raw_len}, segment count {count}"
+            );
+            assert!(buffer.entries.is_empty());
+            assert_eq!(buffer.total_payload_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn raw_segment_slot_allocation_must_fit_aggregate_budget() {
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+        // Eight one-byte segments require more than 1KiB of resident slot metadata.
+        let segments = split_raw_block([1; 32], &[1; 8], RawBlockSegment::HEADER_LEN + 1).unwrap();
+        assert!(matches!(
+            buffer.insert(segments[0].clone(), Instant::now()),
+            RawSegmentInsert::Dropped { .. }
+        ));
+        assert!(buffer.entries.is_empty());
+        assert_eq!(buffer.total_payload_bytes, 0);
+    }
+
+    #[test]
+    fn raw_segment_inconsistent_metadata_releases_existing_entry() {
+        for change_digest in [false, true] {
+            let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+            let mut segments =
+                split_raw_block([1; 32], &[1, 2], RawBlockSegment::HEADER_LEN + 1).unwrap();
+            assert!(matches!(
+                buffer.insert(segments[0].clone(), Instant::now()),
+                RawSegmentInsert::Pending
+            ));
+            if change_digest {
+                segments[1].raw_block_digest[0] ^= 1;
+            } else {
+                segments[1].raw_block_len = 3;
+            }
+            assert!(matches!(
+                buffer.insert(segments[1].clone(), Instant::now()),
+                RawSegmentInsert::Dropped { .. }
+            ));
+            assert!(buffer.entries.is_empty());
+            assert_eq!(buffer.total_payload_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn raw_segment_aggregate_metadata_budget_boundary_and_cleanup() {
+        let metadata = std::mem::size_of::<([u8; 32], RawSegmentEntry)>()
+            + 2 * std::mem::size_of::<Option<RawBlockSegment>>();
+        let budget = 2 * metadata + 4;
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, budget, Duration::from_secs(1)));
+        let now = Instant::now();
+        let sets: Vec<_> = (1..=3)
+            .map(|seed| {
+                split_raw_block([seed; 32], &[1, 2, 3, 4], RawBlockSegment::HEADER_LEN + 2).unwrap()
+            })
+            .collect();
+        // Two entries plus two 2-byte payloads exactly fill the admission budget.
+        for set in &sets[..2] {
+            assert!(matches!(
+                buffer.insert(set[0].clone(), now),
+                RawSegmentInsert::Pending
+            ));
+        }
+        assert!(matches!(
+            buffer.insert(sets[2][0].clone(), now),
+            RawSegmentInsert::Dropped { .. }
+        ));
+        assert_eq!(buffer.entries.len(), 2);
+        // An existing entry exceeding the budget is removed and releases its slots too.
+        assert!(matches!(
+            buffer.insert(sets[0][1].clone(), now),
+            RawSegmentInsert::Dropped { .. }
+        ));
+        assert!(matches!(
+            buffer.insert(sets[1][1].clone(), now),
+            RawSegmentInsert::Complete { .. }
+        ));
+        assert!(buffer.entries.is_empty());
+        assert_eq!(buffer.total_payload_bytes, 0);
+        assert!(matches!(
+            buffer.insert(sets[2][0].clone(), now),
+            RawSegmentInsert::Pending
+        ));
+        assert_eq!(buffer.expire(now + Duration::from_secs(1)), 1);
+        assert!(matches!(
+            buffer.insert(sets[0][0].clone(), now),
+            RawSegmentInsert::Pending
+        ));
+        assert!(matches!(
+            buffer.insert(sets[1][0].clone(), now),
+            RawSegmentInsert::Pending
+        ));
+    }
+
+    #[test]
+    fn raw_segment_rejects_payloads_exceeding_declared_length() {
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 1024, Duration::from_secs(60)));
+        let mut segments =
+            split_raw_block([1; 32], &[1, 2, 3, 4], RawBlockSegment::HEADER_LEN + 2).unwrap();
+        for segment in &mut segments {
+            segment.raw_block_len = 3;
+        }
+        assert!(matches!(
+            buffer.insert(segments[0].clone(), Instant::now()),
+            RawSegmentInsert::Pending
+        ));
+        assert!(matches!(
+            buffer.insert(segments[1].clone(), Instant::now()),
+            RawSegmentInsert::Dropped { .. }
+        ));
+        assert!(buffer.entries.is_empty());
+        assert_eq!(buffer.total_payload_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn raw_segment_handler_survives_authenticated_short_object_then_valid_object() {
+        use sovright_relay::{
+            BlockChunker, Chunk, ChunkHeader, ClientConfig, RelayClient, RelaySession,
+        };
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = peer.local_addr().unwrap();
+        let key = [0x42; 32];
+        let mut client = RelayClient::new(
+            ClientConfig::new(vec![peer_addr], key)
+                .with_bind_addr("127.0.0.1:0".parse().unwrap())
+                .with_fec(2, 1),
+        )
+        .unwrap();
+        client.bind().await.unwrap();
+        let client_addr = client.local_addr().unwrap();
+        let (receiver, outgoing) = client.take_receiver().unwrap();
+        let client_task = tokio::spawn(async move { client.run_with_outgoing(outgoing).await });
+        let rpc = Arc::new(ZebraRpc::new("http://127.0.0.1:1").await.unwrap());
+        let submitter = Arc::new(DualSubmit::primary_only(Arc::clone(&rpc), "unused", None));
+        let metrics = Arc::new(SidecarMetrics::default());
+        let handler_task = spawn_relay_block_handler(
+            receiver,
+            rpc,
+            submitter,
+            SubmitBlockMode::DryRun,
+            false,
+            buffer_config(8, 65536, Duration::from_secs(60)),
+            Arc::clone(&metrics),
+            Arc::new(EmptyMempool),
+            None,
+            None,
+        );
+
+        let valid = zcash_pool_common::fixtures::mainnet_raw_block();
+        let valid_hash = zcash_block_hash(&valid[..ZCASH_FULL_HEADER_SIZE]);
+        let chunker = BlockChunker::new(2, 1).unwrap();
+        let session = RelaySession::new(peer_addr, "test", key);
+        for (hash, raw) in [([1; 32], vec![1]), (valid_hash, valid)] {
+            for segment in split_raw_block(hash, &raw, 2048).unwrap() {
+                for chunk in chunker.raw_block_segment_to_chunks(&segment).unwrap() {
+                    let h = &chunk.header;
+                    let mac = session.compute_hmac(
+                        &h.block_hash,
+                        h.chunk_id,
+                        h.total_chunks,
+                        h.payload_len,
+                        &chunk.payload,
+                    );
+                    let header = ChunkHeader::new_raw_block_segment_authenticated(
+                        &h.block_hash,
+                        h.chunk_id,
+                        h.total_chunks,
+                        h.payload_len,
+                        mac,
+                    );
+                    peer.send_to(&Chunk::new(header, chunk.payload).to_bytes(), client_addr)
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.submit_dry_run_candidates.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        client_task.abort();
+        let handler_result = tokio::time::timeout(Duration::from_secs(2), handler_task).await;
+        assert!(
+            result.is_ok(),
+            "receive/submit task stopped before the valid object"
+        );
+        handler_result
+            .expect("handler did not stop after receiver closed")
+            .expect("handler panicked");
+        assert_eq!(metrics.submit_dry_run_candidates.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            metrics.raw_segment_sets_completed.load(Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            metrics
+                .raw_segment_reassembly_failures
+                .load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[test]
@@ -3027,7 +3338,11 @@ mod tests {
 
     #[test]
     fn raw_segment_buffer_enforces_payload_byte_limit() {
-        let mut buffer = RawSegmentBuffer::new(buffer_config(8, 5, Duration::from_secs(60)));
+        // Leave five payload bytes after charging the two slots and map entry.
+        let budget = std::mem::size_of::<([u8; 32], RawSegmentEntry)>()
+            + 2 * std::mem::size_of::<Option<RawBlockSegment>>()
+            + 5;
+        let mut buffer = RawSegmentBuffer::new(buffer_config(8, budget, Duration::from_secs(60)));
         let segments = split_raw_block(
             [0x03; 32],
             &[1, 2, 3, 4, 5, 6],

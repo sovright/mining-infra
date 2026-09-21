@@ -71,3 +71,25 @@ fn split_raw_block_rejects_budget_without_payload_room() {
 
     assert_eq!(error, SegmentedBlockError::SegmentPayloadTooSmall);
 }
+
+#[test]
+fn reassemble_rejects_untrusted_length_without_panicking() {
+    let mut segments = split_raw_block(block_hash(), &[1], 1024).unwrap();
+    segments[0].raw_block_len = u64::MAX;
+    assert_eq!(
+        reassemble_raw_block(&segments),
+        Err(SegmentedBlockError::LengthMismatch)
+    );
+}
+
+#[test]
+fn reassemble_rejects_total_payload_length_mismatch() {
+    let mut segments = split_raw_block(block_hash(), &[1, 2, 3, 4], 120).unwrap();
+    for segment in &mut segments {
+        segment.raw_block_len = 3;
+    }
+    assert_eq!(
+        reassemble_raw_block(&segments),
+        Err(SegmentedBlockError::LengthMismatch)
+    );
+}
