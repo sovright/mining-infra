@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use super::MessageType;
-use super::config::KeyRole;
+use super::config::{AuthKey, KeyRole};
 use hmac::{Hmac, Mac};
 
 /// Result of one assembly-cleanup pass, feeding the delivery/miss instrument.
@@ -141,6 +141,8 @@ pub struct RelaySession {
     /// admitted while auth is not required -- carries an id so it can be
     /// attributed in logs/metrics; unauthenticated sessions use a sentinel id.
     key_id: String,
+    /// Whether this session proved possession of an authorized key.
+    authenticated: bool,
     /// Authorization scope bound to this session at admission time (role-
     /// scoped keys). Determines whether content this session authors is
     /// relayed onward -- see [`KeyRole::ReceiveOnly`].
@@ -181,8 +183,24 @@ impl RelaySession {
         Self {
             peer_addr,
             key_id: key_id.into(),
+            authenticated: true,
             role,
             auth_key,
+            last_seen: Instant::now(),
+            pending_blocks: HashMap::new(),
+            recent_chunks: HashMap::new(),
+            recent_order: VecDeque::new(),
+        }
+    }
+
+    /// Create a session admitted without authentication.
+    pub(crate) fn new_unauthenticated(peer_addr: SocketAddr, key_id: impl Into<String>) -> Self {
+        Self {
+            peer_addr,
+            key_id: key_id.into(),
+            authenticated: false,
+            role: KeyRole::Full,
+            auth_key: [0u8; 32],
             last_seen: Instant::now(),
             pending_blocks: HashMap::new(),
             recent_chunks: HashMap::new(),
@@ -198,6 +216,17 @@ impl RelaySession {
     /// The role this session was bound with at admission time.
     pub fn role(&self) -> KeyRole {
         self.role
+    }
+
+    /// Whether the session authenticated with a configured key.
+    pub(crate) fn is_authenticated(&self) -> bool {
+        self.authenticated
+    }
+
+    /// Whether this session is still bound to the exact authorized identity,
+    /// secret, and role. Keep the secret comparison inside the session.
+    pub(crate) fn matches_authorization(&self, key: &AuthKey) -> bool {
+        self.key_id == key.id && self.role == key.role && bool::from(self.auth_key.ct_eq(&key.key))
     }
 
     /// Update last seen time

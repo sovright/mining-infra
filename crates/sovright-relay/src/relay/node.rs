@@ -30,10 +30,8 @@ const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
 const VALIDATED_RAW_BLOCK_TTL: Duration = Duration::from_secs(120);
 
 /// Key-id sentinel bound to sessions admitted while auth is not required
-/// (`allow_unauthenticated_peers`). Never a real configured key id, since
-/// [`crate::transport::config`] identity labels are restricted to
-/// `[A-Za-z0-9_-]{1,32}` and this sentinel is intentionally outside that
-/// pattern's spirit by convention (still matches the charset, but reserved).
+/// (`allow_unauthenticated_peers`). Authentication state is tracked
+/// separately, so a configured key may safely use the same display label.
 const UNAUTHENTICATED_KEY_ID: &str = "unauthenticated";
 
 #[derive(Clone, Copy)]
@@ -187,8 +185,8 @@ impl<V: PowValidator> RelayNode<V> {
     }
 
     /// Replace the active authorized key set (hot-revocation, PR-B) and evict
-    /// every live session whose bound `key_id` is no longer present in the
-    /// new set. Called by the `relay-node` binary's auth-keys reload task
+    /// every live session whose bound identity, key, or role has changed in
+    /// the new set. Called by the `relay-node` binary's auth-keys reload task
     /// each time the on-disk keys file changes in a way that rebuilds the
     /// env-keys-union-file-keys active set.
     ///
@@ -206,18 +204,21 @@ impl<V: PowValidator> RelayNode<V> {
         self.evict_sessions_not_in(&keys).await;
     }
 
-    /// Evict every live session whose `key_id` is not present in `keys`.
+    /// Evict every live session without an exact authorization match in `keys`.
     ///
     /// Sessions admitted while auth was not required (bound to the
     /// [`UNAUTHENTICATED_KEY_ID`] sentinel) are never evicted by a key-set
     /// change -- they were never bound to a revocable key in the first
     /// place.
     async fn evict_sessions_not_in(&self, keys: &[AuthKey]) {
-        let keep: std::collections::HashSet<&str> = keys.iter().map(|k| k.id.as_str()).collect();
+        let keep: HashMap<&str, &AuthKey> = keys.iter().map(|key| (key.id.as_str(), key)).collect();
         let mut sessions = self.sessions.write().await;
         let before = sessions.len();
         sessions.retain(|_, session| {
-            session.key_id() == UNAUTHENTICATED_KEY_ID || keep.contains(session.key_id())
+            !session.is_authenticated()
+                || keep
+                    .get(session.key_id())
+                    .is_some_and(|key| session.matches_authorization(key))
         });
         let evicted = before - sessions.len();
         if evicted > 0 {
@@ -803,7 +804,7 @@ impl<V: PowValidator> RelayNode<V> {
                     KeyRole::Full => "full",
                     KeyRole::ReceiveOnly => "receive_only",
                 },
-                self.config.auth_required() && session.key_id() != UNAUTHENTICATED_KEY_ID,
+                session.is_authenticated(),
                 elapsed,
             );
         }
@@ -983,7 +984,7 @@ impl<V: PowValidator> RelayNode<V> {
                     debug!(peer = %src_addr, "Creating unauthenticated session");
                     sessions.insert(
                         src_addr,
-                        RelaySession::new(src_addr, UNAUTHENTICATED_KEY_ID, [0u8; 32]),
+                        RelaySession::new_unauthenticated(src_addr, UNAUTHENTICATED_KEY_ID),
                     );
                     self.metrics.inc_sessions_created();
                     self.metrics
@@ -1141,7 +1142,7 @@ impl<V: PowValidator> RelayNode<V> {
             debug!(peer = %src_addr, "Creating unauthenticated keepalive session");
             sessions.insert(
                 src_addr,
-                RelaySession::new(src_addr, UNAUTHENTICATED_KEY_ID, [0u8; 32]),
+                RelaySession::new_unauthenticated(src_addr, UNAUTHENTICATED_KEY_ID),
             );
             self.metrics.inc_sessions_created();
             self.metrics
@@ -2380,6 +2381,167 @@ mod tests {
         );
     }
 
+    fn authenticated_keepalive(key: [u8; 32]) -> Vec<u8> {
+        let session = RelaySession::new("127.0.0.1:1".parse().unwrap(), "hmac-only", key);
+        let hmac = session.compute_hmac(&[0u8; 32], 0, 0, 0, &[]);
+        Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new()).to_bytes()
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_evicts_same_id_rotated_key() {
+        let old_key = [0x11; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("alice", old_key)]);
+        let node = RelayNode::new(config).unwrap();
+        let addr: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+        node.handle_packet(&authenticated_keepalive(old_key), addr)
+            .await
+            .unwrap();
+        assert_eq!(node.session_count().await, 1);
+
+        node.apply_active_keys(vec![AuthKey::new("alice", [0x22; 32])])
+            .await;
+
+        assert_eq!(
+            node.session_count().await,
+            0,
+            "rotated session must be evicted"
+        );
+    }
+
+    async fn assert_role_change_evicts_session(old_role: KeyRole, new_role: KeyRole) {
+        let key = [0x11; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("alice", key).with_role(old_role)]);
+        let node = RelayNode::new(config).unwrap();
+        let addr: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+        let keepalive = authenticated_keepalive(key);
+        node.handle_packet(&keepalive, addr).await.unwrap();
+        assert_eq!(node.session_count().await, 1);
+
+        node.apply_active_keys(vec![AuthKey::new("alice", key).with_role(new_role)])
+            .await;
+
+        assert_eq!(
+            node.session_count().await,
+            0,
+            "changed role must evict the session"
+        );
+        node.handle_packet(&keepalive, addr).await.unwrap();
+        let sessions = node.sessions.read().await;
+        assert_eq!(sessions.get(&addr).unwrap().role(), new_role);
+        assert_eq!(node.metrics().snapshot().sessions_created, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_evicts_demoted_session() {
+        assert_role_change_evicts_session(KeyRole::Full, KeyRole::ReceiveOnly).await;
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_evicts_promoted_session() {
+        assert_role_change_evicts_session(KeyRole::ReceiveOnly, KeyRole::Full).await;
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_preserves_unchanged_and_reordered_authorizations() {
+        let keys = vec![
+            AuthKey::new("fleet", [0x42; 32]),
+            AuthKey::new("alice", [0x77; 32]).with_role(KeyRole::ReceiveOnly),
+        ];
+        let config =
+            RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(keys.clone());
+        let node = RelayNode::new(config).unwrap();
+        let peers: [SocketAddr; 2] = [
+            "127.0.0.1:11111".parse().unwrap(),
+            "127.0.0.1:22222".parse().unwrap(),
+        ];
+        let last_seen = Instant::now() - Duration::from_secs(30);
+        for (addr, key) in peers.iter().zip(&keys) {
+            node.handle_packet(&authenticated_keepalive(key.key), *addr)
+                .await
+                .unwrap();
+            let mut sessions = node.sessions.write().await;
+            let session = sessions.get_mut(addr).unwrap();
+            session.last_seen = last_seen;
+            assert!(session.mark_chunk_seen([0xab; 32], 0));
+        }
+
+        node.apply_active_keys(keys.clone()).await;
+        node.apply_active_keys(keys.into_iter().rev().collect())
+            .await;
+
+        let mut sessions = node.sessions.write().await;
+        assert_eq!(sessions.len(), 2);
+        for addr in peers {
+            let session = sessions.get_mut(&addr).expect("unchanged session retained");
+            assert_eq!(session.last_seen, last_seen);
+            assert!(
+                !session.mark_chunk_seen([0xab; 32], 0),
+                "replay state retained"
+            );
+        }
+        assert_eq!(node.metrics().snapshot().sessions_created, 2);
+    }
+
+    #[tokio::test]
+    async fn apply_active_keys_rejects_rotated_session_traffic_and_admits_new_key() {
+        let old_key = [0x11; 32];
+        let new_key = [0x22; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("alice", old_key)]);
+        let node = RelayNode::new(config).unwrap();
+        let addr: SocketAddr = "127.0.0.1:22222".parse().unwrap();
+        let old_keepalive = authenticated_keepalive(old_key);
+        node.handle_packet(&old_keepalive, addr).await.unwrap();
+
+        node.apply_active_keys(vec![AuthKey::new("alice", new_key)])
+            .await;
+
+        assert!(
+            matches!(
+                node.handle_packet(&old_keepalive, addr).await,
+                Err(TransportError::AuthenticationFailed)
+            ),
+            "the old key must not keep its established session alive"
+        );
+        let block_hash = [0xab; 32];
+        let chunk = Chunk::new(ChunkHeader::new_block(&block_hash, 0, 13, 4), vec![1; 4]);
+        let old_data = authenticated_wire_chunk(old_key, &block_hash, &chunk);
+        assert!(
+            matches!(
+                node.handle_packet(&old_data, addr).await,
+                Err(TransportError::AuthenticationFailed)
+            ),
+            "the old key must not submit data after rotation"
+        );
+        assert_eq!(node.session_count().await, 0);
+        assert_eq!(node.metrics().snapshot().auth_failures, 2);
+
+        node.handle_packet(&authenticated_keepalive(new_key), addr)
+            .await
+            .unwrap();
+        assert_eq!(node.session_count().await, 1);
+        assert_eq!(node.metrics().snapshot().sessions_created, 2);
+    }
+
+    #[tokio::test]
+    async fn authenticated_key_named_like_unauthenticated_sentinel_is_still_revoked() {
+        let old_key = [0x31; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new(UNAUTHENTICATED_KEY_ID, old_key)]);
+        let node = RelayNode::new(config).unwrap();
+        let addr: SocketAddr = "127.0.0.1:31337".parse().unwrap();
+        node.handle_packet(&authenticated_keepalive(old_key), addr)
+            .await
+            .unwrap();
+
+        node.apply_active_keys(vec![AuthKey::new(UNAUTHENTICATED_KEY_ID, [0x32; 32])])
+            .await;
+
+        assert_eq!(node.session_count().await, 0);
+    }
+
     #[tokio::test]
     async fn apply_active_keys_preserves_unauthenticated_sessions() {
         let config = RelayConfig::default().with_unauthenticated_peers_allowed(true);
@@ -2390,7 +2552,7 @@ mod tests {
             let mut sessions = node.sessions.write().await;
             sessions.insert(
                 addr,
-                RelaySession::new(addr, UNAUTHENTICATED_KEY_ID, [0u8; 32]),
+                RelaySession::new_unauthenticated(addr, UNAUTHENTICATED_KEY_ID),
             );
         }
 
