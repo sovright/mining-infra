@@ -9,9 +9,6 @@
 //!   history. A production implementation would add a ChannelManager that maintains
 //!   persistent channel state server-side.
 //!
-//! - **Block target**: Currently uses a simplified block target. Production would
-//!   extract the actual target from the template.
-
 use crate::channel::Channel;
 use crate::config::PoolConfig;
 use crate::duplicate::{DuplicateDetector, InMemoryDuplicateDetector};
@@ -94,8 +91,6 @@ pub struct PoolServer {
     session_tx: mpsc::Sender<SessionMessage>,
     /// Receiver for session messages
     session_rx: mpsc::Receiver<SessionMessage>,
-    /// Current block target (for checking block finds)
-    current_block_target: Arc<RwLock<[u8; 32]>>,
     /// JD Server (embedded, optional)
     jd_server: Arc<JdServer>,
     /// JD Server listen address (None = disabled)
@@ -336,10 +331,6 @@ impl PoolServer {
             accepted_identities: Arc::new(RwLock::new(HashSet::new())),
             session_tx,
             session_rx,
-            // Initialize to impossible target (all zeros) so any share validated
-            // before the first template arrives is rejected. This is fail-closed:
-            // no hash can be <= [0x00; 32] except the zero hash itself.
-            current_block_target: Arc::new(RwLock::new([0x00; 32])),
             jd_server,
             jd_listen_addr,
             noise_responder,
@@ -864,9 +855,11 @@ impl PoolServer {
             if distributor.has_template() {
                 let mut channels = ctx.channels.write().await;
                 if let Some(channel) = channels.get_mut(&channel_id) {
-                    if let Some(job) = distributor.create_job(channel, true) {
+                    if let Some((job, template)) =
+                        distributor.create_job_with_template(channel, true)
+                    {
                         ctx.duplicate_detector.start_job(job.job_id);
-                        channel.add_job(job.clone(), true);
+                        channel.add_job(job.clone(), template, true);
                         Some(job)
                     } else {
                         None
@@ -951,12 +944,6 @@ impl PoolServer {
     async fn handle_new_template(&self, template: BlockTemplate) -> Result<()> {
         let height = template.height;
         info!("New template at height {}", height);
-
-        // Update block target
-        {
-            let mut target = self.current_block_target.write().await;
-            *target = template.target.0;
-        }
 
         // Update JD Server's current prev_hash (for stale detection)
         self.jd_server
@@ -1054,9 +1041,10 @@ impl PoolServer {
                 let mut channels = self.channels.write().await;
                 for (channel_id, sender) in &session_senders {
                     if let Some(channel) = channels.get_mut(channel_id)
-                        && let Some(job) = distributor.create_job(channel, clean_jobs)
+                        && let Some((job, template)) =
+                            distributor.create_job_with_template(channel, clean_jobs)
                     {
-                        channel.add_job(job.clone(), clean_jobs);
+                        channel.add_job(job.clone(), template, clean_jobs);
                         jobs.push((sender.clone(), job));
                     }
                 }
@@ -1243,13 +1231,10 @@ impl PoolServer {
             }
         }
 
-        // Get block target
-        let block_target = *self.current_block_target.read().await;
-
         // Grab the job without holding the lock during validation.
         // Use is_job_active() which checks BOTH the active flag AND the TTL,
         // matching the Quint spec's job expiry model.
-        let job = {
+        let (job, template) = {
             let channels = self.channels.read().await;
             let channel = channels
                 .get(&channel_id)
@@ -1262,12 +1247,12 @@ impl PoolServer {
                     .map_err(|_| PoolError::ChannelSend)
                     .map(|_| ());
             }
-            channel
+            let channel_job = channel
                 .get_job(share.job_id)
-                .ok_or(PoolError::UnknownJob(share.job_id))?
-                .job
-                .clone()
+                .ok_or(PoolError::UnknownJob(share.job_id))?;
+            (channel_job.job.clone(), Arc::clone(&channel_job.template))
         };
+        let block_target = template.target.0;
 
         // Validate share without holding the channel lock
         let validation_start = std::time::Instant::now();
@@ -1373,12 +1358,6 @@ impl PoolServer {
                     // block propagation must still happen: the JD path does not
                     // build or submit full blocks, so the pool path must do it even
                     // when this share is a payout duplicate.
-                    //
-                    // NOTE(test-gap): this branch (cross_path_dup && is_block) has
-                    // no automated test. handle_share_submission is not unit-testable
-                    // without mocking submit_block; an integration test would need
-                    // two concurrent connections (JDC + SV2 direct) submitting the
-                    // same block solution. Tracked for the integration-test milestone.
                     if validation.is_block {
                         info!(
                             "BLOCK FOUND (cross-path duplicate) by channel {}! Submitting block.",
@@ -1392,44 +1371,21 @@ impl PoolServer {
                         if let Some(ref relay) = self.relay {
                             let header = job
                                 .build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
-                            let relay_data = {
-                                let distributor = self.job_distributor.read().await;
-                                distributor.current_template().map(|t| {
-                                    let tx_hashes: Vec<[u8; 32]> = t
-                                        .transactions
-                                        .iter()
-                                        .filter_map(|tx| {
-                                            let bytes = hex::decode(&tx.hash).ok()?;
-                                            if bytes.len() == 32 {
-                                                let mut arr = [0u8; 32];
-                                                arr.copy_from_slice(&bytes);
-                                                arr.reverse();
-                                                Some(arr)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-                                    let coinbase = t.coinbase.clone();
-                                    (coinbase, tx_hashes)
-                                })
-                            };
-                            if let Some((coinbase, tx_hashes)) = relay_data {
-                                let relay = Arc::clone(relay);
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        relay.announce_block(&header, &coinbase, &tx_hashes).await
-                                    {
-                                        warn!(
-                                            "Failed to announce cross-path dup block to relay: {}",
-                                            e
-                                        );
-                                    }
-                                });
-                            }
+                            let (coinbase, tx_hashes) = relay_template_data(&template);
+                            let relay = Arc::clone(relay);
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    relay.announce_block(&header, &coinbase, &tx_hashes).await
+                                {
+                                    warn!(
+                                        "Failed to announce cross-path dup block to relay: {}",
+                                        e
+                                    );
+                                }
+                            });
                         }
 
-                        if let Err(e) = self.submit_block(&job, &share).await {
+                        if let Err(e) = self.submit_block(&job, &share, &template).await {
                             warn!(
                                 "Failed to submit block for cross-path dup job {}: {}",
                                 share.job_id, e
@@ -1457,9 +1413,7 @@ impl PoolServer {
                     if validation.is_block {
                         info!(
                             "BLOCK FOUND by channel {}! Job: {}, Height: {:?}",
-                            channel_id,
-                            share.job_id,
-                            self.job_distributor.read().await.current_height()
+                            channel_id, share.job_id, template.height
                         );
 
                         // Announce to relay BEFORE submitting to Zebra
@@ -1469,43 +1423,18 @@ impl PoolServer {
                             let header = job
                                 .build_header(&job.build_nonce(&share.nonce_2).unwrap_or_default());
 
-                            // Clone all needed data atomically in one lock acquisition
-                            let relay_data = {
-                                let distributor = self.job_distributor.read().await;
-                                distributor.current_template().map(|t| {
-                                    let tx_hashes: Vec<[u8; 32]> = t
-                                        .transactions
-                                        .iter()
-                                        .filter_map(|tx| {
-                                            let bytes = hex::decode(&tx.hash).ok()?;
-                                            if bytes.len() == 32 {
-                                                let mut arr = [0u8; 32];
-                                                arr.copy_from_slice(&bytes);
-                                                arr.reverse();
-                                                Some(arr)
-                                            } else {
-                                                None
-                                            }
-                                        })
-                                        .collect();
-                                    let coinbase = t.coinbase.clone();
-                                    (coinbase, tx_hashes)
-                                })
-                            };
-
-                            if let Some((coinbase, tx_hashes)) = relay_data {
-                                let relay = Arc::clone(relay);
-                                tokio::spawn(async move {
-                                    if let Err(e) =
-                                        relay.announce_block(&header, &coinbase, &tx_hashes).await
-                                    {
-                                        warn!("Failed to announce block to relay: {}", e);
-                                    }
-                                });
-                            }
+                            let (coinbase, tx_hashes) = relay_template_data(&template);
+                            let relay = Arc::clone(relay);
+                            tokio::spawn(async move {
+                                if let Err(e) =
+                                    relay.announce_block(&header, &coinbase, &tx_hashes).await
+                                {
+                                    warn!("Failed to announce block to relay: {}", e);
+                                }
+                            });
                         }
 
-                        if let Err(e) = self.submit_block(&job, &share).await {
+                        if let Err(e) = self.submit_block(&job, &share, &template).await {
                             warn!("Failed to submit block for job {}: {}", share.job_id, e);
                         }
                     }
@@ -1566,21 +1495,19 @@ impl PoolServer {
         Ok(())
     }
 
-    async fn submit_block(&self, job: &NewEquihashJob, share: &SubmitEquihashShare) -> Result<()> {
-        let template = {
-            let distributor = self.job_distributor.read().await;
-            distributor.current_template().ok_or_else(|| {
-                PoolError::TemplateProvider("missing current template".to_string())
-            })?
-        };
-
+    async fn submit_block(
+        &self,
+        job: &NewEquihashJob,
+        share: &SubmitEquihashShare,
+        template: &BlockTemplate,
+    ) -> Result<()> {
         if template.header.prev_hash.0 != job.prev_hash {
             return Err(PoolError::TemplateProvider(
                 "template prev_hash mismatch for solved job".to_string(),
             ));
         }
 
-        let block_bytes = build_block_bytes(job, share, &template)?;
+        let block_bytes = build_block_bytes(job, share, template)?;
         let block_hex = hex::encode(block_bytes);
 
         // Two-stage: validate via proposal mode first
@@ -1686,6 +1613,25 @@ pub struct PoolStats {
 
 use zcash_pool_common::write_compact_size as write_varint;
 
+#[cfg(feature = "relay")]
+fn relay_template_data(template: &BlockTemplate) -> (Vec<u8>, Vec<[u8; 32]>) {
+    let tx_hashes = template
+        .transactions
+        .iter()
+        .filter_map(|tx| {
+            let bytes = hex::decode(&tx.hash).ok()?;
+            if bytes.len() != 32 {
+                return None;
+            }
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(&bytes);
+            hash.reverse();
+            Some(hash)
+        })
+        .collect();
+    (template.coinbase.clone(), tx_hashes)
+}
+
 fn build_block_bytes(
     job: &NewEquihashJob,
     share: &SubmitEquihashShare,
@@ -1744,6 +1690,200 @@ mod tests {
     use super::*;
     use zcash_equihash_validator::difficulty::difficulty_to_target;
     use zcash_template_provider::testutil::MockZebraRpc;
+
+    fn solved_mainnet_template() -> BlockTemplate {
+        use zcash_template_provider::types::{EquihashHeader, Hash256, TemplateTransaction};
+
+        let (header, _) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+        let transactions = zcash_pool_common::fixtures::mainnet_transactions();
+        let bits = u32::from_le_bytes(header[104..108].try_into().unwrap());
+        BlockTemplate {
+            template_id: 41,
+            height: 3_470_793,
+            header: EquihashHeader {
+                version: u32::from_le_bytes(header[..4].try_into().unwrap()),
+                prev_hash: Hash256(header[4..36].try_into().unwrap()),
+                merkle_root: Hash256(header[36..68].try_into().unwrap()),
+                hash_block_commitments: Hash256(header[68..100].try_into().unwrap()),
+                time: u32::from_le_bytes(header[100..104].try_into().unwrap()),
+                bits,
+                nonce: [0; 32],
+            },
+            target: Hash256(zcash_equihash_validator::compact_to_target(bits).to_le_bytes()),
+            coinbase: transactions[0].clone(),
+            transactions: transactions[1..]
+                .iter()
+                .map(|tx| {
+                    let mut txid = sovright_relay::txid_from_tx_bytes(tx);
+                    txid.reverse();
+                    TemplateTransaction {
+                        data: hex::encode(tx),
+                        hash: hex::encode(txid),
+                        fee: 0,
+                        depends: Vec::new(),
+                    }
+                })
+                .collect(),
+            // The fixture supplies its committed header directly. These JD
+            // metadata fields are not involved in standard share submission.
+            chain_history_root: Hash256([0; 32]),
+            consensus_branch_id: 0xc8e7_1055,
+            total_fees: 0,
+        }
+    }
+
+    async fn assert_solved_job_survives_same_tip_refresh(
+        cross_path_duplicate: bool,
+        change_block_target: bool,
+    ) {
+        use zcash_mining_protocol::messages::RejectReason;
+        use zcash_template_provider::types::Hash256;
+
+        let config = PoolConfig {
+            initial_difficulty: 1e-9,
+            payout_state_path: None,
+            warn_plain_mode: false,
+            ..PoolConfig::default()
+        };
+        let rpc = Arc::new(MockZebraRpc::new());
+        let provider = TemplateProvider::with_rpc(
+            TemplateProviderConfig {
+                zebra_url: config.zebra_url.clone(),
+                submit_url: None,
+                poll_interval_ms: config.template_poll_ms,
+            },
+            Box::new(Arc::clone(&rpc)),
+        );
+        let server = PoolServer::with_template_provider(config, provider).unwrap();
+        let (header, solution) = zcash_pool_common::fixtures::mainnet_header_and_solution();
+        let mut channel = Channel::new(
+            header[108..112].to_vec(),
+            VardiffConfig {
+                initial_difficulty: 1e-9,
+                min_difficulty: 1e-9,
+                ..VardiffConfig::default()
+            },
+        )
+        .unwrap();
+        let channel_id = channel.id;
+        let worker = "snapshot-miner".to_string();
+        channel.worker_identity = Some(worker.clone());
+        let (sender, mut messages) = mpsc::channel(4);
+        server.channels.write().await.insert(channel_id, channel);
+        server.sessions.write().await.insert(channel_id, sender);
+
+        let template_a = solved_mainnet_template();
+        server
+            .handle_new_template(template_a.clone())
+            .await
+            .unwrap();
+        let Some(ServerMessage::NewJob(job_a)) = messages.recv().await else {
+            panic!("template A must publish a mining job");
+        };
+        let share = SubmitEquihashShare {
+            channel_id,
+            sequence_number: 1,
+            job_id: job_a.job_id,
+            nonce_2: header[112..140].to_vec(),
+            time: job_a.time,
+            solution: solution.try_into().unwrap(),
+        };
+        assert_eq!(
+            job_a.build_header(&job_a.build_nonce(&share.nonce_2).unwrap()),
+            header
+        );
+
+        let mut template_b = template_a;
+        template_b.template_id = 42;
+        template_b.transactions.pop();
+        let mut txids = vec![sovright_relay::txid_from_tx_bytes(&template_b.coinbase)];
+        txids.extend(
+            template_b
+                .transactions
+                .iter()
+                .map(|tx| Hash256::from_hex(&tx.hash).unwrap().0),
+        );
+        template_b.header.merkle_root = Hash256(sovright_relay::merkle_root(&txids).unwrap());
+        if change_block_target {
+            // A distinct, deliberately impossible refreshed target makes a
+            // read of the global/latest target suppress this real block find.
+            template_b.target = Hash256([0; 32]);
+        }
+        server.handle_new_template(template_b).await.unwrap();
+        let Some(ServerMessage::NewJob(job_b)) = messages.recv().await else {
+            panic!("template B must publish a mining job");
+        };
+        assert_eq!(job_a.prev_hash, job_b.prev_hash);
+        assert_ne!(job_a.merkle_root, job_b.merkle_root);
+        assert!(!job_b.clean_jobs);
+        assert!(server.channels.read().await[&channel_id].is_job_active(job_a.job_id));
+
+        if cross_path_duplicate {
+            // Model the shared payout tracker's state after JD credited this
+            // solution. The direct path must reject duplicate payout while
+            // still submitting the block using the original template.
+            assert!(
+                server
+                    .payout_tracker
+                    .try_record_share_once(&worker, 1.0, &share.solution)
+            );
+        }
+        let (response_tx, response_rx) = tokio::sync::oneshot::channel();
+        server
+            .handle_share_submission(channel_id, share, response_tx)
+            .await
+            .unwrap();
+        let expected_response = if cross_path_duplicate {
+            ShareResult::Rejected(RejectReason::Duplicate)
+        } else {
+            ShareResult::Accepted
+        };
+        assert_eq!(response_rx.await.unwrap(), expected_response);
+        assert_eq!(
+            server
+                .payout_tracker
+                .get_stats(&worker)
+                .unwrap()
+                .total_shares,
+            1
+        );
+
+        let submissions = rpc.submitted_blocks();
+        assert_eq!(
+            submissions.len(),
+            2,
+            "the real block find must reach proposal validation and final submission"
+        );
+        // Expected bytes come from the independently captured mainnet block,
+        // not from the serializer or snapshot code being tested.
+        let expected_block = zcash_pool_common::fixtures::mainnet_raw_block();
+        for (stage, block_hex) in ["proposal", "submission"].iter().zip(&submissions) {
+            assert!(
+                hex::decode(block_hex).unwrap() == expected_block,
+                "{stage} must contain job A's exact header and transaction body after same-tip refresh"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn solved_job_body_survives_same_tip_refresh() {
+        assert_solved_job_survives_same_tip_refresh(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn solved_job_target_survives_same_tip_refresh() {
+        assert_solved_job_survives_same_tip_refresh(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn cross_path_duplicate_body_survives_same_tip_refresh() {
+        assert_solved_job_survives_same_tip_refresh(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn cross_path_duplicate_target_survives_same_tip_refresh() {
+        assert_solved_job_survives_same_tip_refresh(true, true).await;
+    }
 
     #[test]
     fn test_pool_server_creation() {

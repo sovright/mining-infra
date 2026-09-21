@@ -354,7 +354,7 @@ mod tests {
 
         let mut channel = make_test_channel(vec![0; 4]);
         let job = make_test_job(1, &channel.nonce_1, channel.nonce_2_len, 1_700_000_000);
-        channel.add_job(job, false);
+        channel.add_job(job, crate::channel::test_template(), false);
 
         let processor = ShareProcessor::new();
         let detector = InMemoryDuplicateDetector::new();
@@ -383,10 +383,10 @@ mod tests {
 
         let mut channel = make_test_channel(vec![0; 4]);
         let job1 = make_test_job(1, &channel.nonce_1, channel.nonce_2_len, 1_700_000_000);
-        channel.add_job(job1, false);
+        channel.add_job(job1, crate::channel::test_template(), false);
 
         let job2 = make_test_job(2, &channel.nonce_1, channel.nonce_2_len, 1_700_000_000);
-        channel.add_job(job2, true); // clean_jobs=true marks job 1 stale
+        channel.add_job(job2, crate::channel::test_template(), true); // clean_jobs=true marks job 1 stale
 
         let processor = ShareProcessor::new();
         let detector = InMemoryDuplicateDetector::new();
@@ -418,7 +418,7 @@ mod tests {
 
         let mut channel = make_test_channel(vec![0; 4]); // nonce_2_len = 28
         let job = make_test_job(1, &channel.nonce_1, channel.nonce_2_len, 1_700_000_000);
-        channel.add_job(job, false);
+        channel.add_job(job, crate::channel::test_template(), false);
 
         let processor = ShareProcessor::new();
         let detector = InMemoryDuplicateDetector::new();
@@ -458,7 +458,7 @@ mod tests {
 
         let mut channel = make_test_channel(vec![0; 4]);
         let job = make_test_job(1, &channel.nonce_1, channel.nonce_2_len, 1_700_000_000);
-        channel.add_job(job, false);
+        channel.add_job(job, crate::channel::test_template(), false);
 
         let processor = ShareProcessor::new();
         let detector = InMemoryDuplicateDetector::new();
@@ -711,7 +711,7 @@ mod tests {
         let mut channel = make_test_channel(vec![0; 4]);
         let job_time: u32 = 1_700_000_000;
         let job = make_test_job(1, &channel.nonce_1, channel.nonce_2_len, job_time);
-        channel.add_job(job, false);
+        channel.add_job(job, crate::channel::test_template(), false);
 
         let processor = ShareProcessor::new();
         let block_target = [0xff; 32];

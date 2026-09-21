@@ -726,9 +726,9 @@ fn mainnet_parsed_target_is_met_by_the_block_hash() {
 /// `compact_to_target(job.bits)`, bypassing the template parse. Neither would notice if
 /// `parse_target`'s output stopped reaching the block gate in the right byte order.
 ///
-/// `server.rs` stores this value at `current_block_target` and passes it to
-/// `validate_share_with_job`; this feeds it the same way, which is as far as the gate can
-/// be driven without standing up the server.
+/// `server.rs` retains this value in the job's template snapshot and passes it to
+/// `validate_share_with_job`; this test checks the parsing and block-gate boundary.
+/// Server unit tests also exercise a solved share through the real submission handler.
 #[test]
 fn mainnet_template_target_makes_is_block_fire() {
     let template = mainnet_template();

@@ -75,8 +75,8 @@ fn test_full_mining_lifecycle() {
         .expect("channel creation should succeed");
     assert_eq!(channel.nonce_2_len, 28);
 
-    let job = distributor
-        .create_job(&channel, true)
+    let (job, template1_snapshot) = distributor
+        .create_job_with_template(&channel, true)
         .expect("create_job should succeed with a template");
     assert_eq!(job.channel_id, channel.id);
     assert_eq!(job.nonce_1, vec![0x01, 0x02, 0x03, 0x04]);
@@ -200,8 +200,8 @@ fn test_full_mining_lifecycle() {
     assert_eq!(distributor.current_height(), Some(500_001));
 
     // Create a new job with clean_jobs=true
-    let job2 = distributor
-        .create_job(&channel, true)
+    let (job2, template2_snapshot) = distributor
+        .create_job_with_template(&channel, true)
         .expect("create_job should succeed for new template");
     assert!(job2.clean_jobs);
     assert_ne!(
@@ -213,8 +213,8 @@ fn test_full_mining_lifecycle() {
     let mut channel_with_jobs =
         Channel::new(vec![0x05, 0x06, 0x07, 0x08], VardiffConfig::default())
             .expect("channel creation should succeed");
-    channel_with_jobs.add_job(job.clone(), false);
-    channel_with_jobs.add_job(job2.clone(), true); // clean_jobs=true marks old job stale
+    channel_with_jobs.add_job(job.clone(), template1_snapshot, false);
+    channel_with_jobs.add_job(job2.clone(), template2_snapshot, true); // clean_jobs=true marks old job stale
     assert!(
         !channel_with_jobs.is_job_active(job.job_id),
         "Old job should be stale after clean_jobs"
