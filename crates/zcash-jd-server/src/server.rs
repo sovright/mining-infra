@@ -26,10 +26,12 @@ use sovright_noise::NoiseStream;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::RwLock as TokioRwLock;
+use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use zcash_equihash_validator::{
     EquihashValidator, Target, ValidationError, compact_to_target, target_to_difficulty,
@@ -134,8 +136,96 @@ pub struct CurrentTemplateContext {
 
 #[derive(Debug, Clone)]
 struct PendingMissingTransactions {
-    channel_id: u32,
     expected_txids: Vec<[u8; 32]>,
+    created_at: Instant,
+}
+
+// Bound retained txid payloads separately from request/map overhead. A peer
+// may pipeline a few jobs, but cannot retain arbitrary templates indefinitely.
+const MAX_PENDING_PER_SESSION: usize = 8;
+const MAX_PENDING_GLOBAL: usize = 256;
+const MAX_PENDING_TXID_BYTES_PER_SESSION: usize = 512 * 1024;
+const MAX_PENDING_TXID_BYTES_GLOBAL: usize = 8 * 1024 * 1024;
+const PENDING_MISSING_TTL: Duration = Duration::from_secs(30);
+const PENDING_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum PendingOwner {
+    Session(u64),
+    // Compatibility for trusted in-process callers of the original APIs.
+    // This namespace can never access transport-owned pending requests.
+    Legacy(String),
+}
+
+type PendingRequestKey = (PendingOwner, u32, u32); // owner, channel_id, request_id
+
+#[derive(Default)]
+struct PendingMissingState {
+    requests: HashMap<PendingRequestKey, PendingMissingTransactions>,
+    template_epoch: u64,
+}
+
+impl PendingMissingState {
+    fn expire(&mut self) {
+        self.requests
+            .retain(|_, pending| pending.created_at.elapsed() < PENDING_MISSING_TTL);
+    }
+
+    fn invalidate_template(&mut self) {
+        self.requests.clear();
+        self.template_epoch = self.template_epoch.wrapping_add(1);
+    }
+
+    fn insert(&mut self, key: PendingRequestKey, txids: Vec<[u8; 32]>) -> bool {
+        self.expire();
+        let mut owner_count = 1;
+        let mut total_count = 1;
+        let mut owner_bytes = std::mem::size_of_val(txids.as_slice());
+        let mut total_bytes = owner_bytes;
+        for (existing_key, pending) in &self.requests {
+            if existing_key == &key {
+                continue; // A replacement uses the existing request's slot.
+            }
+            let bytes = std::mem::size_of_val(pending.expected_txids.as_slice());
+            total_count += 1;
+            total_bytes += bytes;
+            if existing_key.0 == key.0 {
+                owner_count += 1;
+                owner_bytes += bytes;
+            }
+        }
+        if owner_count > MAX_PENDING_PER_SESSION
+            || total_count > MAX_PENDING_GLOBAL
+            || owner_bytes > MAX_PENDING_TXID_BYTES_PER_SESSION
+            || total_bytes > MAX_PENDING_TXID_BYTES_GLOBAL
+        {
+            return false;
+        }
+        self.requests.insert(
+            key,
+            PendingMissingTransactions {
+                expected_txids: txids,
+                created_at: Instant::now(),
+            },
+        );
+        true
+    }
+}
+
+/// Owns transport pending state through normal exit, errors, and cancellation.
+struct JdSession {
+    id: u64,
+    pending: Arc<Mutex<PendingMissingState>>,
+}
+
+impl Drop for JdSession {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .requests
+            .retain(|(owner, _, _), _| *owner != PendingOwner::Session(self.id));
+    }
 }
 
 /// JD Server embedded in pool
@@ -159,8 +249,10 @@ pub struct JdServer {
     current_prev_hash: Arc<TokioRwLock<Option<[u8; 32]>>>,
     /// Current template metadata for header/coinbase validation
     current_template: Arc<TokioRwLock<Option<CurrentTemplateContext>>>,
-    /// Outstanding missing-transaction requests keyed by (client_id, request_id)
-    pending_missing: Arc<TokioRwLock<HashMap<(String, u32), PendingMissingTransactions>>>,
+    /// Bounded missing-transaction state, scoped to a server-generated session.
+    /// Synchronous locking permits cleanup even when a transport task is aborted.
+    pending_missing: Arc<Mutex<PendingMissingState>>,
+    next_session_id: AtomicU64,
     /// Per-job dedup sets of seen share keys, keyed by job_id.
     ///
     /// A share key is `sha256(nonce ‖ time_le ‖ solution[..64])`. The dedup
@@ -206,7 +298,8 @@ impl JdServer {
             payout_tracker,
             current_prev_hash: Arc::new(TokioRwLock::new(None)),
             current_template: Arc::new(TokioRwLock::new(None)),
-            pending_missing: Arc::new(TokioRwLock::new(HashMap::new())),
+            pending_missing: Arc::new(Mutex::new(PendingMissingState::default())),
+            next_session_id: AtomicU64::new(1),
             seen_shares: Mutex::new(HashMap::new()),
         }
     }
@@ -214,12 +307,16 @@ impl JdServer {
     /// Update the current prev_hash (called when new block arrives)
     pub async fn set_current_prev_hash(&self, prev_hash: [u8; 32]) {
         let mut lock = self.current_prev_hash.write().await;
+        let changed = *lock != Some(prev_hash);
         *lock = Some(prev_hash);
         drop(lock);
 
         let mut template = self.current_template.write().await;
         if let Some(current) = template.as_mut() {
             current.prev_hash = prev_hash;
+        }
+        if changed {
+            self.pending_missing.lock().unwrap().invalidate_template();
         }
         debug!(
             prev_hash = ?hex::encode(prev_hash),
@@ -236,6 +333,7 @@ impl JdServer {
         {
             let mut current = self.current_template.write().await;
             *current = Some(template.clone());
+            self.pending_missing.lock().unwrap().invalidate_template();
         }
         debug!(
             prev_hash = ?hex::encode(template.prev_hash),
@@ -958,10 +1056,27 @@ impl JdServer {
     ///
     /// Validates the token, checks mode, validates the template,
     /// allocates a job ID, and stores job info.
+    ///
+    /// Compatibility API for trusted in-process callers: pending requests use
+    /// the token's miner name. Network transports use a separate session scope.
     pub async fn handle_set_full_template_job(
         &self,
         request: SetFullTemplateJob,
     ) -> std::result::Result<SetFullTemplateJobSuccess, FullTemplateJobResponse> {
+        self.handle_set_full_template_job_for_session(request, None)
+            .await
+    }
+
+    // Transport callers always supply their server-generated session ID. None
+    // preserves the original trusted in-process API's miner-name namespace.
+    async fn handle_set_full_template_job_for_session(
+        &self,
+        request: SetFullTemplateJob,
+        session_id: Option<u64>,
+    ) -> std::result::Result<SetFullTemplateJobSuccess, FullTemplateJobResponse> {
+        // Capture before reading template metadata; a concurrent update must
+        // not reintroduce pending state from the preceding template epoch.
+        let template_epoch = self.pending_missing.lock().unwrap().template_epoch;
         // 1. Validate basic structure
         if let Err(e) = request.validate() {
             return Err(FullTemplateJobResponse::Error(
@@ -1016,6 +1131,11 @@ impl JdServer {
                 ));
             }
         };
+
+        let owner = session_id
+            .map(PendingOwner::Session)
+            .unwrap_or_else(|| PendingOwner::Legacy(token_info.client_id.clone()));
+        let pending_key = (owner, request.channel_id, request.request_id);
 
         // 3. Verify mode matches (token must be granted FullTemplate mode)
         if token_info.granted_mode != JobDeclarationMode::FullTemplate {
@@ -1165,13 +1285,27 @@ impl JdServer {
                     missing_count = missing.len(),
                     "Full template job needs missing transactions"
                 );
-                self.pending_missing.write().await.insert(
-                    (token_info.client_id.clone(), request.request_id),
-                    PendingMissingTransactions {
-                        channel_id: request.channel_id,
-                        expected_txids: missing.clone(),
-                    },
-                );
+                let mut pending = self.pending_missing.lock().unwrap();
+                if pending.template_epoch != template_epoch {
+                    return Err(FullTemplateJobResponse::Error(
+                        SetFullTemplateJobError::new(
+                            request.channel_id,
+                            request.request_id,
+                            SetFullTemplateJobErrorCode::StalePrevHash,
+                            "Template changed during declaration; retry with the current template",
+                        ),
+                    ));
+                }
+                if !pending.insert(pending_key, missing.clone()) {
+                    return Err(FullTemplateJobResponse::Error(
+                        SetFullTemplateJobError::new(
+                            request.channel_id,
+                            request.request_id,
+                            SetFullTemplateJobErrorCode::ServerOverloaded,
+                            "Too many pending missing-transaction requests or retained txids",
+                        ),
+                    ));
+                }
                 return Err(FullTemplateJobResponse::NeedTransactions(
                     GetMissingTransactions::new(request.channel_id, request.request_id, missing),
                 ));
@@ -1181,9 +1315,10 @@ impl JdServer {
 
         // 6. Register the job
         self.pending_missing
-            .write()
-            .await
-            .remove(&(token_info.client_id.clone(), request.request_id));
+            .lock()
+            .unwrap()
+            .requests
+            .remove(&pending_key);
 
         let job_id = match self.register_full_template_job(&request, &token_info) {
             Ok(id) => id,
@@ -1270,65 +1405,78 @@ impl JdServer {
     /// and stores the transactions for future template validation.
     ///
     /// Returns Ok(()) on success or an error if transaction data is invalid.
+    /// This compatibility API consumes only in-process requests created under
+    /// the token's miner name; it cannot consume a transport session's requests.
     pub async fn handle_provide_missing_transactions(
         &self,
         msg: ProvideMissingTransactions,
         client_id: &str,
     ) -> Result<()> {
-        info!(
-            "Client {} provided {} missing transactions for request {}",
-            client_id,
-            msg.transactions.len(),
-            msg.request_id
-        );
+        self.handle_provide_missing_transactions_for_owner(
+            msg,
+            PendingOwner::Legacy(client_id.to_string()),
+        )
+        .await
+    }
 
-        let pending = {
-            let mut requests = self.pending_missing.write().await;
-            requests.remove(&(client_id.to_string(), msg.request_id))
-        }
-        .ok_or_else(|| {
-            JdServerError::Protocol(format!(
-                "no outstanding missing-transaction request for client {} request {}",
-                client_id, msg.request_id
-            ))
-        })?;
-
-        if pending.channel_id != msg.channel_id {
-            return Err(JdServerError::Protocol(format!(
-                "channel mismatch for missing transactions: expected {}, got {}",
-                pending.channel_id, msg.channel_id
-            )));
-        }
-        if msg.transactions.len() != pending.expected_txids.len() {
-            return Err(JdServerError::Protocol(format!(
-                "expected {} transactions, got {}",
-                pending.expected_txids.len(),
-                msg.transactions.len()
-            )));
-        }
-
-        let mut validator = self.validator.write().await;
-
-        for (expected_txid, tx_data) in pending.expected_txids.iter().zip(msg.transactions.iter()) {
-            TemplateValidator::parse_transaction(tx_data).map_err(JdServerError::Protocol)?;
-            let txid = TemplateValidator::compute_txid(tx_data);
-            if &txid != expected_txid {
+    async fn handle_provide_missing_transactions_for_owner(
+        &self,
+        msg: ProvideMissingTransactions,
+        owner: PendingOwner,
+    ) -> Result<()> {
+        let key = (owner, msg.channel_id, msg.request_id);
+        let no_pending = || {
+            JdServerError::Protocol(
+                "no outstanding missing-transaction request for this session, channel, and request"
+                    .into(),
+            )
+        };
+        {
+            let mut pending = self.pending_missing.lock().unwrap();
+            pending.expire();
+            let request = pending.requests.get(&key).ok_or_else(no_pending)?;
+            if msg.transactions.len() != request.expected_txids.len() {
                 return Err(JdServerError::Protocol(format!(
-                    "provided transaction txid {} did not match requested {}",
-                    hex::encode(txid),
-                    hex::encode(expected_txid),
+                    "expected {} transactions, got {}",
+                    request.expected_txids.len(),
+                    msg.transactions.len()
                 )));
             }
-            validator.add_known_txid(txid);
-
-            debug!(
-                "Added requested txid {} from provided transaction ({} bytes)",
-                hex::encode(txid),
-                tx_data.len()
-            );
         }
 
+        // Parse before taking the state lock; retain the pending reservation
+        // while waiting for the validator so it continues to count toward caps.
+        let mut txids = Vec::with_capacity(msg.transactions.len());
+        for tx_data in &msg.transactions {
+            TemplateValidator::parse_transaction(tx_data).map_err(JdServerError::Protocol)?;
+            txids.push(TemplateValidator::compute_txid(tx_data));
+        }
+        let mut validator = self.validator.write().await;
+        let mut pending = self.pending_missing.lock().unwrap();
+        pending.expire();
+        // A template update or TTL expiry during validation invalidates the
+        // response before any txid is added to the validator.
+        let request = pending.requests.remove(&key).ok_or_else(no_pending)?;
+        if txids != request.expected_txids {
+            return Err(JdServerError::Protocol(
+                "provided transaction txids did not match requested txids".into(),
+            ));
+        }
+        for txid in txids {
+            validator.add_known_txid(txid);
+        }
         Ok(())
+    }
+
+    fn open_session(&self) -> Result<JdSession> {
+        let id = self
+            .next_session_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_| JdServerError::Protocol("JD session IDs exhausted".into()))?;
+        Ok(JdSession {
+            id,
+            pending: Arc::clone(&self.pending_missing),
+        })
     }
 
     /// Get token manager (for testing)
@@ -1444,10 +1592,25 @@ pub async fn handle_jd_client_with_transport(
     jd_server: Arc<JdServer>,
     client_id: String,
 ) -> Result<()> {
+    let session = jd_server.open_session()?;
+    let mut cleanup = tokio::time::interval(PENDING_CLEANUP_INTERVAL);
+    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     info!(client_id, "JD client connected");
 
     loop {
-        let full_message = match transport.read_full_message().await {
+        let read_result = {
+            // Keep the same read future alive across cleanup ticks: cancelling
+            // a partially read frame would lose its framing on either transport.
+            let read = transport.read_full_message();
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    result = &mut read => break result,
+                    _ = cleanup.tick() => jd_server.pending_missing.lock().unwrap().expire(),
+                }
+            }
+        };
+        let full_message = match read_result {
             Ok(Some(message)) => message,
             Ok(None) => {
                 info!(client_id, "JD client disconnected");
@@ -1563,7 +1726,10 @@ pub async fn handle_jd_client_with_transport(
                     "Received SetFullTemplateJob"
                 );
 
-                match jd_server.handle_set_full_template_job(request).await {
+                match jd_server
+                    .handle_set_full_template_job_for_session(request, Some(session.id))
+                    .await
+                {
                     Ok(response) => {
                         let encoded = encode_set_full_template_job_success(&response)?;
                         transport.write_full_message(&encoded).await?;
@@ -1591,7 +1757,10 @@ pub async fn handle_jd_client_with_transport(
 
                 // Handle the provided transactions (no response per protocol)
                 if let Err(e) = jd_server
-                    .handle_provide_missing_transactions(msg, &client_id)
+                    .handle_provide_missing_transactions_for_owner(
+                        msg,
+                        PendingOwner::Session(session.id),
+                    )
                     .await
                 {
                     error!(
@@ -2129,13 +2298,14 @@ mod tests {
         channel_id: u32,
         txids: Vec<[u8; 32]>,
     ) {
-        server.pending_missing.write().await.insert(
-            (client_id.to_string(), request_id),
-            PendingMissingTransactions {
+        assert!(server.pending_missing.lock().unwrap().insert(
+            (
+                PendingOwner::Legacy(client_id.to_string()),
                 channel_id,
-                expected_txids: txids,
-            },
-        );
+                request_id
+            ),
+            txids,
+        ));
     }
 
     #[tokio::test]
@@ -2575,6 +2745,476 @@ mod tests {
     // =========================================================================
     // ProvideMissingTransactions Handler Tests
     // =========================================================================
+
+    async fn pending_test_server() -> Arc<JdServer> {
+        let server = Arc::new(JdServer::new(
+            test_config_full_template(),
+            Arc::new(PayoutTracker::default()),
+        ));
+        server.set_current_prev_hash([0xaa; 32]).await;
+        server
+    }
+
+    fn missing_declaration(
+        server: &JdServer,
+        miner: &str,
+        txids: Vec<[u8; 32]>,
+    ) -> SetFullTemplateJob {
+        let token = server
+            .handle_allocate_token(1, miner, JobDeclarationMode::FullTemplate)
+            .unwrap();
+        SetFullTemplateJob {
+            channel_id: 1,
+            request_id: 42,
+            mining_job_token: token.mining_job_token,
+            version: 5,
+            prev_hash: [0xaa; 32],
+            merkle_root: merkle_root_for(&minimal_tx(), &txids),
+            block_commitments: [0xcc; 32],
+            coinbase_tx: minimal_tx(),
+            time: 1700000000,
+            bits: 0x1d00ffff,
+            tx_short_ids: txids,
+            tx_data: vec![],
+        }
+    }
+
+    async fn pending_peer(
+        server: Arc<JdServer>,
+        label: &str,
+    ) -> (JdTransport, tokio::task::JoinHandle<Result<()>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let label = label.to_string();
+        let handle = tokio::spawn(handle_jd_client(stream, server, label));
+        (JdTransport::Plain(client), handle)
+    }
+
+    async fn declare_over_transport(peer: &mut JdTransport, job: &SetFullTemplateJob) -> u8 {
+        peer.write_full_message(&crate::codec::encode_set_full_template_job(job).unwrap())
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), peer.read_full_message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        MessageFrame::decode(&response).unwrap().msg_type
+    }
+
+    async fn provide_over_transport(peer: &mut JdTransport, tx: Vec<u8>) {
+        let msg = ProvideMissingTransactions::new(1, 42, vec![tx]);
+        peer.write_full_message(&crate::codec::encode_provide_missing_transactions(&msg).unwrap())
+            .await
+            .unwrap();
+    }
+
+    fn assert_pending_overloaded(
+        result: std::result::Result<SetFullTemplateJobSuccess, FullTemplateJobResponse>,
+    ) {
+        assert!(
+            matches!(
+                result,
+                Err(FullTemplateJobResponse::Error(SetFullTemplateJobError {
+                    error_code: SetFullTemplateJobErrorCode::ServerOverloaded,
+                    ..
+                }))
+            ),
+            "pending state must reject capacity overflow: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_security_transport_uses_one_owner_for_declaration_and_reply() {
+        let server = pending_test_server().await;
+        let tx = minimal_tx_with_script(&[0x52]);
+        let job = missing_declaration(
+            &server,
+            "miner-name",
+            vec![TemplateValidator::compute_txid(&tx)],
+        );
+        let (mut peer, handle) = pending_peer(server, "peer-label").await;
+        assert_eq!(
+            declare_over_transport(&mut peer, &job).await,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        provide_over_transport(&mut peer, tx).await;
+        assert_eq!(
+            declare_over_transport(&mut peer, &job).await,
+            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
+        );
+        drop(peer);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_same_miner_and_peer_label_cannot_overwrite_another_session() {
+        let server = pending_test_server().await;
+        let tx_a = minimal_tx_with_script(&[0x52]);
+        let tx_b = minimal_tx_with_script(&[0x53]);
+        let job_a = missing_declaration(
+            &server,
+            "shared-miner",
+            vec![TemplateValidator::compute_txid(&tx_a)],
+        );
+        let job_b = missing_declaration(
+            &server,
+            "shared-miner",
+            vec![TemplateValidator::compute_txid(&tx_b)],
+        );
+        let (mut a, handle_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
+        let (mut b, handle_b) = pending_peer(server, "shared-miner").await;
+        assert_eq!(
+            declare_over_transport(&mut a, &job_a).await,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        assert_eq!(
+            declare_over_transport(&mut b, &job_b).await,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        provide_over_transport(&mut a, tx_a).await;
+        assert_eq!(
+            declare_over_transport(&mut a, &job_a).await,
+            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
+        );
+        provide_over_transport(&mut b, tx_b).await;
+        assert_eq!(
+            declare_over_transport(&mut b, &job_b).await,
+            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
+        );
+        drop((a, b));
+        handle_a.await.unwrap().unwrap();
+        handle_b.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_foreign_session_cannot_consume_request() {
+        let server = pending_test_server().await;
+        let tx = minimal_tx_with_script(&[0x52]);
+        let job = missing_declaration(
+            &server,
+            "shared-miner",
+            vec![TemplateValidator::compute_txid(&tx)],
+        );
+        let (mut a, handle_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
+        let (mut b, handle_b) = pending_peer(server, "shared-miner").await;
+        assert_eq!(
+            declare_over_transport(&mut a, &job).await,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        provide_over_transport(&mut b, tx.clone()).await;
+        // A declaration on B is also a processing barrier for B's one-way reply.
+        assert_eq!(
+            declare_over_transport(&mut b, &job).await,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        provide_over_transport(&mut a, tx).await;
+        assert_eq!(
+            declare_over_transport(&mut a, &job).await,
+            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
+        );
+        drop((a, b));
+        handle_a.await.unwrap().unwrap();
+        handle_b.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_disconnect_and_cancellation_release_requests() {
+        for exit in ["eof", "malformed", "abort"] {
+            let server = pending_test_server().await;
+            let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+            let (mut peer, handle) = pending_peer(Arc::clone(&server), "miner").await;
+            assert_eq!(
+                declare_over_transport(&mut peer, &job).await,
+                message_types::GET_MISSING_TRANSACTIONS
+            );
+            if exit == "malformed" {
+                // Valid frame header, missing the required declaration fields.
+                peer.write_full_message(&[0, 0, message_types::SET_FULL_TEMPLATE_JOB, 0, 0, 0])
+                    .await
+                    .unwrap();
+            } else if exit == "abort" {
+                handle.abort();
+            }
+            drop(peer);
+            let _ = handle.await;
+            assert!(
+                server.pending_missing.lock().unwrap().requests.is_empty(),
+                "{exit} must release pending requests"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_security_idle_transport_expires_requests() {
+        let server = pending_test_server().await;
+        let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        let (mut peer, handle) = pending_peer(Arc::clone(&server), "miner").await;
+        assert_eq!(
+            declare_over_transport(&mut peer, &job).await,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(31)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            server.pending_missing.lock().unwrap().requests.is_empty(),
+            "idle connections must release expired requests"
+        );
+        tokio::time::resume();
+        drop(peer);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_per_owner_request_limit_and_replacement() {
+        let server = pending_test_server().await;
+        let mut job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        for id in 0..8 {
+            job.request_id = id;
+            assert!(matches!(
+                server.handle_set_full_template_job(job.clone()).await,
+                Err(FullTemplateJobResponse::NeedTransactions(_))
+            ));
+        }
+        // Replacing our own request must not spend a second capacity slot.
+        assert!(matches!(
+            server.handle_set_full_template_job(job.clone()).await,
+            Err(FullTemplateJobResponse::NeedTransactions(_))
+        ));
+        job.request_id = 8;
+        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+    }
+
+    #[tokio::test]
+    async fn pending_security_global_request_limit() {
+        let server = pending_test_server().await;
+        for owner in 0..256 {
+            let job = missing_declaration(&server, &format!("miner-{owner}"), vec![[0x11; 32]]);
+            assert!(matches!(
+                server.handle_set_full_template_job(job).await,
+                Err(FullTemplateJobResponse::NeedTransactions(_))
+            ));
+        }
+        let job = missing_declaration(&server, "overflow", vec![[0x11; 32]]);
+        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+    }
+
+    #[tokio::test]
+    async fn pending_security_per_owner_txid_byte_limit() {
+        let server = pending_test_server().await;
+        let mut job = missing_declaration(&server, "miner", vec![[0x11; 32]; 8192]);
+        for id in 0..2 {
+            job.request_id = id;
+            assert!(matches!(
+                server.handle_set_full_template_job(job.clone()).await,
+                Err(FullTemplateJobResponse::NeedTransactions(_))
+            ));
+        }
+        job.request_id = 2;
+        job.tx_short_ids = vec![[0x22; 32]];
+        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+    }
+
+    #[tokio::test]
+    async fn pending_security_global_txid_byte_limit() {
+        let server = pending_test_server().await;
+        for owner in 0..32 {
+            let job =
+                missing_declaration(&server, &format!("miner-{owner}"), vec![[0x11; 32]; 8192]);
+            assert!(matches!(
+                server.handle_set_full_template_job(job).await,
+                Err(FullTemplateJobResponse::NeedTransactions(_))
+            ));
+        }
+        let job = missing_declaration(&server, "overflow", vec![[0x22; 32]]);
+        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_security_expired_response_rejected() {
+        let server = pending_test_server().await;
+        let tx = minimal_tx_with_script(&[0x52]);
+        let txid = TemplateValidator::compute_txid(&tx);
+        let job = missing_declaration(&server, "miner", vec![txid]);
+        assert!(matches!(
+            server.handle_set_full_template_job(job).await,
+            Err(FullTemplateJobResponse::NeedTransactions(_))
+        ));
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(
+            server
+                .handle_provide_missing_transactions(
+                    ProvideMissingTransactions::new(1, 42, vec![tx]),
+                    "miner"
+                )
+                .await
+                .is_err()
+        );
+        assert!(!server.validator().await.is_txid_known(&txid));
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_security_expiry_reclaims_admission_capacity() {
+        let server = pending_test_server().await;
+        let mut job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        for id in 0..8 {
+            job.request_id = id;
+            assert!(matches!(
+                server.handle_set_full_template_job(job.clone()).await,
+                Err(FullTemplateJobResponse::NeedTransactions(_))
+            ));
+        }
+        tokio::time::advance(Duration::from_secs(31)).await;
+        job.request_id = 8;
+        assert!(matches!(
+            server.handle_set_full_template_job(job).await,
+            Err(FullTemplateJobResponse::NeedTransactions(_))
+        ));
+        assert_eq!(server.pending_missing.lock().unwrap().requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_security_transport_limit_spans_miner_names() {
+        let server = pending_test_server().await;
+        let (mut peer, handle) = pending_peer(Arc::clone(&server), "peer").await;
+        for id in 0..8 {
+            let mut job = missing_declaration(&server, &format!("miner-{id}"), vec![[0x11; 32]]);
+            job.request_id = id;
+            assert_eq!(
+                declare_over_transport(&mut peer, &job).await,
+                message_types::GET_MISSING_TRANSACTIONS
+            );
+        }
+        let mut overflow = missing_declaration(&server, "new-miner", vec![[0x11; 32]]);
+        overflow.request_id = 8;
+        peer.write_full_message(&crate::codec::encode_set_full_template_job(&overflow).unwrap())
+            .await
+            .unwrap();
+        let response = peer.read_full_message().await.unwrap().unwrap();
+        let error = crate::codec::decode_set_full_template_job_error(&response).unwrap();
+        assert_eq!(
+            error.error_code,
+            SetFullTemplateJobErrorCode::ServerOverloaded
+        );
+        drop(peer);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_cleanup_tick_preserves_partial_frame() {
+        let server = pending_test_server().await;
+        let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        let (mut peer, handle) = pending_peer(server, "peer").await;
+        let wire = crate::codec::encode_set_full_template_job(&job).unwrap();
+        peer.write_full_message(&wire[..8]).await.unwrap();
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        peer.write_full_message(&wire[8..]).await.unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), peer.read_full_message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            MessageFrame::decode(&response).unwrap().msg_type,
+            message_types::GET_MISSING_TRANSACTIONS
+        );
+        drop(peer);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_template_update_during_declaration_cannot_reinsert_request() {
+        let server = pending_test_server().await;
+        let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        let validator = server.validator.write().await;
+        let declaration = server.handle_set_full_template_job(job);
+        tokio::pin!(declaration);
+        // Poll through the epoch/header checks, then suspend on the validator.
+        tokio::select! {
+            biased;
+            _ = &mut declaration => panic!("declaration must wait for the validator"),
+            _ = tokio::task::yield_now() => {}
+        }
+        server.set_current_prev_hash([0xbb; 32]).await;
+        drop(validator);
+        assert!(matches!(
+            declaration.await,
+            Err(FullTemplateJobResponse::Error(SetFullTemplateJobError {
+                error_code: SetFullTemplateJobErrorCode::StalePrevHash,
+                ..
+            }))
+        ));
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pending_security_template_update_during_reply_rejects_transaction_admission() {
+        let server = pending_test_server().await;
+        let tx = minimal_tx_with_script(&[0x52]);
+        let txid = TemplateValidator::compute_txid(&tx);
+        let job = missing_declaration(&server, "miner", vec![txid]);
+        assert!(matches!(
+            server.handle_set_full_template_job(job).await,
+            Err(FullTemplateJobResponse::NeedTransactions(_))
+        ));
+        let validator = server.validator.read().await;
+        let reply = server.handle_provide_missing_transactions(
+            ProvideMissingTransactions::new(1, 42, vec![tx]),
+            "miner",
+        );
+        tokio::pin!(reply);
+        tokio::select! {
+            biased;
+            _ = &mut reply => panic!("reply must wait for the validator"),
+            _ = tokio::task::yield_now() => {}
+        }
+        server.set_current_prev_hash([0xbb; 32]).await;
+        drop(validator);
+        assert!(reply.await.is_err());
+        assert!(!server.validator().await.is_txid_known(&txid));
+    }
+
+    #[tokio::test]
+    async fn pending_security_template_epoch_clears_requests() {
+        for same_tip in [false, true] {
+            let server = pending_test_server().await;
+            let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+            assert!(matches!(
+                server.handle_set_full_template_job(job).await,
+                Err(FullTemplateJobResponse::NeedTransactions(_))
+            ));
+            if same_tip {
+                server
+                    .set_current_template(CurrentTemplateContext {
+                        version: 5,
+                        prev_hash: [0xaa; 32],
+                        block_commitments: [0xcc; 32],
+                        chain_history_root: [0; 32],
+                        consensus_branch_id: 0,
+                        bits: 0x1d00ffff,
+                        time: 1700000000,
+                        txids: vec![],
+                        coinbase_tx_len: 100,
+                    })
+                    .await;
+            } else {
+                server.set_current_prev_hash([0xbb; 32]).await;
+            }
+            assert!(
+                server.pending_missing.lock().unwrap().requests.is_empty(),
+                "template change must clear requests (same tip: {same_tip})"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_handle_provide_missing_transactions() {
