@@ -3,6 +3,7 @@
 //! Converts templates from Phase 1 into jobs for miners.
 
 use crate::channel::Channel;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use zcash_mining_protocol::messages::NewEquihashJob;
 use zcash_template_provider::types::BlockTemplate;
@@ -39,7 +40,7 @@ fn next_job_id() -> u32 {
 /// Job distributor - creates jobs from templates
 pub struct JobDistributor {
     /// Current template
-    current_template: Option<BlockTemplate>,
+    current_template: Option<Arc<BlockTemplate>>,
     /// Previous block hash (to detect new blocks)
     prev_hash: Option<[u8; 32]>,
 }
@@ -58,16 +59,32 @@ impl JobDistributor {
         let is_new_block = self.prev_hash.as_ref() != Some(&template.header.prev_hash.0);
 
         self.prev_hash = Some(template.header.prev_hash.0);
-        self.current_template = Some(template);
+        self.current_template = Some(Arc::new(template));
 
         is_new_block
     }
 
     /// Create a job for a specific channel
     pub fn create_job(&self, channel: &Channel, clean_jobs: bool) -> Option<NewEquihashJob> {
-        let template = self.current_template.as_ref()?;
+        self.create_job_with_template(channel, clean_jobs)
+            .map(|(job, _)| job)
+    }
 
-        Some(NewEquihashJob {
+    /// Create a job and return the exact template it was derived from.
+    ///
+    /// The snapshot must stay attached to the job: template refreshes on the
+    /// same chain tip may change the transaction set without changing fields in
+    /// the mining job header. Using the distributor's latest template when a
+    /// share arrives can therefore assemble a different block than the miner
+    /// solved.
+    pub fn create_job_with_template(
+        &self,
+        channel: &Channel,
+        clean_jobs: bool,
+    ) -> Option<(NewEquihashJob, Arc<BlockTemplate>)> {
+        let template = Arc::clone(self.current_template.as_ref()?);
+
+        let job = NewEquihashJob {
             channel_id: channel.id,
             job_id: next_job_id(),
             future_job: false,
@@ -81,7 +98,9 @@ impl JobDistributor {
             bits: template.header.bits,
             target: channel.current_target(),
             clean_jobs,
-        })
+        };
+
+        Some((job, template))
     }
 
     /// Get current template height
@@ -96,7 +115,7 @@ impl JobDistributor {
 
     /// Get a clone of the current template
     pub fn current_template(&self) -> Option<BlockTemplate> {
-        self.current_template.clone()
+        self.current_template.as_deref().cloned()
     }
 }
 
@@ -161,5 +180,38 @@ mod tests {
         assert_eq!(job.nonce_1, vec![0x01, 0x02, 0x03, 0x04]);
         assert_eq!(job.nonce_2_len, 28);
         assert!(!job.clean_jobs);
+    }
+
+    #[test]
+    fn created_job_keeps_its_template_snapshot_across_same_tip_refresh() {
+        let mut distributor = JobDistributor::new();
+        let mut template_a = make_template(100, [0x11; 32]);
+        template_a.template_id = 41;
+        template_a.coinbase = vec![0xaa];
+        distributor.update_template(template_a);
+
+        let mut channel =
+            Channel::new(vec![0x01, 0x02, 0x03, 0x04], VardiffConfig::default()).unwrap();
+        let (job, snapshot) = distributor
+            .create_job_with_template(&channel, false)
+            .expect("current template creates a job and snapshot");
+        channel.add_job(job, Arc::clone(&snapshot), false);
+
+        let mut template_b = make_template(100, [0x11; 32]);
+        template_b.template_id = 42;
+        template_b.coinbase = vec![0xbb];
+        assert!(!distributor.update_template(template_b));
+
+        assert_eq!(snapshot.template_id, 41);
+        assert_eq!(snapshot.coinbase, vec![0xaa]);
+        assert_eq!(
+            channel
+                .get_job(channel.last_job_id)
+                .unwrap()
+                .template
+                .template_id,
+            41
+        );
+        assert_eq!(distributor.current_template().unwrap().template_id, 42);
     }
 }

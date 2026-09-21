@@ -190,7 +190,7 @@ async fn test_channel_concurrent_job_cleanup() {
             for job_id in 1..=100u32 {
                 let mut ch = channel.write().await;
                 let job = make_job(ch.id, job_id);
-                ch.add_job(job, true);
+                ch.add_job(job, Arc::new(make_template(1, [0; 32])), true);
             }
         })
     };

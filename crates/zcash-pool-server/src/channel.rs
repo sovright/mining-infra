@@ -4,11 +4,13 @@
 
 use crate::ratelimit::RateLimiter;
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use zcash_equihash_validator::{VardiffConfig, VardiffController};
 use zcash_mining_protocol::messages::NewEquihashJob;
+use zcash_template_provider::types::BlockTemplate;
 
 /// Global channel ID counter
 /// Starts at 1, wraps at u32::MAX - 1 to avoid 0 (reserved for errors)
@@ -48,6 +50,8 @@ pub struct ChannelJob {
     pub job_id: u32,
     /// The full job message sent to miner
     pub job: NewEquihashJob,
+    /// Immutable template snapshot used to create this job.
+    pub template: Arc<BlockTemplate>,
     /// Whether this job is still valid
     pub active: bool,
     /// When this job was created
@@ -127,7 +131,7 @@ impl Channel {
     }
 
     /// Add a job to this channel
-    pub fn add_job(&mut self, job: NewEquihashJob, clean_jobs: bool) {
+    pub fn add_job(&mut self, job: NewEquihashJob, template: Arc<BlockTemplate>, clean_jobs: bool) {
         if clean_jobs {
             // Mark all existing jobs as inactive
             for j in self.jobs.values_mut() {
@@ -140,6 +144,7 @@ impl Channel {
         let channel_job = ChannelJob {
             job_id,
             job,
+            template,
             active: true,
             created_at: Instant::now(),
         };
@@ -224,6 +229,31 @@ impl Channel {
 }
 
 #[cfg(test)]
+pub(crate) fn test_template() -> Arc<BlockTemplate> {
+    use zcash_template_provider::types::{EquihashHeader, Hash256};
+
+    Arc::new(BlockTemplate {
+        template_id: 1,
+        height: 1,
+        header: EquihashHeader {
+            version: 5,
+            prev_hash: Hash256([0; 32]),
+            merkle_root: Hash256([0; 32]),
+            hash_block_commitments: Hash256([0; 32]),
+            time: 0,
+            bits: 0,
+            nonce: [0; 32],
+        },
+        target: Hash256([0xff; 32]),
+        transactions: Vec::new(),
+        coinbase: Vec::new(),
+        chain_history_root: Hash256([0; 32]),
+        consensus_branch_id: 0,
+        total_fees: 0,
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -305,7 +335,7 @@ mod tests {
             clean_jobs: false,
         };
 
-        channel.add_job(job1.clone(), false);
+        channel.add_job(job1.clone(), test_template(), false);
         assert!(channel.is_job_active(1));
 
         let job2 = NewEquihashJob {
@@ -313,7 +343,7 @@ mod tests {
             ..job1.clone()
         };
 
-        channel.add_job(job2, true); // clean_jobs
+        channel.add_job(job2, test_template(), true); // clean_jobs
         assert!(!channel.is_job_active(1)); // Old job now inactive
         assert!(channel.is_job_active(2)); // New job active
     }
@@ -344,13 +374,13 @@ mod tests {
         // Simulate pre-wraparound: add jobs with high IDs near u32::MAX
         for i in 0..8 {
             let id = u32::MAX - 10 + i;
-            channel.add_job(make_job(id, &channel), false);
+            channel.add_job(make_job(id, &channel), test_template(), false);
         }
         assert_eq!(channel.jobs.len(), 8);
 
         // Simulate post-wraparound: add jobs with low IDs (1, 2, 3, 4)
         for id in 1..=4 {
-            channel.add_job(make_job(id, &channel), false);
+            channel.add_job(make_job(id, &channel), test_template(), false);
         }
 
         // After 12 inserts total, eviction should have trimmed to 10.

@@ -3,6 +3,7 @@
 //! These tests verify the integration between pool components without
 //! requiring a running Zebra node.
 
+use std::sync::Arc;
 use std::time::Duration;
 use zcash_equihash_validator::VardiffConfig;
 use zcash_mining_protocol::messages::NewEquihashJob;
@@ -334,7 +335,7 @@ fn test_channel_job_management() {
     };
 
     // Add job
-    channel.add_job(job.clone(), false);
+    channel.add_job(job.clone(), Arc::new(make_test_template(1, [0; 32])), false);
     assert!(channel.is_job_active(1));
     assert!(!channel.is_job_active(999)); // Unknown job
 
@@ -343,7 +344,7 @@ fn test_channel_job_management() {
         job_id: 2,
         ..job.clone()
     };
-    channel.add_job(job2, false);
+    channel.add_job(job2, Arc::new(make_test_template(1, [0; 32])), false);
     assert!(channel.is_job_active(1)); // Still active
     assert!(channel.is_job_active(2)); // New job also active
 
@@ -352,7 +353,7 @@ fn test_channel_job_management() {
         job_id: 3,
         ..job.clone()
     };
-    channel.add_job(job3, true);
+    channel.add_job(job3, Arc::new(make_test_template(1, [0; 32])), true);
     assert!(!channel.is_job_active(1)); // Old job now stale
     assert!(!channel.is_job_active(2)); // Old job now stale
     assert!(channel.is_job_active(3)); // Only new job active
