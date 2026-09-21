@@ -81,6 +81,18 @@ These carry a `worker` label for per-miner breakdowns:
 | `worker_blocks_found_total` | Counter | Blocks found per worker |
 | `hashrate_sol_s` | Gauge | Worker hashrate in solutions/s |
 
+The pool's periodic publisher uses `PoolMetrics::set_worker_hashrates` to publish
+a complete snapshot of current worker estimates. Workers omitted from a snapshot
+lose their `hashrate_sol_s` series; an empty snapshot removes all worker hashrate
+series. This prevents old estimates from surviving window rotation or stale-worker
+cleanup. An absent series means **no current estimate**, not proof that the
+physical miner disconnected. An explicit zero estimate remains exported as zero.
+Worker share and block counters retain their cumulative values, including when a
+worker's estimate disappears and later returns.
+
+Use a single periodic publisher for these snapshots. Do not concurrently update
+worker hashrates through another snapshot publisher or `set_worker_hashrate`.
+
 ## HTTP Endpoints
 
 - `/metrics` - Prometheus metrics in text format

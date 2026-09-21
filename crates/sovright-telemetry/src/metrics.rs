@@ -5,10 +5,12 @@
 
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Method, Request, Response, Server, StatusCode};
+use prometheus::core::Collector;
 use prometheus::{
     Encoder, Gauge, Histogram, HistogramOpts, IntCounter, IntCounterVec, IntGauge, Opts, Registry,
     TextEncoder,
 };
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -554,6 +556,37 @@ impl PoolMetrics {
             .set(hashrate);
     }
 
+    /// Publish a complete snapshot of current worker hashrate estimates.
+    ///
+    /// Omitted workers lose their hashrate series; an empty snapshot removes
+    /// every worker hashrate series. Absence means no current estimate, not
+    /// proof that a miner disconnected. Explicit zero estimates stay present.
+    /// Worker share and block counters are unaffected.
+    ///
+    /// The periodic publisher must be the sole writer of hashrate snapshots;
+    /// do not concurrently publish snapshots or individual worker estimates.
+    pub fn set_worker_hashrates(&self, hashrates: &HashMap<String, f64>) {
+        // Update retained workers first so publishing a new snapshot does not
+        // temporarily remove their series as a GaugeVec reset would.
+        for (worker, hashrate) in hashrates {
+            self.set_worker_hashrate(worker, *hashrate);
+        }
+
+        for family in self.worker_hashrate.collect() {
+            for metric in family.get_metric() {
+                if let Some(worker) = metric
+                    .get_label()
+                    .iter()
+                    .find(|label| label.name() == "worker")
+                    .map(|label| label.value())
+                    && !hashrates.contains_key(worker)
+                {
+                    let _ = self.worker_hashrate.remove_label_values(&[worker]);
+                }
+            }
+        }
+    }
+
     /// Update pool-level aggregate metrics
     pub fn set_pool_aggregates(&self, hashrate: f64, miners: i64, workers: i64) {
         self.pool_total_hashrate.set(hashrate);
@@ -769,6 +802,111 @@ mod tests {
 
         let encoded = metrics.encode();
         assert!(encoded.contains("sovright_pool_estimated_hashrate 1000000"));
+    }
+
+    #[test]
+    fn test_worker_hashrate_snapshot_removes_omitted_workers() {
+        let metrics = PoolMetrics::new();
+        metrics.set_worker_hashrate("rig-a", 100.0);
+        metrics.set_worker_hashrate("rig-b", 200.0);
+
+        // Clones share the registered series, including removal of labels
+        // originally created through a different handle.
+        let publisher = metrics.clone();
+        publisher.set_worker_hashrates(&HashMap::from([
+            ("rig-b".to_string(), 250.0),
+            ("rig-c".to_string(), 300.0),
+        ]));
+
+        let encoded = metrics.encode();
+        assert!(!encoded.contains("hashrate_sol_s{worker=\"rig-a\"}"));
+        assert!(
+            encoded
+                .lines()
+                .any(|line| line == "hashrate_sol_s{worker=\"rig-b\"} 250")
+        );
+        assert!(
+            encoded
+                .lines()
+                .any(|line| line == "hashrate_sol_s{worker=\"rig-c\"} 300")
+        );
+    }
+
+    #[test]
+    fn test_empty_worker_hashrate_snapshot_removes_all_estimates() {
+        let metrics = PoolMetrics::new();
+        metrics.set_worker_hashrates(&HashMap::from([
+            ("rig-a".to_string(), 100.0),
+            ("rig-b".to_string(), 200.0),
+        ]));
+
+        metrics.set_worker_hashrates(&HashMap::new());
+        // Empty snapshots remain safe before the next share starts a window.
+        metrics.set_worker_hashrates(&HashMap::new());
+
+        assert!(
+            !metrics
+                .encode()
+                .lines()
+                .any(|line| line.starts_with("hashrate_sol_s{"))
+        );
+    }
+
+    #[test]
+    fn test_worker_hashrate_snapshot_retains_explicit_zero() {
+        let metrics = PoolMetrics::new();
+        metrics.set_worker_hashrate("rig-a", 100.0);
+
+        metrics.set_worker_hashrates(&HashMap::from([("rig-a".to_string(), 0.0)]));
+
+        assert!(
+            metrics
+                .encode()
+                .lines()
+                .any(|line| line == "hashrate_sol_s{worker=\"rig-a\"} 0")
+        );
+    }
+
+    #[test]
+    fn test_worker_hashrate_reappears_without_resetting_counters() {
+        let metrics = PoolMetrics::new();
+        metrics.record_worker_share_accepted("rig-a");
+        metrics.record_worker_share_accepted("rig-a");
+        metrics.record_worker_share_rejected("rig-a");
+        metrics.record_worker_block_found("rig-a");
+        metrics.set_worker_hashrate("rig-a", 100.0);
+
+        for snapshot in [
+            HashMap::from([("rig-b".to_string(), 200.0)]),
+            HashMap::new(),
+            HashMap::from([("rig-a".to_string(), 300.0)]),
+        ] {
+            metrics.set_worker_hashrates(&snapshot);
+            let encoded = metrics.encode();
+            assert!(
+                encoded
+                    .lines()
+                    .any(|line| line == "worker_shares_accepted_total{worker=\"rig-a\"} 2")
+            );
+            assert!(
+                encoded
+                    .lines()
+                    .any(|line| line == "worker_shares_rejected_total{worker=\"rig-a\"} 1")
+            );
+            assert!(
+                encoded
+                    .lines()
+                    .any(|line| line == "worker_blocks_found_total{worker=\"rig-a\"} 1")
+            );
+        }
+
+        let encoded = metrics.encode();
+        assert!(
+            encoded
+                .lines()
+                .any(|line| line == "hashrate_sol_s{worker=\"rig-a\"} 300")
+        );
+        assert!(!encoded.contains("hashrate_sol_s{worker=\"rig-b\"}"));
     }
 
     #[test]
