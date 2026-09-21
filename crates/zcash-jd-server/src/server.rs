@@ -2248,7 +2248,7 @@ mod tests {
                 .get_job_info(&token_response.token)
                 .is_err()
         );
-        assert!(server.pending_missing.read().await.is_empty());
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
     }
 
     #[tokio::test]
@@ -2752,7 +2752,7 @@ mod tests {
 
         let result = server.handle_set_full_template_job(job_request).await;
         assert_full_template_unavailable(result);
-        assert!(server.pending_missing.read().await.is_empty());
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
     }
 
     fn assert_full_template_unavailable(
@@ -2797,18 +2797,20 @@ mod tests {
         server
     }
 
-    fn missing_declaration(
-        server: &JdServer,
-        miner: &str,
-        txids: Vec<[u8; 32]>,
-    ) -> SetFullTemplateJob {
+    // FullTemplate declarations are intentionally unavailable. Exercise the
+    // dormant pending machinery by seeding its real bounded state, never by
+    // bypassing the production declaration guard.
+    fn unsupported_declaration(server: &JdServer) -> SetFullTemplateJob {
+        // Model an already-issued token: the declaration must still fail closed.
         let token = server
-            .handle_allocate_token(1, miner, JobDeclarationMode::FullTemplate)
+            .token_manager()
+            .allocate_token_with_mode("miner-name", JobDeclarationMode::FullTemplate)
             .unwrap();
+        let txids = vec![[0x11; 32]];
         SetFullTemplateJob {
             channel_id: 1,
             request_id: 42,
-            mining_job_token: token.mining_job_token,
+            mining_job_token: token.token,
             version: 5,
             prev_hash: [0xaa; 32],
             merkle_root: merkle_root_for(&minimal_tx(), &txids),
@@ -2821,22 +2823,9 @@ mod tests {
         }
     }
 
-    async fn pending_peer(
-        server: Arc<JdServer>,
-        label: &str,
-    ) -> (JdTransport, tokio::task::JoinHandle<Result<()>>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let client = TcpStream::connect(listener.local_addr().unwrap())
-            .await
-            .unwrap();
-        let (stream, _) = listener.accept().await.unwrap();
-        let label = label.to_string();
-        let handle = tokio::spawn(handle_jd_client(stream, server, label));
-        (JdTransport::Plain(client), handle)
-    }
-
-    async fn declare_over_transport(peer: &mut JdTransport, job: &SetFullTemplateJob) -> u8 {
-        peer.write_full_message(&crate::codec::encode_set_full_template_job(job).unwrap())
+    async fn transport_barrier(peer: &mut JdTransport) {
+        let request = crate::messages::AllocateMiningJobToken::new(99, "pending-fixture");
+        peer.write_full_message(&crate::codec::encode_allocate_token(&request).unwrap())
             .await
             .unwrap();
         let response = tokio::time::timeout(Duration::from_secs(2), peer.read_full_message())
@@ -2844,7 +2833,45 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        MessageFrame::decode(&response).unwrap().msg_type
+        let response = crate::codec::decode_allocate_token_success(&response).unwrap();
+        assert_eq!(response.request_id, 99);
+        assert_eq!(response.granted_mode, JobDeclarationMode::CoinbaseOnly);
+    }
+
+    async fn pending_peer(
+        server: Arc<JdServer>,
+        label: &str,
+    ) -> (JdTransport, tokio::task::JoinHandle<Result<()>>, u64) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        // Fixtures open peers sequentially on their own server. Capture the ID
+        // assigned by the real transport, then confirm startup via a round trip.
+        let session_id = server.next_session_id.load(Ordering::Relaxed);
+        let handle = tokio::spawn(handle_jd_client(
+            stream,
+            Arc::clone(&server),
+            label.to_string(),
+        ));
+        let mut peer = JdTransport::Plain(client);
+        transport_barrier(&mut peer).await;
+        assert_eq!(
+            server.next_session_id.load(Ordering::Relaxed),
+            session_id + 1
+        );
+        (peer, handle, session_id)
+    }
+
+    fn seed_session_request(server: &JdServer, session_id: u64, txids: Vec<[u8; 32]>) {
+        assert!(
+            server
+                .pending_missing
+                .lock()
+                .unwrap()
+                .insert((PendingOwner::Session(session_id), 1, 42), txids,)
+        );
     }
 
     async fn provide_over_transport(peer: &mut JdTransport, tx: Vec<u8>) {
@@ -2852,81 +2879,86 @@ mod tests {
         peer.write_full_message(&crate::codec::encode_provide_missing_transactions(&msg).unwrap())
             .await
             .unwrap();
+        // ProvideMissingTransactions is one-way. This response proves the
+        // preceding message has been processed by the same transport task.
+        transport_barrier(peer).await;
     }
 
-    fn assert_pending_overloaded(
-        result: std::result::Result<SetFullTemplateJobSuccess, FullTemplateJobResponse>,
-    ) {
-        assert!(
-            matches!(
-                result,
-                Err(FullTemplateJobResponse::Error(SetFullTemplateJobError {
-                    error_code: SetFullTemplateJobErrorCode::ServerOverloaded,
-                    ..
-                }))
-            ),
-            "pending state must reject capacity overflow: {result:?}"
-        );
+    fn assert_pending_declaration_unavailable(error: SetFullTemplateJobError) {
+        assert_eq!(error.channel_id, 1);
+        assert_eq!(error.request_id, 42);
+        assert_eq!(error.error_code, SetFullTemplateJobErrorCode::Other);
+        assert_eq!(error.error_message, FULL_TEMPLATE_UNAVAILABLE);
     }
 
     #[tokio::test]
-    async fn pending_security_transport_uses_one_owner_for_declaration_and_reply() {
+    async fn pending_security_transport_refuses_full_template_without_pending_state() {
         let server = pending_test_server().await;
-        let tx = minimal_tx_with_script(&[0x52]);
-        let job = missing_declaration(
-            &server,
-            "miner-name",
-            vec![TemplateValidator::compute_txid(&tx)],
+        let job = unsupported_declaration(&server);
+        let (mut peer, handle, _) = pending_peer(Arc::clone(&server), "peer-label").await;
+        peer.write_full_message(&crate::codec::encode_set_full_template_job(&job).unwrap())
+            .await
+            .unwrap();
+        let response = tokio::time::timeout(Duration::from_secs(2), peer.read_full_message())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_pending_declaration_unavailable(
+            crate::codec::decode_set_full_template_job_error(&response).unwrap(),
         );
-        let (mut peer, handle) = pending_peer(server, "peer-label").await;
-        assert_eq!(
-            declare_over_transport(&mut peer, &job).await,
-            message_types::GET_MISSING_TRANSACTIONS
-        );
-        provide_over_transport(&mut peer, tx).await;
-        assert_eq!(
-            declare_over_transport(&mut peer, &job).await,
-            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+        assert!(
+            server
+                .token_manager()
+                .get_job_info(&job.mining_job_token)
+                .is_err()
         );
         drop(peer);
         handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn pending_security_same_miner_and_peer_label_cannot_overwrite_another_session() {
+    async fn pending_security_transport_reply_consumes_own_seeded_request() {
+        let server = pending_test_server().await;
+        let tx = minimal_tx_with_script(&[0x52]);
+        let txid = TemplateValidator::compute_txid(&tx);
+        let (mut peer, handle, session_id) = pending_peer(Arc::clone(&server), "peer-label").await;
+        seed_session_request(&server, session_id, vec![txid]);
+        provide_over_transport(&mut peer, tx).await;
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+        assert!(server.validator().await.is_txid_known(&txid));
+        drop(peer);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_security_same_peer_label_cannot_overwrite_another_session() {
         let server = pending_test_server().await;
         let tx_a = minimal_tx_with_script(&[0x52]);
         let tx_b = minimal_tx_with_script(&[0x53]);
-        let job_a = missing_declaration(
-            &server,
-            "shared-miner",
-            vec![TemplateValidator::compute_txid(&tx_a)],
-        );
-        let job_b = missing_declaration(
-            &server,
-            "shared-miner",
-            vec![TemplateValidator::compute_txid(&tx_b)],
-        );
-        let (mut a, handle_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
-        let (mut b, handle_b) = pending_peer(server, "shared-miner").await;
-        assert_eq!(
-            declare_over_transport(&mut a, &job_a).await,
-            message_types::GET_MISSING_TRANSACTIONS
-        );
-        assert_eq!(
-            declare_over_transport(&mut b, &job_b).await,
-            message_types::GET_MISSING_TRANSACTIONS
-        );
+        let txid_a = TemplateValidator::compute_txid(&tx_a);
+        let txid_b = TemplateValidator::compute_txid(&tx_b);
+        let (mut a, handle_a, session_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
+        let (mut b, handle_b, session_b) = pending_peer(Arc::clone(&server), "shared-miner").await;
+        assert_ne!(session_a, session_b);
+        seed_session_request(&server, session_a, vec![txid_a]);
+        seed_session_request(&server, session_b, vec![txid_b]);
+        assert_eq!(server.pending_missing.lock().unwrap().requests.len(), 2);
         provide_over_transport(&mut a, tx_a).await;
-        assert_eq!(
-            declare_over_transport(&mut a, &job_a).await,
-            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
-        );
+        {
+            let pending = server.pending_missing.lock().unwrap();
+            assert_eq!(pending.requests.len(), 1);
+            assert_eq!(
+                pending.requests[&(PendingOwner::Session(session_b), 1, 42)].expected_txids,
+                vec![txid_b]
+            );
+        }
+        assert!(server.validator().await.is_txid_known(&txid_a));
+        assert!(!server.validator().await.is_txid_known(&txid_b));
         provide_over_transport(&mut b, tx_b).await;
-        assert_eq!(
-            declare_over_transport(&mut b, &job_b).await,
-            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
-        );
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+        assert!(server.validator().await.is_txid_known(&txid_b));
         drop((a, b));
         handle_a.await.unwrap().unwrap();
         handle_b.await.unwrap().unwrap();
@@ -2936,28 +2968,21 @@ mod tests {
     async fn pending_security_foreign_session_cannot_consume_request() {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
-        let job = missing_declaration(
-            &server,
-            "shared-miner",
-            vec![TemplateValidator::compute_txid(&tx)],
-        );
-        let (mut a, handle_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
-        let (mut b, handle_b) = pending_peer(server, "shared-miner").await;
-        assert_eq!(
-            declare_over_transport(&mut a, &job).await,
-            message_types::GET_MISSING_TRANSACTIONS
-        );
+        let txid = TemplateValidator::compute_txid(&tx);
+        let (mut a, handle_a, session_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
+        let (mut b, handle_b, _) = pending_peer(Arc::clone(&server), "shared-miner").await;
+        seed_session_request(&server, session_a, vec![txid]);
         provide_over_transport(&mut b, tx.clone()).await;
-        // A declaration on B is also a processing barrier for B's one-way reply.
         assert_eq!(
-            declare_over_transport(&mut b, &job).await,
-            message_types::GET_MISSING_TRANSACTIONS
+            server.pending_missing.lock().unwrap().requests
+                [&(PendingOwner::Session(session_a), 1, 42)]
+                .expected_txids,
+            vec![txid]
         );
+        assert!(!server.validator().await.is_txid_known(&txid));
         provide_over_transport(&mut a, tx).await;
-        assert_eq!(
-            declare_over_transport(&mut a, &job).await,
-            message_types::SET_FULL_TEMPLATE_JOB_SUCCESS
-        );
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+        assert!(server.validator().await.is_txid_known(&txid));
         drop((a, b));
         handle_a.await.unwrap().unwrap();
         handle_b.await.unwrap().unwrap();
@@ -2967,12 +2992,9 @@ mod tests {
     async fn pending_security_disconnect_and_cancellation_release_requests() {
         for exit in ["eof", "malformed", "abort"] {
             let server = pending_test_server().await;
-            let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
-            let (mut peer, handle) = pending_peer(Arc::clone(&server), "miner").await;
-            assert_eq!(
-                declare_over_transport(&mut peer, &job).await,
-                message_types::GET_MISSING_TRANSACTIONS
-            );
+            let (mut peer, handle, session_id) = pending_peer(Arc::clone(&server), "miner").await;
+            seed_session_request(&server, session_id, vec![[0x11; 32]]);
+            assert_eq!(server.pending_missing.lock().unwrap().requests.len(), 1);
             if exit == "malformed" {
                 // Valid frame header, missing the required declaration fields.
                 peer.write_full_message(&[0, 0, message_types::SET_FULL_TEMPLATE_JOB, 0, 0, 0])
@@ -2982,7 +3004,13 @@ mod tests {
                 handle.abort();
             }
             drop(peer);
-            let _ = handle.await;
+            let outcome = handle.await;
+            match exit {
+                "eof" => outcome.unwrap().unwrap(),
+                "malformed" => assert!(outcome.unwrap().is_err()),
+                "abort" => assert!(outcome.unwrap_err().is_cancelled()),
+                _ => unreachable!(),
+            }
             assert!(
                 server.pending_missing.lock().unwrap().requests.is_empty(),
                 "{exit} must release pending requests"
@@ -2993,12 +3021,9 @@ mod tests {
     #[tokio::test]
     async fn pending_security_idle_transport_expires_requests() {
         let server = pending_test_server().await;
-        let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
-        let (mut peer, handle) = pending_peer(Arc::clone(&server), "miner").await;
-        assert_eq!(
-            declare_over_transport(&mut peer, &job).await,
-            message_types::GET_MISSING_TRANSACTIONS
-        );
+        let (peer, handle, session_id) = pending_peer(Arc::clone(&server), "miner").await;
+        seed_session_request(&server, session_id, vec![[0x11; 32]]);
+        assert_eq!(server.pending_missing.lock().unwrap().requests.len(), 1);
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(31)).await;
         tokio::task::yield_now().await;
@@ -3011,69 +3036,53 @@ mod tests {
         handle.await.unwrap().unwrap();
     }
 
-    #[tokio::test]
-    async fn pending_security_per_owner_request_limit_and_replacement() {
-        let server = pending_test_server().await;
-        let mut job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+    #[test]
+    fn pending_security_per_owner_request_limit_and_replacement() {
+        let mut state = PendingMissingState::default();
         for id in 0..8 {
-            job.request_id = id;
-            assert!(matches!(
-                server.handle_set_full_template_job(job.clone()).await,
-                Err(FullTemplateJobResponse::NeedTransactions(_))
-            ));
+            assert!(state.insert((PendingOwner::Session(1), 1, id), vec![[0x11; 32]]));
         }
-        // Replacing our own request must not spend a second capacity slot.
-        assert!(matches!(
-            server.handle_set_full_template_job(job.clone()).await,
-            Err(FullTemplateJobResponse::NeedTransactions(_))
-        ));
-        job.request_id = 8;
-        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+        assert!(state.insert((PendingOwner::Session(1), 1, 7), vec![[0x22; 32]]));
+        assert_eq!(state.requests.len(), 8);
+        assert_eq!(
+            state.requests[&(PendingOwner::Session(1), 1, 7)].expected_txids,
+            vec![[0x22; 32]]
+        );
+        assert!(!state.insert((PendingOwner::Session(1), 1, 8), vec![[0x33; 32]]));
+        assert_eq!(state.requests.len(), 8);
     }
 
-    #[tokio::test]
-    async fn pending_security_global_request_limit() {
-        let server = pending_test_server().await;
+    #[test]
+    fn pending_security_global_request_limit() {
+        let mut state = PendingMissingState::default();
         for owner in 0..256 {
-            let job = missing_declaration(&server, &format!("miner-{owner}"), vec![[0x11; 32]]);
-            assert!(matches!(
-                server.handle_set_full_template_job(job).await,
-                Err(FullTemplateJobResponse::NeedTransactions(_))
-            ));
+            assert!(state.insert((PendingOwner::Session(owner), 1, 42), vec![[0x11; 32]]));
         }
-        let job = missing_declaration(&server, "overflow", vec![[0x11; 32]]);
-        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+        assert!(!state.insert((PendingOwner::Session(256), 1, 42), vec![[0x11; 32]]));
+        assert_eq!(state.requests.len(), 256);
     }
 
-    #[tokio::test]
-    async fn pending_security_per_owner_txid_byte_limit() {
-        let server = pending_test_server().await;
-        let mut job = missing_declaration(&server, "miner", vec![[0x11; 32]; 8192]);
+    #[test]
+    fn pending_security_per_owner_txid_byte_limit() {
+        let mut state = PendingMissingState::default();
         for id in 0..2 {
-            job.request_id = id;
-            assert!(matches!(
-                server.handle_set_full_template_job(job.clone()).await,
-                Err(FullTemplateJobResponse::NeedTransactions(_))
-            ));
+            assert!(state.insert((PendingOwner::Session(1), 1, id), vec![[0x11; 32]; 8192]));
         }
-        job.request_id = 2;
-        job.tx_short_ids = vec![[0x22; 32]];
-        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+        assert!(!state.insert((PendingOwner::Session(1), 1, 2), vec![[0x22; 32]]));
+        assert_eq!(state.requests.len(), 2);
     }
 
-    #[tokio::test]
-    async fn pending_security_global_txid_byte_limit() {
-        let server = pending_test_server().await;
+    #[test]
+    fn pending_security_global_txid_byte_limit() {
+        let mut state = PendingMissingState::default();
         for owner in 0..32 {
-            let job =
-                missing_declaration(&server, &format!("miner-{owner}"), vec![[0x11; 32]; 8192]);
-            assert!(matches!(
-                server.handle_set_full_template_job(job).await,
-                Err(FullTemplateJobResponse::NeedTransactions(_))
+            assert!(state.insert(
+                (PendingOwner::Session(owner), 1, 42),
+                vec![[0x11; 32]; 8192]
             ));
         }
-        let job = missing_declaration(&server, "overflow", vec![[0x22; 32]]);
-        assert_pending_overloaded(server.handle_set_full_template_job(job).await);
+        assert!(!state.insert((PendingOwner::Session(32), 1, 42), vec![[0x22; 32]]));
+        assert_eq!(state.requests.len(), 32);
     }
 
     #[tokio::test(start_paused = true)]
@@ -3081,11 +3090,7 @@ mod tests {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
         let txid = TemplateValidator::compute_txid(&tx);
-        let job = missing_declaration(&server, "miner", vec![txid]);
-        assert!(matches!(
-            server.handle_set_full_template_job(job).await,
-            Err(FullTemplateJobResponse::NeedTransactions(_))
-        ));
+        insert_pending_request(&server, "miner", 42, 1, vec![txid]).await;
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(
             server
@@ -3102,56 +3107,39 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn pending_security_expiry_reclaims_admission_capacity() {
-        let server = pending_test_server().await;
-        let mut job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        let mut state = PendingMissingState::default();
         for id in 0..8 {
-            job.request_id = id;
-            assert!(matches!(
-                server.handle_set_full_template_job(job.clone()).await,
-                Err(FullTemplateJobResponse::NeedTransactions(_))
-            ));
+            assert!(state.insert((PendingOwner::Session(1), 1, id), vec![[0x11; 32]]));
         }
+        assert!(!state.insert((PendingOwner::Session(1), 1, 8), vec![[0x11; 32]]));
         tokio::time::advance(Duration::from_secs(31)).await;
-        job.request_id = 8;
-        assert!(matches!(
-            server.handle_set_full_template_job(job).await,
-            Err(FullTemplateJobResponse::NeedTransactions(_))
-        ));
-        assert_eq!(server.pending_missing.lock().unwrap().requests.len(), 1);
+        assert!(state.insert((PendingOwner::Session(1), 1, 8), vec![[0x11; 32]]));
+        assert_eq!(state.requests.len(), 1);
     }
 
     #[tokio::test]
-    async fn pending_security_transport_limit_spans_miner_names() {
+    async fn pending_security_session_limit_spans_channels() {
         let server = pending_test_server().await;
-        let (mut peer, handle) = pending_peer(Arc::clone(&server), "peer").await;
-        for id in 0..8 {
-            let mut job = missing_declaration(&server, &format!("miner-{id}"), vec![[0x11; 32]]);
-            job.request_id = id;
-            assert_eq!(
-                declare_over_transport(&mut peer, &job).await,
-                message_types::GET_MISSING_TRANSACTIONS
-            );
+        let session = server.open_session().unwrap();
+        let mut state = server.pending_missing.lock().unwrap();
+        for channel in 0..8 {
+            assert!(state.insert(
+                (PendingOwner::Session(session.id), channel, 42),
+                vec![[0x11; 32]]
+            ));
         }
-        let mut overflow = missing_declaration(&server, "new-miner", vec![[0x11; 32]]);
-        overflow.request_id = 8;
-        peer.write_full_message(&crate::codec::encode_set_full_template_job(&overflow).unwrap())
-            .await
-            .unwrap();
-        let response = peer.read_full_message().await.unwrap().unwrap();
-        let error = crate::codec::decode_set_full_template_job_error(&response).unwrap();
-        assert_eq!(
-            error.error_code,
-            SetFullTemplateJobErrorCode::ServerOverloaded
-        );
-        drop(peer);
-        handle.await.unwrap().unwrap();
+        assert!(!state.insert((PendingOwner::Session(session.id), 8, 42), vec![[0x11; 32]]));
+        assert_eq!(state.requests.len(), 8);
+        drop(state);
+        drop(session);
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
     }
 
     #[tokio::test]
     async fn pending_security_cleanup_tick_preserves_partial_frame() {
         let server = pending_test_server().await;
-        let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
-        let (mut peer, handle) = pending_peer(server, "peer").await;
+        let job = unsupported_declaration(&server);
+        let (mut peer, handle, _) = pending_peer(Arc::clone(&server), "peer").await;
         let wire = crate::codec::encode_set_full_template_job(&job).unwrap();
         peer.write_full_message(&wire[..8]).await.unwrap();
         tokio::task::yield_now().await;
@@ -3165,37 +3153,33 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        assert_eq!(
-            MessageFrame::decode(&response).unwrap().msg_type,
-            message_types::GET_MISSING_TRANSACTIONS
+        assert_pending_declaration_unavailable(
+            crate::codec::decode_set_full_template_job_error(&response).unwrap(),
         );
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
         drop(peer);
         handle.await.unwrap().unwrap();
     }
 
     #[tokio::test]
-    async fn pending_security_template_update_during_declaration_cannot_reinsert_request() {
+    async fn pending_security_disabled_declaration_does_not_wait_for_validator() {
         let server = pending_test_server().await;
-        let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
+        let job = unsupported_declaration(&server);
         let validator = server.validator.write().await;
-        let declaration = server.handle_set_full_template_job(job);
-        tokio::pin!(declaration);
-        // Poll through the epoch/header checks, then suspend on the validator.
-        tokio::select! {
-            biased;
-            _ = &mut declaration => panic!("declaration must wait for the validator"),
-            _ = tokio::task::yield_now() => {}
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            server.handle_set_full_template_job(job),
+        )
+        .await
+        .expect("disabled FullTemplate must not enter transaction validation");
+        match result {
+            Err(FullTemplateJobResponse::Error(error)) => {
+                assert_pending_declaration_unavailable(error)
+            }
+            other => panic!("Expected unavailable error, got {other:?}"),
         }
-        server.set_current_prev_hash([0xbb; 32]).await;
-        drop(validator);
-        assert!(matches!(
-            declaration.await,
-            Err(FullTemplateJobResponse::Error(SetFullTemplateJobError {
-                error_code: SetFullTemplateJobErrorCode::StalePrevHash,
-                ..
-            }))
-        ));
         assert!(server.pending_missing.lock().unwrap().requests.is_empty());
+        drop(validator);
     }
 
     #[tokio::test]
@@ -3203,11 +3187,7 @@ mod tests {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
         let txid = TemplateValidator::compute_txid(&tx);
-        let job = missing_declaration(&server, "miner", vec![txid]);
-        assert!(matches!(
-            server.handle_set_full_template_job(job).await,
-            Err(FullTemplateJobResponse::NeedTransactions(_))
-        ));
+        insert_pending_request(&server, "miner", 42, 1, vec![txid]).await;
         let validator = server.validator.read().await;
         let reply = server.handle_provide_missing_transactions(
             ProvideMissingTransactions::new(1, 42, vec![tx]),
@@ -3223,17 +3203,15 @@ mod tests {
         drop(validator);
         assert!(reply.await.is_err());
         assert!(!server.validator().await.is_txid_known(&txid));
+        assert!(server.pending_missing.lock().unwrap().requests.is_empty());
     }
 
     #[tokio::test]
     async fn pending_security_template_epoch_clears_requests() {
         for same_tip in [false, true] {
             let server = pending_test_server().await;
-            let job = missing_declaration(&server, "miner", vec![[0x11; 32]]);
-            assert!(matches!(
-                server.handle_set_full_template_job(job).await,
-                Err(FullTemplateJobResponse::NeedTransactions(_))
-            ));
+            let session = server.open_session().unwrap();
+            seed_session_request(&server, session.id, vec![[0x11; 32]]);
             if same_tip {
                 server
                     .set_current_template(CurrentTemplateContext {
