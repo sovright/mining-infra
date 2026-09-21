@@ -27,7 +27,7 @@ pub struct JdServerConfig {
     /// Enable Noise encryption for JD client connections
     pub noise_enabled: bool,
 
-    /// Enable Full-Template mode (in addition to Coinbase-Only)
+    /// Reserved opt-in; FullTemplate requests are rejected until authorization is implemented
     pub full_template_enabled: bool,
 
     /// Validation level for full templates

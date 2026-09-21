@@ -1,5 +1,7 @@
 # Job Declaration Client Guide
 
+> **Full-Template is unavailable:** FullTemplate instructions below describe the planned client protocol. Current servers reject FullTemplate opt-in and declarations; clients must honor a CoinbaseOnly fallback. See [mode status](./full-template-mode.md).
+
 The JD Client enables decentralized mining by letting you construct your own block templates while still mining with a pool.
 
 ## Why Use JD Client?

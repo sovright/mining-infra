@@ -1,5 +1,7 @@
 # Full-Template Mode Guide
 
+> **Unavailable:** This guide describes a planned protocol flow, not a deployable feature. The pool rejects Full-Template opt-in, and the server rejects FullTemplate declarations and use of existing FullTemplate jobs. Current-version consensus parsing, selected-fee payout authorization, and commitment validation must be completed before enablement. Keep `full_template_enabled` false; no static payout floor makes this mode safe.
+
 Full-Template mode gives miners complete control over block construction, including transaction selection. This is the ultimate form of mining decentralization.
 
 ## Why Full-Template Mode?

@@ -108,7 +108,7 @@ max_connections = 10000
 
 [jd]
 enabled = true
-full_template_enabled = true
+full_template_enabled = false # FullTemplate is currently unavailable
 full_template_validation = "Standard"
 token_lifetime_secs = 300
 ```
@@ -170,7 +170,7 @@ cargo run --release -p zcash-pool-server -- --config pool.toml
 | Option | Default | Description |
 |--------|---------|-------------|
 | `enabled` | `true` | Enable Job Declaration |
-| `full_template_enabled` | `false` | Allow Full-Template mode |
+| `full_template_enabled` | `false` | Keep false; Full-Template opt-in is rejected |
 | `full_template_validation` | `Standard` | Validation level |
 | `token_lifetime_secs` | `300` | Token expiration time |
 | `max_tokens_per_client` | `10` | Max active tokens per client |
@@ -304,18 +304,18 @@ full_template_enabled = false
 
 ### Full-Template Mode
 
-Advanced mode where miners select their own transactions.
+This mode is unavailable. The pool rejects Full-Template opt-in until current-version consensus parsing, selected-fee payout authorization, and commitment validation are implemented. Existing FullTemplate tokens and jobs cannot be used to bypass the restriction. A static `min_pool_payout` value cannot enable the mode safely.
 
 **Configuration:**
 ```toml
 [jd]
 enabled = true
-full_template_enabled = true
+full_template_enabled = false # Required; true is rejected
 full_template_validation = "Standard"  # or "Minimal" or "Strict"
 min_pool_payout = 10000  # zatoshis
 ```
 
-**Validation Levels:**
+**Retained validation levels (do not enable Full-Template):**
 
 | Level | Checks | Performance |
 |-------|--------|-------------|

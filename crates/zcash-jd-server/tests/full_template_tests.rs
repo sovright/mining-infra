@@ -1,11 +1,12 @@
 //! Integration tests for Full-Template mode
 //!
-//! These tests verify the complete flow for Full-Template mode including:
-//! - Mode allocation (requesting and granting Full-Template mode)
+//! FullTemplate is unavailable until consensus payout authorization is implemented.
+//! These tests preserve its wire-format/validator coverage and verify:
+//! - Rejection of unsupported opt-in and already-issued FullTemplate tokens
 //! - Mode fallback when disabled
 //! - SetFullTemplateJob encoding/decoding
 //! - Template validation at different levels
-//! - Missing transactions flow
+//! - Unavailable declarations cannot start a missing-transactions flow
 //! - Backward compatibility with Coinbase-Only mode
 //! - Error code handling
 
@@ -172,25 +173,48 @@ fn minimal_tx() -> Vec<u8> {
     minimal_tx_with_script(&[0x51])
 }
 
+// Bypass allocation only to simulate a token issued before FullTemplate was disabled.
+fn existing_full_template_token(server: &JdServer, client_id: &str) -> Vec<u8> {
+    server
+        .token_manager()
+        .allocate_token_with_mode(client_id, JobDeclarationMode::FullTemplate)
+        .unwrap()
+        .token
+}
+
+fn assert_full_template_unavailable(
+    result: Result<SetFullTemplateJobSuccess, FullTemplateJobResponse>,
+) {
+    match result {
+        Err(FullTemplateJobResponse::Error(error)) => {
+            assert_eq!(error.error_code, SetFullTemplateJobErrorCode::Other);
+            assert!(
+                error
+                    .error_message
+                    .starts_with("FullTemplate is unavailable:")
+            );
+        }
+        other => panic!("Expected unavailable error, got {other:?}"),
+    }
+}
+
 // =============================================================================
 // Mode Allocation Tests
 // =============================================================================
 
-/// Test that Full-Template mode can be requested and granted
+/// Unsupported opt-in cannot grant FullTemplate, even if explicitly configured.
 #[test]
-fn test_full_template_mode_allocation() {
+fn test_full_template_mode_allocation_is_unavailable() {
     let config = test_config_full_template();
     let payout_tracker = Arc::new(PayoutTracker::default());
     let jd_server = JdServer::new(config, payout_tracker);
 
     // Client requests Full-Template mode
-    let response = jd_server
+    let error = jd_server
         .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
+        .expect_err("FullTemplate must not be granted");
 
-    assert_eq!(response.request_id, 1);
-    assert!(!response.mining_job_token.is_empty());
-    assert_eq!(response.granted_mode, JobDeclarationMode::FullTemplate);
+    assert!(error.to_string().contains("FullTemplate is unavailable:"));
 }
 
 /// Test that Full-Template request falls back to CoinbaseOnly when disabled
@@ -618,9 +642,9 @@ fn test_provide_missing_transactions_roundtrip() {
     assert_eq!(decoded.transactions[1], vec![0x03, 0x04]);
 }
 
-/// Test complete missing transactions flow
+/// A legacy token cannot start a missing-transactions flow.
 #[tokio::test]
-async fn test_missing_transactions_flow_complete() {
+async fn test_unavailable_full_template_cannot_start_missing_transactions() {
     let config = test_config_full_template();
     let payout_tracker = Arc::new(PayoutTracker::default());
     let server = JdServer::new(config, payout_tracker);
@@ -629,14 +653,7 @@ async fn test_missing_transactions_flow_complete() {
     let prev_hash = [0xaa; 32];
     server.set_current_prev_hash(prev_hash).await;
 
-    // Allocate Full-Template token
-    let token_response = server
-        .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
-    assert_eq!(
-        token_response.granted_mode,
-        JobDeclarationMode::FullTemplate
-    );
+    let token = existing_full_template_token(&server, "test-miner");
 
     // Submit job with an unknown txid
     let tx_data = minimal_tx_with_script(&[0x52]);
@@ -644,7 +661,7 @@ async fn test_missing_transactions_flow_complete() {
     let job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
-        mining_job_token: token_response.mining_job_token.clone(),
+        mining_job_token: token.clone(),
         version: 5,
         prev_hash,
         merkle_root: [0xbb; 32],
@@ -656,17 +673,7 @@ async fn test_missing_transactions_flow_complete() {
         tx_data: vec![], // Not providing tx data
     };
 
-    // Server should request the missing transaction
-    let result = server.handle_set_full_template_job(job.clone()).await;
-    match result {
-        Err(FullTemplateJobResponse::NeedTransactions(request)) => {
-            assert_eq!(request.channel_id, 1);
-            assert_eq!(request.request_id, 2);
-            assert_eq!(request.missing_tx_ids.len(), 1);
-            assert_eq!(request.missing_tx_ids[0], unknown_txid);
-        }
-        _ => panic!("Expected NeedTransactions response"),
-    }
+    assert_full_template_unavailable(server.handle_set_full_template_job(job).await);
 
     // Client provides missing transaction
     let provide = ProvideMissingTransactions {
@@ -677,10 +684,10 @@ async fn test_missing_transactions_flow_complete() {
     server
         .handle_provide_missing_transactions(provide, "test-miner")
         .await
-        .expect("Providing transactions should succeed");
+        .expect_err("Rejected declarations must not authorize transaction ingestion");
 
-    // After providing transactions, the txid is computed and added to known set
-    // A real resubmission of the job would now succeed
+    assert!(!server.validator().await.is_txid_known(&unknown_txid));
+    assert!(server.token_manager().get_job_info(&token).is_err());
 }
 
 // =============================================================================
@@ -827,9 +834,9 @@ fn test_error_code_byte_values() {
 // Full Template Job Server Flow Tests
 // =============================================================================
 
-/// Test Full-Template job acceptance with valid data
+/// Valid-looking data and a legacy token do not bypass the unsupported-mode gate.
 #[tokio::test]
-async fn test_full_template_job_success() {
+async fn test_full_template_existing_token_is_unavailable() {
     let config = test_config_full_template();
     let payout_tracker = Arc::new(PayoutTracker::default());
     let server = JdServer::new(config, payout_tracker);
@@ -838,16 +845,13 @@ async fn test_full_template_job_success() {
     let prev_hash = [0xaa; 32];
     server.set_current_prev_hash(prev_hash).await;
 
-    // Allocate Full-Template token
-    let token_response = server
-        .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
+    let token = existing_full_template_token(&server, "test-miner");
 
     // Submit job with no transactions (empty template)
     let mut job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
-        mining_job_token: token_response.mining_job_token,
+        mining_job_token: token.clone(),
         version: 5,
         prev_hash,
         merkle_root: [0xbb; 32],
@@ -861,12 +865,8 @@ async fn test_full_template_job_success() {
     set_merkle_root(&mut job);
 
     let result = server.handle_set_full_template_job(job).await;
-    assert!(result.is_ok());
-
-    let success = result.unwrap();
-    assert_eq!(success.channel_id, 1);
-    assert_eq!(success.request_id, 2);
-    assert!(success.job_id > 0);
+    assert_full_template_unavailable(result);
+    assert!(server.token_manager().get_job_info(&token).is_err());
 }
 
 /// Test Full-Template job rejected when using CoinbaseOnly token
@@ -906,9 +906,9 @@ async fn test_full_template_job_mode_mismatch() {
     }
 }
 
-/// Test Full-Template job rejected with stale prev_hash
+/// Unavailable mode is rejected before template-specific validation.
 #[tokio::test]
-async fn test_full_template_job_stale_prev_hash() {
+async fn test_full_template_unavailable_precedes_stale_prev_hash() {
     let config = test_config_full_template();
     let payout_tracker = Arc::new(PayoutTracker::default());
     let server = JdServer::new(config, payout_tracker);
@@ -917,17 +917,14 @@ async fn test_full_template_job_stale_prev_hash() {
     let current_prev_hash = [0xaa; 32];
     server.set_current_prev_hash(current_prev_hash).await;
 
-    // Allocate Full-Template token
-    let token_response = server
-        .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
+    let token = existing_full_template_token(&server, "test-miner");
 
     // Submit job with stale prev_hash
     let stale_prev_hash = [0x11; 32];
     let job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
-        mining_job_token: token_response.mining_job_token,
+        mining_job_token: token,
         version: 5,
         prev_hash: stale_prev_hash,
         merkle_root: [0xbb; 32],
@@ -940,12 +937,7 @@ async fn test_full_template_job_stale_prev_hash() {
     };
 
     let result = server.handle_set_full_template_job(job).await;
-    match result {
-        Err(FullTemplateJobResponse::Error(error)) => {
-            assert_eq!(error.error_code, SetFullTemplateJobErrorCode::StalePrevHash);
-        }
-        _ => panic!("Expected StalePrevHash error"),
-    }
+    assert_full_template_unavailable(result);
 }
 
 /// Test Full-Template job with invalid token
@@ -995,7 +987,7 @@ async fn test_update_known_txids() {
     assert!(validator.is_txid_known(&known_txid));
 }
 
-/// Test job with known txids succeeds
+/// Known transaction IDs do not authorize FullTemplate.
 #[tokio::test]
 async fn test_full_template_job_with_known_txids() {
     let config = test_config_full_template();
@@ -1010,16 +1002,13 @@ async fn test_full_template_job_with_known_txids() {
     let known_txid = [0x99; 32];
     server.update_known_txids([known_txid]).await;
 
-    // Allocate Full-Template token
-    let token_response = server
-        .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
+    let token = existing_full_template_token(&server, "test-miner");
 
     // Submit job referencing known txid
     let mut job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
-        mining_job_token: token_response.mining_job_token,
+        mining_job_token: token,
         version: 5,
         prev_hash,
         merkle_root: [0xbb; 32],
@@ -1033,14 +1022,14 @@ async fn test_full_template_job_with_known_txids() {
     set_merkle_root(&mut job);
 
     let result = server.handle_set_full_template_job(job).await;
-    assert!(result.is_ok());
+    assert_full_template_unavailable(result);
 }
 
 // =============================================================================
 // Multiple Miners Full-Template Tests
 // =============================================================================
 
-/// Test multiple miners using Full-Template mode
+/// Multiple miners with existing tokens cannot bypass the gate.
 #[tokio::test]
 async fn test_multiple_miners_full_template() {
     let config = test_config_full_template();
@@ -1050,19 +1039,13 @@ async fn test_multiple_miners_full_template() {
     let prev_hash = [0xaa; 32];
     server.set_current_prev_hash(prev_hash).await;
 
-    // Allocate tokens for multiple miners
-    let mut job_ids = Vec::new();
     for i in 0..5 {
-        let token = server
-            .handle_allocate_token(i, &format!("miner-{}", i), JobDeclarationMode::FullTemplate)
-            .expect("Token allocation should succeed");
-
-        assert_eq!(token.granted_mode, JobDeclarationMode::FullTemplate);
+        let token = existing_full_template_token(&server, &format!("miner-{i}"));
 
         let mut job = SetFullTemplateJob {
             channel_id: i,
             request_id: i * 10,
-            mining_job_token: token.mining_job_token,
+            mining_job_token: token.clone(),
             version: 5,
             prev_hash,
             merkle_root: [(i * 11) as u8; 32],
@@ -1076,20 +1059,16 @@ async fn test_multiple_miners_full_template() {
         set_merkle_root(&mut job);
 
         let result = server.handle_set_full_template_job(job).await;
-        assert!(result.is_ok(), "Miner {} should succeed", i);
-        job_ids.push(result.unwrap().job_id);
+        assert_full_template_unavailable(result);
+        assert!(server.token_manager().get_job_info(&token).is_err());
     }
-
-    // All job IDs should be unique
-    let unique_ids: std::collections::HashSet<_> = job_ids.iter().collect();
-    assert_eq!(unique_ids.len(), job_ids.len());
 }
 
 // =============================================================================
 // Validation Level Server Integration Tests
 // =============================================================================
 
-/// Test server with Minimal validation level
+/// Minimal validation cannot opt out of the unavailable-mode gate.
 #[tokio::test]
 async fn test_server_minimal_validation() {
     let config = test_config_full_template_minimal();
@@ -1099,15 +1078,13 @@ async fn test_server_minimal_validation() {
     let prev_hash = [0xaa; 32];
     server.set_current_prev_hash(prev_hash).await;
 
-    let token = server
-        .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
+    let token = existing_full_template_token(&server, "test-miner");
 
-    // Submit job with unknown txids - should succeed with Minimal validation
+    // Unknown txids must not be accepted even with Minimal validation.
     let job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
-        mining_job_token: token.mining_job_token,
+        mining_job_token: token,
         version: 5,
         prev_hash,
         merkle_root: [0xbb; 32],
@@ -1120,13 +1097,10 @@ async fn test_server_minimal_validation() {
     };
 
     let result = server.handle_set_full_template_job(job).await;
-    assert!(
-        result.is_ok(),
-        "Minimal validation should accept any template"
-    );
+    assert_full_template_unavailable(result);
 }
 
-/// Test server with Strict validation level
+/// Strict validation does not make FullTemplate payout authorization available.
 #[tokio::test]
 async fn test_server_strict_validation() {
     let config = test_config_full_template_strict();
@@ -1136,16 +1110,14 @@ async fn test_server_strict_validation() {
     let prev_hash = [0xaa; 32];
     server.set_current_prev_hash(prev_hash).await;
 
-    let token = server
-        .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
-        .expect("Token allocation should succeed");
+    let token = existing_full_template_token(&server, "test-miner");
 
-    // Submit job with unknown txids - should request transactions with Strict validation
+    // Unknown txids must not start transaction ingestion in Strict mode either.
     let unknown_txid = [0x99; 32];
     let job = SetFullTemplateJob {
         channel_id: 1,
         request_id: 2,
-        mining_job_token: token.mining_job_token,
+        mining_job_token: token,
         version: 5,
         prev_hash,
         merkle_root: [0xbb; 32],
@@ -1158,11 +1130,5 @@ async fn test_server_strict_validation() {
     };
 
     let result = server.handle_set_full_template_job(job).await;
-    match result {
-        Err(FullTemplateJobResponse::NeedTransactions(request)) => {
-            assert_eq!(request.missing_tx_ids.len(), 1);
-            assert_eq!(request.missing_tx_ids[0], unknown_txid);
-        }
-        _ => panic!("Strict validation should request missing transactions"),
-    }
+    assert_full_template_unavailable(result);
 }
