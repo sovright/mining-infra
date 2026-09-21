@@ -127,6 +127,7 @@ pub enum SegmentedBlockError {
     },
     InconsistentMetadata,
     DigestMismatch,
+    AllocationFailed,
 }
 
 impl fmt::Display for SegmentedBlockError {
@@ -163,6 +164,7 @@ impl fmt::Display for SegmentedBlockError {
                 write!(f, "segments do not describe the same raw block")
             }
             SegmentedBlockError::DigestMismatch => write!(f, "segment digest mismatch"),
+            SegmentedBlockError::AllocationFailed => write!(f, "raw block allocation failed"),
         }
     }
 }
@@ -222,7 +224,16 @@ pub fn reassemble_raw_block(segments: &[RawBlockSegment]) -> Result<Vec<u8>, Seg
         });
     }
 
-    let mut slots: Vec<Option<&RawBlockSegment>> = vec![None; segment_count];
+    // Allocate only for segments actually supplied, never an advertised object
+    // length. The wire count is bounded, but can still vastly exceed the input.
+    if segments.len() > segment_count {
+        return Err(SegmentedBlockError::InconsistentMetadata);
+    }
+    let mut ordered = Vec::new();
+    ordered
+        .try_reserve_exact(segments.len())
+        .map_err(|_| SegmentedBlockError::AllocationFailed)?;
+    let mut payload_len = 0usize;
     for segment in segments {
         if segment.block_hash != first.block_hash
             || segment.segment_count != first.segment_count
@@ -241,25 +252,39 @@ pub fn reassemble_raw_block(segments: &[RawBlockSegment]) -> Result<Vec<u8>, Seg
             return Err(SegmentedBlockError::DigestMismatch);
         }
 
-        let slot = &mut slots[segment.segment_index as usize];
-        if slot.is_some() {
+        payload_len = payload_len
+            .checked_add(segment.payload.len())
+            .ok_or(SegmentedBlockError::LengthMismatch)?;
+        ordered.push(segment);
+    }
+    ordered.sort_unstable_by_key(|segment| segment.segment_index);
+    for (index, segment) in ordered.iter().enumerate() {
+        if index > 0 && segment.segment_index == ordered[index - 1].segment_index {
             return Err(SegmentedBlockError::DuplicateSegment {
                 segment_index: segment.segment_index,
             });
         }
-        *slot = Some(segment);
+        if segment.segment_index as usize != index {
+            return Err(SegmentedBlockError::MissingSegment {
+                segment_index: index as u16,
+            });
+        }
     }
-
-    let mut raw_block = Vec::with_capacity(first.raw_block_len as usize);
-    for (index, slot) in slots.into_iter().enumerate() {
-        let segment = slot.ok_or(SegmentedBlockError::MissingSegment {
-            segment_index: index as u16,
-        })?;
-        raw_block.extend_from_slice(&segment.payload);
+    if ordered.len() < segment_count {
+        return Err(SegmentedBlockError::MissingSegment {
+            segment_index: ordered.len() as u16,
+        });
     }
-
-    if raw_block.len() != first.raw_block_len as usize {
+    if u64::try_from(payload_len).ok() != Some(first.raw_block_len) {
         return Err(SegmentedBlockError::LengthMismatch);
+    }
+
+    let mut raw_block = Vec::new();
+    raw_block
+        .try_reserve_exact(payload_len)
+        .map_err(|_| SegmentedBlockError::AllocationFailed)?;
+    for segment in ordered {
+        raw_block.extend_from_slice(&segment.payload);
     }
     if sha256(&raw_block) != first.raw_block_digest {
         return Err(SegmentedBlockError::DigestMismatch);

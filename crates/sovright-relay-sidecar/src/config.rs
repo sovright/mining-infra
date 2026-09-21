@@ -91,7 +91,7 @@ pub struct Config {
     #[serde(default = "default_raw_segment_max_incomplete_blocks")]
     pub raw_segment_max_incomplete_blocks: usize,
 
-    /// Maximum total raw segment payload bytes to hold in memory.
+    /// Raw segment buffer byte budget, including payloads, slots and entries.
     #[serde(default = "default_raw_segment_max_payload_bytes")]
     pub raw_segment_max_payload_bytes: usize,
 
