@@ -45,3 +45,29 @@ The FORGE bridge is disabled unless both `SOVRIGHT_P2P_RELAY_PEERS` and
 `SOVRIGHT_P2P_RELAY_DATA_SHARDS` and `SOVRIGHT_P2P_RELAY_PARITY_SHARDS`
 override the default `10+3` FEC profile for relay traffic; they must match the
 relay daemon and receiving sidecar.
+
+## Inventory limits
+
+Inventory request bookkeeping is bounded per peer connection. These optional
+environment variables control the limits:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SOVRIGHT_P2P_MAX_PENDING_BLOCKS` | `128` | Outstanding block requests per peer |
+| `SOVRIGHT_P2P_MAX_PENDING_TXS` | `1024` | Outstanding transaction requests per peer |
+| `SOVRIGHT_P2P_RECENT_INVENTORY_ENTRIES` | `4096` | Entries in each recent block-announcement, completed-block, and completed-transaction cache |
+| `SOVRIGHT_P2P_REQUEST_TIMEOUT_SECS` | `30` | Response deadline, from 1 to 3600 seconds |
+
+The existing `SOVRIGHT_P2P_TX_REQUEST_LIMIT_PER_INV` (default `256`) also limits
+transaction requests from an individual inventory message. A zero pending limit
+disables requests of that type; zero recent entries disables recent deduplication.
+Outstanding requests remain deduplicated regardless of the recent-cache size.
+
+When a request window is full, additional inventories are dropped without a retry
+backlog. A later announcement may be requested after capacity becomes available.
+Matching responses, `notfound`, expiry, and connection teardown free outstanding
+request state. Expired and not-found items may be retried; completed items remain
+deduplicated until evicted from the bounded recent cache. Duplicate announcements
+do not extend response deadlines. Block announcement scoring remains independent
+of request capacity. Transaction cache identities continue to come from received
+payloads rather than request order.

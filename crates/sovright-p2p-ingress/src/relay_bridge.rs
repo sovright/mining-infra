@@ -1095,6 +1095,7 @@ mod tests {
             tx_cache_max_tx_bytes: 2_097_152,
             tx_feed_addr: None,
             tx_request_limit_per_inv: 256,
+            inventory_limits: Default::default(),
             event_log: Some(PathBuf::from("/tmp/test.jsonl")),
             relay_peers: vec!["127.0.0.1:1".parse().unwrap()],
             relay_bind_addr: "127.0.0.1:0".parse().unwrap(),
