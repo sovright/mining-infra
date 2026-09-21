@@ -42,6 +42,10 @@ use zcash_template_provider::calculate_block_commitments_hash;
 use zcash_template_provider::types::Hash256;
 
 const MAX_JOB_ID: u32 = u32::MAX - 1;
+// Enabling this requires current-version consensus transaction parsing and
+// validation of selected fees and commitments, not a configured payout floor.
+const FULL_TEMPLATE_PAYOUT_AUTHORIZATION_SUPPORTED: bool = false;
+const FULL_TEMPLATE_UNAVAILABLE: &str = "FullTemplate is unavailable: current-version consensus transaction parsing, selected-fee payout authorization and commitment validation are not implemented";
 
 fn next_positive_job_id(counter: &AtomicU32) -> u32 {
     loop {
@@ -520,7 +524,7 @@ impl JdServer {
         // Determine granted mode based on request and server configuration
         let granted_mode = if requested_mode == JobDeclarationMode::FullTemplate {
             if self.config.full_template_enabled {
-                JobDeclarationMode::FullTemplate
+                return Err(JdServerError::Protocol(FULL_TEMPLATE_UNAVAILABLE.into()));
             } else {
                 // Fall back to CoinbaseOnly if Full-Template not enabled
                 info!(
@@ -612,6 +616,18 @@ impl JdServer {
                 ));
             }
         };
+
+        // Legacy FullTemplate tokens cannot bypass containment via the custom path.
+        if !FULL_TEMPLATE_PAYOUT_AUTHORIZATION_SUPPORTED
+            && token_info.granted_mode == JobDeclarationMode::FullTemplate
+        {
+            return Err(SetCustomMiningJobError::new(
+                request.channel_id,
+                request.request_id,
+                SetCustomMiningJobErrorCode::Other,
+                FULL_TEMPLATE_UNAVAILABLE,
+            ));
+        }
 
         // 3. Check prev_hash matches current (stale detection)
         //    Fail closed: reject if we haven't received any template yet
@@ -725,6 +741,11 @@ impl JdServer {
         }
 
         let job = self.token_manager.find_job_by_id(solution.job_id)?;
+        if !FULL_TEMPLATE_PAYOUT_AUTHORIZATION_SUPPORTED
+            && job.mode == JobDeclarationMode::FullTemplate
+        {
+            return Err(JdServerError::Protocol(FULL_TEMPLATE_UNAVAILABLE.into()));
+        }
         if job.channel_id != solution.channel_id {
             return Err(JdServerError::Protocol(format!(
                 "solution channel {} does not match declared job channel {}",
@@ -846,6 +867,19 @@ impl JdServer {
                 };
             }
         };
+
+        // Already-declared FullTemplate jobs must not keep earning payout credit.
+        if !FULL_TEMPLATE_PAYOUT_AUTHORIZATION_SUPPORTED
+            && job.mode == JobDeclarationMode::FullTemplate
+        {
+            return SubmitSharesJdResponse {
+                channel_id: msg.channel_id,
+                request_id: msg.request_id,
+                accepted: 0,
+                rejected: msg.shares.len() as u16,
+                first_error_code: JdShareErrorCode::StaleJob.as_u8(),
+            };
+        }
 
         let validator = EquihashValidator::new();
         let share_target = job.share_target;
@@ -1146,6 +1180,17 @@ impl JdServer {
             );
             return Err(FullTemplateJobResponse::Error(
                 SetFullTemplateJobError::mode_mismatch(request.channel_id, request.request_id),
+            ));
+        }
+
+        if !FULL_TEMPLATE_PAYOUT_AUTHORIZATION_SUPPORTED {
+            return Err(FullTemplateJobResponse::Error(
+                SetFullTemplateJobError::new(
+                    request.channel_id,
+                    request.request_id,
+                    SetFullTemplateJobErrorCode::Other,
+                    FULL_TEMPLATE_UNAVAILABLE,
+                ),
             ));
         }
 
@@ -2125,7 +2170,7 @@ mod tests {
             async_mining_allowed: true,
             max_tokens_per_client: 10,
             noise_enabled: false,
-            full_template_enabled: true, // Enable Full-Template mode
+            full_template_enabled: true, // Unsupported opt-in must fail closed
             full_template_validation: crate::validation::ValidationLevel::Standard,
             min_pool_payout: 0,
             share_target: JdServerConfig::default().share_target,
@@ -2133,7 +2178,7 @@ mod tests {
     }
 
     #[test]
-    fn test_full_template_mode_requested_and_granted() {
+    fn test_full_template_mode_opt_in_is_unavailable() {
         let config = test_config_full_template();
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
@@ -2141,10 +2186,8 @@ mod tests {
         // Request Full-Template mode
         let result =
             server.handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate);
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert_eq!(response.granted_mode, JobDeclarationMode::FullTemplate);
+        assert!(matches!(result, Err(JdServerError::Protocol(message))
+            if message == FULL_TEMPLATE_UNAVAILABLE));
     }
 
     #[test]
@@ -2164,7 +2207,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_template_job_success() {
+    async fn test_full_template_existing_token_is_unavailable() {
         let config = test_config_full_template();
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
@@ -2173,14 +2216,11 @@ mod tests {
         let prev_hash = [0xaa; 32];
         server.set_current_prev_hash(prev_hash).await;
 
-        // Allocate a token with FullTemplate mode
+        // Simulate an existing token without using the disabled allocation path.
         let token_response = server
-            .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
+            .token_manager
+            .allocate_token_with_mode("test-miner", JobDeclarationMode::FullTemplate)
             .unwrap();
-        assert_eq!(
-            token_response.granted_mode,
-            JobDeclarationMode::FullTemplate
-        );
 
         // Declare a full template job
         let coinbase_tx = minimal_tx();
@@ -2188,7 +2228,7 @@ mod tests {
         let job_request = SetFullTemplateJob {
             channel_id: 1,
             request_id: 2,
-            mining_job_token: token_response.mining_job_token,
+            mining_job_token: token_response.token.clone(),
             version: 5,
             prev_hash,
             merkle_root,
@@ -2201,12 +2241,14 @@ mod tests {
         };
 
         let result = server.handle_set_full_template_job(job_request).await;
-        assert!(result.is_ok());
-
-        let response = result.unwrap();
-        assert_eq!(response.channel_id, 1);
-        assert_eq!(response.request_id, 2);
-        assert!(response.job_id > 0);
+        assert_full_template_unavailable(result);
+        assert!(
+            server
+                .token_manager
+                .get_job_info(&token_response.token)
+                .is_err()
+        );
+        assert!(server.pending_missing.read().await.is_empty());
     }
 
     #[tokio::test]
@@ -2636,7 +2678,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_full_template_job_stale_prev_hash() {
+    async fn test_full_template_unavailable_precedes_stale_prev_hash() {
         let config = test_config_full_template();
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
@@ -2647,7 +2689,8 @@ mod tests {
 
         // Allocate a token
         let token_response = server
-            .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
+            .token_manager
+            .allocate_token_with_mode("test-miner", JobDeclarationMode::FullTemplate)
             .unwrap();
 
         // Try to declare a job with a stale prev_hash
@@ -2656,7 +2699,7 @@ mod tests {
         let job_request = SetFullTemplateJob {
             channel_id: 1,
             request_id: 2,
-            mining_job_token: token_response.mining_job_token,
+            mining_job_token: token_response.token,
             version: 5,
             prev_hash: [0x11; 32], // Different from current
             merkle_root,
@@ -2669,18 +2712,11 @@ mod tests {
         };
 
         let result = server.handle_set_full_template_job(job_request).await;
-        assert!(result.is_err());
-
-        match result.unwrap_err() {
-            FullTemplateJobResponse::Error(error) => {
-                assert_eq!(error.error_code, SetFullTemplateJobErrorCode::StalePrevHash);
-            }
-            _ => panic!("Expected StalePrevHash error"),
-        }
+        assert_full_template_unavailable(result);
     }
 
     #[tokio::test]
-    async fn test_full_template_job_needs_transactions() {
+    async fn test_full_template_unavailable_does_not_request_transactions() {
         let config = test_config_full_template();
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
@@ -2691,7 +2727,8 @@ mod tests {
 
         // Allocate a token
         let token_response = server
-            .handle_allocate_token(1, "test-miner", JobDeclarationMode::FullTemplate)
+            .token_manager
+            .allocate_token_with_mode("test-miner", JobDeclarationMode::FullTemplate)
             .unwrap();
 
         // Declare a job with unknown txids (validator doesn't know them)
@@ -2701,7 +2738,7 @@ mod tests {
         let job_request = SetFullTemplateJob {
             channel_id: 1,
             request_id: 2,
-            mining_job_token: token_response.mining_job_token,
+            mining_job_token: token_response.token,
             version: 5,
             prev_hash,
             merkle_root,
@@ -2714,16 +2751,21 @@ mod tests {
         };
 
         let result = server.handle_set_full_template_job(job_request).await;
-        assert!(result.is_err());
+        assert_full_template_unavailable(result);
+        assert!(server.pending_missing.read().await.is_empty());
+    }
 
-        match result.unwrap_err() {
-            FullTemplateJobResponse::NeedTransactions(request) => {
-                assert_eq!(request.channel_id, 1);
-                assert_eq!(request.request_id, 2);
-                assert_eq!(request.missing_tx_ids.len(), 1);
-                assert_eq!(request.missing_tx_ids[0], unknown_txid);
+    fn assert_full_template_unavailable(
+        result: std::result::Result<SetFullTemplateJobSuccess, FullTemplateJobResponse>,
+    ) {
+        match result {
+            Err(FullTemplateJobResponse::Error(error)) => {
+                assert_eq!(error.channel_id, 1);
+                assert_eq!(error.request_id, 2);
+                assert_eq!(error.error_code, SetFullTemplateJobErrorCode::Other);
+                assert_eq!(error.error_message, FULL_TEMPLATE_UNAVAILABLE);
             }
-            _ => panic!("Expected NeedTransactions"),
+            other => panic!("Expected unavailable error, got {other:?}"),
         }
     }
 

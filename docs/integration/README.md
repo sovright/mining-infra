@@ -1,5 +1,7 @@
 # Zcash Stratum V2 Integration Guide
 
+> **Mode availability:** Full-Template JD is unavailable pending consensus-version payout authorization and commitment validation. FullTemplate guides describe a planned protocol; enabling the server flag is rejected. See [mode status](./full-template-mode.md).
+
 This documentation covers how to integrate Zcash Stratum V2 into your mining infrastructure.
 
 ## What is Stratum V2?

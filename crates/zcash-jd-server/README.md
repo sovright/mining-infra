@@ -43,20 +43,13 @@ let jd_server = JdServer::new(config, payout_tracker);
 
 ## Full-Template Mode
 
-In addition to Coinbase-Only mode, the JD Server supports Full-Template mode where miners can select which transactions to include in their blocks.
+Full-Template mode is unavailable until current-version consensus parsing, selected-fee payout authorization, and commitment validation are implemented. A static minimum payout does not authorize the pool's full entitlement.
 
-### Enabling Full-Template Mode
+### Current behavior
 
-```rust
-let config = JdServerConfig {
-    full_template_enabled: true,
-    full_template_validation: ValidationLevel::Standard,
-    min_pool_payout: 0,
-    ..Default::default()
-};
-```
+Keep `full_template_enabled` false. The pool rejects an opt-in at startup, and the JD server rejects FullTemplate allocation, declarations, and use of existing FullTemplate jobs. With the flag false, a request for FullTemplate retains the protocol's CoinbaseOnly fallback; clients must honor the granted mode.
 
-### Validation Levels
+### Retained validation components (not an enablement mechanism)
 
 | Level | Description |
 |-------|-------------|
@@ -64,7 +57,7 @@ let config = JdServerConfig {
 | `Standard` | Verify pool payout + request missing transactions |
 | `Strict` | Full validation of all transactions |
 
-### Protocol Flow (Full-Template)
+### Planned Protocol Flow (Full-Template; unavailable)
 
 1. Client requests token with `JobDeclarationMode::FullTemplate`
 2. Server grants FullTemplate mode if enabled (falls back to CoinbaseOnly otherwise)
@@ -82,7 +75,7 @@ let config = JdServerConfig {
 | `async_mining_allowed` | true | Allow mining before ack |
 | `pool_payout_script` | empty | Pool's payout output script |
 | `max_tokens_per_client` | 10 | Max active tokens per client |
-| `full_template_enabled` | false | Enable Full-Template mode |
+| `full_template_enabled` | false | Reserved; opt-in is rejected pending safe authorization |
 | `full_template_validation` | Standard | Validation level for Full-Template |
 | `min_pool_payout` | 0 | Minimum pool payout (zatoshis) |
 

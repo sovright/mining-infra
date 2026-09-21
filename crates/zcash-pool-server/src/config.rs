@@ -57,7 +57,7 @@ pub struct PoolConfig {
     /// Enable Noise for JD connections
     pub jd_noise_enabled: bool,
 
-    /// Enable Full-Template mode for JD server
+    /// Reserved Full-Template opt-in; rejected until safe payout authorization exists
     pub jd_full_template_enabled: bool,
 
     /// Validation level for Full-Template mode
@@ -148,6 +148,8 @@ pub enum ConfigError {
     InvalidFecConfig { data: usize, parity: usize },
     /// JD enabled but no pool payout script
     JdMissingPayoutScript,
+    /// FullTemplate cannot safely authorize selected fees and payouts yet
+    JdFullTemplateUnsupported,
     /// Invalid timing jitter configuration (min > max)
     InvalidTimingJitter { min_ms: u64, max_ms: u64 },
     /// Invalid FEC shard total (must be <= 255 for Reed-Solomon)
@@ -191,8 +193,12 @@ impl std::fmt::Display for ConfigError {
                 )
             }
             ConfigError::JdMissingPayoutScript => {
-                write!(f, "jd_listen_addr set but pool_payout_script is missing")
+                write!(f, "jd_listen_addr requires a nonempty pool_payout_script")
             }
+            ConfigError::JdFullTemplateUnsupported => write!(
+                f,
+                "jd_full_template_enabled is unavailable until current-version consensus parsing, selected-fee payout authorization and commitment validation are implemented"
+            ),
             ConfigError::InvalidTimingJitter { min_ms, max_ms } => {
                 write!(
                     f,
@@ -282,8 +288,13 @@ impl PoolConfig {
         }
 
         // JD requires payout script
-        if self.jd_listen_addr.is_some() && self.pool_payout_script.is_none() {
+        if self.jd_listen_addr.is_some()
+            && self.pool_payout_script.as_ref().is_none_or(Vec::is_empty)
+        {
             return Err(ConfigError::JdMissingPayoutScript);
+        }
+        if self.jd_full_template_enabled {
+            return Err(ConfigError::JdFullTemplateUnsupported);
         }
 
         if self
@@ -707,5 +718,27 @@ mod tests {
             valid_config().payout_settlement_retention,
             Duration::from_secs(86_400)
         );
+    }
+
+    #[test]
+    fn payout_authorization_refuses_full_template_opt_in() {
+        let mut cfg = valid_config();
+        cfg.jd_listen_addr = Some("127.0.0.1:3334".parse().unwrap());
+        cfg.pool_payout_script = Some(vec![0x51]);
+        cfg.jd_full_template_enabled = true;
+        cfg.jd_min_pool_payout = 100_000_000;
+        assert_eq!(
+            cfg.validate(),
+            Err(ConfigError::JdFullTemplateUnsupported),
+            "a static payout floor cannot authorize FullTemplate"
+        );
+    }
+
+    #[test]
+    fn payout_authorization_requires_nonempty_pool_script() {
+        let mut cfg = valid_config();
+        cfg.jd_listen_addr = Some("127.0.0.1:3334".parse().unwrap());
+        cfg.pool_payout_script = Some(vec![]);
+        assert_eq!(cfg.validate(), Err(ConfigError::JdMissingPayoutScript));
     }
 }

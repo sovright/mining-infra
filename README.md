@@ -54,7 +54,7 @@ sovright-relay-sidecar (builds binary: relay-sidecar)
 | `zcash-mining-protocol` | Zcash Stratum V2 binary message types and codec with frame validation |
 | `zcash-equihash-validator` | Equihash solution validation and adaptive difficulty controller |
 | `zcash-pool-common` | Shared types: PPS payout tracker, CompactSize encoding |
-| `zcash-jd-server` | Job Declaration Server for Coinbase-Only and Full-Template mining modes |
+| `zcash-jd-server` | Job Declaration Server; Full-Template mode is unavailable pending payout authorization |
 | `zcash-jd-client` | Job Declaration Client binary for decentralized template construction |
 | `sovright-noise` | Noise_NK encryption with X25519 key exchange and zeroized key material |
 | `sovright-telemetry` | Prometheus metrics, JSON logging, OpenTelemetry tracing |
@@ -133,10 +133,10 @@ Pool server configuration (see `crates/zcash-pool-server/src/config.rs`):
 
 ## Job Declaration Modes
 
-The JD protocol supports two modes for miner-controlled block construction:
+The JD protocol defines two modes for miner-controlled block construction:
 
 - **Coinbase-Only**: Miner customizes the coinbase transaction output; pool provides the transaction list. Lower overhead, compatible with most setups.
-- **Full-Template**: Miner selects all transactions in the block. Maximum decentralization and censorship resistance, requires the miner to run a Zebra node.
+- **Full-Template (unavailable)**: Miner-selected transaction sets are rejected until current-version consensus parsing, selected-fee payout authorization, and commitment validation are implemented. Enabling `jd_full_template_enabled` fails configuration validation; a static payout threshold cannot make this mode safe.
 
 ## Security
 

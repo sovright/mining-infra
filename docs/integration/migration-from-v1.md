@@ -1,5 +1,7 @@
 # Migration from Stratum V1 to Stratum V2
 
+> **Migration constraint:** Full-Template JD is currently unavailable. Do not enable it as part of migration; references below describe planned protocol support. See [mode status](./full-template-mode.md).
+
 This guide helps pool operators and mining software developers migrate from Zcash's existing Stratum V1 protocol (ZIP 301) to Stratum V2.
 
 ## Current Zcash Mining Landscape
@@ -136,7 +138,7 @@ Share validation and payout tracking remain unified.
 
 1. Enable Noise encryption on V2 endpoint
 2. Enable Job Declaration support
-3. Optionally enable Full-Template mode
+3. Keep Full-Template mode disabled pending safe payout authorization
 
 #### Phase 3: V1 Deprecation
 
@@ -288,7 +290,7 @@ fn handle_v1_submit(v1_msg: V1Submit) -> V2Submit {
 | Vardiff | Yes | Yes | Low |
 | Session resumption | Yes | Yes | Low |
 | Job Declaration | No | Yes | N/A (new feature) |
-| Full-Template | No | Yes | N/A (new feature) |
+| Full-Template | No | Unavailable | Pending safe payout authorization |
 | Binary encoding | No | Yes | Medium |
 
 ## Testing Your Migration
