@@ -84,8 +84,8 @@ pub struct PoolServer {
     /// Accepted worker identities (bounds Prometheus label cardinality).
     ///
     /// Process-lifetime by design: each accepted name creates `worker` label
-    /// series in the telemetry metric vecs that live until process restart and
-    /// have no removal path, so a name is NEVER released — not on disconnect,
+    /// series in share/block counters that live until process restart. Hashrate
+    /// gauges can expire, but a name is NEVER released — not on disconnect,
     /// not on slow-session drop. Releasing slots would let a client cycle 10k
     /// unique names, disconnect, and repeat to grow metric cardinality without
     /// bound. A reconnecting miner reusing its name does not consume a new slot.
@@ -168,6 +168,11 @@ fn resolve_worker_label(worker_identity: &Option<String>, channel_id: u32) -> St
     worker_identity
         .clone()
         .unwrap_or_else(|| format!("channel_{channel_id}"))
+}
+
+/// Publish the current window's per-worker estimates.
+fn publish_worker_hashrates(metrics: &PoolMetrics, tracker: &PayoutTracker) {
+    metrics.set_worker_hashrates(&tracker.estimate_hashrate_per_miner());
 }
 
 impl PoolServer {
@@ -542,11 +547,7 @@ impl PoolServer {
 
                 // Export per-worker hashrate (difficulty/elapsed over the window),
                 // keyed by the same worker label as the share counters.
-                for (worker_label, worker_hashrate) in
-                    worker_hashrate_tracker.estimate_hashrate_per_miner()
-                {
-                    metrics.set_worker_hashrate(&worker_label, worker_hashrate);
-                }
+                publish_worker_hashrates(&metrics, &worker_hashrate_tracker);
 
                 info!(
                     "Pool stats: {} connections, {} active miners, {:.2} H/s",
@@ -1836,6 +1837,58 @@ mod tests {
     fn worker_label_resolution() {
         assert_eq!(resolve_worker_label(&Some("rig-1".into()), 5), "rig-1");
         assert_eq!(resolve_worker_label(&None, 5), "channel_5");
+    }
+
+    #[test]
+    fn worker_hashrate_publication_clears_rotated_window() {
+        let tracker = PayoutTracker::new(Duration::ZERO);
+        let metrics = PoolMetrics::new();
+        let worker = "rig-1".to_string();
+        tracker.record_share(&worker, 10.0);
+        publish_worker_hashrates(&metrics, &tracker);
+        assert!(metrics.worker_hashrate.with_label_values(&["rig-1"]).get() > 0.0);
+
+        // The maintenance loop rotates before publishing. No new shares means
+        // the next snapshot is empty, not a reason to retain the previous rate.
+        tracker.rotate_window_if_needed();
+        publish_worker_hashrates(&metrics, &tracker);
+        assert_eq!(tracker.estimate_pool_hashrate(), 0.0);
+        assert!(!metrics.encode().contains("hashrate_sol_s{worker="));
+
+        // A worker can publish a fresh estimate after the window restarts.
+        tracker.record_share(&worker, 20.0);
+        publish_worker_hashrates(&metrics, &tracker);
+        assert!(metrics.worker_hashrate.with_label_values(&["rig-1"]).get() > 0.0);
+    }
+
+    #[test]
+    fn worker_hashrate_publication_removes_evicted_workers() {
+        let tracker = PayoutTracker::default();
+        let metrics = PoolMetrics::new();
+        tracker.record_share(&"rig-1".to_string(), 10.0);
+        tracker.record_share(&"channel_2".to_string(), 20.0);
+        metrics.record_worker_share_accepted("rig-1");
+        publish_worker_hashrates(&metrics, &tracker);
+        assert!(
+            metrics
+                .encode()
+                .contains("hashrate_sol_s{worker=\"rig-1\"}")
+        );
+        assert!(
+            metrics
+                .encode()
+                .contains("hashrate_sol_s{worker=\"channel_2\"}")
+        );
+
+        // The telemetry-only tracker evicts idle named and unnamed workers.
+        assert_eq!(tracker.cleanup_stale_miners(Duration::ZERO), 2);
+        tracker.record_share(&"rig-3".to_string(), 30.0);
+        publish_worker_hashrates(&metrics, &tracker);
+        let encoded = metrics.encode();
+        assert!(!encoded.contains("hashrate_sol_s{worker=\"rig-1\"}"));
+        assert!(!encoded.contains("hashrate_sol_s{worker=\"channel_2\"}"));
+        assert!(encoded.contains("hashrate_sol_s{worker=\"rig-3\"}"));
+        assert!(encoded.contains("worker_shares_accepted_total{worker=\"rig-1\"} 1"));
     }
 
     #[test]
