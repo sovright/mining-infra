@@ -84,9 +84,21 @@ The NU7 parser regression fixtures establish structural decoding, not valid
 proofs, signatures, or consensus acceptance. The v6 fixture changes a public
 NU6.3 transaction's branch ID and therefore invalidates its original signatures;
 the v5 fixture is an empty structural transaction. The historical v5/v6 digest
-oracle tests remain in place. Before deployment, qualify real NU7 transaction
-and block fixtures, independent digest agreement, full reconstruction/submission,
-and the exact prerelease dependency build on testnet or an isolated network.
+oracle tests remain in place. Eight additional transparent-only cases compare
+v5/v6 txid and auth digests with a standalone Python implementation of ZIP 244
+and ZIP 229. They cover NU7/NU6.3 branch separation, authorization-script changes,
+and wire/display byte order. The generator uses only Python's standard library;
+it does not derive expected values from the Rust parser. Reproduce the fixture:
+
+```sh
+python3 crates/sovright-p2p-ingress/tests/fixtures/generate_nu7_digests.py
+cargo test -p sovright-p2p-ingress --locked nu7_transparent_digests_match_independent_reference
+```
+
+These synthetic spends have no real UTXO or valid signature and no shielded
+bundles. Before deployment, qualify real NU7 transactions and blocks, shielded
+digest agreement, full reconstruction/submission, and the exact prerelease
+dependency build on testnet or an isolated network.
 
 This daemon still uses **mainnet magic, seeds, and default port**. It is not a
 testnet client; changing the peer address or advertised version does not select

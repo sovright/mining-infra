@@ -11,7 +11,7 @@
 //! skeleton short_id computed here therefore matches what receivers resolve
 //! against their own mempools.
 //!
-//! Only v5 (ZIP-244) transactions have an auth digest, so only they can be
+//! Both v5 (ZIP-244) and v6 (ZIP-229) transactions have an auth digest and can be
 //! short_id'd from bytes; pre-v5 transactions return `None` (left prefilled),
 //! matching the sidecar mempool's `prepare_insert`, which also skips pre-v5.
 //!
@@ -222,6 +222,44 @@ mod tests {
         // One extra trailing byte must be rejected (not a partial parse).
         tx_bytes.push(0x00);
         assert_eq!(wtxid_from_tx_bytes(&tx_bytes, BranchId::Nu5), None);
+    }
+
+    /// Expected digests come from the independent Python ZIP-244/229 reference
+    /// in tests/fixtures, not from the Rust parser or a branch-mutated RPC ID.
+    /// These synthetic transparent spends have no real UTXO or valid signature.
+    #[test]
+    fn nu7_transparent_digests_match_independent_reference() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/nu7_transparent_digests.json"
+        ))
+        .unwrap();
+        let vectors = fixture["vectors"].as_array().unwrap();
+        assert_eq!(vectors.len(), 8);
+        let mut digests = Vec::new();
+        for vector in vectors {
+            let bytes = hex::decode(vector["tx_hex"].as_str().unwrap()).unwrap();
+            let got = wtxid_from_tx_bytes(&bytes, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)
+                .expect("synthetic v5/v6 transaction parses");
+            let wire = got.to_bytes();
+            assert_eq!(hex::encode(&wire[..32]), vector["txid_wire"]);
+            assert_eq!(hex::encode(&wire[32..]), vector["auth_wire"]);
+            assert_eq!(
+                got,
+                wtxid_from_display_hex(
+                    vector["txid_display"].as_str().unwrap(),
+                    vector["auth_display"].as_str().unwrap(),
+                )
+                .unwrap()
+            );
+            digests.push(wire);
+        }
+        // ScriptSig changes only authorization; changing branch changes both.
+        for base in [0, 4] {
+            assert_eq!(&digests[base][..32], &digests[base + 1][..32]);
+            assert_ne!(&digests[base][32..], &digests[base + 1][32..]);
+            assert_ne!(&digests[base][..32], &digests[base + 2][..32]);
+            assert_ne!(&digests[base][32..], &digests[base + 2][32..]);
+        }
     }
 
     // Structural fixture only, not a spendable transaction: no bundles or
