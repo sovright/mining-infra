@@ -32,11 +32,11 @@ use zcash_protocol::consensus::BranchId;
 
 /// Mainnet consensus branch id handed to the transaction reader.
 ///
-/// For v5 (ZIP-244) transactions -- the ONLY version this module short_ids --
+/// For v5 (ZIP-244) and v6 (ZIP-229) transactions,
 /// `zcash_primitives::transaction::Transaction::read` reads the consensus branch
 /// id out of the transaction bytes themselves and computes both the txid and the
 /// auth digest from that embedded value. The `branch_id` argument is therefore
-/// IGNORED for v5 and never affects the returned `WtxId` (see the
+/// IGNORED for these formats and never affects the returned `WtxId` (see the
 /// `branch_id_argument_is_ignored_for_v5` test, which proves it). It is threaded
 /// only to satisfy the reader API (and to parse hypothetical pre-v5
 /// transactions, which are then rejected regardless of the branch id).
@@ -47,7 +47,7 @@ use zcash_protocol::consensus::BranchId;
 /// the documented intent aligned with mainnet.
 pub const SOVRIGHT_P2P_CONSENSUS_BRANCH_ID: BranchId = BranchId::Nu6_3;
 
-/// Parse `tx_bytes` and, for a v5 (ZIP-244) transaction, return its relay
+/// Parse `tx_bytes` and, for a v5/v6 transaction, return its relay
 /// `WtxId` = wire-order `txid (32) || auth_digest (32)`, identical to what the
 /// sidecar builds from Zebra's display-order `txid`/`authdigest`.
 ///
@@ -224,6 +224,22 @@ mod tests {
         assert_eq!(wtxid_from_tx_bytes(&tx_bytes, BranchId::Nu5), None);
     }
 
+    // Structural fixture only, not a spendable transaction: no bundles or
+    // signatures. The old NU5 vector has a noncanonical Orchard proof length
+    // under NU7, so simply changing its branch is not a valid parser fixture.
+    #[test]
+    fn nu7_v5_embedded_branch_is_decodable() {
+        let bytes = hex::decode("050000800a27a726d90a197700000000000000000000000000").unwrap();
+        assert!(wtxid_from_tx_bytes(&bytes, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).is_some());
+    }
+
+    #[test]
+    fn nu7_rejects_noncanonical_orchard_proof_size() {
+        let mut bytes = hex::decode(VECTOR_V5_TX_HEX).unwrap();
+        bytes[8..12].copy_from_slice(&0x7719_0ad9u32.to_le_bytes());
+        assert!(wtxid_from_tx_bytes(&bytes, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).is_none());
+    }
+
     #[test]
     fn truncated_v5_tx_returns_none() {
         let tx_bytes = hex::decode(VECTOR_V5_TX_HEX).unwrap();
@@ -252,6 +268,14 @@ mod v6_equivalence {
         "b5e84a20ed799a4242f9f98a65f5654f02ab0e7dcd5ee6d5f54bee2d11affa63";
     const V6_AUTHDIGEST_DISPLAY: &str =
         "de6c0a19ff76d161cc6dc514faf51992b10b7078b5f2524d2a0b4bb9c4447ce4";
+
+    // Parser compatibility only; signatures are not valid after this mutation.
+    #[test]
+    fn nu7_v6_embedded_branch_is_decodable() {
+        let mut bytes = hex::decode(V6_TX_HEX.trim()).unwrap();
+        bytes[8..12].copy_from_slice(&0x7719_0ad9u32.to_le_bytes());
+        assert!(wtxid_from_tx_bytes(&bytes, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).is_some());
+    }
 
     #[test]
     fn v6_from_bytes_equals_v6_from_zebra_display_fields() {

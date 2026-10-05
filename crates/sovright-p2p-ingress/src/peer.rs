@@ -22,16 +22,11 @@ use crate::wire::{
 use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
 use sovright_relay::WtxId;
 
-// Zcash protocol version sent in our `version` message. NU6.3/Ironwood activated
-// on mainnet at block 3,428,143 (2026-07-28); zebrad 6.2.3 reports 170_160 as its
-// `protocolversion`. Post-upgrade peers complete the handshake with a node
-// advertising an older version and then relay NOTHING to it -- at Ironwood this
-// silently cut block ingest to ~zero for ~6h while every service still looked
-// healthy. MUST be bumped as part of every network upgrade; the authoritative
-// value is `getnetworkinfo.protocolversion` from an upgraded zebrad, never an
-// inference from observed peer versions.
-// See advertised_protocol_version_matches_current_network_upgrade().
-const PROTOCOL_VERSION: i32 = 170_160;
+// NU7 mainnet capability (ZIP 259). Keep the serialized version test and
+// NU7 parser/digest regressions together: bumping only this value can keep a
+// connection alive while silently dropping transactions. This daemon currently
+// uses mainnet magic and seeds; it is not a public-testnet client.
+const PROTOCOL_VERSION: i32 = 170_190;
 
 // Floor for accepting *remote* version messages. We stay permissive here so
 // the ingress can still ingest from slower-to-upgrade peers and from
@@ -626,17 +621,21 @@ mod tests {
         window
     }
 
-    // NU6.3/Ironwood (mainnet height 3,428,143, 2026-07-28) moved the network to
-    // protocol 170_160. We advertised 170_150 through activation: peers completed
-    // the handshake and then relayed NOTHING, so block ingest went to ~zero for
-    // ~6h while every service still reported healthy. This test pins the
-    // advertised version to the current upgrade so the same silent failure cannot
-    // recur unnoticed -- when the next NU lands, this test is what fails first.
+    // Test serialized capability, not just a private constant: NU7 peers use
+    // the first i32 of the version payload to decide whether to disconnect us.
     #[test]
-    fn advertised_protocol_version_matches_current_network_upgrade() {
-        // Authoritative source: `getnetworkinfo.protocolversion` on an upgraded
-        // zebrad (6.2.3 reports 170160). Do NOT infer this from peer counts.
-        assert_eq!(PROTOCOL_VERSION, 170_160);
+    fn outgoing_version_satisfies_nu7_mainnet_peer_floor() {
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap());
+        let advertised = i32::from_le_bytes(payload[..4].try_into().unwrap());
+        assert!(
+            advertised >= 170_190,
+            "NU7 mainnet peers reject {advertised}"
+        );
+        assert_eq!(
+            &payload[4..12],
+            &[0; 8],
+            "ingress must not claim full-node services"
+        );
     }
 
     #[test]

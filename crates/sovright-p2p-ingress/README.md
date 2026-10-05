@@ -71,3 +71,24 @@ deduplicated until evicted from the bounded recent cache. Duplicate announcement
 do not extend response deadlines. Block announcement scoring remains independent
 of request capacity. Transaction cache identities continue to come from received
 payloads rather than request order.
+
+### NU7 candidate compatibility
+
+The mainnet ingress advertises protocol `170190` (ZIP 259). The transaction
+parser is pinned to `zcash_primitives =0.31.0-pre.0` and
+`zcash_protocol =0.11.0-pre.0`: the previous 0.10.x protocol dependency does not
+recognize finalized NU7 branch ID `0x77190AD9`. Bumping only the advertised
+version would leave NU7 transactions absent from the cache/compact path.
+
+The NU7 parser regression fixtures establish structural decoding, not valid
+proofs, signatures, or consensus acceptance. The v6 fixture changes a public
+NU6.3 transaction's branch ID and therefore invalidates its original signatures;
+the v5 fixture is an empty structural transaction. The historical v5/v6 digest
+oracle tests remain in place. Before deployment, qualify real NU7 transaction
+and block fixtures, independent digest agreement, full reconstruction/submission,
+and the exact prerelease dependency build on testnet or an isolated network.
+
+This daemon still uses **mainnet magic, seeds, and default port**. It is not a
+testnet client; changing the peer address or advertised version does not select
+testnet. Remote peer admission remains permissive (`170120`) for observation;
+activation-aware admission and forwarding policy are separate readiness work.
