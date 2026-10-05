@@ -23,9 +23,8 @@ use crate::wire::{
 use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
 use sovright_relay::WtxId;
 
-// Floor for accepting *remote* version messages. We stay permissive here so
-// the ingress can still ingest from slower-to-upgrade peers and from
-// post-NU5/NU6 nodes that haven't moved to NU6.2 yet.
+// Observation-only floor. Forwarding sessions require the selected network's
+// NU7 floor from startup; peer-reported heights never control admission.
 const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 
 // Advertising less than we demand of peers would be incoherent; enforce at
@@ -136,6 +135,13 @@ pub async fn run_peer(
     crawler: Crawler,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
+    // This is a capability filter, not consensus validation. Apply it for the
+    // whole connection lifetime, before/at/after activation and across reorgs.
+    let minimum_version = if relay.is_some() || tx_feed.is_some() {
+        config.network.protocol_version()
+    } else {
+        MIN_ACCEPTABLE_REMOTE_VERSION
+    };
     let connect_started = Instant::now();
     let stream = timeout(config.connect_timeout, TcpStream::connect(peer_addr))
         .await
@@ -194,14 +200,23 @@ pub async fn run_peer(
         transactions.expire(now);
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
+        if (!sent_verack || !saw_verack) && !matches!(msg.command.as_str(), "version" | "verack") {
+            return Err(IngressError::Wire(format!(
+                "{} received before handshake completion",
+                msg.command
+            )));
+        }
         match msg.command.as_str() {
             "version" => {
+                if sent_verack {
+                    return Err(IngressError::Wire("duplicate version message".to_string()));
+                }
                 let remote_version = remote_version(&msg.payload).unwrap_or_default();
                 info!(%peer, remote_version, "received version");
                 events.p2p_peer_version(&peer, remote_version)?;
-                if !is_acceptable_remote_version(remote_version) {
+                if remote_version < minimum_version {
                     return Err(IngressError::Wire(format!(
-                        "remote protocol version too old: {remote_version} < {MIN_ACCEPTABLE_REMOTE_VERSION}"
+                        "remote protocol version too old: {remote_version} < {minimum_version}"
                     )));
                 }
                 if !sent_verack {
@@ -210,6 +225,14 @@ pub async fn run_peer(
                 }
             }
             "verack" => {
+                if !sent_verack {
+                    return Err(IngressError::Wire(
+                        "verack received before version admission".to_string(),
+                    ));
+                }
+                if saw_verack {
+                    return Err(IngressError::Wire("duplicate verack message".to_string()));
+                }
                 saw_verack = true;
                 events.p2p_handshake_complete(&peer)?;
                 events.p2p_handshake_timing(&peer, handshake_started.elapsed().as_millis())?;
@@ -451,10 +474,6 @@ fn remote_version(payload: &[u8]) -> Result<i32> {
     read_i32_le(payload, &mut cursor)
 }
 
-fn is_acceptable_remote_version(remote_version: i32) -> bool {
-    remote_version >= MIN_ACCEPTABLE_REMOTE_VERSION
-}
-
 fn pong_nonce(payload: &[u8]) -> Option<u64> {
     if payload.len() == 8 {
         Some(u64::from_le_bytes(payload.try_into().ok()?))
@@ -655,12 +674,10 @@ mod tests {
 
     #[test]
     fn rejects_remote_versions_below_zcash_mainnet_floor() {
-        assert!(!is_acceptable_remote_version(170_020));
-        assert!(!is_acceptable_remote_version(170_119));
-        assert!(is_acceptable_remote_version(170_120));
-        assert!(is_acceptable_remote_version(
-            Network::Mainnet.protocol_version()
-        ));
+        assert!(170_020 < MIN_ACCEPTABLE_REMOTE_VERSION);
+        assert!(170_119 < MIN_ACCEPTABLE_REMOTE_VERSION);
+        assert!(170_120 >= MIN_ACCEPTABLE_REMOTE_VERSION);
+        assert!(Network::Mainnet.protocol_version() >= MIN_ACCEPTABLE_REMOTE_VERSION);
     }
 
     #[test]
@@ -957,10 +974,20 @@ mod tests {
 
     impl TestPeer {
         async fn start(name: &str, config: Config) -> Self {
+            let version = config.network.protocol_version();
+            Self::start_with_remote_version(name, config, version).await
+        }
+
+        async fn start_with_remote_version(
+            name: &str,
+            config: Config,
+            remote_version: i32,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let log = temp_log_path(name);
             let network = config.network;
+            let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
             let events = EventSink::for_network(Some(log.clone()), network).unwrap();
             let crawler = Crawler::new(&config, [address]);
             let cache = TxCache::new(crate::tx_cache::TxCacheConfig {
@@ -974,7 +1001,7 @@ mod tests {
                 events,
                 None,
                 Some(cache),
-                None,
+                tx_feed,
                 crawler,
             ));
             let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
@@ -986,14 +1013,11 @@ mod tests {
                 read_message(&mut stream, network).await.unwrap().command,
                 "version"
             );
-            write_message(
-                &mut stream,
-                network,
-                "version",
-                &version_payload(address, network),
-            )
-            .await
-            .unwrap();
+            let mut remote_payload = version_payload(address, network);
+            remote_payload[..4].copy_from_slice(&remote_version.to_le_bytes());
+            write_message(&mut stream, network, "version", &remote_payload)
+                .await
+                .unwrap();
             write_message(&mut stream, network, "verack", &[])
                 .await
                 .unwrap();
@@ -1036,6 +1060,119 @@ mod tests {
                 .unwrap();
             self.barrier().await
         }
+    }
+
+    async fn rejected_forwarding_handshake(
+        command: &str,
+        payload: &[u8],
+        use_relay: bool,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = peer_test_config();
+        let (relay, tx_feed) = if use_relay {
+            config.relay_peers = vec!["127.0.0.1:9".parse().unwrap()];
+            config.relay_auth_key = Some([42; 32]);
+            (RelayBridge::from_config(&config).await.unwrap(), None)
+        } else {
+            (
+                None,
+                Some(TxFeedClient::new("127.0.0.1:9".parse().unwrap())),
+            )
+        };
+        let log = temp_log_path("forwarding-handshake");
+        let events = EventSink::new(Some(log.clone())).unwrap();
+        let crawler = Crawler::new(&config, [address]);
+        let task = tokio::spawn(run_peer(
+            address, config, events, relay, None, tx_feed, crawler,
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_message(&mut stream, Network::Mainnet).await.unwrap();
+        write_message(&mut stream, Network::Mainnet, command, payload)
+            .await
+            .unwrap();
+        let mut task = task;
+        let result = timeout(Duration::from_secs(2), &mut task).await;
+        task.abort();
+        let _ = fs::remove_file(log);
+        result
+            .expect("unsafe handshake must be rejected promptly")
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn older_peer_is_allowed_only_on_observation_path() {
+        let mut peer =
+            TestPeer::start_with_remote_version("legacy-observation", peer_test_config(), 170160)
+                .await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+    }
+
+    #[tokio::test]
+    async fn admitted_connection_cannot_renegotiate_to_an_old_version() {
+        let mut config = peer_test_config();
+        config.tx_feed_addr = Some("127.0.0.1:9".parse().unwrap());
+        let mut peer = TestPeer::start("no-downgrade", config).await;
+        let mut old = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        old[..4].copy_from_slice(&170160i32.to_le_bytes());
+        write_message(&mut peer.stream, Network::Mainnet, "version", &old)
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(2), &mut peer.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(IngressError::Wire(message)) if message.contains("duplicate version"))
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_accepts_nu7_peer_and_requests_inventory() {
+        let mut config = peer_test_config();
+        config.tx_feed_addr = Some("127.0.0.1:9".parse().unwrap());
+        let mut peer = TestPeer::start("nu7-forwarding", config).await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+    }
+
+    #[tokio::test]
+    async fn forwarding_rejects_pre_nu7_peer_even_before_activation() {
+        let mut version = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        version[..4].copy_from_slice(&170160i32.to_le_bytes());
+        for use_relay in [false, true] {
+            for claimed_height in [0i32, i32::MAX] {
+                let height_offset = version.len() - 5;
+                version[height_offset..height_offset + 4]
+                    .copy_from_slice(&claimed_height.to_le_bytes());
+                assert!(
+                    rejected_forwarding_handshake("version", &version, use_relay)
+                        .await
+                        .contains("170190")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn application_message_cannot_bypass_version_admission() {
+        assert!(
+            rejected_forwarding_handshake("inv", &[0], false)
+                .await
+                .contains("before handshake")
+        );
+    }
+
+    #[tokio::test]
+    async fn verack_cannot_bypass_version_admission() {
+        assert!(
+            rejected_forwarding_handshake("verack", &[], false)
+                .await
+                .contains("before version")
+        );
     }
 
     fn numbered_inventory(inv_type: u32, number: u64) -> Inventory {

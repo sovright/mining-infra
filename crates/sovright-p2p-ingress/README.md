@@ -122,5 +122,16 @@ cargo run -p sovright-p2p-ingress --locked
 
 Use an isolated testnet node for this example. A configured nonstandard port
 still uses the selected network's magic; a wrong-network response fails framing.
-Remote peer admission remains permissive (`170120`); activation-aware admission
-and production forwarding qualification remain separate readiness work.
+Peer admission depends on the actual output path. A session with a relay bridge
+or transaction feed requires the selected network's NU7 protocol floor from
+startup. An observation-only session, with neither output, accepts `170120` and
+newer. Testnet configuration currently prevents enabling either output.
+
+The forwarding floor stays fixed before, during, and after activation, including
+reorgs; neither peer-supplied height nor a calendar date can lower it. Existing
+connections cannot renegotiate VERSION, and application messages are rejected
+until VERSION admission and VERACK finish. Deploying this candidate restarts
+connections under the new policy. This intentionally reduces the available
+pre-activation peer pool; qualify peer diversity and freshness before rollout.
+A claimed version is not proof of correct consensus behavior: full-node
+validation and NU7 block/submission qualification remain required.
