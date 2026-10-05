@@ -15,18 +15,13 @@ use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::RelayBridge;
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
+use crate::wire::Network;
 use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
 };
 use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
 use sovright_relay::WtxId;
-
-// NU7 mainnet capability (ZIP 259). Keep the serialized version test and
-// NU7 parser/digest regressions together: bumping only this value can keep a
-// connection alive while silently dropping transactions. This daemon currently
-// uses mainnet magic and seeds; it is not a public-testnet client.
-const PROTOCOL_VERSION: i32 = 170_190;
 
 // Floor for accepting *remote* version messages. We stay permissive here so
 // the ingress can still ingest from slower-to-upgrade peers and from
@@ -35,7 +30,7 @@ const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 
 // Advertising less than we demand of peers would be incoherent; enforce at
 // compile time so a future upgrade cannot raise the floor past what we send.
-const _: () = assert!(PROTOCOL_VERSION >= MIN_ACCEPTABLE_REMOTE_VERSION);
+const _: () = assert!(170_180 >= MIN_ACCEPTABLE_REMOTE_VERSION);
 
 // Sub-version sent in our `version` message. Zcash mainnet currently
 // accepts any non-banned user agent; we keep this short and identifying.
@@ -151,8 +146,8 @@ pub async fn run_peer(
     info!(%peer, "connected to Zcash P2P peer");
 
     let (mut reader, mut writer) = stream.into_split();
-    let version = version_payload(peer_addr);
-    write_message(&mut writer, "version", &version).await?;
+    let version = version_payload(peer_addr, config.network);
+    write_message(&mut writer, config.network, "version", &version).await?;
 
     let mut saw_verack = false;
     let mut sent_verack = false;
@@ -168,7 +163,10 @@ pub async fn run_peer(
     loop {
         // Keep the same read future alive across expiry. Cancelling a partial
         // frame read on each deadline would desynchronise the wire decoder.
-        let read = timeout(Duration::from_secs(90), read_message(&mut reader));
+        let read = timeout(
+            Duration::from_secs(90),
+            read_message(&mut reader, config.network),
+        );
         tokio::pin!(read);
         let msg = loop {
             let deadline = blocks
@@ -207,7 +205,7 @@ pub async fn run_peer(
                     )));
                 }
                 if !sent_verack {
-                    write_message(&mut writer, "verack", &[]).await?;
+                    write_message(&mut writer, config.network, "verack", &[]).await?;
                     sent_verack = true;
                 }
             }
@@ -216,10 +214,10 @@ pub async fn run_peer(
                 events.p2p_handshake_complete(&peer)?;
                 events.p2p_handshake_timing(&peer, handshake_started.elapsed().as_millis())?;
                 let nonce = nonce();
-                write_message(&mut writer, "ping", &nonce.to_le_bytes()).await?;
+                write_message(&mut writer, config.network, "ping", &nonce.to_le_bytes()).await?;
                 ping_nonce = Some(nonce);
                 ping_started = Some(Instant::now());
-                write_message(&mut writer, "getaddr", &[]).await?;
+                write_message(&mut writer, config.network, "getaddr", &[]).await?;
             }
             "reject" => {
                 events.p2p_reject(&peer, msg.payload.len())?;
@@ -244,7 +242,7 @@ pub async fn run_peer(
                 }
             }
             "ping" => {
-                write_message(&mut writer, "pong", &msg.payload).await?;
+                write_message(&mut writer, config.network, "pong", &msg.payload).await?;
             }
             "inv" => {
                 if !saw_verack {
@@ -284,7 +282,7 @@ pub async fn run_peer(
                         .map(|inv| inventory_hash_to_display(&inv.hash))
                         .collect();
                     let request = encode_inventory(&block_requests);
-                    write_message(&mut writer, "getdata", &request).await?;
+                    write_message(&mut writer, config.network, "getdata", &request).await?;
                     for hash in requested_hashes {
                         events.p2p_getdata_sent(&peer, &hash)?;
                     }
@@ -295,7 +293,7 @@ pub async fn run_peer(
                         .filter_map(TxInventoryKey::from_inventory)
                         .collect();
                     let request = encode_inventory(&tx_requests);
-                    write_message(&mut writer, "getdata", &request).await?;
+                    write_message(&mut writer, config.network, "getdata", &request).await?;
                     for key in requested_keys {
                         events.p2p_tx_getdata_sent(&peer, key.kind(), &key.display_hash())?;
                     }
@@ -541,9 +539,9 @@ fn received_block_display_hash(
     Ok(actual_hash)
 }
 
-fn version_payload(peer_addr: SocketAddr) -> Vec<u8> {
+fn version_payload(peer_addr: SocketAddr, network: Network) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.extend_from_slice(&network.protocol_version().to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&(unix_time_secs() as i64).to_le_bytes());
     encode_network_address(peer_addr, &mut out);
@@ -625,7 +623,7 @@ mod tests {
     // the first i32 of the version payload to decide whether to disconnect us.
     #[test]
     fn outgoing_version_satisfies_nu7_mainnet_peer_floor() {
-        let payload = version_payload("127.0.0.1:8233".parse().unwrap());
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
         let advertised = i32::from_le_bytes(payload[..4].try_into().unwrap());
         assert!(
             advertised >= 170_190,
@@ -639,8 +637,15 @@ mod tests {
     }
 
     #[test]
+    fn testnet_advertises_its_own_version_with_unchanged_services() {
+        let payload = version_payload("127.0.0.1:18233".parse().unwrap(), Network::Testnet);
+        assert_eq!(i32::from_le_bytes(payload[..4].try_into().unwrap()), 170180);
+        assert_eq!(u64::from_le_bytes(payload[4..12].try_into().unwrap()), 0);
+    }
+
+    #[test]
     fn version_payload_contains_user_agent() {
-        let payload = version_payload("127.0.0.1:8233".parse().unwrap());
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
         assert!(
             payload
                 .windows(USER_AGENT.len())
@@ -653,7 +658,9 @@ mod tests {
         assert!(!is_acceptable_remote_version(170_020));
         assert!(!is_acceptable_remote_version(170_119));
         assert!(is_acceptable_remote_version(170_120));
-        assert!(is_acceptable_remote_version(PROTOCOL_VERSION));
+        assert!(is_acceptable_remote_version(
+            Network::Mainnet.protocol_version()
+        ));
     }
 
     #[test]
@@ -883,6 +890,7 @@ mod tests {
 
     fn peer_test_config() -> Config {
         Config {
+            network: crate::wire::Network::Mainnet,
             seeds: Vec::new(),
             peers: Vec::new(),
             max_peers: 1,
@@ -934,6 +942,7 @@ mod tests {
     }
 
     struct TestPeer {
+        network: Network,
         stream: TcpStream,
         task: tokio::task::JoinHandle<Result<()>>,
         log: std::path::PathBuf,
@@ -951,7 +960,8 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let log = temp_log_path(name);
-            let events = EventSink::new(Some(log.clone())).unwrap();
+            let network = config.network;
+            let events = EventSink::for_network(Some(log.clone()), network).unwrap();
             let crawler = Crawler::new(&config, [address]);
             let cache = TxCache::new(crate::tx_cache::TxCacheConfig {
                 max_entries: 8,
@@ -972,12 +982,27 @@ mod tests {
                 .unwrap()
                 .unwrap();
             stream.set_nodelay(true).unwrap();
-            assert_eq!(read_message(&mut stream).await.unwrap().command, "version");
-            write_message(&mut stream, "version", &version_payload(address))
+            assert_eq!(
+                read_message(&mut stream, network).await.unwrap().command,
+                "version"
+            );
+            write_message(
+                &mut stream,
+                network,
+                "version",
+                &version_payload(address, network),
+            )
+            .await
+            .unwrap();
+            write_message(&mut stream, network, "verack", &[])
                 .await
                 .unwrap();
-            write_message(&mut stream, "verack", &[]).await.unwrap();
-            let mut peer = Self { stream, task, log };
+            let mut peer = Self {
+                network,
+                stream,
+                task,
+                log,
+            };
             assert!(peer.barrier().await.is_empty());
             peer
         }
@@ -985,13 +1010,14 @@ mod tests {
         // The pong is ordered after processing all preceding messages, so a
         // missing getdata is observable without a timing-dependent sleep.
         async fn barrier(&mut self) -> Vec<Inventory> {
-            write_message(&mut self.stream, "ping", &42u64.to_le_bytes())
+            let network = self.network;
+            write_message(&mut self.stream, network, "ping", &42u64.to_le_bytes())
                 .await
                 .unwrap();
             timeout(Duration::from_secs(5), async {
                 let mut requests = Vec::new();
                 loop {
-                    let message = read_message(&mut self.stream).await.unwrap();
+                    let message = read_message(&mut self.stream, network).await.unwrap();
                     match message.command.as_str() {
                         "getdata" => requests.extend(parse_inventory(&message.payload).unwrap()),
                         "pong" => return requests,
@@ -1004,7 +1030,8 @@ mod tests {
         }
 
         async fn announce(&mut self, items: &[Inventory]) -> Vec<Inventory> {
-            write_message(&mut self.stream, "inv", &encode_inventory(items))
+            let network = self.network;
+            write_message(&mut self.stream, network, "inv", &encode_inventory(items))
                 .await
                 .unwrap();
             self.barrier().await
@@ -1019,6 +1046,31 @@ mod tests {
             hash,
             auth_digest: (inv_type == MSG_WTX).then_some([0x42; 32]),
         }
+    }
+
+    #[tokio::test]
+    async fn testnet_handshake_and_inventory_use_testnet_framing() {
+        let mut config = peer_test_config();
+        config.network = Network::Testnet;
+        let mut peer = TestPeer::start("testnet-inventory", config).await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+        let rows = fs::read_to_string(&peer.log).unwrap();
+        for row in rows.lines() {
+            let value: serde_json::Value = serde_json::from_str(row).unwrap();
+            assert_eq!(value["network"], "testnet");
+        }
+        // A valid mainnet frame on an established testnet connection is rejected.
+        write_message(&mut peer.stream, Network::Mainnet, "ping", &[0; 8])
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), &mut peer.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(IngressError::Wire(message)) if message.contains("unexpected magic"))
+        );
     }
 
     #[tokio::test]
@@ -1067,9 +1119,14 @@ mod tests {
             peer.announce(&invs).await.is_empty(),
             "duplicates must not request twice"
         );
-        write_message(&mut peer.stream, "notfound", &encode_inventory(&invs))
-            .await
-            .unwrap();
+        write_message(
+            &mut peer.stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&invs),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             peer.announce(&invs).await,
             invs,
@@ -1190,17 +1247,22 @@ mod tests {
             numbered_inventory(MSG_WTX, 10),
         ];
         assert!(peer.announce(&fresh).await.is_empty());
-        write_message(&mut peer.stream, "notfound", &encode_inventory(&fresh))
-            .await
-            .unwrap();
+        write_message(
+            &mut peer.stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&fresh),
+        )
+        .await
+        .unwrap();
         assert!(
             peer.announce(&fresh).await.is_empty(),
             "unsolicited notfound must not free a slot"
         );
-        write_message(&mut peer.stream, "block", &payload)
+        write_message(&mut peer.stream, Network::Mainnet, "block", &payload)
             .await
             .unwrap();
-        write_message(&mut peer.stream, "tx", &v6_tx())
+        write_message(&mut peer.stream, Network::Mainnet, "tx", &v6_tx())
             .await
             .unwrap();
         assert_eq!(
@@ -1209,9 +1271,14 @@ mod tests {
             "out-of-order responses must free their own slots"
         );
         assert!(peer.announce(&unanswered).await.is_empty());
-        write_message(&mut peer.stream, "notfound", &encode_inventory(&fresh))
-            .await
-            .unwrap();
+        write_message(
+            &mut peer.stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&fresh),
+        )
+        .await
+        .unwrap();
         assert!(
             peer.announce(&answered).await.is_empty(),
             "recently completed responses stay deduplicated"
@@ -1233,9 +1300,14 @@ mod tests {
         ];
         assert_eq!(peer.announce(&invs).await, invs);
         let mut frame = Vec::new();
-        write_message(&mut frame, "inv", &encode_inventory(&invs))
-            .await
-            .unwrap();
+        write_message(
+            &mut frame,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&invs),
+        )
+        .await
+        .unwrap();
         peer.stream.write_all(&frame[..25]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         peer.stream.write_all(&frame[25..]).await.unwrap();

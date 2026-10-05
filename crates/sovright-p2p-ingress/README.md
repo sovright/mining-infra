@@ -100,7 +100,27 @@ bundles. Before deployment, qualify real NU7 transactions and blocks, shielded
 digest agreement, full reconstruction/submission, and the exact prerelease
 dependency build on testnet or an isolated network.
 
-This daemon still uses **mainnet magic, seeds, and default port**. It is not a
-testnet client; changing the peer address or advertised version does not select
-testnet. Remote peer admission remains permissive (`170120`) for observation;
-activation-aware admission and forwarding policy are separate readiness work.
+Set `SOVRIGHT_P2P_NETWORK=mainnet` (the default) or `testnet`. This selects
+network magic, the default peer port (8233/18233), and advertised protocol
+version (170190/170180). Unknown values fail startup. No arbitrary protocol
+version override is supported.
+
+Testnet is currently **observation-only**. It has no implicit DNS seeds; provide
+explicit testnet peers or seeds. Relay peers, transaction-feed output, and the
+submitblock RPC are rejected in testnet mode. Caches remain process-local and
+all structured events carry `network`. Use a separate process and event-log
+path, and keep that path out of mainnet collector inputs. Existing consumers
+are not automatically made network-aware by the additional field.
+
+```sh
+SOVRIGHT_P2P_NETWORK=testnet \
+SOVRIGHT_P2P_PEERS=127.0.0.1:18233 \
+SOVRIGHT_P2P_EVENT_LOG=/tmp/sovright-testnet-observations.jsonl \
+SOVRIGHT_P2P_PEER_RUNTIME_SECS=30 \
+cargo run -p sovright-p2p-ingress --locked
+```
+
+Use an isolated testnet node for this example. A configured nonstandard port
+still uses the selected network's magic; a wrong-network response fails framing.
+Remote peer admission remains permissive (`170120`); activation-aware admission
+and production forwarding qualification remain separate readiness work.

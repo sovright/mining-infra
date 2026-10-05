@@ -5,7 +5,39 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{IngressError, Result};
 
 pub const MAINNET_MAGIC: [u8; 4] = [0x24, 0xe9, 0x27, 0x64];
-pub const DEFAULT_PORT: u16 = 8233;
+/// Public networks only; private/regtest parameters need separate qualification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Network {
+    Mainnet,
+    Testnet,
+}
+
+impl Network {
+    pub fn magic(self) -> [u8; 4] {
+        match self {
+            Self::Mainnet => MAINNET_MAGIC,
+            Self::Testnet => [0xfa, 0x1a, 0xf9, 0xbf],
+        }
+    }
+    pub fn default_port(self) -> u16 {
+        match self {
+            Self::Mainnet => 8233,
+            Self::Testnet => 18233,
+        }
+    }
+    pub fn protocol_version(self) -> i32 {
+        match self {
+            Self::Mainnet => 170190,
+            Self::Testnet => 170180,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Mainnet => "mainnet",
+            Self::Testnet => "testnet",
+        }
+    }
+}
 pub const MAX_MESSAGE_LEN: usize = 2 * 1024 * 1024;
 pub const MSG_TX: u32 = 1;
 pub const MSG_BLOCK: u32 = 2;
@@ -35,14 +67,14 @@ impl Inventory {
     }
 }
 
-pub async fn read_message<R>(reader: &mut R) -> Result<Message>
+pub async fn read_message<R>(reader: &mut R, network: Network) -> Result<Message>
 where
     R: AsyncRead + Unpin,
 {
     let mut header = [0u8; 24];
     reader.read_exact(&mut header).await?;
 
-    if header[0..4] != MAINNET_MAGIC {
+    if header[0..4] != network.magic() {
         return Err(IngressError::Wire(format!(
             "unexpected magic {}",
             hex::encode(&header[0..4])
@@ -68,7 +100,12 @@ where
     Ok(Message { command, payload })
 }
 
-pub async fn write_message<W>(writer: &mut W, command: &str, payload: &[u8]) -> Result<()>
+pub async fn write_message<W>(
+    writer: &mut W,
+    network: Network,
+    command: &str,
+    payload: &[u8],
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
@@ -83,7 +120,7 @@ where
     }
 
     let mut header = Vec::with_capacity(24);
-    header.extend_from_slice(&MAINNET_MAGIC);
+    header.extend_from_slice(&network.magic());
     let mut command_bytes = [0u8; 12];
     command_bytes[..command.len()].copy_from_slice(command.as_bytes());
     header.extend_from_slice(&command_bytes);
@@ -290,10 +327,36 @@ mod tests {
     use tokio::io::duplex;
 
     #[tokio::test]
+    async fn network_frames_are_isolated() {
+        for network in [Network::Mainnet, Network::Testnet] {
+            let mut frame = Vec::new();
+            write_message(&mut frame, network, "ping", &[1, 2])
+                .await
+                .unwrap();
+            assert_eq!(&frame[..4], &network.magic());
+            assert_eq!(
+                read_message(&mut &frame[..], network)
+                    .await
+                    .unwrap()
+                    .payload,
+                [1, 2]
+            );
+            let other = if network == Network::Mainnet {
+                Network::Testnet
+            } else {
+                Network::Mainnet
+            };
+            assert!(read_message(&mut &frame[..], other).await.is_err());
+        }
+    }
+
+    #[tokio::test]
     async fn roundtrips_message_frame() {
         let (mut a, mut b) = duplex(1024);
-        write_message(&mut a, "ping", &[1, 2, 3, 4]).await.unwrap();
-        let msg = read_message(&mut b).await.unwrap();
+        write_message(&mut a, Network::Mainnet, "ping", &[1, 2, 3, 4])
+            .await
+            .unwrap();
+        let msg = read_message(&mut b, Network::Mainnet).await.unwrap();
         assert_eq!(msg.command, "ping");
         assert_eq!(msg.payload, vec![1, 2, 3, 4]);
     }
@@ -308,7 +371,7 @@ mod tests {
         header.extend_from_slice(&[0, 0, 0, 0]);
         a.write_all(&header).await.unwrap();
         a.write_all(&[1]).await.unwrap();
-        let err = read_message(&mut b).await.unwrap_err();
+        let err = read_message(&mut b, Network::Mainnet).await.unwrap_err();
         assert!(matches!(err, IngressError::Wire(_)));
     }
 
