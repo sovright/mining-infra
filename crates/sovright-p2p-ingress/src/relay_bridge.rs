@@ -1234,3 +1234,7 @@ mod tests {
         assert!(!r.contains(&[7u8; 32], t0));
     }
 }
+
+#[cfg(test)]
+#[path = "nu7_transport_tests.rs"]
+mod nu7_transport_tests;

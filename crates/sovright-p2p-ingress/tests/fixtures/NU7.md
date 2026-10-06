@@ -16,3 +16,28 @@ The v6 coinbase remains prefilled: short-ID resolution here exercises only the
 v5 transaction. This is not general shielded-transaction, relay transport,
 FEC/recovery, or submission-path qualification. The two clients share code
 ancestry; matching RPC digests are not independent cryptographic implementations.
+
+## Transport qualification
+
+`real_nu7_authenticated_udp_reaches_sidecar_candidate` sends this fixture through
+an authenticated loopback relay with production Equihash validation, 10+3 FEC,
+and full-prefill compact reconstruction. It verifies byte-exact sidecar output
+without submitting. This does not simulate packet loss or qualify cached/skeleton
+transport, sustained load, or all testnet difficulty targets.
+
+The ignored `live_nu7_authenticated_transport_submission` test requires explicit
+`NU7_TEST_RAW_BLOCK` (hex file), `NU7_TEST_RAW_SHA256`, and `NU7_TEST_RPC_PORT`
+(loopback RPC). It refuses any chain except `test` with active NU7, a known block,
+or a block that does not extend the observed tip. Run only against an isolated
+qualification node and a canonical block independently obtained from a reference
+node. It performs one real submission and requires canonical acceptance; do not
+retry an ambiguous RPC outcome without checking the node first.
+
+```sh
+cargo +1.99.0 test -p sovright-p2p-ingress --locked \
+  live_nu7_authenticated_transport_submission -- --ignored --nocapture
+```
+
+These tests do not change the production testnet-output prohibition. The relay's
+stateless target bound is the mainnet limit, not the larger testnet limit; full
+nodes remain responsible for contextual difficulty and consensus validation.

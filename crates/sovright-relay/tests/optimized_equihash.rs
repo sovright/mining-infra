@@ -8,13 +8,7 @@ fn optimized_relay_preserves_mainnet_decisions_and_rejects_corruption() {
         let full = hex::decode(sample["header"].as_str().unwrap()).unwrap();
         assert_eq!(
             EquihashPowValidator.validate(&full),
-            // Preserve the existing target-range guard: it rejects genesis,
-            // although both Equihash backends accept its solution.
-            if sample["height"] == 0 {
-                PowResult::Invalid
-            } else {
-                PowResult::Valid
-            },
+            PowResult::Valid,
             "height {}",
             sample["height"]
         );

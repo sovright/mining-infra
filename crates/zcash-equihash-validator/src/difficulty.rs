@@ -20,14 +20,28 @@ impl Target {
         self.0
     }
 
-    /// Maximum target for Zcash mainnet (difficulty 1)
+    /// Historical difficulty-one reference used by this crate: `2^227 - 1`.
+    ///
+    /// The name is retained for API compatibility. This is NOT the Zcash
+    /// consensus PoW limit. Existing share-difficulty conversions depend on
+    /// this unit; changing it would rescale targets and accounting by 65,536.
+    /// Use [`Self::mainnet_pow_limit`] for stateless block-admission bounds.
     pub fn max_mainnet() -> Self {
-        // Zcash's powLimit for mainnet
-        // 0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
         let mut target = [0xff; 32];
         target[28] = 0x07;
         target[29] = 0x00;
         target[30] = 0x00;
+        target[31] = 0x00;
+        Self(target)
+    }
+
+    /// Zcash mainnet consensus PoW limit: `2^243 - 1`.
+    ///
+    /// This is a network bound, not the historical share-difficulty unit.
+    /// Source: Zcash protocol specification, PoWLimit (Constants).
+    pub fn mainnet_pow_limit() -> Self {
+        let mut target = [0xff; 32];
+        target[30] = 0x07;
         target[31] = 0x00;
         Self(target)
     }
@@ -76,7 +90,8 @@ impl Ord for Target {
 /// where exponent is the first byte and mantissa is the next 3 bytes
 ///
 /// Returns the all-zero target for encodings that are not valid: a set sign
-/// bit, or a zero mantissa. All-zero is the established "invalid" signal here
+/// bit, a zero target, or nonzero overflow beyond 256 bits.
+/// All-zero is the established "invalid" signal here
 /// -- no hash can meet it, and every caller either rejects it explicitly or
 /// fails closed on it -- so the invalid case needs no separate return type.
 pub fn compact_to_target(compact: u32) -> Target {
@@ -88,7 +103,11 @@ pub fn compact_to_target(compact: u32) -> Target {
     // negative encoding as though it were positive yields a larger, easier
     // target, so an unguarded caller would accept solutions it must reject.
     // Fail closed rather than trusting every caller to pre-screen.
-    if mantissa & 0x0080_0000 != 0 {
+    if mantissa & 0x0080_0000 != 0
+        || exponent > 34
+        || (exponent > 33 && mantissa > 0xff)
+        || (exponent > 32 && mantissa > 0xffff)
+    {
         return Target([0u8; 32]);
     }
 
@@ -135,7 +154,7 @@ pub fn target_to_difficulty_with_max(target: &Target, max: &Target) -> f64 {
     max_val / target_val
 }
 
-/// Convert target to difficulty using mainnet powLimit
+/// Convert target to difficulty using this crate's historical difficulty-one unit.
 pub fn target_to_difficulty(target: &Target) -> f64 {
     target_to_difficulty_with_max(target, &Target::max_mainnet())
 }
@@ -169,7 +188,7 @@ pub fn difficulty_to_target_with_max(difficulty: f64, max: &Target) -> Target {
     f64_to_target(target_val)
 }
 
-/// Convert difficulty to target using mainnet powLimit
+/// Convert difficulty to target using this crate's historical difficulty-one unit.
 pub fn difficulty_to_target(difficulty: f64) -> Target {
     difficulty_to_target_with_max(difficulty, &Target::max_mainnet())
 }
@@ -197,6 +216,37 @@ fn f64_to_target(mut value: f64) -> Target {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_target_rejects_nonzero_overflow_without_truncation() {
+        for bits in [0x21010001, 0x22000101, 0x23000001] {
+            assert_eq!(compact_to_target(bits).to_le_bytes(), [0; 32], "{bits:#x}");
+        }
+        let mut expected = [0; 32];
+        expected[30] = 0xff;
+        expected[31] = 0xff;
+        assert_eq!(compact_to_target(0x2100ffff).to_le_bytes(), expected);
+        expected[30] = 0;
+        assert_eq!(compact_to_target(0x220000ff).to_le_bytes(), expected);
+    }
+
+    #[test]
+    fn consensus_limit_and_legacy_share_unit_are_distinct() {
+        let mut display = Target::mainnet_pow_limit().to_le_bytes();
+        display.reverse();
+        assert_eq!(
+            hex::encode(display),
+            "0007ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert!(compact_to_target(0x1f07ffff) <= Target::mainnet_pow_limit());
+        assert!(compact_to_target(0x1f080000) > Target::mainnet_pow_limit());
+        assert!(compact_to_target(0x1f0162f6) > Target::max_mainnet());
+        // Pin existing default share units independently of the admission bound.
+        let mut expected = [0u8; 32];
+        expected[28] = 0x08; // f64 rounds the legacy difficulty-one target up.
+        assert_eq!(difficulty_to_target(1.0).to_le_bytes(), expected);
+        assert_eq!(target_to_difficulty(&Target::max_mainnet()), 1.0);
+    }
 
     #[test]
     fn compact_to_target_rejects_the_sign_bit() {
