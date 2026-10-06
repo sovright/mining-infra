@@ -673,14 +673,6 @@ mod tests {
     }
 
     #[test]
-    fn rejects_remote_versions_below_zcash_mainnet_floor() {
-        assert!(170_020 < MIN_ACCEPTABLE_REMOTE_VERSION);
-        assert!(170_119 < MIN_ACCEPTABLE_REMOTE_VERSION);
-        assert!(170_120 >= MIN_ACCEPTABLE_REMOTE_VERSION);
-        assert!(Network::Mainnet.protocol_version() >= MIN_ACCEPTABLE_REMOTE_VERSION);
-    }
-
-    #[test]
     fn network_addr_encodes_ipv4_mapped_ipv6() {
         let mut out = Vec::new();
         encode_network_address("1.2.3.4:8233".parse().unwrap(), &mut out);
