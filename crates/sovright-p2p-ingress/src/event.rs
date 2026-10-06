@@ -10,6 +10,7 @@ use crate::error::{IngressError, Result};
 
 #[derive(Clone)]
 pub struct EventSink {
+    network: crate::wire::Network,
     target: EventTarget,
 }
 
@@ -20,7 +21,12 @@ enum EventTarget {
 }
 
 impl EventSink {
+    #[cfg(test)]
     pub fn new(path: Option<PathBuf>) -> Result<Self> {
+        Self::for_network(path, crate::wire::Network::Mainnet)
+    }
+
+    pub fn for_network(path: Option<PathBuf>, network: crate::wire::Network) -> Result<Self> {
         match path {
             Some(path) => {
                 if let Some(parent) = path.parent() {
@@ -28,10 +34,12 @@ impl EventSink {
                 }
                 let file = OpenOptions::new().create(true).append(true).open(path)?;
                 Ok(Self {
+                    network,
                     target: EventTarget::File(Arc::new(Mutex::new(file))),
                 })
             }
             None => Ok(Self {
+                network,
                 target: EventTarget::Stdout,
             }),
         }
@@ -321,7 +329,8 @@ impl EventSink {
         }))
     }
 
-    fn write(&self, value: serde_json::Value) -> Result<()> {
+    fn write(&self, mut value: serde_json::Value) -> Result<()> {
+        value["network"] = serde_json::json!(self.network.name());
         let line = serde_json::to_string(&value)
             .map_err(|e| IngressError::Wire(format!("event serialization failed: {e}")))?;
         match &self.target {

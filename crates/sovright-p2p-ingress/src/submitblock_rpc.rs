@@ -113,7 +113,7 @@ impl SubmittedBlockValidator for MainnetSubmittedBlockValidator {
         // may still be fanned into the mesh, which is acceptable given the
         // loopback-only, trusted-pool threat model.
         let target = compact_to_target(bits);
-        if target.0 == [0u8; 32] || target > Target::max_mainnet() {
+        if target.0 == [0u8; 32] || target > Target::mainnet_pow_limit() {
             return Err(format!("target outside Zcash mainnet range: {bits:#010x}"));
         }
 
@@ -466,6 +466,20 @@ mod tests {
 
         assert_eq!(result, None);
         handle.stop().unwrap();
+    }
+
+    #[test]
+    fn stated_target_guard_accepts_valid_pow_between_legacy_unit_and_consensus_limit() {
+        // Real NU7 testnet block, but its nBits is also within the MAINNET
+        // consensus range. This proves the stateless PoW guard only, not
+        // mainnet consensus acceptance or enabling testnet outputs.
+        let block =
+            hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap();
+        assert!(
+            MainnetSubmittedBlockValidator::new(4 * 1024 * 1024)
+                .validate(&block)
+                .is_ok()
+        );
     }
 
     #[test]

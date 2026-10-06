@@ -1,0 +1,34 @@
+{
+  "network": "testnet",
+  "height": 4465026,
+  "hash": "000089ba27100beede16d64b34e3d1b626b428cb7ee9fe6dcfdc217ce24e78af",
+  "raw_sha256": "bdbd8947e1152275cb8077af334c1dbc87ef99dc71ee8e066ea83db8e917ce61",
+  "source": "Public testnet P2P getdata; bytes match prior two-client activation receipt. Transaction digests cross-checked using getblock verbosity 2 on pinned Zebra 7.0.0-rc.0 and Zakura 1.6.0.",
+  "observed_at": "2026-10-06T13:23:59.080829+00:00",
+  "transactions": [
+    {
+      "txid": "98ccf227cfa19e8ad89312500bf724090997443e6ae0656e33b2d5cec99bb608",
+      "authdigest": "3daa0288e5677776d3a387e1eda4ca34c4669e8086fe695887f3ed33d26ae68d",
+      "version": 6,
+      "size": 6104
+    },
+    {
+      "txid": "a85b0f6a352b9699d4221a93eeadbab457862c4dec2a3ac7ccd0d2f034fc89ea",
+      "authdigest": "1ac2d92355304ef9c89730a3c9706b27edd4d742c420fa2196840d192ed090f0",
+      "version": 5,
+      "size": 278
+    }
+  ],
+  "coinbase_ironwood_actions": 1,
+  "oracle_images": {
+    "zebra": "zfnd/zebra@sha256:d534756d899bc44ce0c7ad6d1672a540d0eb588f8c2face4674298ebb091abca",
+    "zakura": "zakuracore/zakura@sha256:bf53c178e9549217fce7cfaa21efc85c478129ba6dc5307d55640514affeb0ac"
+  },
+  "acceptance_evidence": {
+    "zebra_submitblock_result": null,
+    "zebra_confirmed_height": 4465026,
+    "confirmed_at": "2026-10-06T06:34:59.130186+00:00",
+    "confirmed_block_hash": "000089ba27100beede16d64b34e3d1b626b428cb7ee9fe6dcfdc217ce24e78af",
+    "raw_sha256": "bdbd8947e1152275cb8077af334c1dbc87ef99dc71ee8e066ea83db8e917ce61"
+  }
+}

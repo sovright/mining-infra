@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use crate::config::{Config, is_accepted_peer_addr};
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
+use crate::wire::Network;
 
 #[derive(Clone)]
 pub struct Crawler {
+    network: Network,
     inner: Arc<Mutex<CrawlerInner>>,
     enabled: bool,
     rotation_enabled: bool,
@@ -99,7 +101,7 @@ impl Crawler {
         let now = Instant::now();
         let mut next_sequence = 0u64;
         for peer in initial_peers {
-            if !is_accepted_peer_addr(&peer, config.accept_nonstandard_ports) {
+            if !is_accepted_peer_addr(&peer, config.accept_nonstandard_ports, config.network) {
                 continue;
             }
             if config.excluded_peer_ips.contains(&peer.ip()) {
@@ -125,6 +127,7 @@ impl Crawler {
         }
 
         Self {
+            network: config.network,
             inner: Arc::new(Mutex::new(CrawlerInner {
                 peers,
                 queue,
@@ -426,7 +429,7 @@ impl Crawler {
                 .lock()
                 .map_err(|_| IngressError::Wire("crawler mutex poisoned".to_string()))?;
             for peer in peers {
-                if !is_accepted_peer_addr(&peer, self.accept_nonstandard_ports) {
+                if !is_accepted_peer_addr(&peer, self.accept_nonstandard_ports, self.network) {
                     continue;
                 }
                 if self.excluded_peer_ips.contains(&peer.ip()) {
@@ -472,6 +475,7 @@ mod tests {
 
     fn config(rotation_enabled: bool) -> Config {
         Config {
+            network: crate::wire::Network::Mainnet,
             seeds: Vec::new(),
             peers: Vec::new(),
             max_peers: 8,

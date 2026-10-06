@@ -1011,3 +1011,121 @@ mod real_block_round_trip {
         }
     }
 }
+
+#[cfg(test)]
+mod real_nu7_activation {
+    use super::*;
+    use crate::tx_cache::TxCacheConfig;
+    use sha2::{Digest, Sha256};
+    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
+    use sovright_relay_sidecar::mempool_sync::wtxid_from_display_hex;
+
+    fn fixture() -> (Vec<u8>, serde_json::Value) {
+        let block =
+            hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap();
+        let metadata: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet_nu7_4465026.json"))
+                .unwrap();
+        assert_eq!(hex::encode(Sha256::digest(&block)), metadata["raw_sha256"]);
+        assert_eq!(
+            sovright_relay::consensus_block_hash_display(&block[..ZCASH_FULL_HEADER_SIZE]),
+            metadata["hash"]
+        );
+        (block, metadata)
+    }
+
+    fn cache() -> TxCache {
+        TxCache::new(TxCacheConfig {
+            max_entries: 64,
+            max_bytes: 1 << 20,
+            max_tx_bytes: 1 << 16,
+        })
+    }
+
+    #[test]
+    fn real_nu7_v5_and_ironwood_v6_match_both_node_digest_oracles() {
+        let (block, metadata) = fixture();
+        let compact = compact_block_from_raw_block(&block).unwrap();
+        assert_eq!(compact.prefilled_txs.len(), 2);
+        assert_eq!(
+            metadata["transactions"].as_array().unwrap().len(),
+            compact.prefilled_txs.len()
+        );
+        for (tx, expected) in compact
+            .prefilled_txs
+            .iter()
+            .zip(metadata["transactions"].as_array().unwrap())
+        {
+            assert_eq!(tx.tx_data.len() as u64, expected["size"].as_u64().unwrap());
+            // This shared helper is also used by pool-server's default relay feature.
+            assert_eq!(
+                sovright_relay::merkle::display_hex(&sovright_relay::txid_from_tx_bytes(
+                    &tx.tx_data
+                )),
+                expected["txid"].as_str().unwrap()
+            );
+            assert_eq!(
+                u32::from_le_bytes(tx.tx_data[8..12].try_into().unwrap()),
+                0x7719_0ad9
+            );
+            let oracle = wtxid_from_display_hex(
+                expected["txid"].as_str().unwrap(),
+                expected["authdigest"].as_str().unwrap(),
+            )
+            .unwrap();
+            // Production passes the older branch hint; the embedded NU7 branch
+            // must control both v5 and v6 hashes, including the Ironwood bundle.
+            assert_eq!(
+                wtxid_from_tx_bytes(&tx.tx_data, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID),
+                Some(oracle)
+            );
+        }
+    }
+
+    fn assert_exact_reconstruction(compact: &CompactBlock, receiver: &TxCache, raw: &[u8]) {
+        let mut reconstructor = CompactBlockReconstructor::new(receiver);
+        reconstructor.prepare(
+            &sovright_relay::zcash_block_hash(&compact.header),
+            compact.nonce,
+        );
+        match reconstructor.reconstruct(compact) {
+            ReconstructionResult::Complete { transactions } => {
+                let mut rebuilt = compact.header.clone();
+                crate::wire::encode_compact_size(transactions.len() as u64, &mut rebuilt);
+                for tx in transactions {
+                    rebuilt.extend(tx);
+                }
+                assert_eq!(rebuilt, raw);
+            }
+            other => panic!("NU7 reconstruction failed: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_nu7_full_compact_and_skeleton_reconstruct_exact_block_bytes() {
+        let (block, _) = fixture();
+        let full = compact_block_from_raw_block(&block).unwrap();
+        let receiver = cache();
+        assert_exact_reconstruction(&full, &receiver, &block);
+        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache()).unwrap();
+        assert_eq!(skeleton.prefilled_txs.len(), 1);
+        assert_eq!(skeleton.short_ids.len(), 1);
+        let mut missing = CompactBlockReconstructor::new(&receiver);
+        missing.prepare(
+            &sovright_relay::zcash_block_hash(&skeleton.header),
+            skeleton.nonce,
+        );
+        assert!(
+            matches!(missing.reconstruct(&skeleton), ReconstructionResult::Incomplete { unresolved_short_ids, .. } if unresolved_short_ids.len() == 1)
+        );
+        let tx = &full.prefilled_txs[1].tx_data;
+        receiver.insert(
+            wtxid_from_tx_bytes(tx, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).unwrap(),
+            tx.clone(),
+        );
+        assert_exact_reconstruction(&skeleton, &receiver, &block);
+        let cached = compact_block_from_raw_block_with_tx_cache(&block, &receiver).unwrap();
+        assert_eq!(cached.short_ids.len(), 1);
+        assert_exact_reconstruction(&cached, &receiver, &block);
+    }
+}

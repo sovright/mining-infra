@@ -1514,10 +1514,23 @@ impl JdServer {
     }
 
     fn open_session(&self) -> Result<JdSession> {
-        let id = self
-            .next_session_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
-            .map_err(|_| JdServerError::Protocol("JD session IDs exhausted".into()))?;
+        // Use stable compare-exchange rather than fetch_update (deprecated in
+        // Rust 1.99) or its newer replacement, keeping older toolchains usable.
+        let mut id = self.next_session_id.load(Ordering::Relaxed);
+        loop {
+            let next = id
+                .checked_add(1)
+                .ok_or_else(|| JdServerError::Protocol("JD session IDs exhausted".into()))?;
+            match self.next_session_id.compare_exchange_weak(
+                id,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => id = actual,
+            }
+        }
         Ok(JdSession {
             id,
             pending: Arc::clone(&self.pending_missing),
@@ -3115,6 +3128,46 @@ mod tests {
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(state.insert((PendingOwner::Session(1), 1, 8), vec![[0x11; 32]]));
         assert_eq!(state.requests.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_ids_never_wrap_or_repeat_when_exhausted() {
+        let server = pending_test_server().await;
+        server
+            .next_session_id
+            .store(u64::MAX - 1, Ordering::Relaxed);
+        assert_eq!(server.open_session().unwrap().id, u64::MAX - 1);
+        assert!(server.open_session().is_err());
+        assert!(server.open_session().is_err());
+        assert_eq!(server.next_session_id.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn concurrent_sessions_have_distinct_ids() {
+        let server = pending_test_server().await;
+        let ids = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    let server = &server;
+                    scope.spawn(move || {
+                        (0..100)
+                            .map(|_| server.open_session().unwrap().id)
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(ids.len(), 800);
+        assert_eq!(
+            ids.into_iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            800
+        );
     }
 
     #[tokio::test]

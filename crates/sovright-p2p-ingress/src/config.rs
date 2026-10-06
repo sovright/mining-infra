@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{IngressError, Result};
-use crate::wire::DEFAULT_PORT;
+use crate::wire::Network;
 
 /// Known Zcash forks that reused the Zcash network magic and gossip into
 /// Zcash address books, but whose blocks are not Zcash mainnet blocks.
@@ -51,6 +51,7 @@ pub struct SubmitBlockRpcConfig {
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub network: Network,
     pub seeds: Vec<String>,
     pub peers: Vec<SocketAddr>,
     pub max_peers: usize,
@@ -127,7 +128,23 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let seeds = env_csv("SOVRIGHT_P2P_DNS_SEEDS").unwrap_or_else(default_seeds);
+        let network = match env::var("SOVRIGHT_P2P_NETWORK").as_deref() {
+            Err(env::VarError::NotPresent) | Ok("mainnet") => Network::Mainnet,
+            Ok("testnet") => Network::Testnet,
+            _ => {
+                return Err(IngressError::Config(
+                    "SOVRIGHT_P2P_NETWORK must be mainnet or testnet".to_string(),
+                ));
+            }
+        };
+        // No implicit testnet discovery: operators must explicitly choose its peers/seeds.
+        let seeds = env_csv("SOVRIGHT_P2P_DNS_SEEDS").unwrap_or_else(|| {
+            if network == Network::Mainnet {
+                default_seeds()
+            } else {
+                Vec::new()
+            }
+        });
         let peers = env_socket_csv("SOVRIGHT_P2P_PEERS")?;
         let max_peers = env_usize("SOVRIGHT_P2P_MAX_PEERS", 8)?;
         let connect_timeout = Duration::from_secs(env_u64("SOVRIGHT_P2P_CONNECT_TIMEOUT_SECS", 5)?);
@@ -182,6 +199,11 @@ impl Config {
             ));
         }
         let event_log = env::var("SOVRIGHT_P2P_EVENT_LOG").ok().map(PathBuf::from);
+        if network == Network::Testnet
+            && event_log.as_ref().is_none_or(|p| p.as_os_str().is_empty())
+        {
+            return Err(IngressError::Config("testnet requires an explicit SOVRIGHT_P2P_EVENT_LOG isolated from mainnet collectors".to_string()));
+        }
         let relay_peers = env_socket_csv("SOVRIGHT_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("SOVRIGHT_P2P_RELAY_BIND_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:0".to_string())
@@ -219,6 +241,11 @@ impl Config {
             env_usize("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY", 64)?;
         let submitblock_rpc = submitblock_rpc_from_env()?;
 
+        if network == Network::Testnet
+            && (!relay_peers.is_empty() || tx_feed_addr.is_some() || submitblock_rpc.is_some())
+        {
+            return Err(IngressError::Config("testnet is observation-only: relay peers, tx feed and submitblock RPC are forbidden".to_string()));
+        }
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
                 "configure at least one DNS seed or peer".to_string(),
@@ -226,6 +253,7 @@ impl Config {
         }
 
         Ok(Self {
+            network,
             seeds,
             peers,
             max_peers,
@@ -458,11 +486,11 @@ fn parse_auth_key(value: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-pub fn seed_socket(seed: &str) -> String {
+pub fn seed_socket(seed: &str, network: Network) -> String {
     if seed.contains(':') {
         seed.to_string()
     } else {
-        format!("{seed}:{DEFAULT_PORT}")
+        format!("{seed}:{}", network.default_port())
     }
 }
 
@@ -470,8 +498,13 @@ pub fn is_denied_peer_addr(peer: &SocketAddr) -> bool {
     DENIED_PEER_PORTS.contains(&peer.port())
 }
 
-pub fn is_accepted_peer_addr(peer: &SocketAddr, accept_nonstandard_ports: bool) -> bool {
-    !is_denied_peer_addr(peer) && (accept_nonstandard_ports || peer.port() == DEFAULT_PORT)
+pub fn is_accepted_peer_addr(
+    peer: &SocketAddr,
+    accept_nonstandard_ports: bool,
+    network: Network,
+) -> bool {
+    !is_denied_peer_addr(peer)
+        && (accept_nonstandard_ports || peer.port() == network.default_port())
 }
 
 #[cfg(test)]
@@ -514,9 +547,79 @@ mod tests {
     }
 
     #[test]
+    fn testnet_requires_explicit_peers_and_disallows_pipeline_outputs() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_NETWORK", "testnet".to_string()),
+            ("SOVRIGHT_P2P_DNS_SEEDS", "".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "127.0.0.1:18233".to_string()),
+        ]);
+        assert!(
+            Config::from_env().is_err(),
+            "testnet requires an explicit event log"
+        );
+        let _log = EnvGuard::set(&[(
+            "SOVRIGHT_P2P_EVENT_LOG",
+            "/tmp/nu7-test-events.jsonl".to_string(),
+        )]);
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.network, Network::Testnet);
+        assert!(config.seeds.is_empty());
+        assert_eq!(
+            seed_socket("seed.example", config.network),
+            "seed.example:18233"
+        );
+        for (name, value) in [
+            ("SOVRIGHT_P2P_RELAY_PEERS", "127.0.0.1:9000"),
+            ("SOVRIGHT_P2P_TX_FEED_ADDR", "127.0.0.1:9001"),
+            ("SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR", "127.0.0.1:9002"),
+        ] {
+            let _output = EnvGuard::set(&[(name, value.to_string())]);
+            assert!(
+                Config::from_env().is_err(),
+                "testnet output {name} must be rejected"
+            );
+        }
+        let _empty = EnvGuard::set(&[("SOVRIGHT_P2P_PEERS", "".to_string())]);
+        assert!(Config::from_env().is_err());
+    }
+
+    #[test]
+    fn public_network_ports_are_distinct() {
+        assert!(is_accepted_peer_addr(
+            &"127.0.0.1:18233".parse().unwrap(),
+            false,
+            Network::Testnet
+        ));
+        assert!(!is_accepted_peer_addr(
+            &"127.0.0.1:8233".parse().unwrap(),
+            false,
+            Network::Testnet
+        ));
+        assert!(!is_accepted_peer_addr(
+            &"127.0.0.1:18233".parse().unwrap(),
+            false,
+            Network::Mainnet
+        ));
+    }
+
+    #[test]
+    fn invalid_network_is_rejected() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[("SOVRIGHT_P2P_NETWORK", "tesnet".to_string())]);
+        assert!(Config::from_env().is_err());
+    }
+
+    #[test]
     fn seed_socket_adds_default_port() {
-        assert_eq!(seed_socket("dnsseed.z.cash"), "dnsseed.z.cash:8233");
-        assert_eq!(seed_socket("127.0.0.1:8233"), "127.0.0.1:8233");
+        assert_eq!(
+            seed_socket("dnsseed.z.cash", Network::Mainnet),
+            "dnsseed.z.cash:8233"
+        );
+        assert_eq!(
+            seed_socket("127.0.0.1:8233", Network::Mainnet),
+            "127.0.0.1:8233"
+        );
     }
 
     #[test]
@@ -570,19 +673,23 @@ mod tests {
     fn accepts_standard_port_by_default() {
         assert!(is_accepted_peer_addr(
             &"127.0.0.1:8233".parse().unwrap(),
-            false
+            false,
+            Network::Mainnet
         ));
         assert!(!is_accepted_peer_addr(
             &"127.0.0.1:34567".parse().unwrap(),
-            false
+            false,
+            Network::Mainnet
         ));
         assert!(is_accepted_peer_addr(
             &"127.0.0.1:34567".parse().unwrap(),
-            true
+            true,
+            Network::Mainnet
         ));
         assert!(!is_accepted_peer_addr(
             &"127.0.0.1:16125".parse().unwrap(),
-            true
+            true,
+            Network::Mainnet
         ));
     }
 

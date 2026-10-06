@@ -36,5 +36,7 @@ sha2 = "0.10"
 # Zcash transaction parsing + ZIP-244 txid/auth-digest (for short_id-ing block
 # transactions the tx cache missed). `circuits`/`multicore` (halo2 proving) are
 # not needed -- we only parse and hash, never verify proofs.
-zcash_primitives = { version = "0.29", default-features = false, features = ["std"] }
-zcash_protocol = { version = "0.10", default-features = false }
+# NU7 branch ID support is first published in these prereleases. Exact pins
+# prevent an unrelated prerelease update from changing the qualified parser.
+zcash_primitives = { version = "=0.31.0-pre.0", default-features = false, features = ["std"] }
+zcash_protocol = { version = "=0.11.0-pre.0", default-features = false }

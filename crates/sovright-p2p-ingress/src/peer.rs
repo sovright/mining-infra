@@ -15,6 +15,7 @@ use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::RelayBridge;
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
+use crate::wire::Network;
 use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
@@ -22,25 +23,14 @@ use crate::wire::{
 use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
 use sovright_relay::WtxId;
 
-// Zcash protocol version sent in our `version` message. NU6.3/Ironwood activated
-// on mainnet at block 3,428,143 (2026-07-28); zebrad 6.2.3 reports 170_160 as its
-// `protocolversion`. Post-upgrade peers complete the handshake with a node
-// advertising an older version and then relay NOTHING to it -- at Ironwood this
-// silently cut block ingest to ~zero for ~6h while every service still looked
-// healthy. MUST be bumped as part of every network upgrade; the authoritative
-// value is `getnetworkinfo.protocolversion` from an upgraded zebrad, never an
-// inference from observed peer versions.
-// See advertised_protocol_version_matches_current_network_upgrade().
-const PROTOCOL_VERSION: i32 = 170_160;
-
-// Floor for accepting *remote* version messages. We stay permissive here so
-// the ingress can still ingest from slower-to-upgrade peers and from
-// post-NU5/NU6 nodes that haven't moved to NU6.2 yet.
+// Observation-only floor. Forwarding sessions require the selected network's
+// NU7 floor from startup; peer-reported heights never control admission.
 const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 
 // Advertising less than we demand of peers would be incoherent; enforce at
 // compile time so a future upgrade cannot raise the floor past what we send.
-const _: () = assert!(PROTOCOL_VERSION >= MIN_ACCEPTABLE_REMOTE_VERSION);
+const _: () = assert!(Network::Mainnet.protocol_version() >= MIN_ACCEPTABLE_REMOTE_VERSION);
+const _: () = assert!(Network::Testnet.protocol_version() >= MIN_ACCEPTABLE_REMOTE_VERSION);
 
 // Sub-version sent in our `version` message. Zcash mainnet currently
 // accepts any non-banned user agent; we keep this short and identifying.
@@ -146,6 +136,13 @@ pub async fn run_peer(
     crawler: Crawler,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
+    // This is a capability filter, not consensus validation. Apply it for the
+    // whole connection lifetime, before/at/after activation and across reorgs.
+    let minimum_version = if relay.is_some() || tx_feed.is_some() {
+        config.network.protocol_version()
+    } else {
+        MIN_ACCEPTABLE_REMOTE_VERSION
+    };
     let connect_started = Instant::now();
     let stream = timeout(config.connect_timeout, TcpStream::connect(peer_addr))
         .await
@@ -156,8 +153,8 @@ pub async fn run_peer(
     info!(%peer, "connected to Zcash P2P peer");
 
     let (mut reader, mut writer) = stream.into_split();
-    let version = version_payload(peer_addr);
-    write_message(&mut writer, "version", &version).await?;
+    let version = version_payload(peer_addr, config.network);
+    write_message(&mut writer, config.network, "version", &version).await?;
 
     let mut saw_verack = false;
     let mut sent_verack = false;
@@ -173,7 +170,10 @@ pub async fn run_peer(
     loop {
         // Keep the same read future alive across expiry. Cancelling a partial
         // frame read on each deadline would desynchronise the wire decoder.
-        let read = timeout(Duration::from_secs(90), read_message(&mut reader));
+        let read = timeout(
+            Duration::from_secs(90),
+            read_message(&mut reader, config.network),
+        );
         tokio::pin!(read);
         let msg = loop {
             let deadline = blocks
@@ -201,38 +201,55 @@ pub async fn run_peer(
         transactions.expire(now);
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
+        if (!sent_verack || !saw_verack) && !matches!(msg.command.as_str(), "version" | "verack") {
+            if msg.command == "reject" {
+                events.p2p_reject(&peer, msg.payload.len())?;
+            }
+            return Err(IngressError::Wire(format!(
+                "{} received before handshake completion",
+                msg.command
+            )));
+        }
         match msg.command.as_str() {
             "version" => {
+                if sent_verack {
+                    return Err(IngressError::Wire("duplicate version message".to_string()));
+                }
                 let remote_version = remote_version(&msg.payload).unwrap_or_default();
                 info!(%peer, remote_version, "received version");
                 events.p2p_peer_version(&peer, remote_version)?;
-                if !is_acceptable_remote_version(remote_version) {
+                if remote_version < minimum_version {
                     return Err(IngressError::Wire(format!(
-                        "remote protocol version too old: {remote_version} < {MIN_ACCEPTABLE_REMOTE_VERSION}"
+                        "remote protocol version too old: {remote_version} < {minimum_version}"
                     )));
                 }
                 if !sent_verack {
-                    write_message(&mut writer, "verack", &[]).await?;
+                    write_message(&mut writer, config.network, "verack", &[]).await?;
                     sent_verack = true;
                 }
             }
             "verack" => {
+                if !sent_verack {
+                    return Err(IngressError::Wire(
+                        "verack received before version admission".to_string(),
+                    ));
+                }
+                if saw_verack {
+                    return Err(IngressError::Wire("duplicate verack message".to_string()));
+                }
                 saw_verack = true;
                 events.p2p_handshake_complete(&peer)?;
                 events.p2p_handshake_timing(&peer, handshake_started.elapsed().as_millis())?;
                 let nonce = nonce();
-                write_message(&mut writer, "ping", &nonce.to_le_bytes()).await?;
+                write_message(&mut writer, config.network, "ping", &nonce.to_le_bytes()).await?;
                 ping_nonce = Some(nonce);
                 ping_started = Some(Instant::now());
-                write_message(&mut writer, "getaddr", &[]).await?;
+                write_message(&mut writer, config.network, "getaddr", &[]).await?;
             }
             "reject" => {
                 events.p2p_reject(&peer, msg.payload.len())?;
             }
             "addr" => {
-                if !saw_verack {
-                    continue;
-                }
                 let addrs = parse_addr(&msg.payload, config.crawler_max_addr_per_message)?;
                 let count = addrs.len();
                 let accepted = crawler.add_discovered(&peer, addrs, &events)?;
@@ -249,12 +266,9 @@ pub async fn run_peer(
                 }
             }
             "ping" => {
-                write_message(&mut writer, "pong", &msg.payload).await?;
+                write_message(&mut writer, config.network, "pong", &msg.payload).await?;
             }
             "inv" => {
-                if !saw_verack {
-                    continue;
-                }
                 let invs = parse_inventory(&msg.payload)?;
                 let mut block_requests = Vec::new();
                 let mut tx_requests = Vec::new();
@@ -289,7 +303,7 @@ pub async fn run_peer(
                         .map(|inv| inventory_hash_to_display(&inv.hash))
                         .collect();
                     let request = encode_inventory(&block_requests);
-                    write_message(&mut writer, "getdata", &request).await?;
+                    write_message(&mut writer, config.network, "getdata", &request).await?;
                     for hash in requested_hashes {
                         events.p2p_getdata_sent(&peer, &hash)?;
                     }
@@ -300,16 +314,13 @@ pub async fn run_peer(
                         .filter_map(TxInventoryKey::from_inventory)
                         .collect();
                     let request = encode_inventory(&tx_requests);
-                    write_message(&mut writer, "getdata", &request).await?;
+                    write_message(&mut writer, config.network, "getdata", &request).await?;
                     for key in requested_keys {
                         events.p2p_tx_getdata_sent(&peer, key.kind(), &key.display_hash())?;
                     }
                 }
             }
             "notfound" => {
-                if !saw_verack {
-                    continue;
-                }
                 for inv in parse_inventory(&msg.payload)? {
                     if inv.is_block() {
                         blocks.remove(inv.hash);
@@ -319,9 +330,6 @@ pub async fn run_peer(
                 }
             }
             "block" => {
-                if !saw_verack {
-                    continue;
-                }
                 let display = received_block_display_hash(&mut blocks, &msg.payload)?;
                 let consensus_hash = msg
                     .payload
@@ -372,9 +380,6 @@ pub async fn run_peer(
                 }
             }
             "tx" => {
-                if !saw_verack {
-                    continue;
-                }
                 if let Some(wtxid) = wtxid_for_received_tx(&mut transactions, &msg.payload) {
                     let key = TxInventoryKey::from_wtxid(&wtxid);
                     if let Some(cache) = &tx_cache {
@@ -456,10 +461,6 @@ fn queue_tx_request(
 fn remote_version(payload: &[u8]) -> Result<i32> {
     let mut cursor = 0;
     read_i32_le(payload, &mut cursor)
-}
-
-fn is_acceptable_remote_version(remote_version: i32) -> bool {
-    remote_version >= MIN_ACCEPTABLE_REMOTE_VERSION
 }
 
 fn pong_nonce(payload: &[u8]) -> Option<u64> {
@@ -546,9 +547,9 @@ fn received_block_display_hash(
     Ok(actual_hash)
 }
 
-fn version_payload(peer_addr: SocketAddr) -> Vec<u8> {
+fn version_payload(peer_addr: SocketAddr, network: Network) -> Vec<u8> {
     let mut out = Vec::new();
-    out.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    out.extend_from_slice(&network.protocol_version().to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
     out.extend_from_slice(&(unix_time_secs() as i64).to_le_bytes());
     encode_network_address(peer_addr, &mut out);
@@ -626,35 +627,35 @@ mod tests {
         window
     }
 
-    // NU6.3/Ironwood (mainnet height 3,428,143, 2026-07-28) moved the network to
-    // protocol 170_160. We advertised 170_150 through activation: peers completed
-    // the handshake and then relayed NOTHING, so block ingest went to ~zero for
-    // ~6h while every service still reported healthy. This test pins the
-    // advertised version to the current upgrade so the same silent failure cannot
-    // recur unnoticed -- when the next NU lands, this test is what fails first.
+    // Test serialized capability, not just a private constant: NU7 peers use
+    // the first i32 of the version payload to decide whether to disconnect us.
     #[test]
-    fn advertised_protocol_version_matches_current_network_upgrade() {
-        // Authoritative source: `getnetworkinfo.protocolversion` on an upgraded
-        // zebrad (6.2.3 reports 170160). Do NOT infer this from peer counts.
-        assert_eq!(PROTOCOL_VERSION, 170_160);
+    fn outgoing_version_satisfies_nu7_mainnet_peer_floor() {
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        let advertised = i32::from_le_bytes(payload[..4].try_into().unwrap());
+        assert_eq!(advertised, 170_190);
+        assert_eq!(
+            &payload[4..12],
+            &[0; 8],
+            "ingress must not claim full-node services"
+        );
+    }
+
+    #[test]
+    fn testnet_advertises_its_own_version_with_unchanged_services() {
+        let payload = version_payload("127.0.0.1:18233".parse().unwrap(), Network::Testnet);
+        assert_eq!(i32::from_le_bytes(payload[..4].try_into().unwrap()), 170180);
+        assert_eq!(u64::from_le_bytes(payload[4..12].try_into().unwrap()), 0);
     }
 
     #[test]
     fn version_payload_contains_user_agent() {
-        let payload = version_payload("127.0.0.1:8233".parse().unwrap());
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
         assert!(
             payload
                 .windows(USER_AGENT.len())
                 .any(|w| w == USER_AGENT.as_bytes())
         );
-    }
-
-    #[test]
-    fn rejects_remote_versions_below_zcash_mainnet_floor() {
-        assert!(!is_acceptable_remote_version(170_020));
-        assert!(!is_acceptable_remote_version(170_119));
-        assert!(is_acceptable_remote_version(170_120));
-        assert!(is_acceptable_remote_version(PROTOCOL_VERSION));
     }
 
     #[test]
@@ -884,6 +885,7 @@ mod tests {
 
     fn peer_test_config() -> Config {
         Config {
+            network: crate::wire::Network::Mainnet,
             seeds: Vec::new(),
             peers: Vec::new(),
             max_peers: 1,
@@ -935,6 +937,7 @@ mod tests {
     }
 
     struct TestPeer {
+        network: Network,
         stream: TcpStream,
         task: tokio::task::JoinHandle<Result<()>>,
         log: std::path::PathBuf,
@@ -949,10 +952,21 @@ mod tests {
 
     impl TestPeer {
         async fn start(name: &str, config: Config) -> Self {
+            let version = config.network.protocol_version();
+            Self::start_with_remote_version(name, config, version).await
+        }
+
+        async fn start_with_remote_version(
+            name: &str,
+            config: Config,
+            remote_version: i32,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let log = temp_log_path(name);
-            let events = EventSink::new(Some(log.clone())).unwrap();
+            let network = config.network;
+            let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
+            let events = EventSink::for_network(Some(log.clone()), network).unwrap();
             let crawler = Crawler::new(&config, [address]);
             let cache = TxCache::new(crate::tx_cache::TxCacheConfig {
                 max_entries: 8,
@@ -965,7 +979,7 @@ mod tests {
                 events,
                 None,
                 Some(cache),
-                None,
+                tx_feed,
                 crawler,
             ));
             let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
@@ -973,12 +987,24 @@ mod tests {
                 .unwrap()
                 .unwrap();
             stream.set_nodelay(true).unwrap();
-            assert_eq!(read_message(&mut stream).await.unwrap().command, "version");
-            write_message(&mut stream, "version", &version_payload(address))
+            assert_eq!(
+                read_message(&mut stream, network).await.unwrap().command,
+                "version"
+            );
+            let mut remote_payload = version_payload(address, network);
+            remote_payload[..4].copy_from_slice(&remote_version.to_le_bytes());
+            write_message(&mut stream, network, "version", &remote_payload)
                 .await
                 .unwrap();
-            write_message(&mut stream, "verack", &[]).await.unwrap();
-            let mut peer = Self { stream, task, log };
+            write_message(&mut stream, network, "verack", &[])
+                .await
+                .unwrap();
+            let mut peer = Self {
+                network,
+                stream,
+                task,
+                log,
+            };
             assert!(peer.barrier().await.is_empty());
             peer
         }
@@ -986,13 +1012,14 @@ mod tests {
         // The pong is ordered after processing all preceding messages, so a
         // missing getdata is observable without a timing-dependent sleep.
         async fn barrier(&mut self) -> Vec<Inventory> {
-            write_message(&mut self.stream, "ping", &42u64.to_le_bytes())
+            let network = self.network;
+            write_message(&mut self.stream, network, "ping", &42u64.to_le_bytes())
                 .await
                 .unwrap();
             timeout(Duration::from_secs(5), async {
                 let mut requests = Vec::new();
                 loop {
-                    let message = read_message(&mut self.stream).await.unwrap();
+                    let message = read_message(&mut self.stream, network).await.unwrap();
                     match message.command.as_str() {
                         "getdata" => requests.extend(parse_inventory(&message.payload).unwrap()),
                         "pong" => return requests,
@@ -1005,11 +1032,137 @@ mod tests {
         }
 
         async fn announce(&mut self, items: &[Inventory]) -> Vec<Inventory> {
-            write_message(&mut self.stream, "inv", &encode_inventory(items))
+            let network = self.network;
+            write_message(&mut self.stream, network, "inv", &encode_inventory(items))
                 .await
                 .unwrap();
             self.barrier().await
         }
+    }
+
+    async fn rejected_forwarding_handshake(
+        command: &str,
+        payload: &[u8],
+        use_relay: bool,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut config = peer_test_config();
+        let (relay, tx_feed) = if use_relay {
+            config.relay_peers = vec!["127.0.0.1:9".parse().unwrap()];
+            config.relay_auth_key = Some([42; 32]);
+            (RelayBridge::from_config(&config).await.unwrap(), None)
+        } else {
+            (
+                None,
+                Some(TxFeedClient::new("127.0.0.1:9".parse().unwrap())),
+            )
+        };
+        let log = temp_log_path("forwarding-handshake");
+        let events = EventSink::new(Some(log.clone())).unwrap();
+        let crawler = Crawler::new(&config, [address]);
+        let task = tokio::spawn(run_peer(
+            address, config, events, relay, None, tx_feed, crawler,
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        read_message(&mut stream, Network::Mainnet).await.unwrap();
+        write_message(&mut stream, Network::Mainnet, command, payload)
+            .await
+            .unwrap();
+        let mut task = task;
+        let result = timeout(Duration::from_secs(2), &mut task).await;
+        task.abort();
+        if command == "reject" {
+            assert!(fs::read_to_string(&log).unwrap().contains("p2p_reject"));
+        }
+        let _ = fs::remove_file(log);
+        result
+            .expect("unsafe handshake must be rejected promptly")
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn older_peer_is_allowed_only_on_observation_path() {
+        let mut peer =
+            TestPeer::start_with_remote_version("legacy-observation", peer_test_config(), 170160)
+                .await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+    }
+
+    #[tokio::test]
+    async fn admitted_connection_cannot_renegotiate_to_an_old_version() {
+        let mut config = peer_test_config();
+        config.tx_feed_addr = Some("127.0.0.1:9".parse().unwrap());
+        let mut peer = TestPeer::start("no-downgrade", config).await;
+        let mut old = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        old[..4].copy_from_slice(&170160i32.to_le_bytes());
+        write_message(&mut peer.stream, Network::Mainnet, "version", &old)
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(2), &mut peer.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(IngressError::Wire(message)) if message.contains("duplicate version"))
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarding_accepts_nu7_peer_and_requests_inventory() {
+        let mut config = peer_test_config();
+        config.tx_feed_addr = Some("127.0.0.1:9".parse().unwrap());
+        let mut peer = TestPeer::start("nu7-forwarding", config).await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+    }
+
+    #[tokio::test]
+    async fn forwarding_rejects_pre_nu7_peer_even_before_activation() {
+        let mut version = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        version[..4].copy_from_slice(&170160i32.to_le_bytes());
+        for use_relay in [false, true] {
+            for claimed_height in [0i32, i32::MAX] {
+                let height_offset = version.len() - 5;
+                version[height_offset..height_offset + 4]
+                    .copy_from_slice(&claimed_height.to_le_bytes());
+                assert!(
+                    rejected_forwarding_handshake("version", &version, use_relay)
+                        .await
+                        .contains("170190")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn application_message_cannot_bypass_version_admission() {
+        assert!(
+            rejected_forwarding_handshake("inv", &[0], false)
+                .await
+                .contains("before handshake")
+        );
+    }
+
+    #[tokio::test]
+    async fn early_reject_is_logged_without_admitting_peer() {
+        assert!(
+            rejected_forwarding_handshake("reject", &[], false)
+                .await
+                .contains("before handshake")
+        );
+    }
+
+    #[tokio::test]
+    async fn verack_cannot_bypass_version_admission() {
+        assert!(
+            rejected_forwarding_handshake("verack", &[], false)
+                .await
+                .contains("before version")
+        );
     }
 
     fn numbered_inventory(inv_type: u32, number: u64) -> Inventory {
@@ -1020,6 +1173,31 @@ mod tests {
             hash,
             auth_digest: (inv_type == MSG_WTX).then_some([0x42; 32]),
         }
+    }
+
+    #[tokio::test]
+    async fn testnet_handshake_and_inventory_use_testnet_framing() {
+        let mut config = peer_test_config();
+        config.network = Network::Testnet;
+        let mut peer = TestPeer::start("testnet-inventory", config).await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+        let rows = fs::read_to_string(&peer.log).unwrap();
+        for row in rows.lines() {
+            let value: serde_json::Value = serde_json::from_str(row).unwrap();
+            assert_eq!(value["network"], "testnet");
+        }
+        // A valid mainnet frame on an established testnet connection is rejected.
+        write_message(&mut peer.stream, Network::Mainnet, "ping", &[0; 8])
+            .await
+            .unwrap();
+        let result = timeout(Duration::from_secs(5), &mut peer.task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(IngressError::Wire(message)) if message.contains("unexpected magic"))
+        );
     }
 
     #[tokio::test]
@@ -1068,9 +1246,14 @@ mod tests {
             peer.announce(&invs).await.is_empty(),
             "duplicates must not request twice"
         );
-        write_message(&mut peer.stream, "notfound", &encode_inventory(&invs))
-            .await
-            .unwrap();
+        write_message(
+            &mut peer.stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&invs),
+        )
+        .await
+        .unwrap();
         assert_eq!(
             peer.announce(&invs).await,
             invs,
@@ -1191,17 +1374,22 @@ mod tests {
             numbered_inventory(MSG_WTX, 10),
         ];
         assert!(peer.announce(&fresh).await.is_empty());
-        write_message(&mut peer.stream, "notfound", &encode_inventory(&fresh))
-            .await
-            .unwrap();
+        write_message(
+            &mut peer.stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&fresh),
+        )
+        .await
+        .unwrap();
         assert!(
             peer.announce(&fresh).await.is_empty(),
             "unsolicited notfound must not free a slot"
         );
-        write_message(&mut peer.stream, "block", &payload)
+        write_message(&mut peer.stream, Network::Mainnet, "block", &payload)
             .await
             .unwrap();
-        write_message(&mut peer.stream, "tx", &v6_tx())
+        write_message(&mut peer.stream, Network::Mainnet, "tx", &v6_tx())
             .await
             .unwrap();
         assert_eq!(
@@ -1210,9 +1398,14 @@ mod tests {
             "out-of-order responses must free their own slots"
         );
         assert!(peer.announce(&unanswered).await.is_empty());
-        write_message(&mut peer.stream, "notfound", &encode_inventory(&fresh))
-            .await
-            .unwrap();
+        write_message(
+            &mut peer.stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&fresh),
+        )
+        .await
+        .unwrap();
         assert!(
             peer.announce(&answered).await.is_empty(),
             "recently completed responses stay deduplicated"
@@ -1234,9 +1427,14 @@ mod tests {
         ];
         assert_eq!(peer.announce(&invs).await, invs);
         let mut frame = Vec::new();
-        write_message(&mut frame, "inv", &encode_inventory(&invs))
-            .await
-            .unwrap();
+        write_message(
+            &mut frame,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&invs),
+        )
+        .await
+        .unwrap();
         peer.stream.write_all(&frame[..25]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
         peer.stream.write_all(&frame[25..]).await.unwrap();

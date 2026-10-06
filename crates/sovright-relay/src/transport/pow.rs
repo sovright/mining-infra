@@ -79,7 +79,7 @@ fn header_meets_stated_target(header: &[u8]) -> TargetCheck {
         return TargetCheck::BadTarget;
     }
     let target = compact_to_target(bits);
-    if target.0 == [0u8; 32] || target > Target::max_mainnet() {
+    if target.0 == [0u8; 32] || target > Target::mainnet_pow_limit() {
         return TargetCheck::BadTarget;
     }
 

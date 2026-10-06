@@ -1066,6 +1066,7 @@ mod tests {
 
     fn test_config() -> Config {
         Config {
+            network: crate::wire::Network::Mainnet,
             seeds: Vec::new(),
             peers: vec!["127.0.0.1:8233".parse().unwrap()],
             max_peers: 1,
@@ -1233,3 +1234,7 @@ mod tests {
         assert!(!r.contains(&[7u8; 32], t0));
     }
 }
+
+#[cfg(test)]
+#[path = "nu7_transport_tests.rs"]
+mod nu7_transport_tests;

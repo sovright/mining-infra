@@ -36,7 +36,7 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
-    let events = EventSink::new(config.event_log.clone())?;
+    let events = EventSink::for_network(config.event_log.clone(), config.network)?;
     let relay = RelayBridge::from_config(&config).await?;
     let tx_cache = config.tx_cache_enabled.then(|| {
         TxCache::new(TxCacheConfig {
@@ -61,6 +61,8 @@ async fn main() -> Result<()> {
     let crawler = Crawler::new(&config, peers);
 
     info!(
+        network = config.network.name(),
+        advertised_version = config.network.protocol_version(),
         peers = crawler.known_len(),
         max_peers = config.max_peers,
         crawler_enabled = config.crawler_enabled,
@@ -198,19 +200,16 @@ async fn reap_finished(handles: &mut Vec<JoinHandle<()>>) {
 
 async fn discover_peers(config: &Config) -> Vec<SocketAddr> {
     let mut peers = HashSet::new();
-    peers.extend(
-        config
-            .peers
-            .iter()
-            .copied()
-            .filter(|peer| is_accepted_peer_addr(peer, config.accept_nonstandard_ports)),
-    );
+    peers.extend(config.peers.iter().copied().filter(|peer| {
+        is_accepted_peer_addr(peer, config.accept_nonstandard_ports, config.network)
+    }));
 
     for seed in &config.seeds {
-        match lookup_host(seed_socket(seed)).await {
+        match lookup_host(seed_socket(seed, config.network)).await {
             Ok(addrs) => {
                 for addr in addrs {
-                    if is_accepted_peer_addr(&addr, config.accept_nonstandard_ports) {
+                    if is_accepted_peer_addr(&addr, config.accept_nonstandard_ports, config.network)
+                    {
                         peers.insert(addr);
                     }
                 }

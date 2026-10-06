@@ -71,3 +71,67 @@ deduplicated until evicted from the bounded recent cache. Duplicate announcement
 do not extend response deadlines. Block announcement scoring remains independent
 of request capacity. Transaction cache identities continue to come from received
 payloads rather than request order.
+
+### NU7 candidate compatibility
+
+The mainnet ingress advertises protocol `170190` (ZIP 259). The transaction
+parser is pinned to `zcash_primitives =0.31.0-pre.0` and
+`zcash_protocol =0.11.0-pre.0`: the previous 0.10.x protocol dependency does not
+recognize finalized NU7 branch ID `0x77190AD9`. Bumping only the advertised
+version would leave NU7 transactions absent from the cache/compact path.
+
+The NU7 parser regression fixtures establish structural decoding, not valid
+proofs, signatures, or consensus acceptance. The v6 fixture changes a public
+NU6.3 transaction's branch ID and therefore invalidates its original signatures;
+the v5 fixture is an empty structural transaction. The historical v5/v6 digest
+oracle tests remain in place. Eight additional transparent-only cases compare
+v5/v6 txid and auth digests with a standalone Python implementation of ZIP 244
+and ZIP 229. They cover NU7/NU6.3 branch separation, authorization-script changes,
+and wire/display byte order. The generator uses only Python's standard library;
+it does not derive expected values from the Rust parser. Reproduce the fixture:
+
+```sh
+python3 crates/sovright-p2p-ingress/tests/fixtures/generate_nu7_digests.py
+cargo test -p sovright-p2p-ingress --locked nu7_transparent_digests_match_independent_reference
+```
+
+These synthetic spends have no real UTXO or valid signature and no shielded
+bundles. Before deployment, qualify real NU7 transactions and blocks, shielded
+digest agreement, full reconstruction/submission, and the exact prerelease
+dependency build on testnet or an isolated network.
+
+Set `SOVRIGHT_P2P_NETWORK=mainnet` (the default) or `testnet`. This selects
+network magic, the default peer port (8233/18233), and advertised protocol
+version (170190/170180). Unknown values fail startup. No arbitrary protocol
+version override is supported.
+
+Testnet is currently **observation-only**. It has no implicit DNS seeds; provide
+explicit testnet peers or seeds. Relay peers, transaction-feed output, and the
+submitblock RPC are rejected in testnet mode. Caches remain process-local and
+all structured events carry `network`. Use a separate process and event-log
+path, and keep that path out of mainnet collector inputs. Existing consumers
+are not automatically made network-aware by the additional field.
+
+```sh
+SOVRIGHT_P2P_NETWORK=testnet \
+SOVRIGHT_P2P_PEERS=127.0.0.1:18233 \
+SOVRIGHT_P2P_EVENT_LOG=/tmp/sovright-testnet-observations.jsonl \
+SOVRIGHT_P2P_PEER_RUNTIME_SECS=30 \
+cargo run -p sovright-p2p-ingress --locked
+```
+
+Use an isolated testnet node for this example. A configured nonstandard port
+still uses the selected network's magic; a wrong-network response fails framing.
+Peer admission depends on the actual output path. A session with a relay bridge
+or transaction feed requires the selected network's NU7 protocol floor from
+startup. An observation-only session, with neither output, accepts `170120` and
+newer. Testnet configuration currently prevents enabling either output.
+
+The forwarding floor stays fixed before, during, and after activation, including
+reorgs; neither peer-supplied height nor a calendar date can lower it. Existing
+connections cannot renegotiate VERSION, and application messages are rejected
+until VERSION admission and VERACK finish. Deploying this candidate restarts
+connections under the new policy. This intentionally reduces the available
+pre-activation peer pool; qualify peer diversity and freshness before rollout.
+A claimed version is not proof of correct consensus behavior: full-node
+validation and NU7 block/submission qualification remain required.
