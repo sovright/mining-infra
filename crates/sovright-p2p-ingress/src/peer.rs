@@ -29,7 +29,8 @@ const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 
 // Advertising less than we demand of peers would be incoherent; enforce at
 // compile time so a future upgrade cannot raise the floor past what we send.
-const _: () = assert!(170_180 >= MIN_ACCEPTABLE_REMOTE_VERSION);
+const _: () = assert!(Network::Mainnet.protocol_version() >= MIN_ACCEPTABLE_REMOTE_VERSION);
+const _: () = assert!(Network::Testnet.protocol_version() >= MIN_ACCEPTABLE_REMOTE_VERSION);
 
 // Sub-version sent in our `version` message. Zcash mainnet currently
 // accepts any non-banned user agent; we keep this short and identifying.
@@ -201,6 +202,9 @@ pub async fn run_peer(
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
         if (!sent_verack || !saw_verack) && !matches!(msg.command.as_str(), "version" | "verack") {
+            if msg.command == "reject" {
+                events.p2p_reject(&peer, msg.payload.len())?;
+            }
             return Err(IngressError::Wire(format!(
                 "{} received before handshake completion",
                 msg.command
@@ -246,9 +250,6 @@ pub async fn run_peer(
                 events.p2p_reject(&peer, msg.payload.len())?;
             }
             "addr" => {
-                if !saw_verack {
-                    continue;
-                }
                 let addrs = parse_addr(&msg.payload, config.crawler_max_addr_per_message)?;
                 let count = addrs.len();
                 let accepted = crawler.add_discovered(&peer, addrs, &events)?;
@@ -268,9 +269,6 @@ pub async fn run_peer(
                 write_message(&mut writer, config.network, "pong", &msg.payload).await?;
             }
             "inv" => {
-                if !saw_verack {
-                    continue;
-                }
                 let invs = parse_inventory(&msg.payload)?;
                 let mut block_requests = Vec::new();
                 let mut tx_requests = Vec::new();
@@ -323,9 +321,6 @@ pub async fn run_peer(
                 }
             }
             "notfound" => {
-                if !saw_verack {
-                    continue;
-                }
                 for inv in parse_inventory(&msg.payload)? {
                     if inv.is_block() {
                         blocks.remove(inv.hash);
@@ -335,9 +330,6 @@ pub async fn run_peer(
                 }
             }
             "block" => {
-                if !saw_verack {
-                    continue;
-                }
                 let display = received_block_display_hash(&mut blocks, &msg.payload)?;
                 let consensus_hash = msg
                     .payload
@@ -388,9 +380,6 @@ pub async fn run_peer(
                 }
             }
             "tx" => {
-                if !saw_verack {
-                    continue;
-                }
                 if let Some(wtxid) = wtxid_for_received_tx(&mut transactions, &msg.payload) {
                     let key = TxInventoryKey::from_wtxid(&wtxid);
                     if let Some(cache) = &tx_cache {
@@ -644,10 +633,7 @@ mod tests {
     fn outgoing_version_satisfies_nu7_mainnet_peer_floor() {
         let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
         let advertised = i32::from_le_bytes(payload[..4].try_into().unwrap());
-        assert!(
-            advertised >= 170_190,
-            "NU7 mainnet peers reject {advertised}"
-        );
+        assert_eq!(advertised, 170_190);
         assert_eq!(
             &payload[4..12],
             &[0; 8],
@@ -1086,6 +1072,9 @@ mod tests {
         let mut task = task;
         let result = timeout(Duration::from_secs(2), &mut task).await;
         task.abort();
+        if command == "reject" {
+            assert!(fs::read_to_string(&log).unwrap().contains("p2p_reject"));
+        }
         let _ = fs::remove_file(log);
         result
             .expect("unsafe handshake must be rejected promptly")
@@ -1153,6 +1142,15 @@ mod tests {
     async fn application_message_cannot_bypass_version_admission() {
         assert!(
             rejected_forwarding_handshake("inv", &[0], false)
+                .await
+                .contains("before handshake")
+        );
+    }
+
+    #[tokio::test]
+    async fn early_reject_is_logged_without_admitting_peer() {
+        assert!(
+            rejected_forwarding_handshake("reject", &[], false)
                 .await
                 .contains("before handshake")
         );

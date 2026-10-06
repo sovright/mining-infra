@@ -199,6 +199,11 @@ impl Config {
             ));
         }
         let event_log = env::var("SOVRIGHT_P2P_EVENT_LOG").ok().map(PathBuf::from);
+        if network == Network::Testnet
+            && event_log.as_ref().is_none_or(|p| p.as_os_str().is_empty())
+        {
+            return Err(IngressError::Config("testnet requires an explicit SOVRIGHT_P2P_EVENT_LOG isolated from mainnet collectors".to_string()));
+        }
         let relay_peers = env_socket_csv("SOVRIGHT_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("SOVRIGHT_P2P_RELAY_BIND_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:0".to_string())
@@ -549,6 +554,14 @@ mod tests {
             ("SOVRIGHT_P2P_DNS_SEEDS", "".to_string()),
             ("SOVRIGHT_P2P_PEERS", "127.0.0.1:18233".to_string()),
         ]);
+        assert!(
+            Config::from_env().is_err(),
+            "testnet requires an explicit event log"
+        );
+        let _log = EnvGuard::set(&[(
+            "SOVRIGHT_P2P_EVENT_LOG",
+            "/tmp/nu7-test-events.jsonl".to_string(),
+        )]);
         let config = Config::from_env().unwrap();
         assert_eq!(config.network, Network::Testnet);
         assert!(config.seeds.is_empty());

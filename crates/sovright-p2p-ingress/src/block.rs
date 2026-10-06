@@ -1057,6 +1057,13 @@ mod real_nu7_activation {
             .zip(metadata["transactions"].as_array().unwrap())
         {
             assert_eq!(tx.tx_data.len() as u64, expected["size"].as_u64().unwrap());
+            // This shared helper is also used by pool-server's default relay feature.
+            assert_eq!(
+                sovright_relay::merkle::display_hex(&sovright_relay::txid_from_tx_bytes(
+                    &tx.tx_data
+                )),
+                expected["txid"].as_str().unwrap()
+            );
             assert_eq!(
                 u32::from_le_bytes(tx.tx_data[8..12].try_into().unwrap()),
                 0x7719_0ad9

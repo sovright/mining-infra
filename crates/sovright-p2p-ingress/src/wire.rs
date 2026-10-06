@@ -25,7 +25,7 @@ impl Network {
             Self::Testnet => 18233,
         }
     }
-    pub fn protocol_version(self) -> i32 {
+    pub const fn protocol_version(self) -> i32 {
         match self {
             Self::Mainnet => 170190,
             Self::Testnet => 170180,
