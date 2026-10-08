@@ -24,7 +24,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: tenki-standard-small-2c-4g
     steps:
       - uses: actions/checkout@v4
 

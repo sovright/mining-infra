@@ -8,7 +8,7 @@ on:
 permissions:
   contents: read
   packages: write
-  id-token: write          # for cosign keyless signing
+  id-token: write # for cosign keyless signing
 
 concurrency:
   group: images-${{ github.ref }}
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   build-and-push:
     name: Build and push ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         include:
