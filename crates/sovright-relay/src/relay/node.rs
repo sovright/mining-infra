@@ -22,9 +22,9 @@ use crate::transport::{
     TransportError, ZCASH_FULL_HEADER_SIZE,
 };
 
-use super::ArrivalSink;
 use super::forwarding::ForwardOrder;
 use super::metrics::RelayMetrics;
+use super::{ArrivalSink, ReceiptObject};
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
 const VALIDATED_RAW_BLOCK_TTL: Duration = Duration::from_secs(120);
@@ -348,24 +348,38 @@ impl<V: PowValidator> RelayNode<V> {
         Some(shard_size * assembly.effective_data_shards(self.config.data_shards))
     }
 
-    /// Validate PoW once we can reconstruct serialized data
+    #[cfg(test)]
     fn validate_pow_from_assembly(
         &self,
         assembly: &BlockAssembly,
         msg_type: MessageType,
     ) -> Option<bool> {
+        self.validate_pow_with_identity(assembly, msg_type)
+            .map(|(valid, _)| valid)
+    }
+
+    /// Validate PoW once we can reconstruct serialized data. A valid result
+    /// also carries the consensus hash when an arrival sink will record it.
+    fn validate_pow_with_identity(
+        &self,
+        assembly: &BlockAssembly,
+        msg_type: MessageType,
+    ) -> Option<(bool, Option<String>)> {
         match msg_type {
             // A skeleton carries the full block header in its serialized
             // CompactBlock, so PoW validates exactly like a compact block.
             MessageType::Block | MessageType::CompactSkeleton => {
-                self.validate_compact_block_pow(assembly)
+                self.validate_compact_block_pow_with_identity(assembly)
             }
-            MessageType::RawBlockSegment => self.validate_raw_block_segment(assembly),
+            MessageType::RawBlockSegment => self.validate_raw_block_segment_with_identity(assembly),
             MessageType::Keepalive | MessageType::Auth => None,
         }
     }
 
-    fn validate_compact_block_pow(&self, assembly: &BlockAssembly) -> Option<bool> {
+    fn validate_compact_block_pow_with_identity(
+        &self,
+        assembly: &BlockAssembly,
+    ) -> Option<(bool, Option<String>)> {
         let est_len = self.estimate_original_len(assembly)?;
         let data_shards = assembly.effective_data_shards(self.config.data_shards);
         let data = match self.chunker.decode_data_with_shards(
@@ -394,15 +408,15 @@ impl<V: PowValidator> RelayNode<V> {
 
         let header = &content[4..4 + header_len];
         match self.validator.validate(header) {
-            PowResult::Valid => Some(true),
-            PowResult::Invalid => Some(false),
+            PowResult::Valid => Some((
+                true,
+                self.arrival_sink
+                    .as_ref()
+                    .map(|_| crate::hash::consensus_block_hash_display(header)),
+            )),
+            PowResult::Invalid => Some((false, None)),
             PowResult::Indeterminate => None,
         }
-    }
-
-    fn validate_raw_block_segment(&self, assembly: &BlockAssembly) -> Option<bool> {
-        self.validate_raw_block_segment_with_identity(assembly)
-            .map(|(valid, _)| valid)
     }
 
     fn validate_raw_block_segment_with_identity(
@@ -762,17 +776,20 @@ impl<V: PowValidator> RelayNode<V> {
             // `pow_validated` state (false) and suppress forwarding until a future
             // chunk provides enough data to decide.
             if is_new && !assembly.pow_validated {
-                let validation = if chunk.header.msg_type == MessageType::RawBlockSegment {
-                    self.validate_raw_block_segment_with_identity(assembly)
-                        .map(|(valid, hash)| {
-                            arrival = hash.map(|hash| {
-                                (hash, assembly.started_at.elapsed().as_millis() as u64)
-                            });
-                            valid
-                        })
-                } else {
-                    self.validate_pow_from_assembly(assembly, chunk.header.msg_type)
+                let object_kind = match chunk.header.msg_type {
+                    MessageType::RawBlockSegment => Some(ReceiptObject::RawSegment),
+                    MessageType::Block => Some(ReceiptObject::Compact),
+                    MessageType::CompactSkeleton => Some(ReceiptObject::CompactSkeleton),
+                    MessageType::Keepalive | MessageType::Auth => None,
                 };
+                let validation = self
+                    .validate_pow_with_identity(assembly, chunk.header.msg_type)
+                    .map(|(valid, hash)| {
+                        arrival = hash.zip(object_kind).map(|(hash, kind)| {
+                            (hash, kind, assembly.started_at.elapsed().as_millis() as u64)
+                        });
+                        valid
+                    });
                 match validation {
                     Some(valid) => {
                         if chunk.header.msg_type == MessageType::RawBlockSegment {
@@ -796,9 +813,10 @@ impl<V: PowValidator> RelayNode<V> {
             }
         }
 
-        if let (Some(sink), Some((hash, elapsed))) = (&self.arrival_sink, arrival) {
+        if let (Some(sink), Some((hash, object_kind, elapsed))) = (&self.arrival_sink, arrival) {
             sink.relay_header_received(
                 &hash,
+                object_kind,
                 session.key_id(),
                 match session.role() {
                     KeyRole::Full => "full",
@@ -2663,7 +2681,118 @@ mod tests {
             crate::hash::consensus_block_hash_display(&raw[..ZCASH_FULL_HEADER_SIZE])
         );
         assert!(r.get("peer").is_none());
+        assert_eq!(r["object_kind"], "raw_segment");
         std::fs::remove_file(path).unwrap();
+    }
+
+    /// Feed `chunks` (twice, modelling retransmission) through one session of a
+    /// node with an arrival sink attached; return the parsed arrival records.
+    fn arrival_records_for<V, F>(tag: &str, validator: V, make_chunks: F) -> Vec<serde_json::Value>
+    where
+        V: PowValidator + 'static,
+        F: FnOnce(&BlockChunker) -> (Vec<Chunk>, [u8; 32]),
+    {
+        let path = std::env::temp_dir().join(format!(
+            "relay-arrival-{tag}-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_unauthenticated_peers_allowed(true);
+        let node = RelayNode::with_validator(config, validator)
+            .unwrap()
+            .with_arrival_sink(Some(ArrivalSink::new(&path).unwrap()));
+        let (chunks, object_hash) = make_chunks(&node.chunker);
+        let mut session = RelaySession::new("127.0.0.1:12350".parse().unwrap(), "pool", [7u8; 32]);
+        for _ in 0..2 {
+            for chunk in &chunks {
+                let _ = node.process_chunk_for_session(
+                    &mut session,
+                    chunk,
+                    object_hash,
+                    chunk.header.chunk_id as usize,
+                    chunk.header.total_chunks as usize,
+                );
+            }
+        }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_file(&path);
+        content
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect()
+    }
+
+    fn compact_v3_chunks(
+        compact: &CompactBlock,
+    ) -> impl FnOnce(&BlockChunker) -> (Vec<Chunk>, [u8; 32]) + '_ {
+        move |chunker| {
+            let block_hash = *compact.header_hash().as_bytes();
+            let chunks = chunker
+                .compact_block_to_chunks_adaptive(compact, &block_hash)
+                .unwrap();
+            (
+                chunks,
+                crate::segmented_block::compact_v3_object_hash(block_hash),
+            )
+        }
+    }
+
+    #[test]
+    fn validated_compact_block_emits_one_attributed_receipt() {
+        // Pool gateways send most blocks as compact blocks and fall back to raw
+        // segments only for oversized ones. Receipts must cover compact blocks
+        // too, or a pool's direct submissions are invisible to attribution.
+        let header = vec![0xab; 2189];
+        let compact = CompactBlock::new(header.clone(), 0x5151, Vec::new(), Vec::new());
+        let records = arrival_records_for("compact", StubPowValidator, compact_v3_chunks(&compact));
+        assert_eq!(records.len(), 1, "one receipt per object, got {records:?}");
+        let r = &records[0];
+        assert_eq!(r["stage"], "header_pow_validated");
+        assert_eq!(r["object_kind"], "compact");
+        assert_eq!(r["source_key_id"], "pool");
+        assert_eq!(r["source_role"], "full");
+        assert_eq!(
+            r["hash"],
+            crate::hash::consensus_block_hash_display(&header)
+        );
+    }
+
+    #[test]
+    fn validated_compact_skeleton_emits_attributed_receipt() {
+        let header = vec![0xab; 2189];
+        let compact = CompactBlock::new(header.clone(), 0x5252, Vec::new(), Vec::new());
+        let records = arrival_records_for("skeleton", StubPowValidator, |chunker| {
+            let block_hash = *compact.header_hash().as_bytes();
+            let object_hash = crate::segmented_block::skeleton_object_hash(block_hash);
+            let chunks = chunker
+                .compact_block_to_chunks_skeleton(&compact, &object_hash)
+                .unwrap();
+            (chunks, object_hash)
+        });
+        assert_eq!(records.len(), 1, "one receipt per object, got {records:?}");
+        assert_eq!(records[0]["object_kind"], "compact_skeleton");
+        assert_eq!(
+            records[0]["hash"],
+            crate::hash::consensus_block_hash_display(&header)
+        );
+    }
+
+    #[test]
+    fn invalid_compact_block_emits_no_receipt() {
+        let compact = CompactBlock::new(vec![0xab; 2189], 0x5353, Vec::new(), Vec::new());
+        let records = arrival_records_for(
+            "invalid",
+            crate::RejectAllValidator,
+            compact_v3_chunks(&compact),
+        );
+        assert!(
+            records.is_empty(),
+            "invalid PoW must not log a receipt: {records:?}"
+        );
     }
 
     /// Real UDP loopback benchmark. Not a WAN or complete consensus-block

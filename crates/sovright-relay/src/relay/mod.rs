@@ -9,7 +9,7 @@ mod metrics;
 mod node;
 mod ratelimit;
 
-pub use arrival::ArrivalSink;
+pub use arrival::{ArrivalSink, ReceiptObject};
 pub use client::{BlockReceiver, BlockSender, RelayClient, RelayPayload};
 pub use metrics::{MetricsSnapshot, RelayMetrics, render_prometheus_text};
 pub use node::RelayNode;

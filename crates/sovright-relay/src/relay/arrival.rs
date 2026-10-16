@@ -17,6 +17,25 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// Which relay object carried the validated header of a receipt. Records
+/// written before this field existed came only from raw segment zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptObject {
+    RawSegment,
+    Compact,
+    CompactSkeleton,
+}
+
+impl ReceiptObject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReceiptObject::RawSegment => "raw_segment",
+            ReceiptObject::Compact => "compact",
+            ReceiptObject::CompactSkeleton => "compact_skeleton",
+        }
+    }
+}
+
 /// Append-only JSONL sink for relay block-arrival events.
 #[derive(Clone)]
 pub struct ArrivalSink {
@@ -38,12 +57,14 @@ impl ArrivalSink {
         })
     }
 
-    /// Immediate authenticated peer for a validated segment-zero HEADER.
+    /// Immediate authenticated peer for a validated block HEADER, carried by a
+    /// raw segment zero, a compact block, or a compact skeleton (`object_kind`).
     /// This is not a claim that this peer mined the block, that the complete
     /// block arrived, or that forwarding/destination acceptance succeeded.
     pub fn relay_header_received(
         &self,
         consensus_hash_display: &str,
+        object_kind: ReceiptObject,
         source_key_id: &str,
         source_role: &str,
         authenticated: bool,
@@ -55,6 +76,7 @@ impl ArrivalSink {
             "hash": consensus_hash_display,
             "observed_at_unix_ms": observed,
             "stage": "header_pow_validated",
+            "object_kind": object_kind.as_str(),
             "source_key_id": source_key_id,
             "source_role": source_role,
             "authenticated": authenticated,
@@ -153,7 +175,14 @@ mod tests {
     fn attribution_escapes_identity_and_does_not_claim_full_block_acceptance() {
         let path = temp_path("attribution");
         let sink = ArrivalSink::new(&path).unwrap();
-        sink.relay_header_received("abcd", "pool\"\n", "receive_only", true, 12);
+        sink.relay_header_received(
+            "abcd",
+            ReceiptObject::Compact,
+            "pool\"\n",
+            "receive_only",
+            true,
+            12,
+        );
         let text = fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 1);
         let v: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
@@ -161,6 +190,7 @@ mod tests {
         assert_eq!(v["stage"], "header_pow_validated");
         assert!(v.get("accepted").is_none());
         assert_eq!(v["assembly_elapsed_ms"], 12);
+        assert_eq!(v["object_kind"], "compact");
         fs::remove_file(path).unwrap();
     }
 }

@@ -1,15 +1,21 @@
 # Luxor relay delivery instrumentation and scheduling experiment
 
-The relay arrival timestamp is PoW validation of the reconstructed **segment-zero
-header**, not reconstruction of a full raw block. P2P arrival logs record a full
+The relay arrival timestamp is PoW validation of a reconstructed **block header**
+(carried by a compact block, a compact skeleton, or raw segment zero), not
+reconstruction of a full block. P2P arrival logs record a full
 block. Their difference must not be described as a full-block speedup.
 
 ## Immediate peer attribution
 
 The existing `relay_block_received` JSONL event keeps `hash` and
 `observed_at_unix_ms` for old readers. New fields describe the immediate session:
-`source_key_id`, `source_role` (`full` or `receive_only`), `authenticated`, and
-`stage: header_pow_validated`. No addresses or secret key material are recorded.
+`source_key_id`, `source_role` (`full` or `receive_only`), `authenticated`,
+`stage: header_pow_validated`, and `object_kind` naming the relay object whose
+header validated: `compact`, `compact_skeleton`, or `raw_segment`. Records
+without `object_kind` predate it and came only from raw segment zero. Before
+`object_kind` existed, compact blocks and skeletons produced no receipt at all,
+so a pool that sends normal-sized blocks compactly was nearly invisible. No
+addresses or secret key material are recorded.
 `assembly_elapsed_ms` uses the monotonic assembly timer; the estimated wall-clock
 assembly start is explicitly named an estimate. Neither timer starts at the
 pool's solve or send event. A receipt does not prove mining origin, complete-block
@@ -17,8 +23,12 @@ delivery, successful forwarding, or node acceptance.
 
 Identity comes from the verified session, never the packet's claimed identity.
 Bad HMAC packets cannot create receipts. Duplicate chunks do not create another
-receipt in that assembly. Consumers must deduplicate reconnects by host/hash and
-must count only authenticated Full-role receipts for direct submission evidence.
+receipt in that assembly. Each object kind has its own assembly, so one block
+from one session can produce up to three receipts with the same `hash` (one per
+`object_kind`). Consumers must deduplicate by host/hash (which also absorbs
+reconnects), and timing series that predate `object_kind` stay comparable only
+when filtered to `raw_segment` or a missing field. Consumers must
+count only authenticated Full-role receipts for direct submission evidence.
 Header extraction reuses the validation decode, avoiding an extra FEC decode.
 
 ## Scheduler experiment (off by default)
