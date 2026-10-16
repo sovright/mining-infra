@@ -26,7 +26,7 @@ use relay::RelayWrapper;
 use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
-use sovright_relay_sidecar::dual_submit::{DualSubmit, build_submitter};
+use sovright_relay_sidecar::dual_submit::{DualSubmit, SecondarySample, build_submitter};
 use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
@@ -318,12 +318,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // A/B settings are config-file only: production runs with --config, and
     // keeping them out of the big CLI/config tuple avoids churning three
     // destructuring sites for a measurement feature.
-    let (zebra_url_secondary, submit_log_path) = match &args.config {
+    let (zebra_url_secondary, submit_log_path, secondary_submit_sample) = match &args.config {
         Some(path) => {
             let cfg = config::Config::from_file(std::path::Path::new(path))?;
-            (cfg.zebra_url_secondary.clone(), cfg.submit_log_path.clone())
+            (
+                cfg.zebra_url_secondary.clone(),
+                cfg.submit_log_path.clone(),
+                cfg.secondary_submit_sample,
+            )
         }
-        None => (None, None),
+        None => (None, None, SecondarySample::All),
     };
 
     // Optional A/B second target. `submitter` wraps the RPC client; when no
@@ -350,16 +354,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             },
             None => None,
         };
-    let submitter = Arc::new(build_submitter(
-        Arc::clone(&rpc),
-        &zebra_url,
-        secondary_submitter
-            .as_ref()
-            .map(|(node, url)| (Arc::clone(node), url.as_str())),
-        submit_log_path.as_deref().map(std::path::Path::new),
-    ));
+    let submitter = Arc::new(
+        build_submitter(
+            Arc::clone(&rpc),
+            &zebra_url,
+            secondary_submitter
+                .as_ref()
+                .map(|(node, url)| (Arc::clone(node), url.as_str())),
+            submit_log_path.as_deref().map(std::path::Path::new),
+        )
+        .with_secondary_sample(secondary_submit_sample),
+    );
     if submitter.has_secondary() {
-        info!("submitblock will be mirrored to the secondary node");
+        info!(sample = ?secondary_submit_sample, "submitblock will be mirrored to the secondary node");
     }
 
     // Fold the local Zebra mempool into the reconstruction cache (opt-in). The

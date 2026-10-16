@@ -161,6 +161,36 @@ impl SubmitLogSink {
     }
 }
 
+/// Which blocks the secondary receives.
+///
+/// `EvenHash` mirrors only blocks whose consensus hash (display order) ends in
+/// an even hex digit. That randomises the A/B per block, independently of time
+/// of day or network conditions, and each block's arm can be recomputed from
+/// its hash at analysis time without any extra logging.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecondarySample {
+    #[default]
+    All,
+    EvenHash,
+}
+
+impl SecondarySample {
+    /// Whether a block with this display-order consensus hash goes to the
+    /// secondary. An unreadable (empty) hash is never sampled, because its arm
+    /// could not be determined afterwards.
+    pub fn selects(self, consensus_hash: &str) -> bool {
+        match self {
+            SecondarySample::All => true,
+            SecondarySample::EvenHash => consensus_hash
+                .chars()
+                .last()
+                .and_then(|c| c.to_digit(16))
+                .is_some_and(|v| v % 2 == 0),
+        }
+    }
+}
+
 /// A `SubmitBlock` that submits to a primary node and, optionally, mirrors the
 /// same block to a secondary node for comparison.
 pub struct DualSubmit<P> {
@@ -168,6 +198,7 @@ pub struct DualSubmit<P> {
     primary_url: String,
     secondary: Option<Arc<dyn SubmitBlock + Send + Sync>>,
     secondary_url: String,
+    secondary_sample: SecondarySample,
     log: Option<SubmitLogSink>,
 }
 
@@ -183,6 +214,7 @@ impl<P> DualSubmit<P> {
             primary_url: primary_url.into(),
             secondary: None,
             secondary_url: String::new(),
+            secondary_sample: SecondarySample::All,
             log,
         }
     }
@@ -199,8 +231,16 @@ impl<P> DualSubmit<P> {
             primary_url: primary_url.into(),
             secondary: Some(secondary),
             secondary_url: secondary_url.into(),
+            secondary_sample: SecondarySample::All,
             log,
         }
+    }
+
+    /// Restrict which blocks the secondary receives. The primary still gets
+    /// every block.
+    pub fn with_secondary_sample(mut self, sample: SecondarySample) -> Self {
+        self.secondary_sample = sample;
+        self
     }
 
     pub fn has_secondary(&self) -> bool {
@@ -217,7 +257,9 @@ impl<P: SubmitBlock + Send + Sync> SubmitBlock for DualSubmit<P> {
             // Fire the secondary FIRST but do not await it: spawning is cheap
             // and returns immediately, so the primary is not delayed, while both
             // nodes receive the block within microseconds of each other.
-            if let Some(secondary) = &self.secondary {
+            if let Some(secondary) = &self.secondary
+                && self.secondary_sample.selects(&hash)
+            {
                 let secondary = Arc::clone(secondary);
                 let hex = block_hex.to_string();
                 let url = self.secondary_url.clone();
@@ -564,5 +606,97 @@ mod tests {
         assert!(line.contains("\\\"thing\\\""), "unescaped quote in {line}");
         // Must remain one line -- a newline would corrupt the JSONL stream.
         assert_eq!(line.lines().count(), 1);
+    }
+
+    // ---------------------------------------------------------------
+    // Per-block sampling of the secondary, for randomised A/B.
+    // ---------------------------------------------------------------
+
+    /// The real header with one nonce byte changed until its consensus hash
+    /// has the requested parity. The submitters here do not check PoW, so a
+    /// modified header is fine and gives both branches a deterministic block.
+    fn header_with_hash_parity(even: bool) -> String {
+        let base = real_header_hex();
+        // Nonce starts at byte 108 of the header (4+32+32+32+4+4).
+        for b in 0u8..=255 {
+            let mut hex = base.clone();
+            hex.replace_range(216..218, &format!("{b:02x}"));
+            let hash = consensus_hash_from_block_hex(&hex).unwrap();
+            if SecondarySample::EvenHash.selects(&hash) == even {
+                return hex;
+            }
+        }
+        panic!("no nonce byte produced the requested hash parity");
+    }
+
+    #[test]
+    fn sample_selection_reads_the_last_hex_digit_of_the_hash() {
+        for h in [
+            "00ab0", "0002", "0004", "0006", "0008", "000a", "000c", "000e", "000A",
+        ] {
+            assert!(
+                SecondarySample::EvenHash.selects(h),
+                "{h} should be selected"
+            );
+        }
+        for h in [
+            "0001", "0003", "0005", "0007", "0009", "000b", "000d", "000f", "000F",
+        ] {
+            assert!(
+                !SecondarySample::EvenHash.selects(h),
+                "{h} should be skipped"
+            );
+        }
+        // A block whose hash could not be read is never mirrored under
+        // sampling: its arm would be unknowable at analysis time.
+        assert!(!SecondarySample::EvenHash.selects(""));
+        assert!(SecondarySample::All.selects(""));
+        assert!(SecondarySample::All.selects("0001"));
+    }
+
+    #[tokio::test]
+    async fn even_hash_sampling_mirrors_only_even_hash_blocks() {
+        let primary = Arc::new(Recorder::default());
+        let secondary = Arc::new(Recorder::default());
+        let dual = DualSubmit::with_secondary(
+            primary.clone(),
+            "http://primary:8232",
+            secondary.clone() as Arc<dyn SubmitBlock + Send + Sync>,
+            "http://secondary:8232",
+            None,
+        )
+        .with_secondary_sample(SecondarySample::EvenHash);
+        let even = header_with_hash_parity(true);
+        let odd = header_with_hash_parity(false);
+        dual.submit_block(&even).await.unwrap();
+        dual.submit_block(&odd).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert_eq!(
+            primary.calls.load(Ordering::SeqCst),
+            2,
+            "the primary must receive every block regardless of sampling"
+        );
+        assert_eq!(*secondary.seen.lock().unwrap(), vec![even]);
+    }
+
+    #[tokio::test]
+    async fn an_unsampled_block_logs_only_the_primary() {
+        let dir = tempfile::tempdir().unwrap();
+        let (log, path) = sink(dir.path());
+        let dual = DualSubmit::with_secondary(
+            Recorder::default(),
+            "http://primary:8232",
+            Arc::new(Recorder::default()) as Arc<dyn SubmitBlock + Send + Sync>,
+            "http://secondary:8232",
+            Some(log),
+        )
+        .with_secondary_sample(SecondarySample::EvenHash);
+        dual.submit_block(&header_with_hash_parity(false))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1, "got: {body}");
+        assert!(body.contains("\"target\":\"primary\""));
     }
 }

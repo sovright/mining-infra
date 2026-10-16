@@ -29,6 +29,12 @@ pub struct Config {
     #[serde(default)]
     pub submit_log_path: Option<String>,
 
+    /// Which blocks `zebra_url_secondary` receives: `all` (default) or
+    /// `even_hash` for a per-block randomised A/B. Any other value fails config
+    /// parsing rather than silently mirroring everything.
+    #[serde(default)]
+    pub secondary_submit_sample: crate::dual_submit::SecondarySample,
+
     /// Relay peer addresses
     pub relay_peers: Vec<String>,
 
@@ -493,6 +499,45 @@ mod ab_config_tests {
         let cfg = Config::from_file(&path).unwrap();
         assert!(cfg.zebra_url_secondary.is_none());
         assert!(cfg.submit_log_path.is_none());
+        assert_eq!(
+            cfg.secondary_submit_sample,
+            crate::dual_submit::SecondarySample::All
+        );
+    }
+
+    #[test]
+    fn secondary_submit_sample_reads_even_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            "zebra_url = \"http://127.0.0.1:8232\"\n\
+             zebra_url_secondary = \"http://10.40.64.3:8232\"\n\
+             secondary_submit_sample = \"even_hash\"\n\
+             relay_peers = []\n",
+        )
+        .unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert_eq!(
+            cfg.secondary_submit_sample,
+            crate::dual_submit::SecondarySample::EvenHash
+        );
+    }
+
+    #[test]
+    fn an_unknown_secondary_submit_sample_fails_loudly() {
+        // A typo must not silently fall back to mirroring every block: that
+        // would quietly turn a randomised experiment into an unrandomised one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(
+            &path,
+            "zebra_url = \"http://127.0.0.1:8232\"\n\
+             secondary_submit_sample = \"even\"\n\
+             relay_peers = []\n",
+        )
+        .unwrap();
+        assert!(Config::from_file(&path).is_err());
     }
 
     #[test]
