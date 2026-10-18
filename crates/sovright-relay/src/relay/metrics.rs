@@ -77,6 +77,10 @@ pub struct RelayMetrics {
     /// Same, keyed by the auth key id that authored the dropped chunks --
     /// lets an operator see exactly which invitee key attempted injection.
     receive_only_chunks_dropped_by_key: Mutex<HashMap<String, u64>>,
+    /// Chunks a `Full`-bound session sent that the relay fanned out to other
+    /// peers, keyed by the SOURCE session's auth key id. The inbound mirror of
+    /// `chunks_forwarded_by_key` (which is keyed by destination).
+    chunks_relayed_from_key: Mutex<HashMap<String, u64>>,
 }
 
 impl RelayMetrics {
@@ -257,6 +261,16 @@ impl RelayMetrics {
         *by_key.entry(key_id.to_string()).or_insert(0) += count;
     }
 
+    /// Record `count` chunks authored by the session bound to `key_id` and
+    /// fanned out to other peers.
+    pub fn inc_chunks_relayed_from_key(&self, key_id: &str, count: u64) {
+        let mut by_key = self
+            .chunks_relayed_from_key
+            .lock()
+            .expect("chunks_relayed_from_key mutex poisoned");
+        *by_key.entry(key_id.to_string()).or_insert(0) += count;
+    }
+
     /// Get snapshot of current metrics
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
@@ -304,6 +318,7 @@ impl RelayMetrics {
             receive_only_chunks_dropped_by_key: sorted_key_counts(
                 &self.receive_only_chunks_dropped_by_key,
             ),
+            chunks_relayed_from_key: sorted_key_counts(&self.chunks_relayed_from_key),
         }
     }
 }
@@ -357,6 +372,8 @@ pub struct MetricsSnapshot {
     pub receive_only_chunks_dropped: u64,
     /// Same, per auth key id, sorted by id.
     pub receive_only_chunks_dropped_by_key: Vec<(String, u64)>,
+    /// Chunks relayed per SOURCE auth key id, sorted by id.
+    pub chunks_relayed_from_key: Vec<(String, u64)>,
 }
 
 /// Render relay metrics in Prometheus text exposition format.
@@ -580,6 +597,15 @@ pub fn render_prometheus_text(snapshot: &MetricsSnapshot, sessions: usize) -> St
         "counter",
         &snapshot.receive_only_chunks_dropped_by_key,
     );
+    push_labeled_metric_family(
+        &mut text,
+        "sovright_relay_relay_chunks_relayed_from_key_total",
+        "Total PoW-gated chunks from a Full session accepted for fan-out, labeled by the \
+         SOURCE auth key id. Proves the key sent valid block content, not that \
+         it mined the block.",
+        "counter",
+        &snapshot.chunks_relayed_from_key,
+    );
     text
 }
 
@@ -695,6 +721,7 @@ mod tests {
             chunks_forwarded_by_key: Vec::new(),
             receive_only_chunks_dropped: 0,
             receive_only_chunks_dropped_by_key: Vec::new(),
+            chunks_relayed_from_key: Vec::new(),
         };
 
         let text = render_prometheus_text(&snapshot, 5);
@@ -781,10 +808,30 @@ mod tests {
     }
 
     #[test]
+    fn chunks_relayed_from_key_is_tracked_and_rendered() {
+        let metrics = RelayMetrics::new();
+        metrics.inc_chunks_relayed_from_key("sluicey", 4);
+        metrics.inc_chunks_relayed_from_key("alice", 1);
+        metrics.inc_chunks_relayed_from_key("sluicey", 6);
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(
+            snapshot.chunks_relayed_from_key,
+            vec![("alice".to_string(), 1), ("sluicey".to_string(), 10)]
+        );
+        let text = render_prometheus_text(&snapshot, 0);
+        assert!(text.contains("# TYPE sovright_relay_relay_chunks_relayed_from_key_total counter"));
+        assert!(text.contains(
+            "sovright_relay_relay_chunks_relayed_from_key_total{key_id=\"sluicey\"} 10\n"
+        ));
+    }
+
+    #[test]
     fn labeled_metric_family_omitted_when_empty() {
         let snapshot = MetricsSnapshot::default();
         let text = render_prometheus_text(&snapshot, 0);
         assert!(!text.contains("sovright_relay_relay_sessions_created_by_key_total"));
         assert!(!text.contains("sovright_relay_relay_chunks_forwarded_by_key_total"));
+        assert!(!text.contains("sovright_relay_relay_chunks_relayed_from_key_total"));
     }
 }

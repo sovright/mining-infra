@@ -1089,6 +1089,17 @@ impl<V: PowValidator> RelayNode<V> {
             return Ok(());
         }
 
+        // Only Full sessions reach this point (ReceiveOnly returned above), so
+        // this counts content each Full key authored that the relay fans out.
+        let relayed: u64 = chunks_to_forward
+            .iter()
+            .map(|r| r.chunks.len() as u64)
+            .sum();
+        if relayed > 0 {
+            self.metrics
+                .inc_chunks_relayed_from_key(&source_key_id, relayed);
+        }
+
         for ready in chunks_to_forward {
             self.forward_to_peers(
                 src_addr,
@@ -2226,6 +2237,87 @@ mod tests {
             .expect("a ReceiveOnly session must still receive forwards from a Full session")
             .unwrap();
         assert!(len > 0);
+    }
+
+    #[tokio::test]
+    async fn chunks_relayed_from_key_counts_what_each_full_key_authored() {
+        // Inbound attribution: chunks a Full session sends that the relay
+        // fans out are counted against the SOURCE key. A ReceiveOnly key's
+        // dropped chunks are not counted here (they were never relayed).
+        let pool_key = [0x42; 32];
+        let fleet_key = [0x43; 32];
+        let invitee_key = [0x77; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap()).with_authorized_keys(vec![
+            AuthKey::new("pool", pool_key),
+            AuthKey::new("fleet", fleet_key),
+            AuthKey::new("invitee", invitee_key).with_role(KeyRole::ReceiveOnly),
+        ]);
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+
+        // Exactly one destination, so everything relayed from "pool" lands
+        // on "fleet" and the two directional counters must agree.
+        let observer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let observer_addr = observer.local_addr().unwrap();
+        {
+            let mut sessions = node.sessions.write().await;
+            sessions.insert(
+                observer_addr,
+                RelaySession::new(observer_addr, "fleet", fleet_key),
+            );
+        }
+
+        let compact = CompactBlock::new(vec![0xab; 2189], 0x3333, Vec::new(), Vec::new());
+        let block_hash = *compact.header_hash().as_bytes();
+        let chunks = node
+            .chunker
+            .compact_block_to_chunks(&compact, &block_hash)
+            .unwrap();
+
+        let invitee_addr: SocketAddr = "127.0.0.1:20011".parse().unwrap();
+        for chunk in &chunks {
+            let wire = authenticated_wire_chunk(invitee_key, &block_hash, chunk);
+            node.handle_packet(&wire, invitee_addr).await.unwrap();
+        }
+        let pool_addr: SocketAddr = "127.0.0.1:20012".parse().unwrap();
+        for chunk in &chunks {
+            let wire = authenticated_wire_chunk(pool_key, &block_hash, chunk);
+            node.handle_packet(&wire, pool_addr).await.unwrap();
+        }
+        // Resending the same chunks is deduplicated per session and must not
+        // inflate the count.
+        for chunk in &chunks {
+            let wire = authenticated_wire_chunk(pool_key, &block_hash, chunk);
+            node.handle_packet(&wire, pool_addr).await.unwrap();
+        }
+
+        let snapshot = node.metrics().snapshot();
+        let relayed_from = |id: &str| {
+            snapshot
+                .chunks_relayed_from_key
+                .iter()
+                .find(|(k, _)| k == id)
+                .map(|(_, v)| *v)
+        };
+        let forwarded_to_fleet = snapshot
+            .chunks_forwarded_by_key
+            .iter()
+            .find(|(k, _)| k == "fleet")
+            .map(|(_, v)| *v)
+            .expect("observer received forwards");
+
+        assert!(forwarded_to_fleet > 0);
+        assert_eq!(relayed_from("pool"), Some(forwarded_to_fleet));
+        assert_eq!(
+            relayed_from("invitee"),
+            None,
+            "dropped chunks are not relayed"
+        );
+        assert_eq!(
+            relayed_from("fleet"),
+            None,
+            "the destination authored nothing"
+        );
     }
 
     #[tokio::test]
