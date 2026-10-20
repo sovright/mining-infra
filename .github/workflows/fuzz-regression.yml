@@ -7,7 +7,7 @@ on:
 
 jobs:
   fuzz-mining-protocol:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -37,7 +37,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-sovright-relay:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -61,7 +61,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-jd-server:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -93,7 +93,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-equihash-validator:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -118,7 +118,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-pool-common:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -142,7 +142,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-template-provider:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -167,7 +167,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-sovright-relay-sidecar:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -191,7 +191,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-sovright-noise:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
@@ -215,7 +215,7 @@ jobs:
         run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu ${{ matrix.target }} -- -runs=0
 
   fuzz-pool-server:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     strategy:
       matrix:
         target:
