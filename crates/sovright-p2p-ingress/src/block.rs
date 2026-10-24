@@ -1019,6 +1019,7 @@ mod real_nu7_activation {
     use sha2::{Digest, Sha256};
     use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
     use sovright_relay_sidecar::mempool_sync::wtxid_from_display_hex;
+    use zcash_protocol::consensus::BranchId;
 
     fn fixture() -> (Vec<u8>, serde_json::Value) {
         let block =
@@ -1073,12 +1074,16 @@ mod real_nu7_activation {
                 expected["authdigest"].as_str().unwrap(),
             )
             .unwrap();
-            // Production passes the older branch hint; the embedded NU7 branch
-            // must control both v5 and v6 hashes, including the Ironwood bundle.
-            assert_eq!(
-                wtxid_from_tx_bytes(&tx.tx_data, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID),
-                Some(oracle)
-            );
+            // The embedded NU7 branch, not the reader hint, must control both v5
+            // and v6 hashes, including the Ironwood bundle: a pre-NU7 hint and
+            // the production hint must both reproduce the node oracle.
+            for hint in [BranchId::Nu6_3, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID] {
+                assert_eq!(
+                    wtxid_from_tx_bytes(&tx.tx_data, hint),
+                    Some(oracle),
+                    "hint {hint:?}"
+                );
+            }
         }
     }
 

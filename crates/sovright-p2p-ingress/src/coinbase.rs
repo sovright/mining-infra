@@ -170,6 +170,23 @@ mod tests {
         );
     }
 
+    /// Before NU7 activates, a block's coinbase may still be v4, and the branch
+    /// hint handed to the reader must not stop it from parsing, or orphans lose
+    /// their pool attribution without any error. Block 3470793's v4 transaction
+    /// stands in for a v4 coinbase: only the first transaction's transparent
+    /// outputs are read. The expected script was decoded from the raw bytes
+    /// independently of `zcash_primitives` (largest of two outputs, 41511520 zat).
+    #[test]
+    fn extracts_miner_script_from_a_real_v4_first_transaction() {
+        let v4 = &zcash_pool_common::fixtures::mainnet_transactions()[3];
+        assert_eq!(&v4[..4], &[0x04, 0x00, 0x00, 0x80], "fixture tx 3 is v4");
+        assert_eq!(
+            coinbase_miner_script(&block_from_coinbase(v4)).as_deref(),
+            Some("76a91463920707d63c5033a09604b6e02c1d23449531c088ac"),
+            "a real v4 first transaction must parse"
+        );
+    }
+
     /// Build a minimal but valid v5 coinbase transaction with two transparent
     /// outputs: a large "miner" output and a small "funding stream" output,
     /// each carrying a distinct script. `zcash_primitives::Transaction::read`

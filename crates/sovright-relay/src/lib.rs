@@ -28,7 +28,8 @@ pub use mempool::{
     TxCacheSnapshot,
 };
 pub use merkle::{
-    header_merkle_root, merkle_root, transactions_match_merkle_root, txid_from_tx_bytes,
+    TX_READER_BRANCH_HINT, header_merkle_root, merkle_root, transactions_match_merkle_root,
+    txid_from_tx_bytes,
 };
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};

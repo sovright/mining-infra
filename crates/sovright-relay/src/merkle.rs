@@ -38,14 +38,19 @@ use zcash_protocol::consensus::BranchId;
 /// block 3470793 in the tests.
 const MERKLE_ROOT_RANGE: std::ops::Range<usize> = 36..68;
 
-/// Branch id handed to the transaction reader.
+/// Branch id handed to `zcash_primitives::transaction::Transaction::read`, and
+/// the only definition of it in the workspace: `sovright-p2p-ingress` re-exports
+/// this rather than declaring its own.
 ///
 /// For v5/v6 -- the only versions whose txid is not a plain double-SHA256 --
 /// `Transaction::read` takes the consensus branch id from the transaction bytes
-/// themselves, so this argument never influences a txid we compute. It is
-/// threaded only to satisfy the reader API. Bump it at each network upgrade to
-/// keep the documented intent aligned with mainnet.
-const CONSENSUS_BRANCH_ID: BranchId = BranchId::Nu6_3;
+/// themselves, so this argument never influences a txid or auth digest we
+/// compute. For v4 the reader stores it but hashes the bytes, and it does not
+/// check `valid_in_branch` on read, so pre-NU7 v4 transactions still parse.
+/// `reader_hint_does_not_change_txids` pins the txids and the v4 parse; the
+/// ingress wtxid tests pin the auth digests. It is threaded only to satisfy the
+/// reader API; set it to the current network upgrade.
+pub const TX_READER_BRANCH_HINT: BranchId = BranchId::Nu7;
 
 fn sha256d(bytes: &[u8]) -> [u8; 32] {
     let first = Sha256::digest(bytes);
@@ -64,7 +69,7 @@ fn sha256d(bytes: &[u8]) -> [u8; 32] {
 /// check rather than being submitted on a silent parse failure. Never panics.
 pub fn txid_from_tx_bytes(tx_bytes: &[u8]) -> [u8; 32] {
     let mut cursor = Cursor::new(tx_bytes);
-    if let Ok(tx) = Transaction::read(&mut cursor, CONSENSUS_BRANCH_ID) {
+    if let Ok(tx) = Transaction::read(&mut cursor, TX_READER_BRANCH_HINT) {
         // A well-formed transaction consumes its whole slice; a leftover tail
         // means we mis-parsed, so fall through rather than trust the txid.
         let consumed_all = cursor.position() as usize == tx_bytes.len();
@@ -202,6 +207,38 @@ mod tests {
         let v4 = &txs[3];
         assert_eq!(&v4[..4], &[0x04, 0x00, 0x00, 0x80], "fixture tx 3 is v4");
         assert_eq!(txid_from_tx_bytes(v4), sha256d(v4));
+    }
+
+    /// The branch hint handed to `Transaction::read` must not move any txid, so
+    /// that pointing it at a new network upgrade is safe. Checks the reader
+    /// directly rather than through `txid_from_tx_bytes`: that helper falls
+    /// back to sha256d on a parse failure, which would hide a v4 transaction
+    /// the reader stopped accepting.
+    #[test]
+    fn reader_hint_does_not_change_txids() {
+        let (_, txs) = fixture();
+        for (index, tx) in txs.iter().enumerate() {
+            let txids: Vec<[u8; 32]> = [BranchId::Nu6_3, BranchId::Nu7]
+                .into_iter()
+                .map(|hint| {
+                    let mut cursor = Cursor::new(tx.as_slice());
+                    let parsed = Transaction::read(&mut cursor, hint)
+                        .unwrap_or_else(|e| panic!("tx {index} must parse under {hint:?}: {e}"));
+                    assert_eq!(
+                        cursor.position() as usize,
+                        tx.len(),
+                        "tx {index} must be read whole under {hint:?}"
+                    );
+                    *parsed.txid().as_ref()
+                })
+                .collect();
+            assert_eq!(txids[0], txids[1], "tx {index}: txid depends on the hint");
+            assert_eq!(
+                txids[1],
+                txid_from_tx_bytes(tx),
+                "tx {index}: reader and txid_from_tx_bytes disagree"
+            );
+        }
     }
 
     /// The whole point: a single substituted transaction -- what a short-id
