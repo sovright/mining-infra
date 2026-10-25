@@ -49,7 +49,8 @@ const MERKLE_ROOT_RANGE: std::ops::Range<usize> = 36..68;
 /// check `valid_in_branch` on read, so pre-NU7 v4 transactions still parse.
 /// `reader_hint_does_not_change_txids` pins the txids and the v4 parse; the
 /// ingress wtxid tests pin the auth digests. It is threaded only to satisfy the
-/// reader API; set it to the current network upgrade.
+/// reader API: any value works for v5/v6 and the v4 read path today, and Nu7 is
+/// chosen to track the newest known branch, not because NU7 is active.
 pub const TX_READER_BRANCH_HINT: BranchId = BranchId::Nu7;
 
 fn sha256d(bytes: &[u8]) -> [u8; 32] {

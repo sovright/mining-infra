@@ -16,7 +16,7 @@ use sovright_relay_sidecar::submit::{
 
 use super::nu7_fixture::{Nu7Fixture, tx_cache};
 use crate::block::{compact_block_from_raw_block, compact_block_from_raw_block_with_tx_cache};
-use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
+use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 
 /// Records every block it is asked to submit. It is not a node.
 #[derive(Default)]
@@ -126,10 +126,7 @@ async fn nu7_short_id_block_without_the_transaction_prepares_a_request() {
 #[tokio::test]
 async fn nu7_truncated_transaction_fails_the_merkle_check() {
     let truncated = Nu7Fixture::load().v5_transaction()[..139].to_vec();
-    assert_eq!(
-        wtxid_from_tx_bytes(&truncated, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID),
-        None
-    );
+    assert_eq!(wtxid_from_tx_bytes(&truncated, TX_READER_BRANCH_HINT), None);
     let sha256d: [u8; 32] = Sha256::digest(Sha256::digest(&truncated)).into();
     assert_eq!(txid_from_tx_bytes(&truncated), sha256d);
 
@@ -144,7 +141,7 @@ async fn nu7_effecting_data_change_fails_the_merkle_check() {
     let fixture = Nu7Fixture::load();
     let mut changed = fixture.v5_transaction();
     changed[169] ^= 0x01;
-    assert!(wtxid_from_tx_bytes(&changed, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).is_some());
+    assert!(wtxid_from_tx_bytes(&changed, TX_READER_BRANCH_HINT).is_some());
     assert_ne!(txid_display(&changed), fixture.v5_txid_display());
 
     let (outcome, submitted) = submit_short_id_block(Some(changed)).await;
@@ -157,10 +154,7 @@ async fn nu7_effecting_data_change_fails_the_merkle_check() {
 async fn nu7_v4_transaction_under_the_v5_key_fails_the_merkle_check() {
     let v4 = zcash_pool_common::fixtures::mainnet_transactions()[3].clone();
     assert_eq!(&v4[..4], &[0x04, 0x00, 0x00, 0x80]);
-    assert_eq!(
-        wtxid_from_tx_bytes(&v4, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID),
-        None
-    );
+    assert_eq!(wtxid_from_tx_bytes(&v4, TX_READER_BRANCH_HINT), None);
 
     let (outcome, submitted) = submit_short_id_block(Some(v4)).await;
     assert_merkle_rejected(outcome, &submitted);
@@ -192,7 +186,7 @@ async fn known_gap_nu7_auth_only_change_passes_the_merkle_only_check() {
     let mut altered = fixture.v5_transaction();
     altered[100] ^= 0x01; // inside the input's scriptSig, bytes 58..=163
     assert_eq!(txid_display(&altered), fixture.v5_txid_display());
-    let altered_wtxid = wtxid_from_tx_bytes(&altered, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)
+    let altered_wtxid = wtxid_from_tx_bytes(&altered, TX_READER_BRANCH_HINT)
         .expect("the altered transaction still parses");
     assert_ne!(altered_wtxid, fixture.v5_wtxid(), "the auth digest changed");
 

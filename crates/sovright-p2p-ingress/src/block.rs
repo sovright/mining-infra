@@ -3,7 +3,7 @@ use sovright_relay::{CompactBlock, PrefilledTx, ShortId, WtxId, ZCASH_FULL_HEADE
 use crate::error::{IngressError, Result};
 use crate::tx_cache::TxCache;
 use crate::wire::{decode_compact_size, read_u32_le};
-use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
+use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 
 const OVERWINTERED_FLAG: u32 = 1 << 31;
 const OVERWINTER_VERSION_GROUP_ID: u32 = 0x03C4_8270;
@@ -72,7 +72,7 @@ pub(crate) fn skeleton_compact_block_from_raw_block(
     compact_block_from_raw_block_with_resolver(block_payload, |tx_payload| {
         tx_cache
             .wtxid_for_payload(tx_payload)
-            .or_else(|| wtxid_from_tx_bytes(tx_payload, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID))
+            .or_else(|| wtxid_from_tx_bytes(tx_payload, TX_READER_BRANCH_HINT))
     })
 }
 
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(skeleton.prefilled_txs[0].index, 0);
         assert_eq!(skeleton.prefilled_txs[0].tx_data, coinbase);
         let expected_wtxid =
-            crate::wtxid::wtxid_from_tx_bytes(&tx1, crate::wtxid::SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)
+            crate::wtxid::wtxid_from_tx_bytes(&tx1, crate::wtxid::TX_READER_BRANCH_HINT)
                 .expect("minimal v5 tx must resolve from bytes");
         assert_eq!(
             skeleton.short_ids,
@@ -918,7 +918,7 @@ mod real_block_round_trip {
             max_tx_bytes: 1 << 16,
         });
         for tx in txs.iter().skip(1) {
-            if let Some(wtxid) = wtxid_from_tx_bytes(tx, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID) {
+            if let Some(wtxid) = wtxid_from_tx_bytes(tx, TX_READER_BRANCH_HINT) {
                 cache.insert(wtxid, tx.clone());
             }
         }
@@ -976,7 +976,7 @@ mod real_block_round_trip {
             max_tx_bytes: 1 << 16,
         });
         for tx in txs.iter().skip(1) {
-            if let Some(wtxid) = wtxid_from_tx_bytes(tx, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID) {
+            if let Some(wtxid) = wtxid_from_tx_bytes(tx, TX_READER_BRANCH_HINT) {
                 receiver.insert(wtxid, tx.clone());
             }
         }
@@ -1077,7 +1077,7 @@ mod real_nu7_activation {
             // The embedded NU7 branch, not the reader hint, must control both v5
             // and v6 hashes, including the Ironwood bundle: a pre-NU7 hint and
             // the production hint must both reproduce the node oracle.
-            for hint in [BranchId::Nu6_3, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID] {
+            for hint in [BranchId::Nu6_3, TX_READER_BRANCH_HINT] {
                 assert_eq!(
                     wtxid_from_tx_bytes(&tx.tx_data, hint),
                     Some(oracle),
@@ -1125,7 +1125,7 @@ mod real_nu7_activation {
         );
         let tx = &full.prefilled_txs[1].tx_data;
         receiver.insert(
-            wtxid_from_tx_bytes(tx, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).unwrap(),
+            wtxid_from_tx_bytes(tx, TX_READER_BRANCH_HINT).unwrap(),
             tx.clone(),
         );
         assert_exact_reconstruction(&skeleton, &receiver, &block);

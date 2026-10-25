@@ -6,7 +6,7 @@ use sovright_relay::{WtxId, ZCASH_FULL_HEADER_SIZE};
 
 use crate::block::compact_block_from_raw_block;
 use crate::tx_cache::{TxCache, TxCacheConfig};
-use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
+use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 
 pub(super) struct Nu7Fixture {
     pub raw: Vec<u8>,
@@ -40,7 +40,7 @@ impl Nu7Fixture {
     }
 
     pub fn v5_wtxid(&self) -> WtxId {
-        wtxid_from_tx_bytes(&self.v5_transaction(), SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).unwrap()
+        wtxid_from_tx_bytes(&self.v5_transaction(), TX_READER_BRANCH_HINT).unwrap()
     }
 
     /// Slot 1's txid as both node oracles report it, display order.

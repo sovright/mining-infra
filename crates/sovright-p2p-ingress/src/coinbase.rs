@@ -22,7 +22,7 @@ use std::io::Cursor;
 use sovright_relay::ZCASH_FULL_HEADER_SIZE;
 
 use crate::wire::decode_compact_size;
-use crate::wtxid::SOVRIGHT_P2P_CONSENSUS_BRANCH_ID;
+use crate::wtxid::TX_READER_BRANCH_HINT;
 use zcash_primitives::transaction::Transaction;
 
 /// Parse the coinbase of a raw Zcash block payload and return the hex-encoded
@@ -45,7 +45,7 @@ pub(crate) fn coinbase_miner_script(block_payload: &[u8]) -> Option<String> {
     // stops, so handing it the rest of the block after the header is fine. The
     // branch id is ignored for the transparent portion we read here.
     let mut reader = Cursor::new(coinbase_bytes);
-    let tx = Transaction::read(&mut reader, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).ok()?;
+    let tx = Transaction::read(&mut reader, TX_READER_BRANCH_HINT).ok()?;
 
     // The miner payout is the largest-value transparent output. Smaller outputs
     // are protocol funding streams.
@@ -82,7 +82,7 @@ pub(crate) fn coinbase_text(block_payload: &[u8]) -> Option<String> {
     }
     let coinbase_bytes = block_payload.get(cursor..)?;
     let mut reader = Cursor::new(coinbase_bytes);
-    let tx = Transaction::read(&mut reader, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).ok()?;
+    let tx = Transaction::read(&mut reader, TX_READER_BRANCH_HINT).ok()?;
 
     let bundle = tx.transparent_bundle()?;
     let input = bundle.vin.first()?;

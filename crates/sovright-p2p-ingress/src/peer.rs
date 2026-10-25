@@ -20,7 +20,7 @@ use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
 };
-use crate::wtxid::{SOVRIGHT_P2P_CONSENSUS_BRANCH_ID, wtxid_from_tx_bytes};
+use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 use sovright_relay::WtxId;
 
 // Observation-only floor. Forwarding sessions require the selected network's
@@ -496,7 +496,7 @@ fn wtxid_for_received_tx(
     pending_tx_responses: &mut RequestWindow<TxInventoryKey>,
     payload: &[u8],
 ) -> Option<WtxId> {
-    let derived = wtxid_from_tx_bytes(payload, SOVRIGHT_P2P_CONSENSUS_BRANCH_ID)?;
+    let derived = wtxid_from_tx_bytes(payload, TX_READER_BRANCH_HINT)?;
 
     let wtx_match = pending_tx_responses.complete(TxInventoryKey::from_wtxid(&derived));
     // MSG_TX names only the txid. The payload-derived wtxid still supplies the
@@ -792,7 +792,7 @@ mod tests {
     }
 
     fn v6_wtxid() -> WtxId {
-        wtxid_from_tx_bytes(&v6_tx(), SOVRIGHT_P2P_CONSENSUS_BRANCH_ID).expect("v6 resolves")
+        wtxid_from_tx_bytes(&v6_tx(), TX_READER_BRANCH_HINT).expect("v6 resolves")
     }
 
     /// THE regression. A peer answered an earlier request out of order (or

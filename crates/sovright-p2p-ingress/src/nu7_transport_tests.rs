@@ -132,6 +132,58 @@ async fn real_nu7_cached_compact_and_skeleton_cross_authenticated_udp() {
     }
 }
 
+/// Skeleton-first with a cold origin cache: the origin never saw the v5
+/// transaction, so the skeleton's short ID comes from the cache-miss fallback
+/// that derives the NU7 v5 wtxid from the transaction bytes. A receiver holding
+/// the transaction must still rebuild the exact block from the skeleton alone.
+#[tokio::test]
+async fn real_nu7_skeleton_from_cold_origin_cache_reconstructs_exact_block() {
+    use sovright_relay::ZCASH_FULL_HEADER_SIZE;
+    let fixture = Nu7Fixture::load();
+    let cold_origin = tx_cache();
+
+    let mut skeleton = None;
+    let (_, finished) = relay_loopback(
+        &fixture.raw,
+        BridgeMode {
+            compact_from_tx_cache: true,
+            skeleton_first: true,
+        },
+        Some(&cold_origin),
+        |payload| {
+            if let RelayPayload::CompactSkeleton(block) = payload {
+                skeleton = Some(block);
+            }
+            skeleton.is_some()
+        },
+    )
+    .await;
+    assert!(finished, "no skeleton within 5 s from a cold origin cache");
+    let skeleton = skeleton.unwrap();
+    assert_eq!(&skeleton.header[..], &fixture.raw[..ZCASH_FULL_HEADER_SIZE]);
+    assert_eq!(
+        skeleton.short_ids.len(),
+        1,
+        "the v5 transaction must be a short ID even though the origin never cached it"
+    );
+
+    let receiver = tx_cache();
+    receiver.insert(fixture.v5_wtxid(), fixture.v5_transaction());
+    match handle_relay_compact_block_with_mempool(
+        &NeverSubmit,
+        &skeleton,
+        SubmitBlockMode::DryRun,
+        &receiver,
+    )
+    .await
+    {
+        Ok(SubmissionOutcome::DryRun(candidate)) => {
+            assert_eq!(hex::decode(candidate.block_hex).unwrap(), fixture.raw)
+        }
+        other => panic!("expected a DryRun candidate, got {other:?}"),
+    }
+}
+
 /// Bridge settings the qualification tests vary.
 #[derive(Clone, Copy)]
 struct BridgeMode {
