@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::error::{IngressError, Result};
-use crate::wire::Network;
+use crate::wire::{MIN_ACCEPTABLE_REMOTE_VERSION, Network};
 
 /// Known Zcash forks that reused the Zcash network magic and gossip into
 /// Zcash address books, but whose blocks are not Zcash mainnet blocks.
@@ -124,6 +124,13 @@ pub struct Config {
     /// Maximum bounded LRU size for the forward dedup ring. Default 64.
     pub relay_forward_dedup_capacity: usize,
     pub submitblock_rpc: Option<SubmitBlockRpcConfig>,
+    /// Lowest peer version a forwarding session admits, when an operator sets
+    /// one below the advertised version. Read from
+    /// `SOVRIGHT_P2P_FORWARDING_MIN_PEER_VERSION` (default unset: the floor is
+    /// the advertised version). Meant for the window before a network upgrade
+    /// activates, so the ingress can advertise the new version while still
+    /// hearing peers that have not upgraded yet; remove it at activation.
+    pub forwarding_min_peer_version: Option<i32>,
 }
 
 impl Config {
@@ -240,6 +247,7 @@ impl Config {
         let relay_forward_dedup_capacity =
             env_usize("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_CAPACITY", 64)?;
         let submitblock_rpc = submitblock_rpc_from_env()?;
+        let forwarding_min_peer_version = forwarding_min_peer_version_from_env(network)?;
 
         if network == Network::Testnet
             && (!relay_peers.is_empty() || tx_feed_addr.is_some() || submitblock_rpc.is_some())
@@ -301,6 +309,7 @@ impl Config {
             relay_forward_dedup_window,
             relay_forward_dedup_capacity,
             submitblock_rpc,
+            forwarding_min_peer_version,
         })
     }
 }
@@ -382,6 +391,33 @@ pub fn default_seeds() -> Vec<String> {
         "mainnet.seeder.zfnd.org".to_string(),
         "mainnet.is.yolo.money".to_string(),
     ]
+}
+
+impl Config {
+    /// The version floor for sessions that forward into the relay or tx feed.
+    pub fn forwarding_min_peer_version(&self) -> i32 {
+        self.forwarding_min_peer_version
+            .unwrap_or_else(|| self.network.protocol_version())
+    }
+}
+
+fn forwarding_min_peer_version_from_env(network: Network) -> Result<Option<i32>> {
+    const NAME: &str = "SOVRIGHT_P2P_FORWARDING_MIN_PEER_VERSION";
+    let value = match env::var(NAME) {
+        Ok(value) => value,
+        Err(_) => return Ok(None),
+    };
+    let version: i32 = value
+        .trim()
+        .parse()
+        .map_err(|e| IngressError::Config(format!("invalid {NAME}: {e}")))?;
+    let advertised = network.protocol_version();
+    if !(MIN_ACCEPTABLE_REMOTE_VERSION..=advertised).contains(&version) {
+        return Err(IngressError::Config(format!(
+            "{NAME} must be between {MIN_ACCEPTABLE_REMOTE_VERSION} and the advertised version {advertised}: {version}"
+        )));
+    }
+    Ok(Some(version))
 }
 
 fn env_csv(name: &str) -> Option<Vec<String>> {
@@ -966,5 +1002,55 @@ mod tests {
                 .contains("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_SEND_ROUNDS must be at least 1"),
             "{err}"
         );
+    }
+
+    fn forwarding_floor_env(value: Option<&str>) -> Vec<(&'static str, String)> {
+        let mut vars = vec![
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+        ];
+        if let Some(value) = value {
+            vars.push((
+                "SOVRIGHT_P2P_FORWARDING_MIN_PEER_VERSION",
+                value.to_string(),
+            ));
+        }
+        vars
+    }
+
+    #[test]
+    fn forwarding_min_peer_version_defaults_to_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // Register the key with the guard so drop restores any outside value.
+        let _guard = EnvGuard::set(&forwarding_floor_env(Some("170190")));
+        unsafe { env::remove_var("SOVRIGHT_P2P_FORWARDING_MIN_PEER_VERSION") };
+        assert_eq!(
+            Config::from_env().unwrap().forwarding_min_peer_version,
+            None
+        );
+    }
+
+    #[test]
+    fn parses_pre_activation_forwarding_floor() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&forwarding_floor_env(Some("170160")));
+        assert_eq!(
+            Config::from_env().unwrap().forwarding_min_peer_version,
+            Some(170_160)
+        );
+    }
+
+    #[test]
+    fn forwarding_floor_must_sit_between_observation_floor_and_advertised_version() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        for bad in ["170119", "170191", "-1", "nu7", ""] {
+            let _guard = EnvGuard::set(&forwarding_floor_env(Some(bad)));
+            let err = Config::from_env().unwrap_err().to_string();
+            assert!(
+                err.contains("SOVRIGHT_P2P_FORWARDING_MIN_PEER_VERSION"),
+                "{bad}: {err}"
+            );
+        }
     }
 }

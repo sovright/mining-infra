@@ -63,6 +63,7 @@ async fn main() -> Result<()> {
     info!(
         network = config.network.name(),
         advertised_version = config.network.protocol_version(),
+        forwarding_min_peer_version = config.forwarding_min_peer_version(),
         peers = crawler.known_len(),
         max_peers = config.max_peers,
         crawler_enabled = config.crawler_enabled,

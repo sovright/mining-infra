@@ -522,6 +522,7 @@ mod tests {
             relay_raw_segment_round_delay_millis: 0,
             relay_forward_dedup_window: Duration::from_secs(30),
             relay_forward_dedup_capacity: 64,
+            forwarding_min_peer_version: None,
             submitblock_rpc: None,
         }
     }

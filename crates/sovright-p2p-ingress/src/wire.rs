@@ -5,6 +5,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::error::{IngressError, Result};
 
 pub const MAINNET_MAGIC: [u8; 4] = [0x24, 0xe9, 0x27, 0x64];
+
+/// Observation-only floor. Forwarding sessions require the selected network's
+/// advertised version unless an operator lowers the forwarding floor, and never
+/// below this value.
+pub const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 /// Public networks only; private/regtest parameters need separate qualification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Network {

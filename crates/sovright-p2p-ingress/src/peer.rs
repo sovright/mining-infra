@@ -15,17 +15,13 @@ use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::RelayBridge;
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
-use crate::wire::Network;
 use crate::wire::{
     Inventory, encode_compact_size, encode_inventory, parse_addr, parse_inventory, read_i32_le,
     read_message, write_message,
 };
+use crate::wire::{MIN_ACCEPTABLE_REMOTE_VERSION, Network};
 use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 use sovright_relay::WtxId;
-
-// Observation-only floor. Forwarding sessions require the selected network's
-// NU7 floor from startup; peer-reported heights never control admission.
-const MIN_ACCEPTABLE_REMOTE_VERSION: i32 = 170_120;
 
 // Advertising less than we demand of peers would be incoherent; enforce at
 // compile time so a future upgrade cannot raise the floor past what we send.
@@ -138,8 +134,9 @@ pub async fn run_peer(
     let peer = peer_addr.to_string();
     // This is a capability filter, not consensus validation. Apply it for the
     // whole connection lifetime, before/at/after activation and across reorgs.
+    // Peer-reported heights never control admission; only configuration does.
     let minimum_version = if relay.is_some() || tx_feed.is_some() {
-        config.network.protocol_version()
+        config.forwarding_min_peer_version()
     } else {
         MIN_ACCEPTABLE_REMOTE_VERSION
     };
@@ -936,6 +933,7 @@ mod tests {
             relay_raw_segment_round_delay_millis: 0,
             relay_forward_dedup_window: Duration::from_secs(30),
             relay_forward_dedup_capacity: 64,
+            forwarding_min_peer_version: None,
             submitblock_rpc: None,
         }
     }
@@ -1049,9 +1047,17 @@ mod tests {
         payload: &[u8],
         use_relay: bool,
     ) -> String {
+        rejected_forwarding_handshake_with(peer_test_config(), command, payload, use_relay).await
+    }
+
+    async fn rejected_forwarding_handshake_with(
+        mut config: Config,
+        command: &str,
+        payload: &[u8],
+        use_relay: bool,
+    ) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let mut config = peer_test_config();
         let (relay, tx_feed) = if use_relay {
             config.relay_peers = vec!["127.0.0.1:9".parse().unwrap()];
             config.relay_auth_key = Some([42; 32]);
@@ -1139,6 +1145,29 @@ mod tests {
                         .contains("170190")
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn forwarding_floor_override_admits_pre_nu7_peer() {
+        let mut config = peer_test_config();
+        config.tx_feed_addr = Some("127.0.0.1:9".parse().unwrap());
+        config.forwarding_min_peer_version = Some(170_160);
+        let mut peer = TestPeer::start_with_remote_version("floor-override", config, 170_160).await;
+        let inventory = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+        assert_eq!(peer.announce(&[inventory]).await, vec![inventory]);
+    }
+
+    #[tokio::test]
+    async fn forwarding_floor_override_still_rejects_peers_below_it() {
+        let mut version = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        version[..4].copy_from_slice(&170_150i32.to_le_bytes());
+        for use_relay in [false, true] {
+            let mut config = peer_test_config();
+            config.forwarding_min_peer_version = Some(170_160);
+            let err =
+                rejected_forwarding_handshake_with(config, "version", &version, use_relay).await;
+            assert!(err.contains("170150 < 170160"), "{err}");
         }
     }
 
