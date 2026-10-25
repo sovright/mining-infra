@@ -202,10 +202,11 @@ impl ZebraChainView {
     /// can't distinguish "parent doesn't exist" from "we couldn't ask").
     /// At 11.6% cumulative rate this produced page-level noise.
     ///
-    /// The retry budget (~2s total) is sized to mask brief freezes but
-    /// short enough that a genuinely-down Zebra still surfaces quickly to
-    /// the caller — better than blocking the per-candidate gate path for
-    /// many seconds during a real outage.
+    /// The retry schedule (~2s of backoff) is sized to mask brief freezes,
+    /// and the whole lookup is capped at [`RETRY_BUDGET`] so a genuinely-down
+    /// or hung Zebra still surfaces quickly to the caller — better than
+    /// blocking the per-candidate gate path for many seconds during a real
+    /// outage.
     async fn get_block_header_with_retry(
         &self,
         rpc: &ZebraRpc,
@@ -222,21 +223,50 @@ impl ZebraChainView {
 ///
 /// Extracted as a free function so tests can drive the retry loop without
 /// instantiating a real `ZebraRpc`/HTTP client.
-async fn retry_transient<F, Fut, T>(mut op: F) -> RpcResult<T>
+async fn retry_transient<F, Fut, T>(op: F) -> RpcResult<T>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = RpcResult<T>>,
 {
-    // First attempt + 3 retries, exponentially spaced (100ms, 500ms, 1500ms).
-    const BACKOFFS_MS: [u64; 3] = [100, 500, 1500];
+    retry_transient_within(RETRY_BUDGET, op).await
+}
+
+/// First attempt + 3 retries, exponentially spaced.
+const RETRY_BACKOFFS_MS: [u64; 3] = [100, 500, 1500];
+
+/// Wall-clock cap on one lookup, attempts and backoff included. The lookup is
+/// awaited inline on the relay receive loop, so it must not inherit the RPC
+/// client's 30s request timeout per attempt: a Zebra that accepts connections
+/// but never answers would otherwise stall every later block for ~2 minutes.
+const RETRY_BUDGET: Duration = Duration::from_secs(3);
+
+async fn retry_transient_within<F, Fut, T>(budget: Duration, mut op: F) -> RpcResult<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = RpcResult<T>>,
+{
+    let deadline = tokio::time::Instant::now() + budget;
     let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
-    for attempt in 0..=BACKOFFS_MS.len() {
-        match op().await {
+    for attempt in 0..=RETRY_BACKOFFS_MS.len() {
+        let Ok(result) = tokio::time::timeout_at(deadline, op()).await else {
+            return Err(format!(
+                "get_block_header: no answer within the {}ms retry budget",
+                budget.as_millis()
+            )
+            .into());
+        };
+        match result {
             Ok(value) => return Ok(value),
             Err(err) => {
                 // `get` returns None on the extra final pass: retries exhausted.
-                let backoff_ms = match BACKOFFS_MS.get(attempt) {
-                    Some(&ms) if is_transient_transport_error(err.as_ref()) => ms,
+                let backoff_ms = match RETRY_BACKOFFS_MS.get(attempt) {
+                    Some(&ms)
+                        if is_transient_transport_error(err.as_ref())
+                            && tokio::time::Instant::now() + Duration::from_millis(ms)
+                                < deadline =>
+                    {
+                        ms
+                    }
                     _ => {
                         last_err = Some(err);
                         break;
@@ -478,6 +508,60 @@ mod tests {
         assert!(result.is_err());
         // 1 first attempt + 3 retries = 4 total.
         assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn retry_budget_cuts_off_an_attempt_that_never_answers() {
+        // A Zebra that accepts the connection but never answers would
+        // otherwise hold the receive loop for the 30s request timeout.
+        let budget = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let result: RpcResult<u32> =
+            retry_transient_within(budget, std::future::pending::<RpcResult<u32>>).await;
+        assert!(result.is_err(), "a hung attempt must fail, not hang");
+        assert!(
+            started.elapsed() < budget + Duration::from_millis(150),
+            "gave up after {:?}, budget was {budget:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_budget_stops_retrying_slow_timeouts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Each attempt burns time before failing with a timeout: retrying all
+        // four of them (plus backoff) would blow far past the budget.
+        let budget = Duration::from_millis(200);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_clone = Arc::clone(&calls);
+        let started = std::time::Instant::now();
+        let result: RpcResult<u32> = retry_transient_within(budget, || {
+            let calls = Arc::clone(&calls_clone);
+            async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                Err::<u32, _>("request timeout".into())
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(
+            started.elapsed() < budget + Duration::from_millis(150),
+            "gave up after {:?}, budget was {budget:?}",
+            started.elapsed()
+        );
+        assert!(
+            calls.load(Ordering::SeqCst) < 4,
+            "budget must cut the retries short"
+        );
+    }
+
+    #[test]
+    fn production_budget_fits_the_full_refused_retry_schedule() {
+        // Refused connections fail in milliseconds; all four attempts and the
+        // 2.1s of backoff must still fit inside the budget.
+        let backoff: u64 = RETRY_BACKOFFS_MS.iter().sum();
+        assert!(Duration::from_millis(backoff) + Duration::from_millis(500) <= RETRY_BUDGET);
     }
 
     #[tokio::test]
