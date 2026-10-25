@@ -210,6 +210,25 @@ mod tests {
         assert_eq!(txid_from_tx_bytes(v4), sha256d(v4));
     }
 
+    /// The pinned zcash crates must be the releases that schedule NU7 on
+    /// mainnet (ZIP 259, Zebra 7.0.0), with the branch id the hint names. The
+    /// `-pre.0` prereleases left the mainnet height unset.
+    #[test]
+    fn pinned_protocol_crate_schedules_nu7_on_mainnet() {
+        use zcash_protocol::consensus::{
+            BlockHeight, MAIN_NETWORK, NetworkUpgrade, Parameters, TEST_NETWORK,
+        };
+        assert_eq!(
+            MAIN_NETWORK.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(3_543_405))
+        );
+        assert_eq!(
+            TEST_NETWORK.activation_height(NetworkUpgrade::Nu7),
+            Some(BlockHeight::from_u32(4_465_026))
+        );
+        assert_eq!(u32::from(TX_READER_BRANCH_HINT), 0x7719_0ad9);
+    }
+
     /// The branch hint handed to `Transaction::read` must not move any txid, so
     /// that pointing it at a new network upgrade is safe. Checks the reader
     /// directly rather than through `txid_from_tx_bytes`: that helper falls

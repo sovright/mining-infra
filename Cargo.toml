@@ -38,5 +38,5 @@ sha2 = "0.10"
 # not needed -- we only parse and hash, never verify proofs.
 # NU7 branch ID support is first published in these prereleases. Exact pins
 # prevent an unrelated prerelease update from changing the qualified parser.
-zcash_primitives = { version = "=0.31.0-pre.0", default-features = false, features = ["std"] }
-zcash_protocol = { version = "=0.11.0-pre.0", default-features = false }
+zcash_primitives = { version = "=0.31.0", default-features = false, features = ["std"] }
+zcash_protocol = { version = "=0.11.0", default-features = false }
