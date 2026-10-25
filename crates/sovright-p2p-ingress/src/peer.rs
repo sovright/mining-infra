@@ -603,10 +603,14 @@ mod tests {
     use std::fs;
 
     fn temp_log_path(name: &str) -> std::path::PathBuf {
+        // Tests run in parallel and several share a name, so pid and time alone
+        // collide and one test's cleanup can delete another's log mid-read.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = format!(
-            "sovright-p2p-peer-{name}-{}-{}.jsonl",
+            "sovright-p2p-peer-{name}-{}-{}-{}.jsonl",
             std::process::id(),
-            unix_time_secs()
+            unix_time_secs(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
         std::env::temp_dir().join(unique)
     }
