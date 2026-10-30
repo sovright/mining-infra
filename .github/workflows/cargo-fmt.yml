@@ -7,7 +7,7 @@ on:
 
 jobs:
   fmt:
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

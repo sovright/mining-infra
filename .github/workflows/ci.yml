@@ -4,14 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
-
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   test:
     name: Build and test
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -23,7 +22,7 @@ jobs:
 
   clippy:
     name: Clippy
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +41,7 @@ jobs:
     # finding a solution within the time budget — a slow runner should warn, not
     # block the PR.
     name: Tier-2 full-chain mining (non-blocking)
-    runs-on: ubuntu-latest
+    runs-on: tenki-standard-small-2c-4g
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
