@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{IngressError, Result};
+use zcash_equihash_validator::Target;
 
 pub const MAINNET_MAGIC: [u8; 4] = [0x24, 0xe9, 0x27, 0x64];
 
@@ -18,6 +19,14 @@ pub enum Network {
 }
 
 impl Network {
+    /// The easiest target a header on this network can state.
+    pub fn pow_limit(self) -> Target {
+        match self {
+            Self::Mainnet => Target::mainnet_pow_limit(),
+            Self::Testnet => Target::testnet_pow_limit(),
+        }
+    }
+
     pub fn magic(self) -> [u8; 4] {
         match self {
             Self::Mainnet => MAINNET_MAGIC,

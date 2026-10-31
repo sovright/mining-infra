@@ -18,6 +18,7 @@ pub use config::{AuthKey, ClientConfig, KeyRole, RelayConfig};
 pub use error::TransportError;
 pub use pow::{
     EQUIHASH_K, EQUIHASH_N, EQUIHASH_SOLUTION_SIZE, EquihashPowValidator, PowResult, PowValidator,
-    RejectAllValidator, StubPowValidator, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+    RejectAllValidator, StubPowValidator, TargetCheck, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE,
+    header_meets_stated_target,
 };
 pub use session::{BlockAssembly, RelaySession};

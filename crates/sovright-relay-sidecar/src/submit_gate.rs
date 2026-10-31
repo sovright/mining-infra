@@ -43,8 +43,11 @@
 //! All four decisions are independent and emit distinct rejection variants
 //! so metrics can attribute the cause precisely.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use crate::submit::SubmissionCandidate;
 
@@ -73,6 +76,8 @@ pub struct GateConfig {
     /// Maximum entries to retain in the dedup ring. Bounded so a flood does
     /// not exhaust memory. Default 256.
     pub dedup_capacity: usize,
+    /// Unverified attempts per block in a dedup window. Default 4.
+    pub unreadable_attempts_per_block: usize,
 }
 
 impl Default for GateConfig {
@@ -82,9 +87,16 @@ impl Default for GateConfig {
             allowed_below: 3,
             dedup_window: Duration::from_secs(300),
             dedup_capacity: 256,
+            unreadable_attempts_per_block: DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK,
         }
     }
 }
+
+/// How many unverified candidates one block can send to Zebra in a dedup window by
+/// default. Each holds the gate through a Zebra call, so there has to be a limit. Four
+/// leaves room for the real body behind three others or a few failed calls. Anyone
+/// holding a real header can still use all of it.
+pub const DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK: usize = 4;
 
 /// Why the gate rejected a candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +109,8 @@ pub enum RejectReason {
     OutOfHeightWindow,
     /// Block hash was already accepted by the gate within the dedup window.
     DuplicateSubmit,
+    /// This block has used up its unverified attempts for the dedup window.
+    UnverifiedLimit,
 }
 
 impl RejectReason {
@@ -106,6 +120,7 @@ impl RejectReason {
             RejectReason::UnknownParent => "unknown_parent",
             RejectReason::OutOfHeightWindow => "out_of_height_window",
             RejectReason::DuplicateSubmit => "duplicate_submit",
+            RejectReason::UnverifiedLimit => "unverified_limit",
         }
     }
 }
@@ -139,6 +154,11 @@ impl DedupRing {
         self.entries.iter().any(|(h, _)| h == hash)
     }
 
+    fn count(&mut self, hash: &str, now: Instant) -> usize {
+        self.evict_expired(now);
+        self.entries.iter().filter(|(h, _)| h == hash).count()
+    }
+
     fn record(&mut self, hash: String, now: Instant) {
         self.evict_expired(now);
         if self.entries.len() == self.capacity {
@@ -158,20 +178,46 @@ impl DedupRing {
     }
 }
 
+/// Exact bodies waiting on Zebra without the gate lock.
+type UnverifiedBodies = Arc<Mutex<HashSet<[u8; 32]>>>;
+
+/// One unverified body at Zebra. The gate lock is not held through that call, so this
+/// keeps a concurrent copy of the same bytes out instead. Ending it any way, by an
+/// answer, an error, a timeout or cancellation, lets the next copy try.
+pub struct UnverifiedSlot {
+    in_flight: UnverifiedBodies,
+    body: [u8; 32],
+}
+
+impl Drop for UnverifiedSlot {
+    fn drop(&mut self) {
+        // This can run while unwinding, so a poisoned lock must not panic here.
+        self.in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.body);
+    }
+}
+
 /// The gate. Apply to a candidate before invoking `submit_block`.
 pub struct SubmitGate<V: ChainView> {
     config: GateConfig,
     chain: V,
     dedup: DedupRing,
+    unverified_attempts: DedupRing,
+    unverified_in_flight: UnverifiedBodies,
 }
 
 impl<V: ChainView> SubmitGate<V> {
     pub fn new(config: GateConfig, chain: V) -> Self {
         let dedup = DedupRing::new(config.dedup_capacity, config.dedup_window);
+        let unverified_attempts = DedupRing::new(config.dedup_capacity, config.dedup_window);
         Self {
             config,
             chain,
             dedup,
+            unverified_attempts,
+            unverified_in_flight: UnverifiedBodies::default(),
         }
     }
 
@@ -197,18 +243,105 @@ impl<V: ChainView> SubmitGate<V> {
         if !self.config.enabled {
             return GateDecision::Accept;
         }
+        if let Some(reason) = self.chain_rejection(candidate, meta) {
+            return GateDecision::Reject(reason);
+        }
 
+        // (4) Hash dedup — and record on accept
+        if self.dedup.contains(&candidate.block_hash, now) {
+            return GateDecision::Reject(RejectReason::DuplicateSubmit);
+        }
+        self.dedup.record(candidate.block_hash.clone(), now);
+
+        // Only accepted candidates are logged, so each line is a block the
+        // polled window alone would have rejected.
+        let polled_tip = self.chain.tip_height();
+        if meta.height > polled_tip.saturating_add(1) {
+            tracing::info!(
+                consensus_block_hash = %candidate.consensus_block_hash,
+                height = meta.height,
+                polled_tip,
+                observed_tip = ?meta.observed_tip,
+                parent_confirmations = ?meta.parent_confirmations,
+                "submit gate: upper bound passed on parent best-chain evidence"
+            );
+        }
+        GateDecision::Accept
+    }
+
+    /// [`Self::apply_at`] for a candidate the strict reader could not read. Only
+    /// Zebra can say whether this body is the block, so this reserves an attempt and
+    /// records nothing: a forged body must not hide the real one. The caller then lets
+    /// go of the gate for the Zebra call, and calls [`Self::record_submitted_now`] if
+    /// Zebra has the block. A different body of the same block may run alongside this
+    /// one, since it may be the real one; the same bytes wait for this answer.
+    pub fn reserve_unverified_now(
+        &mut self,
+        candidate: &SubmissionCandidate,
+        meta: &CandidateMeta,
+    ) -> Result<UnverifiedSlot, RejectReason> {
+        self.reserve_unverified_at(candidate, meta, Instant::now())
+    }
+
+    pub fn reserve_unverified_at(
+        &mut self,
+        candidate: &SubmissionCandidate,
+        meta: &CandidateMeta,
+        now: Instant,
+    ) -> Result<UnverifiedSlot, RejectReason> {
+        if self.config.enabled {
+            if let Some(reason) = self.chain_rejection(candidate, meta) {
+                return Err(reason);
+            }
+            if self.dedup.contains(&candidate.block_hash, now) {
+                return Err(RejectReason::DuplicateSubmit);
+            }
+        }
+        let body: [u8; 32] = Sha256::digest(candidate.block_hex.as_bytes()).into();
+        let mut in_flight = self
+            .unverified_in_flight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if in_flight.contains(&body) {
+            return Err(RejectReason::DuplicateSubmit);
+        }
+        if self.config.enabled {
+            let attempts = self.unverified_attempts.count(&candidate.block_hash, now);
+            if attempts >= self.config.unreadable_attempts_per_block {
+                return Err(RejectReason::UnverifiedLimit);
+            }
+            self.unverified_attempts
+                .record(candidate.block_hash.clone(), now);
+        }
+        in_flight.insert(body);
+        Ok(UnverifiedSlot {
+            in_flight: Arc::clone(&self.unverified_in_flight),
+            body,
+        })
+    }
+
+    /// Zebra took this block or already had it, so later copies are duplicates.
+    pub fn record_submitted_now(&mut self, candidate: &SubmissionCandidate) {
+        self.dedup
+            .record(candidate.block_hash.clone(), Instant::now());
+    }
+
+    fn chain_rejection(
+        &self,
+        candidate: &SubmissionCandidate,
+        meta: &CandidateMeta,
+    ) -> Option<RejectReason> {
         // (1) Header mutation — the candidate's header must still hash to the
         //     block hash recorded at construction. This is a mutation guard, not
         //     a PoW check; PoW is verified in the transport before the block
         //     enters the mesh.
         if !meta.header_hash_matches(&candidate.block_hash) {
-            return GateDecision::Reject(RejectReason::HeaderMutated);
+            return Some(RejectReason::HeaderMutated);
         }
 
         // (2) Parent-known
         if !self.chain.parent_known(&meta.parent_hash) {
-            return GateDecision::Reject(RejectReason::UnknownParent);
+            return Some(RejectReason::UnknownParent);
         }
 
         // (3) Height window. The tip is polled and can lag behind the node,
@@ -223,28 +356,9 @@ impl<V: ChainView> SubmitGate<V> {
         let lower = tip.saturating_sub(self.config.allowed_below);
         let upper = tip.saturating_add(1);
         if meta.height < lower || meta.height > upper {
-            return GateDecision::Reject(RejectReason::OutOfHeightWindow);
+            return Some(RejectReason::OutOfHeightWindow);
         }
-
-        // (4) Hash dedup — and record on accept
-        if self.dedup.contains(&candidate.block_hash, now) {
-            return GateDecision::Reject(RejectReason::DuplicateSubmit);
-        }
-        self.dedup.record(candidate.block_hash.clone(), now);
-
-        // Only accepted candidates are logged, so each line is a block the
-        // polled window alone would have rejected.
-        if meta.height > polled_tip.saturating_add(1) {
-            tracing::info!(
-                consensus_block_hash = %candidate.consensus_block_hash,
-                height = meta.height,
-                polled_tip,
-                observed_tip = ?meta.observed_tip,
-                parent_confirmations = ?meta.parent_confirmations,
-                "submit gate: upper bound passed on parent best-chain evidence"
-            );
-        }
-        GateDecision::Accept
+        None
     }
 }
 
@@ -409,10 +523,38 @@ mod tests {
         }
     }
 
+    /// An attempt counts whatever Zebra answered, and ends with the dedup window.
+    #[test]
+    fn unverified_attempts_refresh_when_the_window_ends_and_not_before() {
+        let window = Duration::from_secs(300);
+        let mut gate = SubmitGate::new(
+            GateConfig {
+                dedup_window: window,
+                unreadable_attempts_per_block: 2,
+                ..enabled_config()
+            },
+            chain(100, vec![[1u8; 32]]),
+        );
+        let candidate = candidate("aa");
+        let meta = meta(100, [1u8; 32], "aa");
+        let start = Instant::now();
+        assert!(gate.reserve_unverified_at(&candidate, &meta, start).is_ok());
+        assert!(gate.reserve_unverified_at(&candidate, &meta, start).is_ok());
+
+        assert_eq!(
+            gate.reserve_unverified_at(&candidate, &meta, start + window)
+                .err(),
+            Some(RejectReason::UnverifiedLimit)
+        );
+        let later = start + window + Duration::from_millis(1);
+        assert!(gate.reserve_unverified_at(&candidate, &meta, later).is_ok());
+    }
+
     fn candidate(hash: &str) -> SubmissionCandidate {
         SubmissionCandidate {
             block_hash: hash.to_string(),
             consensus_block_hash: hash.to_string(),
+            unverified: None,
             block_hex: "ff".to_string(),
             tx_count: 1,
             block_bytes: 1,
@@ -472,6 +614,7 @@ mod tests {
             allowed_below: 3,
             dedup_window: Duration::from_secs(60),
             dedup_capacity: 8,
+            unreadable_attempts_per_block: DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK,
         }
     }
 

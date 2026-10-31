@@ -2,7 +2,7 @@
 
 use sovright_relay::{
     AuthDigest, BlockHash, BlockTxn, CompactBlockBuilder, CompactBlockReconstructor, GetBlockTxn,
-    ReconstructionResult, TestMempool, TxId, WtxId, zcash_block_hash,
+    ReconstructionResult, TestMempool, TxId, WtxId, ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
 };
 
 fn make_wtxid(seed: u8) -> WtxId {
@@ -24,13 +24,17 @@ fn full_round_trip_synchronized_mempools() {
 
     let coinbase = make_wtxid(0);
     let txs: Vec<_> = (1..=10).map(make_wtxid).collect();
-    let tx_data: Vec<Vec<u8>> = (0..=10).map(|i| vec![i as u8; 100]).collect();
+    // Version 1, nothing in it, the lock time telling them apart: the smallest
+    // transaction the reader accepts.
+    let tx_data: Vec<Vec<u8>> = (0..=10u8)
+        .map(|i| [1, 0, 0, 0, 0, 0, i, 0, 0, 0].to_vec())
+        .collect();
 
     // Reconstruction verifies the header's merkle commitment, so the header
     // must commit to this transaction set; filler bytes would be rejected
     // before the round trip under test could run.
     let header = {
-        let mut h = vec![0xab; 2189];
+        let mut h = vec![0xab; ZCASH_FULL_HEADER_SIZE];
         let txids: Vec<[u8; 32]> = tx_data
             .iter()
             .map(|t| sovright_relay::txid_from_tx_bytes(t))
@@ -83,6 +87,7 @@ fn full_round_trip_synchronized_mempools() {
         ReconstructionResult::Invalid { reason } => {
             panic!("Unexpected invalid reconstruction: {}", reason);
         }
+        ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
         _ => panic!("Expected complete reconstruction"),
     }
 }
@@ -155,6 +160,7 @@ fn round_trip_with_missing_transactions() {
         ReconstructionResult::Invalid { reason } => {
             panic!("Unexpected invalid reconstruction: {}", reason);
         }
+        ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
         _ => panic!("Expected incomplete reconstruction"),
     };
 

@@ -5,6 +5,7 @@ pub mod compact;
 pub mod config;
 pub mod dual_submit;
 pub mod mempool_sync;
+pub mod metrics_textfile;
 pub mod rpc;
 pub mod submit;
 pub mod submit_gate;

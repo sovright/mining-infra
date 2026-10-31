@@ -14,42 +14,96 @@
 //! outputs are protocol funding streams (dev fund / funding streams).
 //!
 //! This is best-effort telemetry: ANY failure (short payload, unparseable tx,
-//! no transparent outputs) returns `None` and MUST NEVER fail or slow the
+//! no transparent outputs) leaves a field `None` and MUST NEVER fail or slow the
 //! block-relay path.
+//!
+//! A coinbase is whatever the peer sent, and reading one can cost as much as
+//! reading a block, so none of this runs on an async worker. With a relay bridge
+//! the fields come from the coinbase the strict reader already read while
+//! preparing the forward, so a body that fails validation has none, and neither
+//! does a copy of a known block, which is not read at all. Without a bridge,
+//! [`coinbase_telemetry_off_workers`] reads it, one block at a time. Either way
+//! they arrive after `p2p_block_received`, on a `p2p_block_coinbase` line.
 
 use std::io::Cursor;
 
 use sovright_relay::ZCASH_FULL_HEADER_SIZE;
+use tokio::sync::Semaphore;
+use tracing::warn;
 
+use crate::relay_bridge::run_holding_permit;
 use crate::wire::decode_compact_size;
 use crate::wtxid::TX_READER_BRANCH_HINT;
 use zcash_primitives::transaction::Transaction;
 
-/// Parse the coinbase of a raw Zcash block payload and return the hex-encoded
-/// `scriptPubKey` of its largest-value transparent output (the miner payout).
-///
-/// Returns `None` on any failure: payload shorter than the header, unreadable
-/// tx count, coinbase that will not parse, or a coinbase with no transparent
-/// outputs. Never panics.
-pub(crate) fn coinbase_miner_script(block_payload: &[u8]) -> Option<String> {
-    // Skip the block header, then read the transaction count. The coinbase is
-    // the first transaction immediately after the count.
+/// Coinbases read at once for sessions with no relay bridge. Peer tasks each wait
+/// for their own delivery, so `max_peers` limits how many queue here.
+static OBSERVATION_PERMITS: Semaphore = Semaphore::const_new(1);
+
+/// What a block's coinbase says about who mined it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CoinbaseTelemetry {
+    pub(crate) miner_script: Option<String>,
+    pub(crate) miner_tag: Option<String>,
+}
+
+impl CoinbaseTelemetry {
+    pub(crate) fn of(coinbase: &Transaction) -> Self {
+        Self {
+            miner_script: miner_script(coinbase),
+            miner_tag: miner_tag(coinbase),
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.miner_script.is_none() && self.miner_tag.is_none()
+    }
+}
+
+/// Read the first transaction of a raw block payload. `Transaction::read` reads
+/// exactly ONE transaction and stops, so handing it the rest of the block after
+/// the header is fine. The branch id is ignored for the transparent portion read
+/// here. `None` on any failure: payload shorter than the header, unreadable tx
+/// count, or a coinbase that will not parse. Never panics.
+fn read_coinbase(block_payload: &[u8]) -> Option<Transaction> {
     let mut cursor = ZCASH_FULL_HEADER_SIZE;
     let tx_count = decode_compact_size(block_payload, &mut cursor).ok()?;
     if tx_count == 0 {
         return None;
     }
     let coinbase_bytes = block_payload.get(cursor..)?;
+    Transaction::read(&mut Cursor::new(coinbase_bytes), TX_READER_BRANCH_HINT).ok()
+}
 
-    // `Transaction::read` reads exactly ONE transaction (the coinbase) and
-    // stops, so handing it the rest of the block after the header is fine. The
-    // branch id is ignored for the transparent portion we read here.
-    let mut reader = Cursor::new(coinbase_bytes);
-    let tx = Transaction::read(&mut reader, TX_READER_BRANCH_HINT).ok()?;
+fn coinbase_telemetry(block_payload: &[u8]) -> CoinbaseTelemetry {
+    read_coinbase(block_payload)
+        .as_ref()
+        .map(CoinbaseTelemetry::of)
+        .unwrap_or_default()
+}
 
+/// [`CoinbaseTelemetry`] for a block no forward will parse, off the async workers.
+/// The permit stays with the read until it ends, even if the caller is cancelled.
+pub(crate) async fn coinbase_telemetry_off_workers(block_payload: &[u8]) -> CoinbaseTelemetry {
+    let Ok(permit) = OBSERVATION_PERMITS.acquire().await else {
+        return CoinbaseTelemetry::default();
+    };
+    let block = block_payload.to_vec();
+    match run_holding_permit(permit, move || coinbase_telemetry(&block)).await {
+        Ok((telemetry, _permit)) => telemetry,
+        Err(error) => {
+            warn!(%error, "Coinbase telemetry read did not finish");
+            CoinbaseTelemetry::default()
+        }
+    }
+}
+
+/// The hex-encoded `scriptPubKey` of a coinbase's largest-value transparent
+/// output (the miner payout). `None` for a coinbase with no transparent outputs.
+fn miner_script(coinbase: &Transaction) -> Option<String> {
     // The miner payout is the largest-value transparent output. Smaller outputs
     // are protocol funding streams.
-    let bundle = tx.transparent_bundle()?;
+    let bundle = coinbase.transparent_bundle()?;
     let miner_out = bundle.vout.iter().max_by_key(|out| out.value())?;
     Some(hex::encode(&miner_out.script_pubkey().0.0))
 }
@@ -74,17 +128,8 @@ pub(crate) const MAX_COINBASE_TEXT: usize = 64;
 ///
 /// Returns `None` on any failure and on a script with no printable bytes. Never
 /// panics: this is best-effort telemetry on the block-relay hot path.
-pub(crate) fn coinbase_text(block_payload: &[u8]) -> Option<String> {
-    let mut cursor = ZCASH_FULL_HEADER_SIZE;
-    let tx_count = decode_compact_size(block_payload, &mut cursor).ok()?;
-    if tx_count == 0 {
-        return None;
-    }
-    let coinbase_bytes = block_payload.get(cursor..)?;
-    let mut reader = Cursor::new(coinbase_bytes);
-    let tx = Transaction::read(&mut reader, TX_READER_BRANCH_HINT).ok()?;
-
-    let bundle = tx.transparent_bundle()?;
+fn miner_tag(coinbase: &Transaction) -> Option<String> {
+    let bundle = coinbase.transparent_bundle()?;
     let input = bundle.vin.first()?;
     // NB: the `script_sig` FIELD is #[deprecated] in zcash_transparent 0.9.0
     // (bundle.rs:229); the accessor is not. Task 9 runs clippy with -D warnings,
@@ -124,8 +169,32 @@ pub(crate) fn coinbase_text(block_payload: &[u8]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    fn coinbase_miner_script(block_payload: &[u8]) -> Option<String> {
+        coinbase_telemetry(block_payload).miner_script
+    }
+
+    fn coinbase_text(block_payload: &[u8]) -> Option<String> {
+        coinbase_telemetry(block_payload).miner_tag
+    }
+
+    #[tokio::test]
+    async fn the_off_worker_read_gives_the_same_answer() {
+        let block = zcash_pool_common::fixtures::mainnet_raw_block();
+        let telemetry = coinbase_telemetry_off_workers(&block).await;
+        assert!(telemetry.miner_script.is_some());
+        assert_eq!(telemetry, coinbase_telemetry(&block));
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_coinbase_gives_empty_telemetry_off_the_workers() {
+        assert_eq!(
+            coinbase_telemetry_off_workers(&[0u8; 10]).await,
+            CoinbaseTelemetry::default()
+        );
+    }
     use crate::wire::encode_compact_size;
 
     const OVERWINTERED_FLAG: u32 = 1 << 31;
@@ -240,7 +309,7 @@ mod tests {
     /// A minimal valid v5 coinbase whose single input carries `script_sig`.
     /// Same shape as `v5_coinbase_two_outputs`, but the input script -- where a
     /// pool stamps its tag -- is caller-supplied instead of fixed filler.
-    fn v5_coinbase_with_script_sig(script_sig: &[u8]) -> Vec<u8> {
+    pub(crate) fn v5_coinbase_with_script_sig(script_sig: &[u8]) -> Vec<u8> {
         let mut tx = Vec::new();
         tx.extend_from_slice(&(OVERWINTERED_FLAG | 5).to_le_bytes());
         tx.extend_from_slice(&TX_V5_VERSION_GROUP_ID.to_le_bytes());

@@ -1,4 +1,8 @@
-use sovright_relay::{CompactBlock, PrefilledTx, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE};
+use std::ops::Range;
+
+use sovright_relay::{
+    CompactBlock, ParsedBlockBody, PrefilledTx, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE,
+};
 
 use crate::error::{IngressError, Result};
 use crate::tx_cache::TxCache;
@@ -26,20 +30,24 @@ const SAPLING_OUTPUT_SIZE: usize = SAPLING_OUTPUT_PREFIX_SIZE + 192;
 const ORCHARD_ACTION_SIZE: usize = 5 * 32 + 580 + 80;
 const REDDSA_SIGNATURE_SIZE: usize = 64;
 
-pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<CompactBlock> {
-    compact_block_from_raw_block_with_resolver(block_payload, |_| None)
+/// The compact block for a body the reader accepted. Everything comes from
+/// `parsed`, so there is no second payload to pair its boundaries with.
+pub(crate) fn compact_block_from_parsed(parsed: &ParsedBlockBody) -> Result<CompactBlock> {
+    compact_block_from_transactions(parsed.header(), parsed.transactions(), |_| None)
 }
 
-pub(crate) fn compact_block_from_raw_block_with_tx_cache(
-    block_payload: &[u8],
+pub(crate) fn compact_block_from_parsed_with_tx_cache(
+    parsed: &ParsedBlockBody,
     tx_cache: &TxCache,
 ) -> Result<CompactBlock> {
-    compact_block_from_raw_block_with_resolver(block_payload, |tx_payload| {
-        tx_cache.wtxid_for_payload(tx_payload)
-    })
+    compact_block_from_transactions(
+        parsed.header(),
+        parsed.transactions(),
+        cached_wtxid(tx_cache),
+    )
 }
 
-/// Build the compact *skeleton* for a raw block: the coinbase prefilled, and a
+/// Build the compact *skeleton* for a parsed block: the coinbase prefilled, and a
 /// short_id for every non-coinbase transaction the origin can resolve to a
 /// wtxid, so each receiver resolves those short_ids against its OWN mempool.
 ///
@@ -65,53 +73,115 @@ pub(crate) fn compact_block_from_raw_block_with_tx_cache(
 /// This is, by construction, the maximally short-id'd tx-cache compaction. It
 /// is named and documented separately because it is the *fast-path* object: it
 /// is sent first and with heavier FEC parity, ahead of the full compact block.
+pub(crate) fn skeleton_compact_block_from_parsed(
+    parsed: &ParsedBlockBody,
+    tx_cache: &TxCache,
+) -> Result<CompactBlock> {
+    compact_block_from_transactions(
+        parsed.header(),
+        parsed.transactions(),
+        skeleton_wtxid(tx_cache),
+    )
+}
+
+/// The block parser's compact block. It is the pool gateway's structural check;
+/// relay forwarding cuts along the reader's boundaries instead.
+pub(crate) fn compact_block_from_raw_block(block_payload: &[u8]) -> Result<CompactBlock> {
+    compact_block_from_block_parser(block_payload, |_| None)
+}
+
+#[cfg(test)]
+pub(crate) fn compact_block_from_raw_block_with_tx_cache(
+    block_payload: &[u8],
+    tx_cache: &TxCache,
+) -> Result<CompactBlock> {
+    compact_block_from_block_parser(block_payload, cached_wtxid(tx_cache))
+}
+
+#[cfg(test)]
 pub(crate) fn skeleton_compact_block_from_raw_block(
     block_payload: &[u8],
     tx_cache: &TxCache,
 ) -> Result<CompactBlock> {
-    compact_block_from_raw_block_with_resolver(block_payload, |tx_payload| {
+    compact_block_from_block_parser(block_payload, skeleton_wtxid(tx_cache))
+}
+
+/// Reconstruct `compact` against `receiver`'s mempool and serialize the block.
+#[cfg(test)]
+pub(crate) fn reconstruct_block(compact: &CompactBlock, receiver: &TxCache) -> Vec<u8> {
+    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
+
+    let mut reconstructor = CompactBlockReconstructor::new(receiver);
+    reconstructor.prepare(
+        &sovright_relay::zcash_block_hash(&compact.header),
+        compact.nonce,
+    );
+    let ReconstructionResult::Complete { transactions } = reconstructor.reconstruct(compact) else {
+        panic!("reconstruction did not complete");
+    };
+    let mut block = compact.header.clone();
+    crate::wire::encode_compact_size(transactions.len() as u64, &mut block);
+    transactions
+        .iter()
+        .for_each(|tx| block.extend_from_slice(tx));
+    block
+}
+
+fn cached_wtxid(tx_cache: &TxCache) -> impl FnMut(&[u8]) -> Option<WtxId> {
+    |tx_payload| tx_cache.wtxid_for_payload(tx_payload)
+}
+
+fn skeleton_wtxid(tx_cache: &TxCache) -> impl FnMut(&[u8]) -> Option<WtxId> {
+    |tx_payload| {
         tx_cache
             .wtxid_for_payload(tx_payload)
             .or_else(|| wtxid_from_tx_bytes(tx_payload, TX_READER_BRANCH_HINT))
-    })
+    }
 }
 
-fn compact_block_from_raw_block_with_resolver<F>(
-    block_payload: &[u8],
-    mut resolve_wtxid: F,
-) -> Result<CompactBlock>
-where
-    F: FnMut(&[u8]) -> Option<WtxId>,
-{
-    let header = block_payload
-        .get(..ZCASH_FULL_HEADER_SIZE)
-        .ok_or_else(|| IngressError::Wire("block payload shorter than Zcash header".to_string()))?
-        .to_vec();
-
-    let mut cursor = ZCASH_FULL_HEADER_SIZE;
-    let tx_count = decode_compact_size(block_payload, &mut cursor)?;
-    if tx_count == 0 {
-        return Err(IngressError::Wire(
-            "block payload has no transactions".to_string(),
-        ));
-    }
+fn check_prefilled_index_range(tx_count: u64) -> Result<()> {
     if tx_count > u16::MAX as u64 + 1 {
         return Err(IngressError::Wire(format!(
             "too many transactions for relay prefilled indices: {tx_count}"
         )));
     }
+    Ok(())
+}
 
+fn compact_block_from_block_parser<F>(
+    block_payload: &[u8],
+    resolve_wtxid: F,
+) -> Result<CompactBlock>
+where
+    F: FnMut(&[u8]) -> Option<WtxId>,
+{
+    let boundaries = transaction_boundaries(block_payload)?;
+    compact_block_from_transactions(
+        &block_payload[..ZCASH_FULL_HEADER_SIZE],
+        boundaries
+            .iter()
+            .map(|boundary| &block_payload[boundary.clone()]),
+        resolve_wtxid,
+    )
+}
+
+fn compact_block_from_transactions<'a, F>(
+    header: &[u8],
+    transactions: impl ExactSizeIterator<Item = &'a [u8]>,
+    mut resolve_wtxid: F,
+) -> Result<CompactBlock>
+where
+    F: FnMut(&[u8]) -> Option<WtxId>,
+{
+    check_prefilled_index_range(transactions.len() as u64)?;
+
+    let header = header.to_vec();
     let header_hash = sovright_relay::zcash_block_hash(&header);
     let nonce = 0;
     let mut short_ids = Vec::new();
-    let mut prefilled_txs = Vec::with_capacity(tx_count as usize);
+    let mut prefilled_txs = Vec::with_capacity(transactions.len());
     let mut last_prefilled_index: i64 = -1;
-    for index in 0..tx_count {
-        let start = cursor;
-        skip_transaction(block_payload, &mut cursor)?;
-        let tx_data = block_payload
-            .get(start..cursor)
-            .ok_or_else(|| IngressError::Wire("transaction cursor escaped block".to_string()))?;
+    for (index, tx_data) in transactions.enumerate() {
         if index > 0
             && let Some(wtxid) = resolve_wtxid(tx_data)
         {
@@ -126,6 +196,33 @@ where
         last_prefilled_index = index as i64;
     }
 
+    Ok(CompactBlock::new(header, nonce, short_ids, prefilled_txs))
+}
+
+/// Where the block parser finds each transaction.
+fn transaction_boundaries(block_payload: &[u8]) -> Result<Vec<Range<usize>>> {
+    if block_payload.len() < ZCASH_FULL_HEADER_SIZE {
+        return Err(IngressError::Wire(
+            "block payload shorter than Zcash header".to_string(),
+        ));
+    }
+
+    let mut cursor = ZCASH_FULL_HEADER_SIZE;
+    let tx_count = decode_compact_size(block_payload, &mut cursor)?;
+    if tx_count == 0 {
+        return Err(IngressError::Wire(
+            "block payload has no transactions".to_string(),
+        ));
+    }
+    check_prefilled_index_range(tx_count)?;
+
+    let mut boundaries = Vec::with_capacity(tx_count as usize);
+    for _ in 0..tx_count {
+        let start = cursor;
+        skip_transaction(block_payload, &mut cursor)?;
+        boundaries.push(start..cursor);
+    }
+
     if cursor != block_payload.len() {
         return Err(IngressError::Wire(format!(
             "trailing bytes after block transactions: {}",
@@ -133,7 +230,7 @@ where
         )));
     }
 
-    Ok(CompactBlock::new(header, nonce, short_ids, prefilled_txs))
+    Ok(boundaries)
 }
 
 fn skip_transaction(payload: &[u8], cursor: &mut usize) -> Result<()> {
@@ -634,6 +731,7 @@ mod tests {
             ReconstructionResult::Invalid { reason } => {
                 panic!("unexpected invalid compact block: {reason}");
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
         }
     }
 
@@ -875,7 +973,7 @@ mod tests {
 mod real_block_round_trip {
     use super::*;
     use crate::tx_cache::TxCacheConfig;
-    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
+    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult, parse_block_body};
 
     /// Mainnet block 3470793: header on line 1, then its 7 transactions in
     /// block order. Five are v6 (ZIP-229, NU6.3) and two are v4. Loaded from
@@ -923,7 +1021,8 @@ mod real_block_round_trip {
             }
         }
 
-        let compact = compact_block_from_raw_block_with_tx_cache(&block, &cache).unwrap();
+        let parsed = parse_block_body(block.clone()).unwrap();
+        let compact = compact_block_from_parsed_with_tx_cache(&parsed, &cache).unwrap();
         assert_eq!(compact.tx_count(), txs.len());
 
         let header_hash = sovright_relay::zcash_block_hash(&header);
@@ -937,6 +1036,7 @@ mod real_block_round_trip {
             ReconstructionResult::Invalid { reason } => {
                 panic!("real block failed reconstruction: {reason}");
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Incomplete {
                 missing_wtxids,
                 unresolved_short_ids,
@@ -967,7 +1067,8 @@ mod real_block_round_trip {
             max_bytes: 1 << 20,
             max_tx_bytes: 1 << 16,
         });
-        let skeleton = skeleton_compact_block_from_raw_block(&block, &origin).unwrap();
+        let parsed = parse_block_body(block.clone()).unwrap();
+        let skeleton = skeleton_compact_block_from_parsed(&parsed, &origin).unwrap();
 
         // Receiver holds every transaction the origin could short_id.
         let receiver = TxCache::new(TxCacheConfig {
@@ -995,6 +1096,7 @@ mod real_block_round_trip {
             ReconstructionResult::Invalid { reason } => {
                 panic!("real block failed skeleton reconstruction: {reason}");
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Incomplete {
                 missing_wtxids,
                 unresolved_short_ids,
@@ -1017,7 +1119,7 @@ mod real_nu7_activation {
     use super::*;
     use crate::tx_cache::TxCacheConfig;
     use sha2::{Digest, Sha256};
-    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult};
+    use sovright_relay::{CompactBlockReconstructor, ReconstructionResult, parse_block_body};
     use sovright_relay_sidecar::mempool_sync::wtxid_from_display_hex;
     use zcash_protocol::consensus::BranchId;
 
@@ -1046,7 +1148,8 @@ mod real_nu7_activation {
     #[test]
     fn real_nu7_v5_and_ironwood_v6_match_both_node_digest_oracles() {
         let (block, metadata) = fixture();
-        let compact = compact_block_from_raw_block(&block).unwrap();
+        let parsed = parse_block_body(block.clone()).unwrap();
+        let compact = compact_block_from_parsed(&parsed).unwrap();
         assert_eq!(compact.prefilled_txs.len(), 2);
         assert_eq!(
             metadata["transactions"].as_array().unwrap().len(),
@@ -1109,10 +1212,11 @@ mod real_nu7_activation {
     #[test]
     fn real_nu7_full_compact_and_skeleton_reconstruct_exact_block_bytes() {
         let (block, _) = fixture();
-        let full = compact_block_from_raw_block(&block).unwrap();
+        let parsed = parse_block_body(block.clone()).unwrap();
+        let full = compact_block_from_parsed(&parsed).unwrap();
         let receiver = cache();
         assert_exact_reconstruction(&full, &receiver, &block);
-        let skeleton = skeleton_compact_block_from_raw_block(&block, &cache()).unwrap();
+        let skeleton = skeleton_compact_block_from_parsed(&parsed, &cache()).unwrap();
         assert_eq!(skeleton.prefilled_txs.len(), 1);
         assert_eq!(skeleton.short_ids.len(), 1);
         let mut missing = CompactBlockReconstructor::new(&receiver);
@@ -1129,8 +1233,187 @@ mod real_nu7_activation {
             tx.clone(),
         );
         assert_exact_reconstruction(&skeleton, &receiver, &block);
-        let cached = compact_block_from_raw_block_with_tx_cache(&block, &receiver).unwrap();
+        let cached = compact_block_from_parsed_with_tx_cache(&parsed, &receiver).unwrap();
         assert_eq!(cached.short_ids.len(), 1);
         assert_exact_reconstruction(&cached, &receiver, &block);
+    }
+}
+
+/// Forwarding cuts along the reader's boundaries. Two real blocks pin that this
+/// changes nothing on the wire: the block parser, still the gateway's check, is
+/// the oracle.
+#[cfg(test)]
+mod reader_boundaries {
+    use super::*;
+    use crate::tx_cache::TxCacheConfig;
+    use sovright_relay::{
+        BlockBodyError, BlockChunker, parse_block_body, validate_block_transactions,
+    };
+
+    // The builders take the parsed block and nothing else of the block, so its
+    // boundaries cannot meet another block's bytes. A signature that brings a
+    // second payload back stops compiling here.
+    const _: fn(&ParsedBlockBody) -> Result<CompactBlock> = compact_block_from_parsed;
+    const _: fn(&ParsedBlockBody, &TxCache) -> Result<CompactBlock> =
+        compact_block_from_parsed_with_tx_cache;
+    const _: fn(&ParsedBlockBody, &TxCache) -> Result<CompactBlock> =
+        skeleton_compact_block_from_parsed;
+
+    fn real_blocks() -> [Vec<u8>; 2] {
+        [
+            zcash_pool_common::fixtures::mainnet_raw_block(),
+            hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap(),
+        ]
+    }
+
+    /// Block position and wtxid of each non-coinbase transaction that has one.
+    fn resolvable(parsed: &ParsedBlockBody) -> Vec<(usize, WtxId)> {
+        parsed
+            .transactions()
+            .enumerate()
+            .skip(1)
+            .filter_map(|(position, tx)| {
+                wtxid_from_tx_bytes(tx, TX_READER_BRANCH_HINT).map(|wtxid| (position, wtxid))
+            })
+            .collect()
+    }
+
+    /// A cache holding the first `count` resolvable transactions.
+    fn cache_holding(parsed: &ParsedBlockBody, count: usize) -> TxCache {
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 64,
+            max_bytes: 1 << 20,
+            max_tx_bytes: 1 << 16,
+        });
+        let transactions: Vec<&[u8]> = parsed.transactions().collect();
+        for (position, wtxid) in resolvable(parsed).into_iter().take(count) {
+            cache.insert(wtxid, transactions[position].to_vec());
+        }
+        cache
+    }
+
+    #[test]
+    fn the_same_bytes_go_on_the_wire_as_with_the_block_parser() {
+        let wire = |compact: Result<CompactBlock>| {
+            BlockChunker::serialize_compact_block(&compact.unwrap())
+        };
+        for raw in real_blocks() {
+            let parsed = parse_block_body(raw.clone()).unwrap();
+            assert_eq!(
+                wire(compact_block_from_parsed(&parsed)),
+                wire(compact_block_from_raw_block(&raw))
+            );
+            let all = resolvable(&parsed).len();
+            for cached in [0, 1, all] {
+                let cache = cache_holding(&parsed, cached);
+                assert_eq!(
+                    wire(compact_block_from_parsed_with_tx_cache(&parsed, &cache)),
+                    wire(compact_block_from_raw_block_with_tx_cache(&raw, &cache)),
+                    "compact, {cached} cached"
+                );
+                assert_eq!(
+                    wire(skeleton_compact_block_from_parsed(&parsed, &cache)),
+                    wire(skeleton_compact_block_from_raw_block(&raw, &cache)),
+                    "skeleton, {cached} cached"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn slices_and_short_ids_keep_block_order_at_every_cache_level() {
+        for raw in real_blocks() {
+            let parsed = parse_block_body(raw.clone()).unwrap();
+            let transactions: Vec<&[u8]> = parsed.transactions().collect();
+            let resolvable = resolvable(&parsed);
+            let receiver = cache_holding(&parsed, resolvable.len());
+            let header_hash = sovright_relay::zcash_block_hash(parsed.header());
+
+            for cached in [0, 1, resolvable.len()] {
+                let origin = cache_holding(&parsed, cached);
+                let compact = compact_block_from_parsed_with_tx_cache(&parsed, &origin).unwrap();
+
+                let (short_id_slots, short_ids): (Vec<usize>, Vec<ShortId>) = resolvable[..cached]
+                    .iter()
+                    .map(|(position, wtxid)| {
+                        (
+                            *position,
+                            ShortId::compute(wtxid, &header_hash, compact.nonce),
+                        )
+                    })
+                    .unzip();
+                assert_eq!(compact.short_ids, short_ids);
+
+                let mut slots =
+                    (0..transactions.len()).filter(|slot| !short_id_slots.contains(slot));
+                let mut next_position = 0;
+                for prefilled in &compact.prefilled_txs {
+                    let position = next_position + usize::from(prefilled.index);
+                    assert_eq!(Some(position), slots.next());
+                    assert_eq!(prefilled.tx_data, transactions[position]);
+                    next_position = position + 1;
+                }
+                assert_eq!(slots.next(), None);
+
+                assert_eq!(reconstruct_block(&compact, &receiver), raw);
+            }
+        }
+    }
+
+    /// With nothing cached, v5 and v6 fall back to a short_id from their own
+    /// bytes. A v4 transaction has no wtxid, so it falls back to a prefill.
+    #[test]
+    fn the_skeleton_falls_back_to_the_bytes_and_then_to_a_prefill() {
+        for raw in real_blocks() {
+            let parsed = parse_block_body(raw.clone()).unwrap();
+            let resolvable = resolvable(&parsed);
+            let skeleton =
+                skeleton_compact_block_from_parsed(&parsed, &cache_holding(&parsed, 0)).unwrap();
+
+            assert_eq!(skeleton.short_ids.len(), resolvable.len());
+            assert_eq!(
+                skeleton.prefilled_txs.len(),
+                parsed.transactions().len() - resolvable.len()
+            );
+            let receiver = cache_holding(&parsed, resolvable.len());
+            assert_eq!(reconstruct_block(&skeleton, &receiver), raw);
+        }
+    }
+
+    /// Moving a boundary keeps the count and the joined bytes, so neither shows
+    /// the slices are right. Only checking each slice does, which is why the
+    /// builders read a `ParsedBlockBody` rather than comparing counts afterwards.
+    #[test]
+    fn a_shifted_boundary_keeps_the_count_and_fails_the_slice_check() {
+        for raw in real_blocks() {
+            let parsed = parse_block_body(raw.clone()).unwrap();
+            let transactions: Vec<&[u8]> = parsed.transactions().collect();
+            let body = raw.len() - transactions.iter().map(|tx| tx.len()).sum::<usize>();
+            let moved = body + transactions[0].len() + 1;
+            let mut shifted = transactions.clone();
+            shifted[0] = &raw[body..moved];
+            shifted[1] = &raw[moved..moved + transactions[1].len() - 1];
+
+            let compact =
+                compact_block_from_transactions(parsed.header(), shifted.iter().copied(), |_| None)
+                    .unwrap();
+
+            assert_eq!(compact.tx_count(), transactions.len());
+            assert_eq!(
+                compact
+                    .prefilled_txs
+                    .iter()
+                    .flat_map(|tx| tx.tx_data.iter().copied())
+                    .collect::<Vec<u8>>(),
+                raw[body..]
+            );
+            assert_eq!(
+                validate_block_transactions(
+                    &compact.header,
+                    compact.prefilled_txs.iter().map(|tx| tx.tx_data.as_slice())
+                ),
+                Err(BlockBodyError::TransactionBoundary { index: 0 })
+            );
+        }
     }
 }

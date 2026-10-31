@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use sovright_relay::test_support::{committed_header, parseable_transaction};
 use sovright_relay::{CompactBlock, PrefilledTx, ShortId, zcash_block_hash};
 use sovright_relay_sidecar::submit::{
     BlockKnownFuture, RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode,
@@ -35,8 +36,12 @@ impl SubmitBlock for CountingSubmitter {
     }
 }
 
+fn tx() -> Vec<u8> {
+    parseable_transaction(1)
+}
+
 fn header() -> Vec<u8> {
-    vec![0xab; 1487]
+    committed_header(0xab, &[tx()])
 }
 
 fn raw_block_hash(raw_block: &[u8]) -> [u8; 32] {
@@ -44,10 +49,7 @@ fn raw_block_hash(raw_block: &[u8]) -> [u8; 32] {
 }
 
 fn raw_block() -> Vec<u8> {
-    let mut block = header();
-    block.push(1);
-    block.extend_from_slice(&[0x01, 0x02, 0x03]);
-    block
+    sovright_relay::test_support::raw_block(&header(), &[tx()])
 }
 
 #[test]
@@ -67,7 +69,7 @@ fn candidate_rejects_missing_short_id_transactions() {
         vec![ShortId::from_bytes([1, 2, 3, 4, 5, 6])],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     );
 
@@ -78,18 +80,19 @@ fn candidate_rejects_missing_short_id_transactions() {
 
 #[test]
 fn candidate_serializes_contiguous_prefilled_transactions() {
+    let txs = [parseable_transaction(1), parseable_transaction(2)];
     let compact = CompactBlock::new(
-        header(),
+        committed_header(0xab, &txs),
         0,
         vec![],
         vec![
             PrefilledTx {
                 index: 0,
-                tx_data: vec![0x01, 0x02],
+                tx_data: txs[0].clone(),
             },
             PrefilledTx {
                 index: 0,
-                tx_data: vec![0x03],
+                tx_data: txs[1].clone(),
             },
         ],
     );
@@ -97,8 +100,12 @@ fn candidate_serializes_contiguous_prefilled_transactions() {
     let candidate = build_submission_candidate(&compact).unwrap();
 
     assert_eq!(candidate.tx_count, 2);
-    assert_eq!(candidate.block_bytes, 1487 + 1 + 3);
-    assert!(candidate.block_hex.ends_with("02010203"));
+    assert_eq!(
+        candidate.block_bytes,
+        1487 + 1 + txs[0].len() + txs[1].len()
+    );
+    let body = [&[2u8], txs[0].as_slice(), txs[1].as_slice()].concat();
+    assert!(candidate.block_hex.ends_with(&hex::encode(body)));
 }
 
 #[tokio::test]
@@ -110,7 +117,7 @@ async fn dry_run_does_not_submit_to_zebra() {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     );
 
@@ -131,7 +138,7 @@ async fn live_mode_submits_candidate_to_zebra() {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     );
 
@@ -158,7 +165,7 @@ async fn live_mode_treats_duplicate_submitblock_as_idempotent() {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     );
 
@@ -185,7 +192,7 @@ async fn live_mode_rejects_non_duplicate_submitblock_reason() {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     );
 
@@ -287,7 +294,7 @@ fn compact_with_prefilled_one() -> CompactBlock {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     )
 }
@@ -298,6 +305,7 @@ fn enabled_gate_config() -> GateConfig {
         allowed_below: 3,
         dedup_window: std::time::Duration::from_secs(60),
         dedup_capacity: 8,
+        unreadable_attempts_per_block: 4,
     }
 }
 
@@ -581,7 +589,7 @@ async fn classify_with(known: Option<bool>) -> SubmitRejectionClass {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx(),
         }],
     );
     match handle_relay_compact_block(&submitter, &compact, SubmitBlockMode::Live)
@@ -627,7 +635,7 @@ fn rejection_class_strings_are_stable() {
 // --- every submit path classifies its rejections -------------------------
 //
 // Rejection classification was added in #88 but wired into only ONE of the five
-// places that call submit_block. The raw-segment path -- which carries almost
+// places that then called submit_block. The raw-segment path -- which carries almost
 // all traffic -- was not among them, so on 2026-09-03 the fleet showed 119
 // rejections, every single one labelled `unknown`, with race_lost and invalid
 // both at zero. The labels existed and classified nothing.

@@ -184,6 +184,7 @@ async fn e2e_compact_block_reconstruction() {
         ReconstructionResult::Invalid { reason } => {
             panic!("Unexpected invalid reconstruction: {}", reason);
         }
+        ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
         ReconstructionResult::Complete { .. } => {
             // This might happen if the mempool happens to have all we need
             // due to hash collisions, which is fine

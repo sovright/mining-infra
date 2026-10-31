@@ -19,6 +19,7 @@ use std::time::Duration;
 use jsonrpsee::server::{RpcModule, ServerBuilder, ServerHandle};
 use jsonrpsee::types::ErrorObjectOwned;
 use serde_json::{Value, json};
+use sovright_relay::test_support::{commit_header, parseable_transaction, raw_block};
 use sovright_relay::{CompactBlock, PrefilledTx, consensus_block_hash, zcash_block_hash};
 use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
 use sovright_relay_sidecar::rpc::ZebraRpc;
@@ -54,9 +55,14 @@ fn grandparent_display() -> String {
     hex::encode(bytes)
 }
 
+fn child_tx() -> Vec<u8> {
+    parseable_transaction(1)
+}
+
 fn child_header() -> Vec<u8> {
     let mut header = vec![0xab; 1487];
     header[4..36].copy_from_slice(&parent_hash());
+    commit_header(&mut header, &[child_tx()]);
     header
 }
 
@@ -67,16 +73,13 @@ fn child_compact() -> CompactBlock {
         vec![],
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: child_tx(),
         }],
     )
 }
 
 fn child_raw() -> Vec<u8> {
-    let mut block = child_header();
-    block.push(1);
-    block.extend_from_slice(&[0x01, 0x02, 0x03]);
-    block
+    raw_block(&child_header(), &[child_tx()])
 }
 
 /// A verbose `getblockheader` result in Zebra's shape. The sidecar reads
@@ -199,6 +202,7 @@ fn gate_over(view: &Arc<ZebraChainView>) -> SubmitGate<Arc<ZebraChainView>> {
             allowed_below: 3,
             dedup_window: Duration::from_secs(60),
             dedup_capacity: 8,
+            unreadable_attempts_per_block: 4,
         },
         Arc::clone(view),
     )

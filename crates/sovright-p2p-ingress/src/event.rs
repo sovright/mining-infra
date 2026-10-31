@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::json;
+use sovright_relay::BlockBodyError;
 
+use crate::coinbase::CoinbaseTelemetry;
 use crate::error::{IngressError, Result};
 
 #[derive(Clone)]
@@ -42,6 +44,16 @@ impl EventSink {
                 network,
                 target: EventTarget::Stdout,
             }),
+        }
+    }
+
+    /// A sink whose writes fail: the file is open for reading only.
+    #[cfg(test)]
+    pub(crate) fn unwritable() -> Self {
+        let file = File::open(std::env::current_exe().unwrap()).unwrap();
+        Self {
+            network: crate::wire::Network::Mainnet,
+            target: EventTarget::File(Arc::new(Mutex::new(file))),
         }
     }
 
@@ -263,16 +275,16 @@ impl EventSink {
         }))
     }
 
+    /// A block arrived. This takes no parsing, so it is written before anything can
+    /// wait, and it stays in the log whatever happens to the block afterwards.
     pub fn p2p_block_received(
         &self,
         peer: &str,
         hash: &str,
         consensus_hash: &str,
         bytes: usize,
-        miner_script: Option<&str>,
-        miner_tag: Option<&str>,
     ) -> Result<()> {
-        let mut value = json!({
+        self.write(json!({
             "event": "p2p_block_received",
             "peer": peer,
             "hash": hash,
@@ -282,21 +294,102 @@ impl EventSink {
             "consensus_hash": consensus_hash,
             "bytes": bytes,
             "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    /// Who mined a block, once its coinbase has been read off the async workers and
+    /// the body validated. Written before the send, so a failed send keeps it.
+    /// It is best effort, with no exactly-once guarantee: join it on
+    /// `consensus_hash`, per block and idempotently. It is not a receipt. A copy that
+    /// takes over after a failed send writes another line, which can carry a
+    /// different `miner_tag`, because one hash does not mean one body. With nothing
+    /// to report it writes nothing.
+    pub fn p2p_block_coinbase(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        coinbase: &CoinbaseTelemetry,
+    ) -> Result<()> {
+        self.write_coinbase_event("p2p_block_coinbase", peer, hash, consensus_hash, coinbase)
+    }
+
+    /// Coinbase observed without validating that the body matches the header.
+    pub fn p2p_block_coinbase_unverified(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        coinbase: &CoinbaseTelemetry,
+    ) -> Result<()> {
+        self.write_coinbase_event(
+            "p2p_block_coinbase_unverified",
+            peer,
+            hash,
+            consensus_hash,
+            coinbase,
+        )
+    }
+
+    fn write_coinbase_event(
+        &self,
+        event: &str,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        coinbase: &CoinbaseTelemetry,
+    ) -> Result<()> {
+        if coinbase.is_empty() {
+            return Ok(());
+        }
+        let mut value = json!({
+            "event": event,
+            "peer": peer,
+            "hash": hash,
+            "consensus_hash": consensus_hash,
+            "observed_at_unix_ms": now_unix_ms(),
         });
         // Best-effort coinbase miner payout scriptPubKey (hex). Present only
         // when the coinbase parsed and had a transparent output; the join key
         // downstream against Zebra's getblock verbosity-2 scriptPubKey.hex.
-        if let Some(miner_script) = miner_script {
+        if let Some(miner_script) = &coinbase.miner_script {
             value["miner_script"] = json!(miner_script);
         }
         // Best-effort coinbase tag (printable ASCII, capped at parse time).
         // Miner-CHOSEN text: the consumer maps it to a curated identifier and
         // never renders it raw. Absent when the coinbase did not parse or
         // carried nothing printable.
-        if let Some(miner_tag) = miner_tag {
+        if let Some(miner_tag) = &coinbase.miner_tag {
             value["miner_tag"] = json!(miner_tag);
         }
         self.write(value)
+    }
+
+    /// A body the reader could not read, sent on under the emergency bypass. The size,
+    /// header and proof-of-work checks ran. The Merkle and duplicate checks could not,
+    /// so nothing here says the body belongs to this header. A repeat among the
+    /// transactions read before the failure is refused, but that does not cover the
+    /// body, so `duplicate_txid` is listed as skipped.
+    pub fn p2p_block_unverified_forwarded(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        error: &BlockBodyError,
+        bytes: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_block_unverified_forwarded",
+            "peer": peer,
+            "hash": hash,
+            "consensus_hash": consensus_hash,
+            "reason": error.label(),
+            "detail": error.to_string(),
+            "checks_run": ["size", "header", "proof_of_work"],
+            "checks_skipped": ["merkle", "duplicate_txid"],
+            "bytes": bytes,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
     }
 
     pub fn p2p_relay_block_forwarded(
@@ -316,6 +409,29 @@ impl EventSink {
             "tx_count": tx_count,
             "mode": mode,
             "relay_objects": relay_objects,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
+    /// One refused body. `reason` is the metric's label. A hash that later appears
+    /// on chain is only a lead, because a bad body can carry a real block's header:
+    /// it was a false rejection only if the node accepted these same bytes.
+    pub fn p2p_block_body_rejected(
+        &self,
+        peer: &str,
+        hash: &str,
+        consensus_hash: &str,
+        error: &BlockBodyError,
+        bytes: usize,
+    ) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_block_body_rejected",
+            "peer": peer,
+            "hash": hash,
+            "consensus_hash": consensus_hash,
+            "reason": error.label(),
+            "detail": error.to_string(),
+            "bytes": bytes,
             "observed_at_unix_ms": now_unix_ms(),
         }))
     }
@@ -372,6 +488,35 @@ mod tests {
             now_unix_ms()
         );
         std::env::temp_dir().join(unique)
+    }
+
+    #[test]
+    fn a_refused_body_is_logged_with_its_reason_and_hashes() {
+        let path = temp_log_path("body-rejected");
+        let events = EventSink::new(Some(path.clone())).unwrap();
+
+        events
+            .p2p_block_body_rejected(
+                "127.0.0.1:8233",
+                "aaaa",
+                "bbbb",
+                &BlockBodyError::Transaction { index: 3 },
+                1234,
+            )
+            .unwrap();
+
+        let line = fs::read_to_string(&path).unwrap();
+        let event: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(event["event"], "p2p_block_body_rejected");
+        assert_eq!(event["peer"], "127.0.0.1:8233");
+        assert_eq!(event["hash"], "aaaa");
+        assert_eq!(event["consensus_hash"], "bbbb");
+        assert_eq!(event["reason"], "transaction");
+        assert_eq!(event["detail"], "transaction 3 does not parse");
+        assert_eq!(event["bytes"], 1234);
+        assert_eq!(event["network"], "mainnet");
+        assert!(event["observed_at_unix_ms"].is_u64());
+        let _ = fs::remove_file(path);
     }
 
     #[test]
@@ -442,30 +587,36 @@ mod tests {
     }
 
     #[test]
-    fn writes_miner_tag_on_block_received() {
-        let path = temp_log_path("block-received-tag");
+    fn a_receipt_is_a_receipt_and_the_miner_comes_on_its_own_line() {
+        let path = temp_log_path("block-coinbase");
         let events = EventSink::new(Some(path.clone())).unwrap();
 
         events
-            .p2p_block_received(
+            .p2p_block_received("127.0.0.1:8233", "abcd", "ef01", 1234)
+            .unwrap();
+        let coinbase = |miner_tag: Option<&str>| CoinbaseTelemetry {
+            miner_script: Some("76a914aa".to_string()),
+            miner_tag: miner_tag.map(str::to_string),
+        };
+        events
+            .p2p_block_coinbase(
                 "127.0.0.1:8233",
                 "abcd",
                 "ef01",
-                1234,
-                Some("76a914aa"),
-                Some("/NiceHash/"),
+                &coinbase(Some("/NiceHash/")),
             )
             .unwrap();
         // Absent, not null: a missing key and a null mean the same thing to the
         // consumer, and omitting keeps the hot-path log line smaller.
         events
-            .p2p_block_received(
+            .p2p_block_coinbase("127.0.0.1:8233", "abcd", "ef01", &coinbase(None))
+            .unwrap();
+        events
+            .p2p_block_coinbase(
                 "127.0.0.1:8233",
                 "abcd",
                 "ef01",
-                1234,
-                Some("76a914aa"),
-                None,
+                &CoinbaseTelemetry::default(),
             )
             .unwrap();
 
@@ -476,8 +627,13 @@ mod tests {
             .collect();
         fs::remove_file(&path).ok();
 
-        assert_eq!(lines[0]["miner_tag"], serde_json::json!("/NiceHash/"));
-        assert_eq!(lines[0]["miner_script"], serde_json::json!("76a914aa"));
-        assert!(lines[1].get("miner_tag").is_none());
+        assert_eq!(lines.len(), 3, "nothing to report writes nothing");
+        assert_eq!(lines[0]["event"], "p2p_block_received");
+        assert!(lines[0].get("miner_script").is_none());
+        assert_eq!(lines[1]["event"], "p2p_block_coinbase");
+        assert_eq!(lines[1]["hash"], "abcd");
+        assert_eq!(lines[1]["miner_tag"], serde_json::json!("/NiceHash/"));
+        assert_eq!(lines[1]["miner_script"], serde_json::json!("76a914aa"));
+        assert!(lines[2].get("miner_tag").is_none());
     }
 }

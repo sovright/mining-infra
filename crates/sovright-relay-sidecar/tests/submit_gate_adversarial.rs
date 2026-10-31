@@ -85,14 +85,16 @@ fn header_bytes_with_parent(parent: [u8; 32]) -> Vec<u8> {
     h
 }
 
-fn compact_one_prefilled(header: Vec<u8>) -> CompactBlock {
+fn compact_one_prefilled(mut header: Vec<u8>) -> CompactBlock {
+    let tx = sovright_relay::test_support::parseable_transaction(1);
+    sovright_relay::test_support::commit_header(&mut header, std::slice::from_ref(&tx));
     CompactBlock::new(
         header,
         0,
         Vec::<ShortId>::new(),
         vec![PrefilledTx {
             index: 0,
-            tx_data: vec![0x01],
+            tx_data: tx,
         }],
     )
 }
@@ -103,6 +105,7 @@ fn enabled_gate_config() -> GateConfig {
         allowed_below: 3,
         dedup_window: Duration::from_secs(60),
         dedup_capacity: 8,
+        unreadable_attempts_per_block: 4,
     }
 }
 

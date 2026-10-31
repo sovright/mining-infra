@@ -141,6 +141,7 @@ fn gate_reconstruction_full_mempool() {
         ReconstructionResult::Invalid { reason } => {
             panic!("Unexpected invalid reconstruction: {}", reason);
         }
+        ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
         ReconstructionResult::Incomplete { .. } => {
             // This is also acceptable - short ID collisions may cause issues
         }

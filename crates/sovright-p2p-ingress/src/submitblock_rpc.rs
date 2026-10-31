@@ -52,7 +52,7 @@ impl RelayBlockForwarder for RelayBridge {
         block: &'a [u8],
         tx_cache: Option<&'a TxCache>,
     ) -> RelayFuture<'a> {
-        Box::pin(async move { RelayBridge::forward_block(self, block, tx_cache).await })
+        Box::pin(async move { RelayBridge::forward_pool_block(self, block, tx_cache).await })
     }
 }
 

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::compact_block::CompactBlock;
 use crate::mempool::MempoolProvider;
+use crate::merkle::BlockBodyError;
 use crate::types::{ShortId, WtxId};
 
 /// Result of compact block reconstruction
@@ -21,6 +22,8 @@ pub enum ReconstructionResult {
         /// Human-readable reason
         reason: String,
     },
+    /// Every slot was filled, but the assembled block fails body validation
+    InvalidBody(BlockBodyError),
     /// Missing some transactions - need to request them
     Incomplete {
         /// Transactions we have (Some) and missing (None), in block order
@@ -146,44 +149,13 @@ impl<'a, M: MempoolProvider> CompactBlockReconstructor<'a, M> {
             // Without this the sidecar submitted unverified assemblies and let
             // Zebra be the validator, which rejected them -- spending the fast
             // path's entire latency advantage to learn something knowable
-            // locally. Returning Invalid falls back to getblocktxn / raw block.
-            if !crate::merkle::transactions_match_merkle_root(&compact.header, &filled) {
-                // Emit enough to identify the offending slot offline. The block
-                // is on-chain moments later, so logging the consensus hash plus
-                // our own per-slot txids makes the failure joinable against
-                // `getblock <hash> 1`: whichever index disagrees is the
-                // transaction we substituted, and the counter alone can never
-                // say which one that was.
-                //
-                // Prefilled slots are excluded: their bytes come from the
-                // compact block itself, so they cannot be the substitution.
-                let prefilled_positions = prefilled_positions(compact);
-                let expected = crate::merkle::header_merkle_root(&compact.header)
-                    .map(|root| crate::merkle::display_hex(&root))
-                    .unwrap_or_else(|| "short-header".to_string());
-                let txids: Vec<[u8; 32]> = filled
-                    .iter()
-                    .map(|tx| crate::merkle::txid_from_tx_bytes(tx))
-                    .collect();
-                let computed = crate::merkle::merkle_root(&txids)
-                    .map(|root| crate::merkle::display_hex(&root))
-                    .unwrap_or_else(|| "no-transactions".to_string());
-                tracing::warn!(
-                    consensus_block_hash =
-                        %crate::consensus_block_hash_display(&compact.header),
-                    expected_merkle_root = %expected,
-                    computed_merkle_root = %computed,
-                    tx_count = filled.len(),
-                    prefilled_count = prefilled_positions.len(),
-                    mempool_slots = %crate::merkle::mempool_slot_digest(
-                        &filled,
-                        &prefilled_positions,
-                    ),
-                    "Reconstruction merkle mismatch; slots listed are mempool-resolved"
-                );
-                return ReconstructionResult::Invalid {
-                    reason: "merkle root mismatch".into(),
-                };
+            // locally. This is the same rule every other candidate passes, once.
+            if let Err(error) = crate::merkle::validate_block_transactions(
+                &compact.header,
+                filled.iter().map(Vec::as_slice),
+            ) {
+                log_invalid_assembly(compact, &filled, &error);
+                return ReconstructionResult::InvalidBody(error);
             }
             ReconstructionResult::Complete {
                 transactions: filled,
@@ -194,6 +166,63 @@ impl<'a, M: MempoolProvider> CompactBlockReconstructor<'a, M> {
                 missing_wtxids,
                 unresolved_short_ids,
             }
+        }
+    }
+}
+
+/// Emit enough to identify the offending slot offline. The block is on-chain
+/// moments later, so logging the consensus hash plus our own per-slot txids makes
+/// the failure joinable against `getblock <hash> 1`: whichever index disagrees is
+/// the transaction we substituted, and a counter alone can never say which one
+/// that was.
+///
+/// Prefilled slots are excluded: their bytes come from the compact block itself,
+/// so they cannot be the substitution.
+fn log_invalid_assembly(compact: &CompactBlock, filled: &[Vec<u8>], error: &BlockBodyError) {
+    let prefilled_positions = prefilled_positions(compact);
+    let consensus_block_hash = crate::consensus_block_hash_display(&compact.header);
+    let mempool_slots = crate::merkle::mempool_slot_digest(filled, &prefilled_positions);
+    match error {
+        BlockBodyError::MerkleMismatch => {
+            let expected = crate::merkle::header_merkle_root(&compact.header)
+                .map(|root| crate::merkle::display_hex(&root))
+                .unwrap_or_else(|| "short-header".to_string());
+            let txids: Vec<[u8; 32]> = filled
+                .iter()
+                .map(|tx| crate::merkle::txid_from_tx_bytes(tx))
+                .collect();
+            let computed = crate::merkle::merkle_root(&txids)
+                .map(|root| crate::merkle::display_hex(&root))
+                .unwrap_or_else(|| "no-transactions".to_string());
+            tracing::warn!(
+                %consensus_block_hash,
+                expected_merkle_root = %expected,
+                computed_merkle_root = %computed,
+                tx_count = filled.len(),
+                prefilled_count = prefilled_positions.len(),
+                %mempool_slots,
+                "Reconstruction merkle mismatch; slots listed are mempool-resolved"
+            );
+        }
+        BlockBodyError::DuplicateTxid { index } => {
+            tracing::warn!(
+                %consensus_block_hash,
+                repeated_at = index,
+                tx_count = filled.len(),
+                prefilled_count = prefilled_positions.len(),
+                %mempool_slots,
+                "Reconstruction repeats a txid; slots listed are mempool-resolved"
+            );
+        }
+        error => {
+            tracing::warn!(
+                %consensus_block_hash,
+                %error,
+                tx_count = filled.len(),
+                prefilled_count = prefilled_positions.len(),
+                %mempool_slots,
+                "Reconstructed block failed body validation; slots listed are mempool-resolved"
+            );
         }
     }
 }
@@ -221,6 +250,8 @@ mod tests {
     use crate::builder::CompactBlockBuilder;
     use crate::compact_block::{CompactBlock, PrefilledTx};
     use crate::mempool::TestMempool;
+    use crate::merkle::MAX_BLOCK_BYTES;
+    use crate::test_support::{parseable_transaction, parseable_transaction_with_script};
     use crate::types::{AuthDigest, ShortId, TxId};
 
     fn make_wtxid(seed: u8) -> WtxId {
@@ -228,6 +259,10 @@ mod tests {
             TxId::from_bytes([seed; 32]),
             AuthDigest::from_bytes([seed; 32]),
         )
+    }
+
+    fn tx(seed: u32) -> Vec<u8> {
+        parseable_transaction(seed)
     }
 
     /// A synthetic header that actually commits to `txs`.
@@ -238,7 +273,7 @@ mod tests {
     /// they are for; real headers and real ZIP-244 txids are covered by the
     /// mainnet block fixture in `crate::merkle`.
     fn header_committing_to(txs: &[Vec<u8>]) -> Vec<u8> {
-        let mut header = vec![0u8; 2189];
+        let mut header = vec![0u8; crate::ZCASH_FULL_HEADER_SIZE];
         let txids: Vec<[u8; 32]> = txs
             .iter()
             .map(|t| crate::merkle::txid_from_tx_bytes(t))
@@ -251,7 +286,7 @@ mod tests {
     #[test]
     fn reconstruct_complete_block() {
         // Sender side: build compact block
-        let header = header_committing_to(&[vec![10], vec![11], vec![12]]);
+        let header = header_committing_to(&[tx(10), tx(11), tx(12)]);
         let nonce = 12345u64;
 
         let coinbase = make_wtxid(0);
@@ -259,21 +294,21 @@ mod tests {
         let tx2 = make_wtxid(2);
 
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-        builder.add_transaction(coinbase, vec![10]);
-        builder.add_transaction(tx1, vec![11]);
-        builder.add_transaction(tx2, vec![12]);
+        builder.add_transaction(coinbase, tx(10));
+        builder.add_transaction(tx1, tx(11));
+        builder.add_transaction(tx2, tx(12));
 
         // Sender's view of receiver's mempool (has tx1 and tx2)
         let mut sender_view = TestMempool::new();
-        sender_view.insert(tx1, vec![11]);
-        sender_view.insert(tx2, vec![12]);
+        sender_view.insert(tx1, tx(11));
+        sender_view.insert(tx2, tx(12));
 
         let compact = builder.build(&sender_view);
 
         // Receiver side: reconstruct
         let mut receiver_mempool = TestMempool::new();
-        receiver_mempool.insert(tx1, vec![11]);
-        receiver_mempool.insert(tx2, vec![12]);
+        receiver_mempool.insert(tx1, tx(11));
+        receiver_mempool.insert(tx2, tx(12));
 
         let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
 
@@ -285,13 +320,14 @@ mod tests {
         match result {
             ReconstructionResult::Complete { transactions } => {
                 assert_eq!(transactions.len(), 3);
-                assert_eq!(transactions[0], vec![10]); // coinbase
-                assert_eq!(transactions[1], vec![11]); // tx1
-                assert_eq!(transactions[2], vec![12]); // tx2
+                assert_eq!(transactions[0], tx(10)); // coinbase
+                assert_eq!(transactions[1], tx(11)); // tx1
+                assert_eq!(transactions[2], tx(12)); // tx2
             }
             ReconstructionResult::Invalid { reason } => {
                 panic!("Unexpected invalid reconstruction: {}", reason);
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Incomplete { .. } => {
                 panic!("Expected complete reconstruction");
             }
@@ -307,12 +343,12 @@ mod tests {
         let tx1 = make_wtxid(1);
 
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-        builder.add_transaction(coinbase, vec![10]);
-        builder.add_transaction(tx1, vec![11]);
+        builder.add_transaction(coinbase, tx(10));
+        builder.add_transaction(tx1, tx(11));
 
         // Sender thinks receiver has tx1
         let mut sender_view = TestMempool::new();
-        sender_view.insert(tx1, vec![11]);
+        sender_view.insert(tx1, tx(11));
 
         let compact = builder.build(&sender_view);
 
@@ -335,6 +371,7 @@ mod tests {
             ReconstructionResult::Invalid { reason } => {
                 panic!("Unexpected invalid reconstruction: {}", reason);
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Complete { .. } => {
                 panic!("Expected incomplete reconstruction");
             }
@@ -362,6 +399,7 @@ mod tests {
             ReconstructionResult::Invalid { reason } => {
                 panic!("Unexpected invalid reconstruction: {}", reason);
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Complete { .. } => {
                 panic!("Expected unresolved short ID due to collision");
             }
@@ -370,13 +408,13 @@ mod tests {
 
     #[test]
     fn reconstruct_coinbase_only_block() {
-        let header = header_committing_to(&[vec![10]]);
+        let header = header_committing_to(&[tx(10)]);
         let nonce = 12345u64;
 
         let coinbase = make_wtxid(0);
 
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-        builder.add_transaction(coinbase, vec![10]);
+        builder.add_transaction(coinbase, tx(10));
 
         // No transactions in mempool (only coinbase, which is prefilled)
         let sender_view = TestMempool::new();
@@ -393,11 +431,12 @@ mod tests {
         match result {
             ReconstructionResult::Complete { transactions } => {
                 assert_eq!(transactions.len(), 1);
-                assert_eq!(transactions[0], vec![10]); // coinbase only
+                assert_eq!(transactions[0], tx(10)); // coinbase only
             }
             ReconstructionResult::Invalid { reason } => {
                 panic!("Unexpected invalid reconstruction: {}", reason);
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Incomplete { .. } => {
                 panic!("Expected complete reconstruction");
             }
@@ -406,22 +445,22 @@ mod tests {
 
     #[test]
     fn reconstruct_large_block() {
-        let mut block_txs: Vec<Vec<u8>> = vec![vec![0; 100]];
-        block_txs.extend((1u8..=200).map(|i| vec![i; 100]));
+        let mut block_txs: Vec<Vec<u8>> = vec![tx(0)];
+        block_txs.extend((1u32..=200).map(tx));
         let header = header_committing_to(&block_txs);
         let nonce = 12345u64;
 
         let coinbase = make_wtxid(0);
 
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-        builder.add_transaction(coinbase, vec![0; 100]);
+        builder.add_transaction(coinbase, tx(0));
 
         let mut sender_view = TestMempool::new();
         let mut receiver_mempool = TestMempool::new();
 
         for i in 1u8..=200 {
             let wtxid = make_wtxid(i);
-            let tx_data = vec![i; 100];
+            let tx_data = tx(i.into());
             builder.add_transaction(wtxid, tx_data.clone());
             sender_view.insert(wtxid, tx_data.clone());
             receiver_mempool.insert(wtxid, tx_data);
@@ -439,11 +478,12 @@ mod tests {
         match result {
             ReconstructionResult::Complete { transactions } => {
                 assert_eq!(transactions.len(), 201); // coinbase + 200
-                assert_eq!(transactions[0], vec![0; 100]); // coinbase
+                assert_eq!(transactions[0], tx(0)); // coinbase
             }
             ReconstructionResult::Invalid { reason } => {
                 panic!("Unexpected invalid reconstruction: {}", reason);
             }
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
             ReconstructionResult::Incomplete { .. } => {
                 panic!("Expected complete reconstruction");
             }
@@ -455,21 +495,21 @@ mod tests {
         let mempool = TestMempool::new();
         let mut reconstructor = CompactBlockReconstructor::new(&mempool);
 
-        let header = vec![0u8; 2189];
+        let header = vec![0u8; crate::ZCASH_FULL_HEADER_SIZE];
         let nonce = 0u64;
 
         let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
-        let compact = CompactBlock::new(vec![0u8; 2189], 0, vec![], vec![]);
+        let compact = CompactBlock::new(header, 0, vec![], vec![]);
 
         // A zero-transaction block cannot exist on mainnet -- every block has a
         // coinbase -- and nothing commits to it, so there is no root to check
         // against. This used to reconstruct "successfully" into an empty block;
         // it is now rejected rather than handed to submit.
         match reconstructor.reconstruct(&compact) {
-            ReconstructionResult::Invalid { reason } => {
-                assert_eq!(reason, "merkle root mismatch");
+            ReconstructionResult::InvalidBody(error) => {
+                assert_eq!(error, BlockBodyError::EmptyTransactions);
             }
             other => panic!("expected a zero-transaction block to be invalid: {other:?}"),
         }
@@ -482,34 +522,137 @@ mod tests {
     #[test]
     fn reconstruct_rejects_a_substituted_transaction() {
         let nonce = 12345u64;
-        let header = header_committing_to(&[vec![10], vec![11]]);
+        let header = header_committing_to(&[tx(10), tx(11)]);
 
         let coinbase = make_wtxid(0);
         let tx1 = make_wtxid(1);
 
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-        builder.add_transaction(coinbase, vec![10]);
-        builder.add_transaction(tx1, vec![11]);
+        builder.add_transaction(coinbase, tx(10));
+        builder.add_transaction(tx1, tx(11));
 
         let mut sender_view = TestMempool::new();
-        sender_view.insert(tx1, vec![11]);
+        sender_view.insert(tx1, tx(11));
         let compact = builder.build(&sender_view);
 
         // The receiver holds a DIFFERENT transaction under the same wtxid --
         // what a short-id collision or a stale mempool copy looks like.
         let mut receiver_mempool = TestMempool::new();
-        receiver_mempool.insert(tx1, vec![99]);
+        receiver_mempool.insert(tx1, tx(99));
 
         let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
         let header_hash = crate::zcash_block_hash(&header);
         reconstructor.prepare(&header_hash, nonce);
 
         match reconstructor.reconstruct(&compact) {
-            ReconstructionResult::Invalid { reason } => {
-                assert_eq!(reason, "merkle root mismatch");
+            ReconstructionResult::InvalidBody(error) => {
+                assert_eq!(error, BlockBodyError::MerkleMismatch);
             }
             other => panic!("expected a substituted transaction to be invalid: {other:?}"),
         }
+    }
+
+    /// A compact block with the coinbase prefilled and the rest as short ids,
+    /// reconstructed from a mempool holding `mempool` under them.
+    fn assemble(header: &[u8], coinbase: Vec<u8>, mempool: &[Vec<u8>]) -> ReconstructionResult {
+        let nonce = 12345u64;
+        let hash = crate::zcash_block_hash(header);
+        let wtxids: Vec<WtxId> = (1..=mempool.len() as u8).map(make_wtxid).collect();
+        let mut receiver = TestMempool::new();
+        for (wtxid, tx_data) in wtxids.iter().zip(mempool) {
+            receiver.insert(*wtxid, tx_data.clone());
+        }
+        let short_ids = wtxids
+            .iter()
+            .map(|wtxid| ShortId::compute(wtxid, &hash, nonce))
+            .collect();
+        let compact = CompactBlock::new(
+            header.to_vec(),
+            nonce,
+            short_ids,
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase,
+            }],
+        );
+        let mut reconstructor = CompactBlockReconstructor::new(&receiver);
+        reconstructor.prepare(&hash, nonce);
+        reconstructor.reconstruct(&compact)
+    }
+
+    fn assert_invalid_body(result: ReconstructionResult, expected: BlockBodyError) {
+        match result {
+            ReconstructionResult::InvalidBody(error) => assert_eq!(error, expected),
+            other => panic!("expected {expected:?}, got {other:?}"),
+        }
+    }
+
+    /// Repeating the last transaction keeps the root the header commits to, so
+    /// this is not a mismatch and must not be reported as one.
+    #[test]
+    fn reconstruct_reports_a_repeated_txid_as_its_own_error() {
+        let header = header_committing_to(&[tx(0), tx(1), tx(2)]);
+        let root = crate::merkle::header_merkle_root(&header);
+        let repeated = [tx(0), tx(1), tx(2), tx(2)];
+        let txids: Vec<[u8; 32]> = repeated
+            .iter()
+            .map(|t| crate::merkle::txid_from_tx_bytes(t))
+            .collect();
+        assert_eq!(crate::merkle::merkle_root(&txids), root);
+
+        assert_invalid_body(
+            assemble(&header, tx(0), &[tx(1), tx(2), tx(2)]),
+            BlockBodyError::DuplicateTxid { index: 3 },
+        );
+    }
+
+    /// The merkle check alone passes this: the header commits to bytes that hash
+    /// through the fallback, and only the strict rule refuses them.
+    #[test]
+    fn reconstruct_refuses_a_mempool_entry_that_does_not_parse() {
+        let garbage = vec![0xff; 40];
+        let header = header_committing_to(&[tx(0), garbage.clone()]);
+
+        assert_invalid_body(
+            assemble(&header, tx(0), &[garbage]),
+            BlockBodyError::Transaction { index: 1 },
+        );
+    }
+
+    #[test]
+    fn reconstruct_refuses_a_slot_holding_more_than_one_transaction() {
+        let joined = [tx(1), tx(2)].concat();
+        let header = header_committing_to(&[tx(0), joined.clone()]);
+
+        assert_invalid_body(
+            assemble(&header, tx(0), &[joined]),
+            BlockBodyError::TransactionBoundary { index: 1 },
+        );
+    }
+
+    /// One byte over, with the header committing to it: only the size limit
+    /// refuses this, and it counts what the block serializes to.
+    #[test]
+    fn reconstruct_applies_the_block_size_limit() {
+        let padding = parseable_transaction_with_script(1, 65_536).len() - 65_536;
+        let block_bytes =
+            |script: usize| crate::ZCASH_FULL_HEADER_SIZE + 1 + tx(0).len() + padding + script;
+        let script = MAX_BLOCK_BYTES - block_bytes(0);
+        let fits = parseable_transaction_with_script(1, script);
+        let over = parseable_transaction_with_script(1, script + 1);
+        let fitting_header = header_committing_to(&[tx(0), fits.clone()]);
+        let oversized_header = header_committing_to(&[tx(0), over.clone()]);
+
+        assert!(matches!(
+            assemble(&fitting_header, tx(0), &[fits]),
+            ReconstructionResult::Complete { .. }
+        ));
+        assert_invalid_body(
+            assemble(&oversized_header, tx(0), &[over]),
+            BlockBodyError::TooLarge {
+                bytes: MAX_BLOCK_BYTES + 1,
+            },
+        );
     }
 
     /// The diagnostic names a guilty slot by index, so its decoding of the
@@ -547,9 +690,9 @@ mod tests {
     #[test]
     fn reported_prefilled_positions_are_the_slots_reconstruct_prefills() {
         let nonce = 7u64;
-        let coinbase_data = vec![0xc0];
-        let mempool_data = vec![0xa1];
-        let trailing_data = vec![0xa2];
+        let coinbase_data = tx(0xc0);
+        let mempool_data = tx(0xa1);
+        let trailing_data = tx(0xa2);
         let header = header_committing_to(&[
             coinbase_data.clone(),
             mempool_data.clone(),

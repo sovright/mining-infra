@@ -159,6 +159,24 @@ pub struct SubmitGateConfig {
     /// Maximum entries to retain in the dedup ring. Default 256.
     #[serde(default = "default_submit_gate_dedup_capacity")]
     pub dedup_capacity: usize,
+    /// Emergency bypass, off by default: send Zebra a raw block whose transactions
+    /// this sidecar cannot read. The Merkle and duplicate checks cannot run on it,
+    /// so Zebra is its only validator. It applies only to a transaction this
+    /// sidecar failed to parse itself, whatever the sender did, and needs the gate.
+    /// Only blocks in the mainnet target range qualify, on either network.
+    #[serde(default)]
+    pub submit_unreadable_blocks: bool,
+    /// How many unverified candidates one block can send to Zebra. An attempt counts
+    /// whatever Zebra answers, and ends after `dedup_window_secs`. It also bounds how
+    /// many run at once across all blocks. Default 4.
+    #[serde(default = "default_submit_gate_unreadable_attempts")]
+    pub unreadable_attempts_per_block: usize,
+    /// Seconds for one unverified attempt's async waits together: the parent lookup,
+    /// the gate, `submitblock` and the lookup after a rejection. Separate RPC timeouts
+    /// cannot add up past it. The synchronous Equihash check cannot be interrupted, so
+    /// an attempt can run past this. Default 10.
+    #[serde(default = "default_submit_gate_unreadable_budget_secs")]
+    pub unreadable_submit_budget_secs: u64,
 }
 
 impl Default for SubmitGateConfig {
@@ -168,6 +186,9 @@ impl Default for SubmitGateConfig {
             allowed_below: default_submit_gate_allowed_below(),
             dedup_window_secs: default_submit_gate_dedup_window_secs(),
             dedup_capacity: default_submit_gate_dedup_capacity(),
+            submit_unreadable_blocks: false,
+            unreadable_attempts_per_block: default_submit_gate_unreadable_attempts(),
+            unreadable_submit_budget_secs: default_submit_gate_unreadable_budget_secs(),
         }
     }
 }
@@ -180,8 +201,17 @@ impl SubmitGateConfig {
             allowed_below: self.allowed_below,
             dedup_window: std::time::Duration::from_secs(self.dedup_window_secs),
             dedup_capacity: self.dedup_capacity,
+            unreadable_attempts_per_block: self.unreadable_attempts_per_block,
         }
     }
+}
+
+fn default_submit_gate_unreadable_budget_secs() -> u64 {
+    10
+}
+
+fn default_submit_gate_unreadable_attempts() -> usize {
+    crate::submit_gate::DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK
 }
 
 fn default_submit_gate_allowed_below() -> u64 {
@@ -428,6 +458,25 @@ mod tests {
 
         assert_eq!(config.send_burst_packets, 32);
         assert_eq!(config.send_burst_delay_micros, 1000);
+    }
+
+    #[test]
+    fn the_emergency_bypass_is_off_unless_set() {
+        assert!(!SubmitGateConfig::default().submit_unreadable_blocks);
+        let config: SubmitGateConfig = toml::from_str("submit_unreadable_blocks = true").unwrap();
+        assert!(config.submit_unreadable_blocks);
+        assert_eq!(
+            config.to_gate_config().unreadable_attempts_per_block,
+            crate::submit_gate::DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK
+        );
+
+        assert_eq!(config.unreadable_submit_budget_secs, 10);
+
+        let config: SubmitGateConfig =
+            toml::from_str("unreadable_attempts_per_block = 7\nunreadable_submit_budget_secs = 5")
+                .unwrap();
+        assert_eq!(config.to_gate_config().unreadable_attempts_per_block, 7);
+        assert_eq!(config.unreadable_submit_budget_secs, 5);
     }
 
     #[test]

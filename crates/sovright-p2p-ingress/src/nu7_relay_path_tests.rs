@@ -2,20 +2,21 @@
 //! and the 10+3 FEC decoder. Isolated qualification only; no production code
 //! is changed.
 //!
-//! The merkle root is verified only when short IDs are reconstructed
-//! (`sovright_relay`'s reconstructor). All-prefilled compact blocks and raw
-//! segments are submitted without that check, so nothing here makes a claim
-//! about them. "Submitted" means the counting submitter was called; no node
-//! accepts anything in these tests.
+//! The body of a short-ID block is checked in `sovright_relay`'s reconstructor.
+//! All-prefilled compact blocks and raw segments reach the same rule by their own
+//! paths, so nothing here makes a claim about them. "Submitted" means the
+//! counting submitter was called; no node accepts anything in these tests.
 use sha2::{Digest, Sha256};
-use sovright_relay::{BlockChunker, FecError, txid_from_tx_bytes};
+use sovright_relay::{
+    BlockBodyError, BlockChunker, FecError, parse_block_body, txid_from_tx_bytes,
+};
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitFuture,
     build_submission_candidate, handle_relay_compact_block_with_mempool,
 };
 
 use super::nu7_fixture::{Nu7Fixture, tx_cache};
-use crate::block::{compact_block_from_raw_block, compact_block_from_raw_block_with_tx_cache};
+use crate::block::{compact_block_from_parsed, compact_block_from_parsed_with_tx_cache};
 use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 
 /// Records every block it is asked to submit. It is not a node.
@@ -47,7 +48,8 @@ async fn submit_short_id_block(
     let fixture = Nu7Fixture::load();
     let origin = tx_cache();
     origin.insert(fixture.v5_wtxid(), fixture.v5_transaction());
-    let compact = compact_block_from_raw_block_with_tx_cache(&fixture.raw, &origin).unwrap();
+    let parsed = parse_block_body(fixture.raw.clone()).unwrap();
+    let compact = compact_block_from_parsed_with_tx_cache(&parsed, &origin).unwrap();
     assert_eq!(
         compact.short_ids.len(),
         1,
@@ -69,15 +71,14 @@ async fn submit_short_id_block(
     (outcome, submitter.submitted())
 }
 
-fn assert_merkle_rejected(
+fn assert_body_rejected(
     outcome: Result<SubmissionOutcome, RelayBlockError>,
     submitted: &[String],
+    expected: BlockBodyError,
 ) {
     match outcome {
-        Err(RelayBlockError::ReconstructionInvalid { reason }) => {
-            assert_eq!(reason, "merkle root mismatch")
-        }
-        other => panic!("expected a merkle rejection, got {other:?}"),
+        Err(RelayBlockError::InvalidBlockBody(error)) => assert_eq!(error, expected),
+        other => panic!("expected {expected:?}, got {other:?}"),
     }
     assert!(
         submitted.is_empty(),
@@ -121,17 +122,21 @@ async fn nu7_short_id_block_without_the_transaction_prepares_a_request() {
     assert!(submitted.is_empty());
 }
 
-/// Truncated bytes cannot be parsed, so the txid falls back to sha256d of the
-/// bytes and the merkle check rejects the block.
+/// Truncated bytes cannot be parsed. The txid helper would fall back to sha256d
+/// of them, but the reader refuses them first, so the reason names the slot.
 #[tokio::test]
-async fn nu7_truncated_transaction_fails_the_merkle_check() {
+async fn nu7_truncated_transaction_is_refused_by_the_reader() {
     let truncated = Nu7Fixture::load().v5_transaction()[..139].to_vec();
     assert_eq!(wtxid_from_tx_bytes(&truncated, TX_READER_BRANCH_HINT), None);
     let sha256d: [u8; 32] = Sha256::digest(Sha256::digest(&truncated)).into();
     assert_eq!(txid_from_tx_bytes(&truncated), sha256d);
 
     let (outcome, submitted) = submit_short_id_block(Some(truncated)).await;
-    assert_merkle_rejected(outcome, &submitted);
+    assert_body_rejected(
+        outcome,
+        &submitted,
+        BlockBodyError::Transaction { index: 1 },
+    );
 }
 
 /// The first output's value (byte 169) is effecting data: the transaction
@@ -145,7 +150,7 @@ async fn nu7_effecting_data_change_fails_the_merkle_check() {
     assert_ne!(txid_display(&changed), fixture.v5_txid_display());
 
     let (outcome, submitted) = submit_short_id_block(Some(changed)).await;
-    assert_merkle_rejected(outcome, &submitted);
+    assert_body_rejected(outcome, &submitted, BlockBodyError::MerkleMismatch);
 }
 
 /// A real v4 transaction is rejected because it is a different transaction,
@@ -157,7 +162,7 @@ async fn nu7_v4_transaction_under_the_v5_key_fails_the_merkle_check() {
     assert_eq!(wtxid_from_tx_bytes(&v4, TX_READER_BRANCH_HINT), None);
 
     let (outcome, submitted) = submit_short_id_block(Some(v4)).await;
-    assert_merkle_rejected(outcome, &submitted);
+    assert_body_rejected(outcome, &submitted, BlockBodyError::MerkleMismatch);
 }
 
 /// A real NU6.3 v6 transaction: rejected as a different transaction, not for
@@ -172,16 +177,16 @@ async fn nu7_pre_nu7_v6_transaction_under_the_v5_key_fails_the_merkle_check() {
     );
 
     let (outcome, submitted) = submit_short_id_block(Some(v6)).await;
-    assert_merkle_rejected(outcome, &submitted);
+    assert_body_rejected(outcome, &submitted, BlockBodyError::MerkleMismatch);
 }
 
 /// Documents a current gap in the sidecar's short-ID path, not a guarantee
 /// to preserve. A v5 scriptSig is authorizing data (ZIP 244): changing one of
-/// its bytes keeps the txid, so the merkle-only check passes and the altered
-/// block is submitted. Whichever layer gains authorization or block-commitment
+/// its bytes keeps the txid, so the body check passes and the altered block is
+/// submitted. Whichever layer gains authorization or block-commitment
 /// verification, this expectation is re-evaluated then.
 #[tokio::test]
-async fn known_gap_nu7_auth_only_change_passes_the_merkle_only_check() {
+async fn known_gap_nu7_auth_only_change_passes_the_body_check() {
     let fixture = Nu7Fixture::load();
     let mut altered = fixture.v5_transaction();
     altered[100] ^= 0x01; // inside the input's scriptSig, bytes 58..=163
@@ -216,7 +221,8 @@ async fn known_gap_nu7_auth_only_change_passes_the_merkle_only_check() {
 /// decode, and return the raw block the sidecar would build from the result.
 fn fec_round_trip(lost: &[usize]) -> Result<Vec<u8>, FecError> {
     let fixture = Nu7Fixture::load();
-    let compact = compact_block_from_raw_block(&fixture.raw).unwrap();
+    let parsed = parse_block_body(fixture.raw.clone()).unwrap();
+    let compact = compact_block_from_parsed(&parsed).unwrap();
     let chunker = BlockChunker::new(10, 3).unwrap();
     let chunks = chunker
         .compact_block_to_chunks(&compact, &sovright_relay::zcash_block_hash(&compact.header))

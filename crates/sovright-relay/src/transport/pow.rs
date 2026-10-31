@@ -12,9 +12,11 @@
 //!
 //! Like the equivalent guard in `sovright-p2p-ingress::submitblock_rpc`, this
 //! is an anti-garbage check and NOT a consensus-difficulty check: it requires
-//! the header to meet its OWN stated target within the valid mainnet range.
+//! the header to meet its OWN stated target within the network's valid range.
 //! Whether that target clears the current network difficulty is the full
 //! node's job, and needs chain context this layer does not have.
+
+use zcash_equihash_validator::{Target, compact_to_target};
 
 /// Minimum block header size in bytes for validation.
 ///
@@ -39,17 +41,21 @@ pub enum PowResult {
 
 /// Outcome of the hash-to-target half of the PoW check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TargetCheck {
+pub enum TargetCheck {
     Met,
     NotMet,
-    /// nBits is malformed or outside the valid mainnet range.
+    /// nBits is malformed or above `pow_limit`, or the header is too short to
+    /// hold a solution.
     BadTarget,
 }
 
-/// Does this header meet the target its own nBits encodes?
+/// Does this header meet the target its own nBits encodes, within `pow_limit`?
 ///
 /// Zcash's PoW hash is the **double-SHA256** of the full 1487-byte serialized
 /// header, compared as a little-endian 256-bit integer against the target.
+///
+/// `Met` is not proof of work. The sender picks nBits, so a made-up header needs
+/// only about `2^256 / pow_limit` hashes, and the solution is not looked at here.
 ///
 /// This deliberately does not call `EquihashValidator::verify_share`, which
 /// bundles the Equihash check and the target check into a single call. The two
@@ -61,8 +67,10 @@ enum TargetCheck {
 /// agreement is pinned by
 /// `zcash-equihash-validator/tests/consensus_pow_hash.rs`, so the two cannot
 /// drift apart unnoticed.
-fn header_meets_stated_target(header: &[u8]) -> TargetCheck {
-    use zcash_equihash_validator::{Target, compact_to_target};
+pub fn header_meets_stated_target(header: &[u8], pow_limit: &Target) -> TargetCheck {
+    let Some(header) = header.get(..ZCASH_FULL_HEADER_SIZE) else {
+        return TargetCheck::BadTarget;
+    };
 
     // nBits is at offset 104, little-endian: version(4) prev(32) merkle(32)
     // commitments(32) time(4). Offset 100 is `time`; reading it there silently
@@ -79,11 +87,11 @@ fn header_meets_stated_target(header: &[u8]) -> TargetCheck {
         return TargetCheck::BadTarget;
     }
     let target = compact_to_target(bits);
-    if target.0 == [0u8; 32] || target > Target::mainnet_pow_limit() {
+    if target.0 == [0u8; 32] || target > *pow_limit {
         return TargetCheck::BadTarget;
     }
 
-    let hash = crate::consensus_block_hash(&header[..ZCASH_FULL_HEADER_SIZE]);
+    let hash = crate::consensus_block_hash(header);
     if target.is_met_by(&hash) {
         TargetCheck::Met
     } else {
@@ -163,7 +171,7 @@ impl PowValidator for EquihashPowValidator {
 
         // (1) Equihash solution validity.
         match equihash_verifier::is_valid_solution(EQUIHASH_N, EQUIHASH_K, input, nonce, solution) {
-            Ok(()) => match header_meets_stated_target(header) {
+            Ok(()) => match header_meets_stated_target(header, &Target::mainnet_pow_limit()) {
                 // (2) Hash-to-target. Without this a valid-but-trivial solution
                 // would be forwarded into the mesh for free.
                 TargetCheck::Met => PowResult::Valid,
@@ -273,6 +281,113 @@ mod tests {
         header[104..108].copy_from_slice(&0x0300_0001u32.to_le_bytes());
 
         assert_eq!(EquihashPowValidator.validate(&header), PowResult::Invalid);
+    }
+
+    /// A real header with its nBits replaced by `bits`, ground until its hash
+    /// meets that target. The solution no longer verifies, which this check does
+    /// not look at.
+    fn header_stating(bits: u32) -> Vec<u8> {
+        let target = compact_to_target(bits);
+        let mut header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+        header[zcash_pool_common::BITS_OFFSET..][..4].copy_from_slice(&bits.to_le_bytes());
+        for nonce in 0u32.. {
+            header[ZCASH_EQUIHASH_INPUT_SIZE..][..4].copy_from_slice(&nonce.to_le_bytes());
+            if target.is_met_by(&crate::consensus_block_hash(&header)) {
+                return header;
+            }
+        }
+        unreachable!("a target this easy is met within a few thousand hashes");
+    }
+
+    #[test]
+    fn a_real_header_meets_its_target_on_the_consensus_hash() {
+        let header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+        let limit = Target::mainnet_pow_limit();
+
+        assert_eq!(
+            header_meets_stated_target(&header, &limit),
+            TargetCheck::Met
+        );
+    }
+
+    #[test]
+    fn invalid_target_encodings_are_bad_targets() {
+        let cases = [
+            ("negative", 0x1f87_ffffu32),
+            ("zero mantissa", 0x1f00_0000),
+            ("rounds down to zero", 0x0100_0001),
+            ("overflowing exponent", 0x2300_0001),
+            ("just above the mainnet limit", 0x1f08_0000),
+        ];
+        for (name, bits) in cases {
+            let mut header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+            header[zcash_pool_common::BITS_OFFSET..][..4].copy_from_slice(&bits.to_le_bytes());
+
+            assert_eq!(
+                header_meets_stated_target(&header, &Target::mainnet_pow_limit()),
+                TargetCheck::BadTarget,
+                "{name}"
+            );
+        }
+    }
+
+    /// A real testnet minimum-difficulty header: valid solution, met target, and
+    /// still refused here, because this validator is limited to the mainnet range.
+    #[test]
+    fn a_real_testnet_minimum_difficulty_header_is_outside_the_validator() {
+        let header = zcash_pool_common::fixtures::testnet_genesis_serialized_header();
+        let input = &header[..ZCASH_EQUIHASH_INPUT_SIZE];
+        let nonce = &header[ZCASH_EQUIHASH_INPUT_SIZE..ZCASH_HEADER_SIZE];
+        let solution = &header[ZCASH_HEADER_SIZE + 3..];
+
+        assert!(
+            equihash_verifier::is_valid_solution(EQUIHASH_N, EQUIHASH_K, input, nonce, solution)
+                .is_ok()
+        );
+        assert_eq!(
+            header_meets_stated_target(&header, &Target::testnet_pow_limit()),
+            TargetCheck::Met
+        );
+        assert_eq!(EquihashPowValidator.validate(&header), PowResult::Invalid);
+    }
+
+    #[test]
+    fn a_header_too_short_for_a_solution_is_a_bad_target() {
+        let header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+
+        assert_eq!(
+            header_meets_stated_target(&header[..140], &Target::mainnet_pow_limit()),
+            TargetCheck::BadTarget
+        );
+    }
+
+    /// The limit is the network's: a minimum-difficulty testnet target is out of
+    /// range on mainnet, and `Met` needs no valid solution.
+    #[test]
+    fn the_limit_decides_which_targets_are_in_range() {
+        let header = header_stating(0x2007_ffff);
+
+        assert_eq!(
+            header_meets_stated_target(&header, &Target::testnet_pow_limit()),
+            TargetCheck::Met
+        );
+        assert_eq!(
+            header_meets_stated_target(&header, &Target::mainnet_pow_limit()),
+            TargetCheck::BadTarget
+        );
+        assert_eq!(EquihashPowValidator.validate(&header), PowResult::Invalid);
+    }
+
+    #[test]
+    fn a_hash_above_an_in_range_target_is_not_met() {
+        let mut header = hex::decode(MAINNET_HEADER_HEX).unwrap();
+        header[zcash_pool_common::BITS_OFFSET..][..4]
+            .copy_from_slice(&0x0300_0001u32.to_le_bytes());
+
+        assert_eq!(
+            header_meets_stated_target(&header, &Target::mainnet_pow_limit()),
+            TargetCheck::NotMet
+        );
     }
 
     #[test]

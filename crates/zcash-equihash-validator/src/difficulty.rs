@@ -46,6 +46,16 @@ impl Target {
         Self(target)
     }
 
+    /// Zcash testnet consensus PoW limit: `2^251 - 1`.
+    ///
+    /// Testnet allows minimum-difficulty blocks, so real testnet headers can
+    /// state targets above [`Self::mainnet_pow_limit`].
+    pub fn testnet_pow_limit() -> Self {
+        let mut target = [0xff; 32];
+        target[31] = 0x07;
+        Self(target)
+    }
+
     /// Maximum target from a little-endian 256-bit pow limit
     pub fn max_from_le_bytes(bytes: [u8; 32]) -> Self {
         Self(bytes)
@@ -228,6 +238,19 @@ mod tests {
         assert_eq!(compact_to_target(0x2100ffff).to_le_bytes(), expected);
         expected[30] = 0;
         assert_eq!(compact_to_target(0x220000ff).to_le_bytes(), expected);
+    }
+
+    #[test]
+    fn the_testnet_limit_is_two_to_the_251_minus_one() {
+        let mut display = Target::testnet_pow_limit().to_le_bytes();
+        display.reverse();
+        assert_eq!(
+            hex::encode(display),
+            "07ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+        assert!(compact_to_target(0x2007ffff) <= Target::testnet_pow_limit());
+        assert!(compact_to_target(0x20080000) > Target::testnet_pow_limit());
+        assert!(compact_to_target(0x2007ffff) > Target::mainnet_pow_limit());
     }
 
     #[test]

@@ -8,11 +8,14 @@ use std::error::Error;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use sovright_relay::{
-    BlockHash, CompactBlock, CompactBlockReconstructor, GetBlockTxn, MempoolProvider,
-    ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display,
-    zcash_block_hash,
+    BlockBodyError, BlockHash, CompactBlock, CompactBlockReconstructor, EquihashPowValidator,
+    GetBlockTxn, MempoolProvider, PowResult, PowValidator, ReconstructionResult, ShortId, WtxId,
+    ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display, validate_block_body,
+    validate_block_transactions, zcash_block_hash,
 };
 
 use crate::rpc::ZebraRpc;
@@ -124,8 +127,12 @@ pub struct SubmissionCandidate {
     /// with ingress receipts and the first-to-Zebra win attribution pipeline.
     pub consensus_block_hash: String,
     pub block_hex: String,
+    /// 0 for an unverified candidate, whose transactions could not all be read.
     pub tx_count: usize,
     pub block_bytes: usize,
+    /// Why this sidecar could not read the body, if it is going to Zebra anyway
+    /// under the emergency bypass. The Merkle and duplicate checks have not run.
+    pub unverified: Option<BlockBodyError>,
 }
 
 /// Outcome from handling one relay-received compact block.
@@ -211,7 +218,7 @@ pub enum RelayBlockError {
         bytes: usize,
     },
     RawBlockHashMismatch,
-    InvalidCompactSize,
+    InvalidBlockBody(BlockBodyError),
     SubmitFailed(String),
     SubmitRejected(String, SubmitRejectionClass),
 }
@@ -256,9 +263,7 @@ impl fmt::Display for RelayBlockError {
             RelayBlockError::RawBlockHashMismatch => {
                 write!(f, "raw block header hash does not match relay metadata")
             }
-            RelayBlockError::InvalidCompactSize => {
-                write!(f, "invalid transaction count compactSize")
-            }
+            RelayBlockError::InvalidBlockBody(error) => write!(f, "invalid block body: {error}"),
             RelayBlockError::SubmitFailed(error) => write!(f, "submitblock RPC failed: {error}"),
             RelayBlockError::SubmitRejected(reason, class) => {
                 write!(f, "submitblock rejected: {reason} ({})", class.as_str())
@@ -319,6 +324,12 @@ pub fn build_submission_candidate(
         next_position = position as usize + 1;
     }
 
+    // Each slice, not the joined block: shifted boundaries can join into valid
+    // bytes that this compact block did not actually carry.
+    let tx_count =
+        validate_block_transactions(&compact.header, txs.iter().map(|tx| tx.tx_data.as_slice()))
+            .map_err(RelayBlockError::InvalidBlockBody)?;
+
     let mut block = Vec::with_capacity(
         compact.header.len()
             + compact_size_len(txs.len())
@@ -334,8 +345,9 @@ pub fn build_submission_candidate(
         block_hash: compact.header_hash().to_string(),
         consensus_block_hash: consensus_block_hash_display(&compact.header),
         block_hex: hex::encode(&block),
-        tx_count: txs.len(),
+        tx_count,
         block_bytes: block.len(),
+        unverified: None,
     })
 }
 
@@ -374,9 +386,13 @@ pub fn build_submission_candidate_with_mempool<M: MempoolProvider>(
         ReconstructionResult::Invalid { reason } => {
             Err(RelayBlockError::ReconstructionInvalid { reason })
         }
+        ReconstructionResult::InvalidBody(error) => Err(RelayBlockError::InvalidBlockBody(error)),
     }
 }
 
+/// Serialize transactions the reconstructor already validated against `header`.
+/// Its one call is on `ReconstructionResult::Complete`, which is why it stays
+/// private: nothing else may reach a candidate without that check.
 fn build_submission_candidate_from_transactions(
     header: &[u8],
     transactions: &[Vec<u8>],
@@ -401,6 +417,7 @@ fn build_submission_candidate_from_transactions(
         block_hex: hex::encode(&block),
         tx_count: transactions.len(),
         block_bytes: block.len(),
+        unverified: None,
     })
 }
 
@@ -422,13 +439,7 @@ pub fn build_raw_block_submission_candidate(
         return Err(RelayBlockError::RawBlockHashMismatch);
     }
 
-    let mut cursor = ZCASH_FULL_HEADER_SIZE;
-    let tx_count = decode_compact_size(raw_block, &mut cursor)?;
-    if tx_count == 0 {
-        return Err(RelayBlockError::EmptyTransactions);
-    }
-    let tx_count = usize::try_from(tx_count)
-        .map_err(|_| RelayBlockError::TooManyTransactions { count: usize::MAX })?;
+    let tx_count = validate_block_body(raw_block).map_err(RelayBlockError::InvalidBlockBody)?;
 
     Ok(SubmissionCandidate {
         block_hash: hex::encode(block_hash),
@@ -436,6 +447,32 @@ pub fn build_raw_block_submission_candidate(
         block_hex: hex::encode(raw_block),
         tx_count,
         block_bytes: raw_block.len(),
+        unverified: None,
+    })
+}
+
+/// A raw block this sidecar could not read, for the emergency bypass. Nothing here
+/// says the body belongs to its header, so the header has to show a real proof of
+/// work. The relay's checks are not relied on, and neither is what the sender saw.
+///
+/// The cost of the Equihash check has not been measured. It is the relay node's
+/// check, so it covers the mainnet target range on either network: a testnet
+/// minimum-difficulty block is refused here as it is at the first relay.
+fn unverified_raw_candidate(
+    raw_block: &[u8],
+    error: BlockBodyError,
+) -> Result<SubmissionCandidate, RelayBlockError> {
+    let header = raw_block_header(raw_block)?;
+    if EquihashPowValidator.validate(header) != PowResult::Valid {
+        return Err(RelayBlockError::InvalidBlockBody(error));
+    }
+    Ok(SubmissionCandidate {
+        block_hash: hex::encode(raw_block_header_hash(header)),
+        consensus_block_hash: consensus_block_hash_display(header),
+        block_hex: hex::encode(raw_block),
+        tx_count: 0,
+        block_bytes: raw_block.len(),
+        unverified: Some(error),
     })
 }
 
@@ -559,33 +596,7 @@ where
     V: crate::submit_gate::ChainView,
 {
     let candidate = build_submission_candidate(compact)?;
-    let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
-        &compact.header,
-        candidate.block_hash.clone(),
-        parent,
-    )
-    .map_err(candidate_meta_error)?;
-
-    match gate.apply_now(&candidate, &meta) {
-        crate::submit_gate::GateDecision::Accept => {}
-        crate::submit_gate::GateDecision::Reject(reason) => {
-            return Ok(SubmissionOutcome::GateRejected { candidate, reason });
-        }
-    }
-
-    match mode {
-        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
-        SubmitBlockMode::Live => {
-            let result = submitter
-                .submit_block(&candidate.block_hex)
-                .await
-                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
-            let status =
-                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
-                    .await?;
-            Ok(SubmissionOutcome::Submitted { candidate, status })
-        }
-    }
+    submit_through_gate(submitter, candidate, &compact.header, mode, gate, parent).await
 }
 
 /// Handle one relay raw block, evaluating the safety gate against the
@@ -606,17 +617,96 @@ where
     V: crate::submit_gate::ChainView,
 {
     let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
+    let header = raw_block_header(raw_block)?;
+    submit_through_gate(submitter, candidate, header, mode, gate, parent).await
+}
 
-    // Raw blocks carry the full header at the start. Extract the prev_hash
-    // from the first ZCASH_FULL_HEADER_SIZE bytes; the gate metadata needs it.
-    let header = raw_block.get(..ZCASH_FULL_HEADER_SIZE).ok_or_else(|| {
-        RelayBlockError::ReconstructionInvalid {
+/// [`handle_relay_compact_block_with_gate`], validating the candidate first: a
+/// bad body costs neither the parent lookup, which is a Zebra round trip, nor a
+/// wait for the gate lock while a good copy may be queued behind it.
+pub async fn validate_then_gate_compact_block<S, V, L, F>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    look_up_parent: L,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+    L: FnOnce() -> F,
+    F: Future<Output = Option<crate::submit_gate::ParentObservation>>,
+{
+    let candidate = build_submission_candidate(compact)?;
+    let parent = look_up_parent().await;
+    let mut gate = gate.lock().await;
+    submit_through_gate(
+        submitter,
+        candidate,
+        &compact.header,
+        mode,
+        &mut gate,
+        parent.as_ref(),
+    )
+    .await
+}
+
+/// [`validate_then_gate_compact_block`] for a reassembled raw block.
+pub async fn validate_then_gate_raw_block<S, V, L, F>(
+    submitter: &S,
+    raw_block: &[u8],
+    expected_block_hash: Option<[u8; 32]>,
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    look_up_parent: L,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+    L: FnOnce() -> F,
+    F: Future<Output = Option<crate::submit_gate::ParentObservation>>,
+{
+    let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
+    let header = raw_block_header(raw_block)?;
+    let parent = look_up_parent().await;
+    let mut gate = gate.lock().await;
+    submit_through_gate(
+        submitter,
+        candidate,
+        header,
+        mode,
+        &mut gate,
+        parent.as_ref(),
+    )
+    .await
+}
+
+/// Raw blocks carry the full header at the start. The gate metadata needs its
+/// prev_hash.
+fn raw_block_header(raw_block: &[u8]) -> Result<&[u8], RelayBlockError> {
+    raw_block
+        .get(..ZCASH_FULL_HEADER_SIZE)
+        .ok_or_else(|| RelayBlockError::ReconstructionInvalid {
             reason: format!(
                 "raw block shorter than the {} byte header prefix",
                 ZCASH_FULL_HEADER_SIZE
             ),
-        }
-    })?;
+        })
+}
+
+/// Run a validated candidate through the gate and, if it passes, the mode.
+async fn submit_through_gate<S, V>(
+    submitter: &S,
+    candidate: SubmissionCandidate,
+    header: &[u8],
+    mode: SubmitBlockMode,
+    gate: &mut crate::submit_gate::SubmitGate<V>,
+    parent: Option<&crate::submit_gate::ParentObservation>,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+{
     let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
         header,
         candidate.block_hash.clone(),
@@ -646,6 +736,103 @@ where
     }
 }
 
+/// The refusal the emergency bypass may override, if this is one. A transaction that
+/// did not parse is the only one: anything else is a finding about the body.
+pub fn unreadable_body(
+    outcome: &Result<SubmissionOutcome, RelayBlockError>,
+) -> Option<BlockBodyError> {
+    match outcome {
+        Err(RelayBlockError::InvalidBlockBody(error @ BlockBodyError::Transaction { .. })) => {
+            Some(*error)
+        }
+        _ => None,
+    }
+}
+
+/// What bounds one emergency bypass attempt, and where it is counted.
+#[derive(Clone, Copy)]
+pub struct UnverifiedLimits<'a> {
+    /// Time for the attempt's async waits together: the parent lookup, the gate,
+    /// `submitblock` and the lookup after a rejection, so separate RPC timeouts cannot
+    /// add up. It is not a wall-clock limit on the attempt: a timer cannot interrupt
+    /// the synchronous Equihash check, which can run past it.
+    pub budget: Duration,
+    pub bypassed: &'a AtomicU64,
+}
+
+/// The emergency bypass, for a raw block the strict path refused as
+/// [`unreadable_body`]. Zebra is the only validator of these bytes.
+///
+/// The gate lock is held only to reserve an attempt and to record the result, so a
+/// candidate waiting on Zebra holds up nothing else. The block is recorded only once
+/// Zebra has it. A dry run has no verdict, and a rejection, an RPC error, a timeout or
+/// cancellation says nothing about the real body, so none of them may hide it.
+pub async fn submit_unverified_raw_block<S, V, L, F>(
+    submitter: &S,
+    raw_block: &[u8],
+    error: BlockBodyError,
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    limits: UnverifiedLimits<'_>,
+    look_up_parent: L,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+    L: FnOnce() -> F,
+    F: Future<Output = Option<crate::submit_gate::ParentObservation>>,
+{
+    let attempt = async {
+        let candidate = unverified_raw_candidate(raw_block, error)?;
+        let header = raw_block_header(raw_block)?;
+        let parent = look_up_parent().await;
+        let meta = crate::submit_gate::CandidateMeta::from_header_bytes(
+            header,
+            candidate.block_hash.clone(),
+            parent.as_ref(),
+        )
+        .map_err(candidate_meta_error)?;
+
+        let reservation = gate.lock().await.reserve_unverified_now(&candidate, &meta);
+        let slot = match reservation {
+            Ok(slot) => slot,
+            Err(reason) => return Ok(SubmissionOutcome::GateRejected { candidate, reason }),
+        };
+        limits.bypassed.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            consensus_block_hash = %candidate.consensus_block_hash,
+            reason = candidate.unverified.map(|error| error.label()),
+            block_bytes = candidate.block_bytes,
+            checks_run = "size,header,proof_of_work",
+            checks_skipped = "merkle,duplicate_txid",
+            "Sending Zebra a block body without the Merkle and duplicate checks"
+        );
+
+        match mode {
+            SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+            SubmitBlockMode::Live => {
+                let result = submitter
+                    .submit_block(&candidate.block_hex)
+                    .await
+                    .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+                let hash = &candidate.consensus_block_hash;
+                let status = classify_submitblock_outcome(result, submitter, hash).await?;
+                gate.lock().await.record_submitted_now(&candidate);
+                drop(slot);
+                Ok(SubmissionOutcome::Submitted { candidate, status })
+            }
+        }
+    };
+    tokio::time::timeout(limits.budget, attempt)
+        .await
+        .unwrap_or_else(|_| {
+            Err(RelayBlockError::SubmitFailed(format!(
+                "unverified submission exceeded its {:?} budget",
+                limits.budget
+            )))
+        })
+}
+
 /// A gated candidate whose `CandidateMeta` could not be built never reaches
 /// the gate or `submit_block`; each cause keeps its own reason text.
 fn candidate_meta_error(error: crate::submit_gate::CandidateMetaError) -> RelayBlockError {
@@ -656,7 +843,7 @@ fn candidate_meta_error(error: crate::submit_gate::CandidateMetaError) -> RelayB
 
 /// Submit-result classification WITH the follow-up lookup, for every submit path.
 ///
-/// There are five places that call `submit_block`. When rejection classification
+/// There were five places that called `submit_block`. When rejection classification
 /// was added in #88 only one of them was wired up, so the other four -- including
 /// the raw-segment path, which carries almost all traffic -- left the class at
 /// `Unknown`. The result was 119 rejections fleet-wide on 2026-09-03, every one
@@ -720,37 +907,6 @@ fn encode_compact_size(count: usize, out: &mut Vec<u8>) -> Result<(), RelayBlock
     Ok(())
 }
 
-fn decode_compact_size(input: &[u8], cursor: &mut usize) -> Result<u64, RelayBlockError> {
-    let Some(tag) = input.get(*cursor).copied() else {
-        return Err(RelayBlockError::InvalidCompactSize);
-    };
-    *cursor += 1;
-    match tag {
-        0x00..=0xfc => Ok(tag as u64),
-        0xfd => {
-            let bytes = input
-                .get(*cursor..*cursor + 2)
-                .ok_or(RelayBlockError::InvalidCompactSize)?;
-            *cursor += 2;
-            Ok(u16::from_le_bytes(bytes.try_into().unwrap()) as u64)
-        }
-        0xfe => {
-            let bytes = input
-                .get(*cursor..*cursor + 4)
-                .ok_or(RelayBlockError::InvalidCompactSize)?;
-            *cursor += 4;
-            Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
-        }
-        0xff => {
-            let bytes = input
-                .get(*cursor..*cursor + 8)
-                .ok_or(RelayBlockError::InvalidCompactSize)?;
-            *cursor += 8;
-            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-        }
-    }
-}
-
 fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
     zcash_block_hash(header)
 }
@@ -758,6 +914,7 @@ fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sovright_relay::test_support::parseable_transaction;
     use sovright_relay::{
         AuthDigest, CompactBlock, PrefilledTx, ShortId, TestMempool, TxId, WtxId,
     };
@@ -771,33 +928,25 @@ mod tests {
 
     #[test]
     fn submission_candidate_decodes_differential_prefilled_indices() {
-        let header = vec![0xab; 2189];
+        use sovright_relay::test_support::{committed_header, parseable_transaction, raw_block};
+        let txs: Vec<Vec<u8>> = (1..=3).map(parseable_transaction).collect();
+        let header = committed_header(0xab, &txs);
         let compact = CompactBlock::new(
             header.clone(),
             0,
             Vec::new(),
-            vec![
-                PrefilledTx {
+            txs.iter()
+                .map(|tx| PrefilledTx {
                     index: 0,
-                    tx_data: vec![0x01],
-                },
-                PrefilledTx {
-                    index: 0,
-                    tx_data: vec![0x02, 0x03],
-                },
-                PrefilledTx {
-                    index: 0,
-                    tx_data: vec![0x04],
-                },
-            ],
+                    tx_data: tx.clone(),
+                })
+                .collect(),
         );
 
         let candidate = build_submission_candidate(&compact).unwrap();
         let block = hex::decode(&candidate.block_hex).unwrap();
 
-        let mut expected = header;
-        expected.push(3);
-        expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        let expected = raw_block(&header, &txs);
 
         assert_eq!(candidate.tx_count, 3);
         assert_eq!(candidate.block_bytes, expected.len());
@@ -838,6 +987,7 @@ mod tests {
         let candidate = SubmissionCandidate {
             block_hash: "internal-id".to_string(),
             consensus_block_hash: "00abcdef".to_string(),
+            unverified: None,
             block_hex: "00".to_string(),
             tx_count: 1,
             block_bytes: 1,
@@ -851,15 +1001,15 @@ mod tests {
     #[test]
     fn submission_candidate_reconstructs_short_ids_from_mempool() {
         let nonce = 42;
-        let coinbase = vec![0x01, 0x02];
-        let tx1 = vec![0x03, 0x04, 0x05];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
         let tx1_wtxid = make_wtxid(0x11);
         // Reconstruction verifies the header's merkle commitment, so the test
         // header has to actually commit to these two transactions. An arbitrary
         // filler header would now (correctly) be rejected before this path is
         // reached, and the test would prove nothing about short-id resolution.
         let header = {
-            let mut h = vec![0xcd; 2189];
+            let mut h = vec![0xcd; ZCASH_FULL_HEADER_SIZE];
             let txids: Vec<[u8; 32]> = [&coinbase, &tx1]
                 .iter()
                 .map(|t| sovright_relay::txid_from_tx_bytes(t))

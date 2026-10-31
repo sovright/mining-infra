@@ -444,6 +444,7 @@ mod tests {
                 missing_wtxids.len()
             ),
             ReconstructionResult::Invalid { reason } => panic!("Invalid: {reason}"),
+            ReconstructionResult::InvalidBody(error) => panic!("invalid body: {error}"),
         }
     }
 

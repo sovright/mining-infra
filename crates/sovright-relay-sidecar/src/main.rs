@@ -2,16 +2,15 @@
 
 use clap::Parser;
 use sovright_relay::{
-    ArrivalSink, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
-    TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
-    ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
+    ArrivalSink, BlockBodyError, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment,
+    RelayPayload, TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord,
+    WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
 };
 use std::collections::HashMap;
-use std::fs;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -28,12 +27,13 @@ use sovright_relay_sidecar::compact::build_compact_block;
 use sovright_relay_sidecar::config;
 use sovright_relay_sidecar::dual_submit::{DualSubmit, SecondarySample, build_submitter};
 use sovright_relay_sidecar::mempool_sync::run_zebra_mempool_sync;
+use sovright_relay_sidecar::metrics_textfile::write_metrics_textfile;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    SubmitRejectionClass, handle_relay_compact_block, handle_relay_compact_block_with_gate,
-    handle_relay_compact_block_with_mempool, handle_relay_raw_block,
-    handle_relay_raw_block_with_gate,
+    SubmitRejectionClass, UnverifiedLimits, handle_relay_compact_block,
+    handle_relay_compact_block_with_mempool, handle_relay_raw_block, submit_unverified_raw_block,
+    unreadable_body, validate_then_gate_compact_block, validate_then_gate_raw_block,
 };
 use sovright_relay_sidecar::submit_gate::SubmitGate;
 use tokio::sync::Mutex as TokioMutex;
@@ -416,6 +416,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // is always None. The ZebraChainView feeds the gate's parent-known
         // check and is shared so we can also use it for parent-height lookups
         // on each candidate before invoking the gated handler.
+        let unreadable_submit = submit_gate_cfg
+            .as_ref()
+            .and_then(UnreadableSubmit::from_config);
+        if let Some(unreadable) = &unreadable_submit {
+            warn!(
+                budget = ?unreadable.budget,
+                "Emergency bypass on: raw blocks this sidecar cannot read go to Zebra without \
+                 the Merkle and duplicate checks. Only blocks in the mainnet target range \
+                 qualify"
+            );
+            metrics
+                .unreadable_submit_enabled
+                .store(true, Ordering::Relaxed);
+        }
         let (gate, chain_view) = if let Some(cfg) = submit_gate_cfg.as_ref().filter(|c| c.enabled) {
             let chain_view = ZebraChainView::new(ZebraChainViewConfig::default());
             // Spawn the polling task; drop the JoinHandle since the view's
@@ -443,6 +457,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Arc::clone(&mempool),
             gate,
             chain_view,
+            unreadable_submit,
         ))
     } else {
         relay.start().await?;
@@ -692,6 +707,7 @@ fn spawn_relay_block_handler<M>(
     mempool: Arc<M>,
     gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
     chain_view: Option<Arc<ZebraChainView>>,
+    unreadable_submit: Option<UnreadableSubmit>,
 ) -> tokio::task::JoinHandle<()>
 where
     M: MempoolProvider + Send + Sync + 'static,
@@ -736,20 +752,14 @@ where
                                     );
                                     continue;
                                 }
-                                let parent = chain_view
-                                    .observe_candidate_parent(rpc.as_ref(), &compact.header)
-                                    .await;
-                                let outcome = {
-                                    let mut gate_guard = gate.lock().await;
-                                    handle_relay_compact_block_with_gate(
-                                        submitter.as_ref(),
-                                        &compact,
-                                        mode,
-                                        &mut gate_guard,
-                                        parent.as_ref(),
-                                    )
-                                    .await
-                                };
+                                let outcome = validate_then_gate_compact_block(
+                                    submitter.as_ref(),
+                                    &compact,
+                                    mode,
+                                    gate,
+                                    || chain_view.observe_candidate_parent(rpc.as_ref(), &compact.header),
+                                )
+                                .await;
                                 // Per-cause GateRejected metric is incremented in
                                 // log_submission_outcome; here we tick the
                                 // accepted-by-gate counter for outcomes that came
@@ -861,17 +871,13 @@ where
                                              let raw_outcome = if let (Some(gate), Some(chain_view)) =
                                                  (&gate, &chain_view)
                                             {
-                                                let parent = chain_view
-                                                    .observe_candidate_parent(rpc.as_ref(), &raw_block)
-                                                    .await;
-                                                let mut gate_guard = gate.lock().await;
-                                                handle_relay_raw_block_with_gate(
+                                                validate_then_gate_raw_block(
                                                     submitter.as_ref(),
                                                     &raw_block,
                                                     Some(block_hash),
                                                     mode,
-                                                    &mut gate_guard,
-                                                    parent.as_ref(),
+                                                    gate,
+                                                    || chain_view.observe_candidate_parent(rpc.as_ref(), &raw_block),
                                                 )
                                                 .await
                                             } else {
@@ -883,6 +889,32 @@ where
                                                 )
                                                 .await
                                             };
+                                            if let (
+                                                Some(error),
+                                                Some(unreadable),
+                                                Some(gate),
+                                                Some(chain_view),
+                                            ) = (
+                                                unreadable_body(&raw_outcome),
+                                                &unreadable_submit,
+                                                &gate,
+                                                &chain_view,
+                                            ) {
+                                                // Off the receive task, which must keep
+                                                // reading while Zebra judges this.
+                                                unreadable.spawn(UnverifiedSubmission {
+                                                    submitter: Arc::clone(&submitter),
+                                                    rpc: Arc::clone(&rpc),
+                                                    gate: Arc::clone(gate),
+                                                    chain_view: Arc::clone(chain_view),
+                                                    metrics: Arc::clone(&metrics),
+                                                    mode,
+                                                    raw_block,
+                                                    error,
+                                                    first_seen,
+                                                });
+                                                continue;
+                                            }
                                             if gate.is_some()
                                                 && matches!(
                                                     raw_outcome,
@@ -1399,6 +1431,94 @@ fn expire_raw_segment_buffer(
     expired_count
 }
 
+/// The emergency bypass, as the receive task runs it: each attempt on a task of its
+/// own, so nothing else waits on Zebra.
+#[derive(Clone)]
+struct UnreadableSubmit {
+    budget: Duration,
+    /// One permit per attempt running, across all blocks. Attempts per block do not
+    /// bound this, because each new header brings its own.
+    running: Arc<tokio::sync::Semaphore>,
+}
+
+/// One reassembled block on its way through the bypass.
+struct UnverifiedSubmission {
+    submitter: Arc<DualSubmit<Arc<ZebraRpc>>>,
+    rpc: Arc<ZebraRpc>,
+    gate: Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>,
+    chain_view: Arc<ZebraChainView>,
+    metrics: Arc<SidecarMetrics>,
+    mode: SubmitBlockMode,
+    raw_block: Vec<u8>,
+    error: BlockBodyError,
+    first_seen: Instant,
+}
+
+impl UnreadableSubmit {
+    /// `None` unless the bypass is on, which also needs the gate.
+    fn from_config(config: &config::SubmitGateConfig) -> Option<Self> {
+        (config.enabled && config.submit_unreadable_blocks).then(|| {
+            Self::new(
+                Duration::from_secs(config.unreadable_submit_budget_secs),
+                config.unreadable_attempts_per_block,
+            )
+        })
+    }
+
+    fn new(budget: Duration, max_running: usize) -> Self {
+        Self {
+            budget,
+            running: Arc::new(tokio::sync::Semaphore::new(max_running)),
+        }
+    }
+
+    fn spawn(&self, submission: UnverifiedSubmission) {
+        let Ok(permit) = Arc::clone(&self.running).try_acquire_owned() else {
+            warn!("Emergency bypass is at its limit; refusing an unreadable block");
+            submission.metrics.inc_submit_gate_rejected(
+                sovright_relay_sidecar::submit_gate::RejectReason::UnverifiedLimit,
+            );
+            return;
+        };
+        let budget = self.budget;
+        tokio::spawn(async move {
+            let _permit = permit;
+            let UnverifiedSubmission {
+                submitter,
+                rpc,
+                gate,
+                chain_view,
+                metrics,
+                mode,
+                raw_block,
+                error,
+                first_seen,
+            } = submission;
+            let outcome = submit_unverified_raw_block(
+                submitter.as_ref(),
+                &raw_block,
+                error,
+                mode,
+                gate.as_ref(),
+                UnverifiedLimits {
+                    budget,
+                    bypassed: &metrics.block_body_unverified,
+                },
+                || chain_view.observe_candidate_parent(rpc.as_ref(), &raw_block),
+            )
+            .await;
+            if matches!(
+                outcome,
+                Ok(SubmissionOutcome::DryRun(_)) | Ok(SubmissionOutcome::Submitted { .. })
+            ) {
+                metrics.inc_submit_gate_accepted();
+            }
+            let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
+            log_submission_outcome(outcome, metrics.as_ref(), Some(first_seen_to_submit_ms));
+        });
+    }
+}
+
 fn log_submission_outcome(
     outcome: Result<SubmissionOutcome, sovright_relay_sidecar::submit::RelayBlockError>,
     metrics: &SidecarMetrics,
@@ -1484,6 +1604,10 @@ fn log_submission_outcome(
                 metrics.inc_submit_rpc_failures();
                 warn!(%error, "Relay block submitblock RPC failed");
             }
+            RelayBlockError::InvalidBlockBody(error) => {
+                metrics.inc_block_body_rejected(&error);
+                warn!(%error, "Relay block body refused before submitblock");
+            }
             error => {
                 metrics.inc_not_submit_candidates();
                 warn!(%error, "Relay block is not a submit candidate");
@@ -1503,15 +1627,24 @@ fn classify_reconstruction_invalid(reason: &str) -> &'static str {
         "duplicate_prefilled"
     } else if reason.contains("out of bounds") {
         "prefilled_out_of_bounds"
-    } else if reason.contains("merkle root mismatch") {
-        // The reconstructor now verifies the header commitment, so this is the
-        // expected label for a short-id collision or a stale mempool copy --
-        // failures that previously reached Zebra as a submit rejection instead
-        // of being caught locally. It needs its own bucket precisely because it
-        // is the one we expect to see.
-        "merkle_mismatch"
     } else {
         "other"
+    }
+}
+
+/// The same bucket for a filled block that failed body validation.
+///
+/// A merkle mismatch is the expected label for a short-id collision or a stale
+/// mempool copy -- failures that previously reached Zebra as a submit rejection
+/// instead of being caught locally. It needs its own bucket precisely because it
+/// is the one we expect to see, and a repeated txid needs another: its root can
+/// match, so counting it as a mismatch sends whoever reads the metric after
+/// short-id collisions that never happened.
+fn classify_invalid_assembly(error: &BlockBodyError) -> &'static str {
+    match error {
+        BlockBodyError::MerkleMismatch => "merkle_mismatch",
+        BlockBodyError::DuplicateTxid { .. } => "duplicate_txid",
+        _ => "other",
     }
 }
 
@@ -1569,6 +1702,11 @@ fn record_compact_reconstruction_outcome(
                 "Compact block reconstruction produced an invalid block"
             );
         }
+        Err(RelayBlockError::InvalidBlockBody(error)) => {
+            let kind = classify_invalid_assembly(error);
+            metrics.inc_compact_reconstruction_invalids(kind);
+            warn!(%error, kind, "Compact block reconstruction produced an invalid block");
+        }
         Err(error) => {
             // Previously folded into the invalid counter, which made "invalid"
             // a catch-all that overstated true reconstruction invalidity and
@@ -1589,7 +1727,9 @@ struct SidecarMetrics {
     compact_reconstruction_invalids_duplicate_prefilled: AtomicU64,
     compact_reconstruction_invalids_out_of_bounds: AtomicU64,
     compact_reconstruction_invalids_merkle_mismatch: AtomicU64,
+    compact_reconstruction_invalids_duplicate_txid: AtomicU64,
     compact_reconstruction_invalids_other: AtomicU64,
+    block_body_rejections: [AtomicU64; BlockBodyError::ALL.len()],
     compact_reconstruction_errors: AtomicU64,
     compact_reconstruction_missing_wtxids: AtomicU64,
     compact_reconstruction_unresolved_short_ids: AtomicU64,
@@ -1638,6 +1778,9 @@ struct SidecarMetrics {
     submit_gate_rejected_unknown_parent: AtomicU64,
     submit_gate_rejected_out_of_window: AtomicU64,
     submit_gate_rejected_duplicate: AtomicU64,
+    submit_gate_rejected_unverified_limit: AtomicU64,
+    block_body_unverified: AtomicU64,
+    unreadable_submit_enabled: AtomicBool,
     raw_segment_incomplete_blocks: AtomicUsize,
     raw_segment_payload_bytes: AtomicUsize,
     tx_cache_entries: AtomicUsize,
@@ -1698,11 +1841,16 @@ impl SidecarMetrics {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    fn inc_block_body_rejected(&self, error: &BlockBodyError) {
+        self.block_body_rejections[error.kind_index()].fetch_add(1, Ordering::Relaxed);
+    }
+
     fn inc_compact_reconstruction_invalids(&self, kind: &str) {
         match kind {
             "duplicate_prefilled" => &self.compact_reconstruction_invalids_duplicate_prefilled,
             "prefilled_out_of_bounds" => &self.compact_reconstruction_invalids_out_of_bounds,
             "merkle_mismatch" => &self.compact_reconstruction_invalids_merkle_mismatch,
+            "duplicate_txid" => &self.compact_reconstruction_invalids_duplicate_txid,
             _ => &self.compact_reconstruction_invalids_other,
         }
         .fetch_add(1, Ordering::Relaxed);
@@ -1837,6 +1985,9 @@ impl SidecarMetrics {
             sovright_relay_sidecar::submit_gate::RejectReason::DuplicateSubmit => {
                 &self.submit_gate_rejected_duplicate
             }
+            sovright_relay_sidecar::submit_gate::RejectReason::UnverifiedLimit => {
+                &self.submit_gate_rejected_unverified_limit
+            }
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -1905,6 +2056,9 @@ impl SidecarMetrics {
             .load(Ordering::Relaxed);
         let cri_merkle_mismatch = self
             .compact_reconstruction_invalids_merkle_mismatch
+            .load(Ordering::Relaxed);
+        let cri_duplicate_txid = self
+            .compact_reconstruction_invalids_duplicate_txid
             .load(Ordering::Relaxed);
         let cri_other = self
             .compact_reconstruction_invalids_other
@@ -1981,7 +2135,7 @@ impl SidecarMetrics {
         let tx_feed_dropped_too_large = self.tx_feed_dropped_too_large.load(Ordering::Relaxed);
         let zebra_mempool_sync_inserts = self.zebra_mempool_sync_inserts.load(Ordering::Relaxed);
 
-        format!(
+        let mut text = format!(
             concat!(
                 "# TYPE sovright_relay_sidecar_relay_compact_blocks_received_total counter\n",
                 "sovright_relay_sidecar_relay_compact_blocks_received_total {compact_blocks_received}\n",
@@ -1996,6 +2150,7 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"duplicate_prefilled\"}} {cri_duplicate_prefilled}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"prefilled_out_of_bounds\"}} {cri_out_of_bounds}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"merkle_mismatch\"}} {cri_merkle_mismatch}\n",
+                "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"duplicate_txid\"}} {cri_duplicate_txid}\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total{{reason=\"other\"}} {cri_other}\n",
                 "# TYPE sovright_relay_sidecar_relay_compact_reconstruction_errors_total counter\n",
                 "sovright_relay_sidecar_relay_compact_reconstruction_errors_total {compact_reconstruction_errors}\n",
@@ -2094,6 +2249,7 @@ impl SidecarMetrics {
             cri_duplicate_prefilled = cri_duplicate_prefilled,
             cri_out_of_bounds = cri_out_of_bounds,
             cri_merkle_mismatch = cri_merkle_mismatch,
+            cri_duplicate_txid = cri_duplicate_txid,
             cri_other = cri_other,
             compact_reconstruction_errors = compact_reconstruction_errors,
             compact_reconstruction_missing_wtxids = compact_reconstruction_missing_wtxids,
@@ -2145,7 +2301,29 @@ impl SidecarMetrics {
             submit_gate_rejected_unknown_parent = submit_gate_rejected_unknown_parent,
             submit_gate_rejected_out_of_window = submit_gate_rejected_out_of_window,
             submit_gate_rejected_duplicate = submit_gate_rejected_duplicate,
-        )
+        );
+        text.push_str(&format!(
+            "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"unverified_limit\"}} {}\n",
+            self.submit_gate_rejected_unverified_limit
+                .load(Ordering::Relaxed)
+        ));
+        text.push_str(&format!(
+            "# TYPE sovright_relay_sidecar_relay_block_body_unverified_total counter\n\
+             sovright_relay_sidecar_relay_block_body_unverified_total {}\n\
+             # TYPE sovright_relay_sidecar_unreadable_block_submit_enabled gauge\n\
+             sovright_relay_sidecar_unreadable_block_submit_enabled {}\n",
+            self.block_body_unverified.load(Ordering::Relaxed),
+            u8::from(self.unreadable_submit_enabled.load(Ordering::Relaxed))
+        ));
+        text.push_str("# TYPE sovright_relay_sidecar_relay_block_body_rejected_total counter\n");
+        for (kind, count) in BlockBodyError::ALL.iter().zip(&self.block_body_rejections) {
+            text.push_str(&format!(
+                "sovright_relay_sidecar_relay_block_body_rejected_total{{reason=\"{}\"}} {}\n",
+                kind.label(),
+                count.load(Ordering::Relaxed)
+            ));
+        }
+        text
     }
 }
 
@@ -2169,19 +2347,6 @@ fn spawn_metrics_textfile_writer(
     });
 }
 
-fn write_metrics_textfile(
-    path: &Path,
-    text: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, text)?;
-    fs::rename(tmp, path)?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,6 +2356,7 @@ mod tests {
     };
     use std::sync::atomic::Ordering;
 
+    use sovright_relay::test_support::{committed_header, parseable_transaction};
     use sovright_relay_sidecar::submit::{SubmitBlock, SubmitFuture};
 
     #[derive(Default)]
@@ -2226,6 +2392,117 @@ mod tests {
         let root = sovright_relay::merkle_root(&txids).expect("tests commit to >=1 tx");
         header[36..68].copy_from_slice(&root);
         header
+    }
+
+    /// Block 3470793 with a transaction changed: still parses, new txid.
+    fn bad_mainnet_transactions() -> Vec<Vec<u8>> {
+        let mut txs = zcash_pool_common::fixtures::mainnet_transactions();
+        txs[3][60] ^= 0x01;
+        txs
+    }
+
+    fn mainnet_compact(txs: &[Vec<u8>]) -> CompactBlock {
+        CompactBlock::new(
+            zcash_pool_common::fixtures::mainnet_serialized_header(),
+            0,
+            Vec::new(),
+            txs.iter()
+                .map(|tx| PrefilledTx {
+                    index: 0,
+                    tx_data: tx.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_block_body_rejection_is_counted_by_reason() {
+        let metrics = SidecarMetrics::default();
+
+        log_submission_outcome(
+            Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::MerkleMismatch,
+            )),
+            &metrics,
+            None,
+        );
+
+        let text = metrics.render_prometheus_text();
+        let name = "sovright_relay_sidecar_relay_block_body_rejected_total";
+        assert!(text.contains(&format!("{name}{{reason=\"merkle_mismatch\"}} 1")));
+        assert!(text.contains(&format!("{name}{{reason=\"duplicate_txid\"}} 0")));
+    }
+
+    /// A rejected body must not take the header's slot in the fast-path dedup,
+    /// in dry-run or live mode.
+    #[tokio::test]
+    async fn a_bad_body_does_not_take_the_fast_path_slot() {
+        for mode in [SubmitBlockMode::DryRun, SubmitBlockMode::Live] {
+            let submitter = CountingSubmitter::default();
+            let metrics = SidecarMetrics::default();
+            let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+            let mempool = TestMempool::new();
+            let now = Instant::now();
+
+            for txs in [
+                bad_mainnet_transactions(),
+                zcash_pool_common::fixtures::mainnet_transactions(),
+            ] {
+                submit_compact_fast_path(
+                    &submitter,
+                    &mainnet_compact(&txs),
+                    mode,
+                    false,
+                    &mempool,
+                    &metrics,
+                    &mut dedup,
+                    now,
+                    false,
+                )
+                .await;
+            }
+
+            assert_eq!(metrics.full_block_deduplicated.load(Ordering::Relaxed), 0);
+            let good_calls = usize::from(matches!(mode, SubmitBlockMode::Live));
+            assert_eq!(submitter.calls.load(Ordering::SeqCst), good_calls);
+        }
+    }
+
+    /// Through the reassembly buffer: the bad body completes and is refused,
+    /// then the good one completes and is submitted byte for byte.
+    #[tokio::test]
+    async fn reassembled_raw_bodies_are_validated() {
+        let good = zcash_pool_common::fixtures::mainnet_raw_block();
+        let mut bad = good.clone();
+        let tx = bad_mainnet_transactions().swap_remove(3);
+        let genuine = zcash_pool_common::fixtures::mainnet_transactions().swap_remove(3);
+        let offset = good
+            .windows(genuine.len())
+            .position(|window| window == genuine.as_slice())
+            .unwrap();
+        bad[offset..offset + tx.len()].copy_from_slice(&tx);
+        let hash = zcash_block_hash(&good[..ZCASH_FULL_HEADER_SIZE]);
+        let submitter = CountingSubmitter::default();
+        let mut buffer =
+            RawSegmentBuffer::new(buffer_config(8, 1024 * 1024, Duration::from_secs(60)));
+        let frame = RawBlockSegment::HEADER_LEN + 8 * 1024;
+
+        for (raw, submitted) in [(&bad, 0), (&good, 1)] {
+            let mut complete = None;
+            for segment in sovright_relay::split_raw_block(hash, raw, frame).unwrap() {
+                if let RawSegmentInsert::Complete { segments, .. } =
+                    buffer.insert(segment, Instant::now())
+                {
+                    complete = Some(segments);
+                }
+            }
+            let block = reassemble_raw_block(&complete.expect("all segments arrived")).unwrap();
+            assert_eq!(&block, raw);
+            let outcome =
+                handle_relay_raw_block(&submitter, &block, Some(hash), SubmitBlockMode::Live).await;
+            assert_eq!(outcome.is_ok(), submitted == 1);
+            assert_eq!(submitter.calls.load(Ordering::SeqCst), submitted);
+        }
     }
 
     fn buffer_config(
@@ -2394,6 +2671,7 @@ mod tests {
             Arc::new(EmptyMempool),
             None,
             None,
+            None,
         );
 
         let valid = zcash_pool_common::fixtures::mainnet_raw_block();
@@ -2450,6 +2728,290 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
+    }
+
+    /// The real receive task, from UDP through the raw buffer to the decision, with
+    /// a client whose chunks the test sends by hand.
+    struct ReceiveTask {
+        peer: tokio::net::UdpSocket,
+        peer_addr: SocketAddr,
+        client_addr: SocketAddr,
+        client_task: tokio::task::JoinHandle<Result<(), sovright_relay::TransportError>>,
+        handler_task: tokio::task::JoinHandle<()>,
+        metrics: Arc<SidecarMetrics>,
+    }
+
+    const TEST_KEY: [u8; 32] = [0x42; 32];
+
+    impl ReceiveTask {
+        /// The gate is disabled, so the tests need no chain behind it; the lib tests
+        /// cover its decisions.
+        async fn start(
+            zebra_url: &str,
+            mode: SubmitBlockMode,
+            unreadable_submit: Option<UnreadableSubmit>,
+        ) -> Self {
+            use sovright_relay::{ClientConfig, RelayClient};
+            let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let peer_addr = peer.local_addr().unwrap();
+            let mut client = RelayClient::new(
+                ClientConfig::new(vec![peer_addr], TEST_KEY)
+                    .with_bind_addr("127.0.0.1:0".parse().unwrap())
+                    .with_fec(2, 1),
+            )
+            .unwrap();
+            client.bind().await.unwrap();
+            let client_addr = client.local_addr().unwrap();
+            let (receiver, outgoing) = client.take_receiver().unwrap();
+            let client_task = tokio::spawn(async move { client.run_with_outgoing(outgoing).await });
+            let rpc = Arc::new(ZebraRpc::new(zebra_url).await.unwrap());
+            let submitter = Arc::new(DualSubmit::primary_only(Arc::clone(&rpc), "unused", None));
+            let metrics = Arc::new(SidecarMetrics::default());
+            let chain_view = ZebraChainView::new(ZebraChainViewConfig::default());
+            let gate = Arc::new(TokioMutex::new(SubmitGate::new(
+                Default::default(),
+                Arc::clone(&chain_view),
+            )));
+            let handler_task = spawn_relay_block_handler(
+                receiver,
+                rpc,
+                submitter,
+                mode,
+                false,
+                buffer_config(8, 65536, Duration::from_secs(60)),
+                Arc::clone(&metrics),
+                Arc::new(EmptyMempool),
+                Some(gate),
+                Some(chain_view),
+                unreadable_submit,
+            );
+            Self {
+                peer,
+                peer_addr,
+                client_addr,
+                client_task,
+                handler_task,
+                metrics,
+            }
+        }
+
+        async fn send(&self, raw: &[u8]) {
+            use sovright_relay::{BlockChunker, Chunk, ChunkHeader, RelaySession};
+            let hash = zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
+            let chunker = BlockChunker::new(2, 1).unwrap();
+            let session = RelaySession::new(self.peer_addr, "test", TEST_KEY);
+            for segment in split_raw_block(hash, raw, 2048).unwrap() {
+                for chunk in chunker.raw_block_segment_to_chunks(&segment).unwrap() {
+                    let h = &chunk.header;
+                    let mac = session.compute_hmac(
+                        &h.block_hash,
+                        h.chunk_id,
+                        h.total_chunks,
+                        h.payload_len,
+                        &chunk.payload,
+                    );
+                    let header = ChunkHeader::new_raw_block_segment_authenticated(
+                        &h.block_hash,
+                        h.chunk_id,
+                        h.total_chunks,
+                        h.payload_len,
+                        mac,
+                    );
+                    self.peer
+                        .send_to(
+                            &Chunk::new(header, chunk.payload).to_bytes(),
+                            self.client_addr,
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        async fn wait_for(&self, what: &str, done: impl Fn(&SidecarMetrics) -> bool) {
+            let settled = tokio::time::timeout(Duration::from_secs(5), async {
+                while !done(&self.metrics) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            assert!(settled.is_ok(), "{what} never happened");
+        }
+
+        fn stop(self) -> Arc<SidecarMetrics> {
+            self.client_task.abort();
+            self.handler_task.abort();
+            self.metrics
+        }
+    }
+
+    fn refused_as_unreadable(metrics: &SidecarMetrics) -> u64 {
+        let index = BlockBodyError::Transaction { index: 0 }.kind_index();
+        metrics.block_body_rejections[index].load(Ordering::Relaxed)
+    }
+
+    fn unreadable_block() -> Vec<u8> {
+        let txs = zcash_pool_common::fixtures::mainnet_transactions();
+        let mut unknown = 0x8000_0007u32.to_le_bytes().to_vec();
+        unknown.extend_from_slice(&0x7a7a_7a7au32.to_le_bytes());
+        unknown.resize(400, 0x5a);
+        let mut raw = zcash_pool_common::fixtures::mainnet_serialized_header();
+        raw.push(2);
+        raw.extend_from_slice(&txs[0]);
+        raw.extend_from_slice(&unknown);
+        raw
+    }
+
+    #[tokio::test]
+    async fn the_receive_task_refuses_an_unreadable_block_by_default() {
+        let task = ReceiveTask::start("http://127.0.0.1:1", SubmitBlockMode::DryRun, None).await;
+
+        task.send(&unreadable_block()).await;
+        task.wait_for("the refusal", |metrics| refused_as_unreadable(metrics) == 1)
+            .await;
+
+        let metrics = task.stop();
+        assert_eq!(metrics.submit_dry_run_candidates.load(Ordering::Relaxed), 0);
+        assert_eq!(metrics.block_body_unverified.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn the_receive_task_takes_an_unreadable_block_under_the_bypass() {
+        let bypass = UnreadableSubmit::new(Duration::from_secs(5), 4);
+        let task =
+            ReceiveTask::start("http://127.0.0.1:1", SubmitBlockMode::DryRun, Some(bypass)).await;
+
+        task.send(&unreadable_block()).await;
+        task.wait_for("the dry run", |metrics| {
+            metrics.submit_dry_run_candidates.load(Ordering::Relaxed) == 1
+        })
+        .await;
+
+        let metrics = task.stop();
+        assert_eq!(metrics.block_body_unverified.load(Ordering::Relaxed), 1);
+        assert_eq!(refused_as_unreadable(&metrics), 0);
+    }
+
+    /// A Zebra that answers everything except this one body, which it never answers.
+    async fn zebra_holding(held: String) -> (String, jsonrpsee::server::ServerHandle) {
+        use jsonrpsee::server::{RpcModule, ServerBuilder};
+        use jsonrpsee::types::ErrorObjectOwned;
+
+        let mut module = RpcModule::new(held);
+        module
+            .register_async_method("submitblock", |params, held, _| async move {
+                let (block_hex,): (String,) = params.parse()?;
+                if block_hex == *held {
+                    std::future::pending::<()>().await;
+                }
+                Ok::<Option<String>, ErrorObjectOwned>(None)
+            })
+            .unwrap();
+        module
+            .register_method("getblockheader", |_, _, _| {
+                Err::<(), ErrorObjectOwned>(ErrorObjectOwned::owned(-5, "not found", None::<()>))
+            })
+            .unwrap();
+        let server = ServerBuilder::default()
+            .http_only()
+            .build("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!("http://{}", server.local_addr().unwrap());
+        (url, server.start(module))
+    }
+
+    /// The real receive task and real RPC client: while Zebra sits on the unverified
+    /// body, the task reads the next block and gets it accepted.
+    #[tokio::test]
+    async fn the_receive_task_keeps_going_while_zebra_holds_an_unverified_body() {
+        let held = unreadable_block();
+        let (url, _zebra) = zebra_holding(hex::encode(&held)).await;
+        let bypass = UnreadableSubmit::new(Duration::from_secs(30), 4);
+        let task = ReceiveTask::start(&url, SubmitBlockMode::Live, Some(bypass)).await;
+
+        task.send(&held).await;
+        task.wait_for("the attempt", |metrics| {
+            metrics.block_body_unverified.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        // Another header: a second body of this one would stop at the client, which is
+        // the upstream limit and not what this shows.
+        let txs = [parseable_transaction(9)];
+        let mut valid = header_committing_to(&txs);
+        valid.push(1);
+        valid.extend_from_slice(&txs[0]);
+        task.send(&valid).await;
+
+        task.wait_for("the valid block", |metrics| {
+            metrics.submit_successes.load(Ordering::Relaxed) == 1
+        })
+        .await;
+        task.stop();
+    }
+
+    /// Attempts per block do not bound this, because each new header brings its own.
+    #[tokio::test]
+    async fn the_receive_task_runs_only_so_many_attempts_at_once() {
+        let held = unreadable_block();
+        let (url, _zebra) = zebra_holding(hex::encode(&held)).await;
+        let bypass = UnreadableSubmit::new(Duration::from_secs(30), 1);
+        let task = ReceiveTask::start(&url, SubmitBlockMode::Live, Some(bypass.clone())).await;
+        let _running = Arc::clone(&bypass.running).acquire_owned().await.unwrap();
+
+        task.send(&held).await;
+        task.wait_for("the refusal", |metrics| {
+            metrics
+                .submit_gate_rejected_unverified_limit
+                .load(Ordering::Relaxed)
+                == 1
+        })
+        .await;
+
+        let metrics = task.stop();
+        assert_eq!(metrics.block_body_unverified.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn the_bypass_takes_its_limits_from_the_config_and_needs_the_gate() {
+        let config = config::SubmitGateConfig {
+            enabled: true,
+            submit_unreadable_blocks: true,
+            unreadable_attempts_per_block: 3,
+            unreadable_submit_budget_secs: 7,
+            ..Default::default()
+        };
+
+        let bypass = UnreadableSubmit::from_config(&config).expect("it is on");
+        assert_eq!(bypass.budget, Duration::from_secs(7));
+        assert_eq!(bypass.running.available_permits(), 3);
+
+        for off in [
+            config::SubmitGateConfig {
+                enabled: false,
+                ..config.clone()
+            },
+            config::SubmitGateConfig {
+                submit_unreadable_blocks: false,
+                ..config
+            },
+        ] {
+            assert!(UnreadableSubmit::from_config(&off).is_none());
+        }
+    }
+
+    #[test]
+    fn the_bypass_has_its_own_metrics() {
+        let metrics = SidecarMetrics::default();
+        metrics.block_body_unverified.store(3, Ordering::Relaxed);
+        metrics
+            .unreadable_submit_enabled
+            .store(true, Ordering::Relaxed);
+
+        let text = metrics.render_prometheus_text();
+
+        assert!(text.contains("sovright_relay_sidecar_relay_block_body_unverified_total 3\n"));
+        assert!(text.contains("sovright_relay_sidecar_unreadable_block_submit_enabled 1\n"));
     }
 
     #[test]
@@ -2527,8 +3089,8 @@ mod tests {
         let now = Instant::now();
 
         let nonce = 9;
-        let coinbase = vec![0x01, 0x02];
-        let tx1 = vec![0x03, 0x04, 0x05];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
         let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
         let wtxid = make_wtxid(0x11);
         let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
@@ -2591,10 +3153,10 @@ mod tests {
         let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
         let now = Instant::now();
 
-        let header = vec![0xcd; 2189];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
+        let header = committed_header(0xcd, &[coinbase.clone(), tx1.clone()]);
         let nonce = 3;
-        let coinbase = vec![0x01];
-        let tx1 = vec![0x02, 0x03];
         let short_id = ShortId::compute(&make_wtxid(0x21), &zcash_block_hash(&header), nonce);
         let empty_mempool = TestMempool::new();
 
@@ -2670,10 +3232,10 @@ mod tests {
         let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
         let now = Instant::now();
 
-        let header = vec![0xef; 2189];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
+        let header = committed_header(0xef, &[coinbase.clone(), tx1.clone()]);
         let nonce = 5;
-        let coinbase = vec![0x01];
-        let tx1 = vec![0x02, 0x03];
         let wtxid = make_wtxid(0x31);
         let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
 
@@ -3013,8 +3575,8 @@ mod tests {
         let nonce = 42;
         let coinbase_wtxid = make_wtxid(0x01);
         let tx1_wtxid = make_wtxid(0x02);
-        let coinbase = vec![0x01, 0x02];
-        let tx1 = vec![0x03, 0x04, 0x05];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
         let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
         let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
         builder.add_transaction(coinbase_wtxid, coinbase.clone());
@@ -3410,12 +3972,13 @@ mod tests {
     /// and needs its own bucket instead of being swept into `other`.
     #[test]
     fn a_merkle_mismatch_gets_its_own_bucket() {
-        assert_eq!(
-            classify_reconstruction_invalid("merkle root mismatch"),
-            "merkle_mismatch"
-        );
         let m = SidecarMetrics::default();
-        m.inc_compact_reconstruction_invalids("merkle_mismatch");
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::MerkleMismatch,
+            )),
+            &m,
+        );
         assert_eq!(
             m.compact_reconstruction_invalids_merkle_mismatch
                 .load(Ordering::Relaxed),
@@ -3426,6 +3989,51 @@ mod tests {
                 .load(Ordering::Relaxed),
             0,
             "a merkle mismatch must not also land in other"
+        );
+    }
+
+    /// A repeated txid keeps the root, so nobody chasing short-id collisions from
+    /// the mismatch counter should be sent after one.
+    #[test]
+    fn a_repeated_txid_gets_its_own_bucket_not_the_mismatch_one() {
+        let m = SidecarMetrics::default();
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::DuplicateTxid { index: 6 },
+            )),
+            &m,
+        );
+
+        let text = m.render_prometheus_text();
+        let invalids = "sovright_relay_sidecar_relay_compact_reconstruction_invalids_total";
+        assert!(
+            text.contains(&format!("{invalids}{{reason=\"duplicate_txid\"}} 1\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{invalids}{{reason=\"merkle_mismatch\"}} 0\n")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{invalids}{{reason=\"other\"}} 0\n")),
+            "{text}"
+        );
+        assert_eq!(m.compact_reconstruction_invalids.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn other_body_failures_of_a_filled_block_land_in_other() {
+        let m = SidecarMetrics::default();
+        record_compact_reconstruction_outcome(
+            &Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::Transaction { index: 2 },
+            )),
+            &m,
+        );
+        assert_eq!(
+            m.compact_reconstruction_invalids_other
+                .load(Ordering::Relaxed),
+            1
         );
     }
 

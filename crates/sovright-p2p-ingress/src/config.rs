@@ -34,6 +34,12 @@ impl Default for InventoryLimits {
     }
 }
 
+/// How many different unreadable bodies one header can send under the emergency
+/// bypass by default. Honest copies use one place, so this leaves room for three
+/// others, at a worst case of four raw sends per header per dedup window. Anyone
+/// holding a real header can still use all of it.
+pub const DEFAULT_UNREADABLE_BODIES_PER_HEADER: usize = 4;
+
 /// Optional loopback JSON-RPC front door for pool-originated solved blocks.
 ///
 /// The pool sends its normal `submitblock` request here. The ingress starts
@@ -94,6 +100,8 @@ pub struct Config {
     pub tx_request_limit_per_inv: usize,
     pub inventory_limits: InventoryLimits,
     pub event_log: Option<PathBuf>,
+    /// Optional Prometheus textfile for the relay bridge's metrics.
+    pub metrics_textfile: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
     pub relay_bind_addr: SocketAddr,
     pub relay_auth_key: Option<[u8; 32]>,
@@ -114,6 +122,14 @@ pub struct Config {
     /// Only meaningful with `relay_compact_from_tx_cache`; a no-op otherwise.
     pub relay_skeleton_first: bool,
     pub relay_raw_fallback_with_tx_cache: bool,
+    /// Emergency bypass, off by default: forward a body the transaction reader
+    /// cannot read as raw segments, without the Merkle and duplicate checks. Every
+    /// other refusal stands.
+    pub relay_forward_unreadable_blocks: bool,
+    /// How many different unreadable bodies one header can send under the bypass.
+    /// An entry ends after `relay_forward_dedup_window`, or at once if its send
+    /// failed or was cancelled. Honest copies are identical and use one place.
+    pub relay_unreadable_bodies_per_header: usize,
     pub relay_raw_segment_send_rounds: usize,
     pub relay_raw_segment_round_delay_millis: u64,
     /// First-seen-wins window for the relay-bridge forward path. If the same
@@ -211,6 +227,10 @@ impl Config {
         {
             return Err(IngressError::Config("testnet requires an explicit SOVRIGHT_P2P_EVENT_LOG isolated from mainnet collectors".to_string()));
         }
+        let metrics_textfile = env::var("SOVRIGHT_P2P_METRICS_TEXTFILE")
+            .ok()
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from);
         let relay_peers = env_socket_csv("SOVRIGHT_P2P_RELAY_PEERS")?;
         let relay_bind_addr = env::var("SOVRIGHT_P2P_RELAY_BIND_ADDR")
             .unwrap_or_else(|_| "0.0.0.0:0".to_string())
@@ -233,6 +253,17 @@ impl Config {
         let relay_skeleton_first = env_bool("SOVRIGHT_P2P_RELAY_SKELETON_FIRST", false)?;
         let relay_raw_fallback_with_tx_cache =
             env_bool("SOVRIGHT_P2P_RELAY_RAW_FALLBACK_WITH_TX_CACHE", false)?;
+        let relay_forward_unreadable_blocks =
+            env_bool("SOVRIGHT_P2P_RELAY_FORWARD_UNREADABLE_BLOCKS", false)?;
+        let relay_unreadable_bodies_per_header = env_usize(
+            "SOVRIGHT_P2P_RELAY_UNREADABLE_BODIES_PER_HEADER",
+            DEFAULT_UNREADABLE_BODIES_PER_HEADER,
+        )?;
+        if relay_unreadable_bodies_per_header == 0 {
+            return Err(IngressError::Config(
+                "SOVRIGHT_P2P_RELAY_UNREADABLE_BODIES_PER_HEADER must be at least 1".to_string(),
+            ));
+        }
         let relay_raw_segment_send_rounds =
             env_usize("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_SEND_ROUNDS", 1)?;
         if relay_raw_segment_send_rounds == 0 {
@@ -250,9 +281,12 @@ impl Config {
         let forwarding_min_peer_version = forwarding_min_peer_version_from_env(network)?;
 
         if network == Network::Testnet
-            && (!relay_peers.is_empty() || tx_feed_addr.is_some() || submitblock_rpc.is_some())
+            && (!relay_peers.is_empty()
+                || tx_feed_addr.is_some()
+                || submitblock_rpc.is_some()
+                || metrics_textfile.is_some())
         {
-            return Err(IngressError::Config("testnet is observation-only: relay peers, tx feed and submitblock RPC are forbidden".to_string()));
+            return Err(IngressError::Config("testnet is observation-only: relay peers, tx feed, submitblock RPC and the metrics textfile are forbidden".to_string()));
         }
         if seeds.is_empty() && peers.is_empty() {
             return Err(IngressError::Config(
@@ -293,6 +327,7 @@ impl Config {
             tx_request_limit_per_inv,
             inventory_limits,
             event_log,
+            metrics_textfile,
             relay_peers,
             relay_bind_addr,
             relay_auth_key,
@@ -304,6 +339,8 @@ impl Config {
             relay_compact_from_tx_cache,
             relay_skeleton_first,
             relay_raw_fallback_with_tx_cache,
+            relay_forward_unreadable_blocks,
+            relay_unreadable_bodies_per_header,
             relay_raw_segment_send_rounds,
             relay_raw_segment_round_delay_millis,
             relay_forward_dedup_window,
@@ -609,6 +646,10 @@ mod tests {
             ("SOVRIGHT_P2P_RELAY_PEERS", "127.0.0.1:9000"),
             ("SOVRIGHT_P2P_TX_FEED_ADDR", "127.0.0.1:9001"),
             ("SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR", "127.0.0.1:9002"),
+            (
+                "SOVRIGHT_P2P_METRICS_TEXTFILE",
+                "/tmp/nu7-test-metrics.prom",
+            ),
         ] {
             let _output = EnvGuard::set(&[(name, value.to_string())]);
             assert!(
@@ -846,6 +887,68 @@ mod tests {
         // Spoofs remain fail-closed even after lowercasing.
         assert!(!is_loopback_http_url("http://localhost.evil.com:8232"));
         assert!(!is_loopback_http_url("http://evil.com@127.0.0.1:8232"));
+    }
+
+    #[test]
+    fn the_bypass_budget_has_a_default_and_can_be_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let base = [
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX", "42".repeat(32)),
+        ];
+        {
+            let _guard = EnvGuard::set(&base);
+            assert_eq!(
+                Config::from_env()
+                    .unwrap()
+                    .relay_unreadable_bodies_per_header,
+                DEFAULT_UNREADABLE_BODIES_PER_HEADER
+            );
+        }
+        let with_budget = |value: &str| {
+            let mut vars = base.to_vec();
+            vars.push((
+                "SOVRIGHT_P2P_RELAY_UNREADABLE_BODIES_PER_HEADER",
+                value.to_string(),
+            ));
+            vars
+        };
+        {
+            let _guard = EnvGuard::set(&with_budget("7"));
+            assert_eq!(
+                Config::from_env()
+                    .unwrap()
+                    .relay_unreadable_bodies_per_header,
+                7
+            );
+        }
+        let _guard = EnvGuard::set(&with_budget("0"));
+        assert!(Config::from_env().is_err());
+    }
+
+    #[test]
+    fn the_emergency_bypass_is_off_unless_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let base = [
+            ("SOVRIGHT_P2P_DNS_SEEDS", "dnsseed.z.cash".to_string()),
+            ("SOVRIGHT_P2P_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_PEERS", "".to_string()),
+            ("SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX", "42".repeat(32)),
+        ];
+        {
+            let _guard = EnvGuard::set(&base);
+            assert!(!Config::from_env().unwrap().relay_forward_unreadable_blocks);
+        }
+        let mut with_bypass = base.to_vec();
+        with_bypass.push((
+            "SOVRIGHT_P2P_RELAY_FORWARD_UNREADABLE_BLOCKS",
+            "true".to_string(),
+        ));
+        let _guard = EnvGuard::set(&with_bypass);
+
+        assert!(Config::from_env().unwrap().relay_forward_unreadable_blocks);
     }
 
     #[test]

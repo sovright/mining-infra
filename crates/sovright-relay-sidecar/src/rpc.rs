@@ -130,15 +130,25 @@ pub struct RawTransaction {
     pub authdigest: Option<String>,
 }
 
+/// Bound on each Zebra RPC call. Set explicitly rather than inheriting jsonrpsee's
+/// 60s default. These are all local loopback RPCs, so 30s is ample; the shorter bound
+/// stops a stalled zebrad from pinning a connection long enough to matter under the
+/// submitblock gateway's small connection cap.
+pub const ZEBRA_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl ZebraRpc {
     /// Create a new Zebra RPC client
     pub async fn new(url: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // Set the request timeout explicitly rather than inheriting jsonrpsee's
-        // 60s default. These are all local loopback RPCs, so 30s is ample; the
-        // shorter bound stops a stalled zebrad from pinning a connection long
-        // enough to matter under the submitblock gateway's small connection cap.
+        Self::with_request_timeout(url, ZEBRA_RPC_REQUEST_TIMEOUT).await
+    }
+
+    /// [`Self::new`] with its own bound on each call.
+    pub async fn with_request_timeout(
+        url: &str,
+        request_timeout: Duration,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let client = HttpClientBuilder::default()
-            .request_timeout(Duration::from_secs(30))
+            .request_timeout(request_timeout)
             .build(url)?;
         Ok(Self {
             client,

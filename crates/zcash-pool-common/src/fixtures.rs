@@ -28,6 +28,14 @@ pub const MAINNET_BLOCK_3470793_HASH_DISPLAY: &str =
     "000000000030976123e65211bdfb288b21b4492f56bb1a42710588ca6b8c0d98";
 
 /// The serialized header as hex, exactly as it appears on line 1.
+/// The serialized header of the testnet genesis block, from Zebra's test vector
+/// `block-test-0-000-000`. Its nBits are the minimum difficulty `0x2007ffff`, above
+/// the mainnet limit, and it has a real Equihash solution.
+pub fn testnet_genesis_serialized_header() -> Vec<u8> {
+    hex::decode(include_str!("../testdata/testnet_genesis_header.txt").trim())
+        .expect("static header hex")
+}
+
 pub fn mainnet_header_hex() -> &'static str {
     MAINNET_BLOCK_3470793
         .lines()

@@ -1,0 +1,92 @@
+{
+  "0000000000000000000000000000000000000000000000000000000000000001": {
+    "case": "in_order",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": "pool-a"
+  },
+  "0000000000000000000000000000000000000000000000000000000000000002": {
+    "case": "coinbase_before_receipt",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": "pool-a"
+  },
+  "0000000000000000000000000000000000000000000000000000000000000003": {
+    "case": "duplicate_line",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": "pool-a"
+  },
+  "0000000000000000000000000000000000000000000000000000000000000004": {
+    "case": "conflicting_tag",
+    "attribution": "conflict",
+    "miner_script": null,
+    "miner_tag": null
+  },
+  "0000000000000000000000000000000000000000000000000000000000000005": {
+    "case": "conflicting_script",
+    "attribution": "conflict",
+    "miner_script": null,
+    "miner_tag": null
+  },
+  "0000000000000000000000000000000000000000000000000000000000000006": {
+    "case": "missing_coinbase",
+    "attribution": "unknown",
+    "miner_script": null,
+    "miner_tag": null
+  },
+  "0000000000000000000000000000000000000000000000000000000000000007": {
+    "case": "refused_body",
+    "attribution": "unknown",
+    "miner_script": null,
+    "miner_tag": null
+  },
+  "0000000000000000000000000000000000000000000000000000000000000008": {
+    "case": "unverified_forward",
+    "attribution": "unknown",
+    "miner_script": null,
+    "miner_tag": null
+  },
+  "0000000000000000000000000000000000000000000000000000000000000009": {
+    "case": "gateway_block_with_p2p_copy",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": "pool-a"
+  },
+  "000000000000000000000000000000000000000000000000000000000000000a": {
+    "case": "old_format",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": "pool-a"
+  },
+  "000000000000000000000000000000000000000000000000000000000000000b": {
+    "case": "old_format_without_tag",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": null
+  },
+  "000000000000000000000000000000000000000000000000000000000000000c": {
+    "case": "old_and_new_agree",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": "pool-a"
+  },
+  "000000000000000000000000000000000000000000000000000000000000000d": {
+    "case": "old_and_new_conflict",
+    "attribution": "conflict",
+    "miner_script": null,
+    "miner_tag": null
+  },
+  "000000000000000000000000000000000000000000000000000000000000000e": {
+    "case": "no_tag",
+    "attribution": "miner",
+    "miner_script": "76a91425db9091e9786867e536f70089a5102523ab1d6a88ac",
+    "miner_tag": null
+  },
+  "000000000000000000000000000000000000000000000000000000000000000f": {
+    "case": "tag_on_one_line_only",
+    "attribution": "conflict",
+    "miner_script": null,
+    "miner_tag": null
+  }
+}

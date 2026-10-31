@@ -6,7 +6,7 @@
 use sovright_relay::types::{AuthDigest, TxId, WtxId};
 use sovright_relay::{
     CompactBlock, CompactBlockBuilder, CompactBlockReconstructor, PrefilledTx,
-    ReconstructionResult, ShortId, TestMempool, zcash_block_hash,
+    ReconstructionResult, ShortId, TestMempool, ZCASH_FULL_HEADER_SIZE, zcash_block_hash,
 };
 
 /// Helper: compute Zcash header hash (same as CompactBlock::header_hash)
@@ -19,7 +19,7 @@ fn header_hash(header: &[u8]) -> [u8; 32] {
 /// Reconstruction verifies the header's merkle root, so a filler header is now
 /// rejected before the BIP-152 short-id behaviour these tests cover can run.
 fn header_committing_to(fill: u8, txs: &[Vec<u8>]) -> Vec<u8> {
-    let mut header = vec![fill; 2189];
+    let mut header = vec![fill; ZCASH_FULL_HEADER_SIZE];
     let txids: Vec<[u8; 32]> = txs
         .iter()
         .map(|t| sovright_relay::txid_from_tx_bytes(t))
@@ -27,6 +27,12 @@ fn header_committing_to(fill: u8, txs: &[Vec<u8>]) -> Vec<u8> {
     let root = sovright_relay::merkle_root(&txids).expect("tests commit to >=1 tx");
     header[36..68].copy_from_slice(&root);
     header
+}
+
+/// The smallest transaction the reader accepts: version 1, nothing in it, and
+/// `seed` as its lock time, so different seeds have different txids.
+fn parseable_tx(seed: u8) -> Vec<u8> {
+    [1, 0, 0, 0, 0, 0, seed, 0, 0, 0].to_vec()
 }
 
 /// Helper: create a deterministic WtxId from a seed byte
@@ -43,7 +49,10 @@ fn make_wtxid(seed: u8) -> WtxId {
 /// in their mempool. Receiver reconstructs the complete block in correct order.
 #[test]
 fn test_simple_roundtrip() {
-    let header = header_committing_to(0xab, &[vec![0xc0; 50], vec![0xa1; 80], vec![0xa2; 90]]);
+    let header = header_committing_to(
+        0xab,
+        &[parseable_tx(0xc0), parseable_tx(0xa1), parseable_tx(0xa2)],
+    );
     let nonce = 0xdeadbeef_u64;
 
     let coinbase = make_wtxid(0);
@@ -52,14 +61,14 @@ fn test_simple_roundtrip() {
 
     // --- Sender side ---
     let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-    builder.add_transaction(coinbase, vec![0xc0; 50]); // coinbase data
-    builder.add_transaction(tx1, vec![0xa1; 80]);
-    builder.add_transaction(tx2, vec![0xa2; 90]);
+    builder.add_transaction(coinbase, parseable_tx(0xc0)); // coinbase data
+    builder.add_transaction(tx1, parseable_tx(0xa1));
+    builder.add_transaction(tx2, parseable_tx(0xa2));
 
     // Sender knows receiver has tx1 and tx2
     let mut sender_view = TestMempool::new();
-    sender_view.insert(tx1, vec![0xa1; 80]);
-    sender_view.insert(tx2, vec![0xa2; 90]);
+    sender_view.insert(tx1, parseable_tx(0xa1));
+    sender_view.insert(tx2, parseable_tx(0xa2));
 
     let compact = builder.build(&sender_view);
 
@@ -70,8 +79,8 @@ fn test_simple_roundtrip() {
 
     // --- Receiver side ---
     let mut receiver_mempool = TestMempool::new();
-    receiver_mempool.insert(tx1, vec![0xa1; 80]);
-    receiver_mempool.insert(tx2, vec![0xa2; 90]);
+    receiver_mempool.insert(tx1, parseable_tx(0xa1));
+    receiver_mempool.insert(tx2, parseable_tx(0xa2));
 
     let hh = header_hash(&header);
     let mut reconstructor = CompactBlockReconstructor::new(&receiver_mempool);
@@ -80,9 +89,9 @@ fn test_simple_roundtrip() {
     match reconstructor.reconstruct(&compact) {
         ReconstructionResult::Complete { transactions } => {
             assert_eq!(transactions.len(), 3);
-            assert_eq!(transactions[0], vec![0xc0; 50], "coinbase at index 0");
-            assert_eq!(transactions[1], vec![0xa1; 80], "tx1 at index 1");
-            assert_eq!(transactions[2], vec![0xa2; 90], "tx2 at index 2");
+            assert_eq!(transactions[0], parseable_tx(0xc0), "coinbase at index 0");
+            assert_eq!(transactions[1], parseable_tx(0xa1), "tx1 at index 1");
+            assert_eq!(transactions[2], parseable_tx(0xa2), "tx2 at index 2");
         }
         other => panic!("expected Complete, got {:?}", other),
     }
@@ -91,13 +100,13 @@ fn test_simple_roundtrip() {
 /// Test 2: Coinbase-only block roundtrip (no short IDs needed).
 #[test]
 fn test_empty_block_roundtrip() {
-    let header = header_committing_to(0x42, &[vec![0xff; 30]]);
+    let header = header_committing_to(0x42, &[parseable_tx(0xff)]);
     let nonce = 99u64;
 
     let coinbase = make_wtxid(0);
 
     let mut builder = CompactBlockBuilder::new(header.clone(), nonce);
-    builder.add_transaction(coinbase, vec![0xff; 30]);
+    builder.add_transaction(coinbase, parseable_tx(0xff));
 
     // No txs to share via mempool
     let sender_view = TestMempool::new();
@@ -116,7 +125,7 @@ fn test_empty_block_roundtrip() {
     match reconstructor.reconstruct(&compact) {
         ReconstructionResult::Complete { transactions } => {
             assert_eq!(transactions.len(), 1);
-            assert_eq!(transactions[0], vec![0xff; 30]);
+            assert_eq!(transactions[0], parseable_tx(0xff));
         }
         other => panic!("expected Complete, got {:?}", other),
     }
