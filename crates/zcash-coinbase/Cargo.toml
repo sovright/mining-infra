@@ -12,5 +12,12 @@ byteorder.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+zcash_primitives.workspace = true
+zcash_protocol.workspace = true
+
+[features]
+# Real NU7 coinbase vectors for other crates' tests.
+test-support = []
 
 [dev-dependencies]
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }

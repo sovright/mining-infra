@@ -106,22 +106,9 @@ fn recompute_coinbase_only_block_commitments(
     chain_history_root: [u8; 32],
     consensus_branch_id: u32,
 ) -> std::result::Result<[u8; 32], String> {
-    let parsed = zcash_coinbase::tx_parse::parse_transaction(coinbase_tx)
-        .map_err(|e| format!("declared coinbase cannot be parsed for commitments: {}", e))?;
-    if parsed.inputs.is_empty() {
-        return Err("declared coinbase has no transparent inputs for commitments".to_string());
-    }
-
-    let mut script_sigs = Vec::new();
-    for input in parsed.inputs {
-        script_sigs.extend_from_slice(&input.script_sig);
-    }
-
-    let coinbase_digest = zcash_coinbase::auth_digest::compute_coinbase_auth_digest(
-        &script_sigs,
-        consensus_branch_id,
-    );
-    let auth_data_root = zcash_coinbase::auth_digest::compute_auth_data_root(&[coinbase_digest]);
+    let auth_data_root =
+        zcash_coinbase::digest::coinbase_only_auth_data_root(coinbase_tx, consensus_branch_id)
+            .map_err(|e| format!("declared coinbase has no valid commitments: {}", e))?;
     Ok(calculate_block_commitments_hash(&Hash256(chain_history_root), &Hash256(auth_data_root)).0)
 }
 
@@ -437,11 +424,11 @@ impl JdServer {
 
             let expected_merkle_root =
                 TemplateValidator::compute_merkle_root(&request.coinbase_tx, &template.txids)
-                    .ok_or_else(|| {
+                    .map_err(|reason| {
                         SetCustomMiningJobError::invalid_coinbase(
                             request.channel_id,
                             request.request_id,
-                            "coinbase transaction is empty",
+                            reason,
                         )
                     })?;
             if expected_merkle_root != request.merkle_root {
@@ -1494,7 +1481,7 @@ impl JdServer {
         let mut txids = Vec::with_capacity(msg.transactions.len());
         for tx_data in &msg.transactions {
             TemplateValidator::parse_transaction(tx_data).map_err(JdServerError::Protocol)?;
-            txids.push(TemplateValidator::compute_txid(tx_data));
+            txids.push(TemplateValidator::compute_txid(tx_data).map_err(JdServerError::Protocol)?);
         }
         let mut validator = self.validator.write().await;
         let mut pending = self.pending_missing.lock().unwrap();
@@ -2312,38 +2299,15 @@ mod tests {
         minimal_tx_with_script(&[0x51])
     }
 
+    /// The NU6 branch these tests' templates declare.
+    const TEST_BRANCH_ID: u32 = 0xc8e7_1055;
+
     fn minimal_tx_with_script(script: &[u8]) -> Vec<u8> {
-        let mut tx = Vec::new();
-        tx.extend_from_slice(&1u32.to_le_bytes()); // version
-        tx.push(0x01); // vin count
-        tx.extend_from_slice(&[0u8; 32]); // prevout hash
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
-        tx.push(0x01); // scriptSig length
-        tx.push(0x00); // scriptSig
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
-        tx.push(0x01); // vout count
-        tx.extend_from_slice(&0u64.to_le_bytes()); // value
-        tx.push(script.len() as u8);
-        tx.extend_from_slice(script);
-        tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
-        tx
+        zcash_coinbase::fixtures::v5_coinbase(TEST_BRANCH_ID, &[0x00], script)
     }
 
     fn minimal_v5_tx_with_script(script: &[u8]) -> Vec<u8> {
-        let mut tx = Vec::new();
-        tx.extend_from_slice(&5u32.to_le_bytes()); // version
-        tx.push(0x01); // vin count
-        tx.extend_from_slice(&[0u8; 32]); // prevout hash
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // prevout index
-        tx.push(0x01); // scriptSig length
-        tx.push(0x00); // scriptSig
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes()); // sequence
-        tx.push(0x01); // vout count
-        tx.extend_from_slice(&0u64.to_le_bytes()); // value
-        tx.push(script.len() as u8);
-        tx.extend_from_slice(script);
-        tx.extend_from_slice(&0u32.to_le_bytes()); // lock_time
-        tx
+        minimal_tx_with_script(script)
     }
 
     async fn insert_pending_request(
@@ -2456,7 +2420,7 @@ mod tests {
         let prev_hash = [0xaa; 32];
         let coinbase_tx = minimal_v5_tx_with_script(&[0x51, 0x24]);
         let chain_history_root = [0x42; 32];
-        let consensus_branch_id = 0xc8e7_1055;
+        let consensus_branch_id = TEST_BRANCH_ID;
         let declared_block_commitments = recompute_coinbase_only_block_commitments(
             &coinbase_tx,
             chain_history_root,
@@ -2510,7 +2474,7 @@ mod tests {
         let prev_hash = [0xaa; 32];
         let coinbase_tx = minimal_v5_tx_with_script(&[0x51, 0x24]);
         let chain_history_root = [0x42; 32];
-        let consensus_branch_id = 0xc8e7_1055;
+        let consensus_branch_id = TEST_BRANCH_ID;
         let mut declared_block_commitments = recompute_coinbase_only_block_commitments(
             &coinbase_tx,
             chain_history_root,
@@ -2935,7 +2899,7 @@ mod tests {
     async fn pending_security_transport_reply_consumes_own_seeded_request() {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
-        let txid = TemplateValidator::compute_txid(&tx);
+        let txid = TemplateValidator::compute_txid(&tx).unwrap();
         let (mut peer, handle, session_id) = pending_peer(Arc::clone(&server), "peer-label").await;
         seed_session_request(&server, session_id, vec![txid]);
         provide_over_transport(&mut peer, tx).await;
@@ -2950,8 +2914,8 @@ mod tests {
         let server = pending_test_server().await;
         let tx_a = minimal_tx_with_script(&[0x52]);
         let tx_b = minimal_tx_with_script(&[0x53]);
-        let txid_a = TemplateValidator::compute_txid(&tx_a);
-        let txid_b = TemplateValidator::compute_txid(&tx_b);
+        let txid_a = TemplateValidator::compute_txid(&tx_a).unwrap();
+        let txid_b = TemplateValidator::compute_txid(&tx_b).unwrap();
         let (mut a, handle_a, session_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
         let (mut b, handle_b, session_b) = pending_peer(Arc::clone(&server), "shared-miner").await;
         assert_ne!(session_a, session_b);
@@ -2981,7 +2945,7 @@ mod tests {
     async fn pending_security_foreign_session_cannot_consume_request() {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
-        let txid = TemplateValidator::compute_txid(&tx);
+        let txid = TemplateValidator::compute_txid(&tx).unwrap();
         let (mut a, handle_a, session_a) = pending_peer(Arc::clone(&server), "shared-miner").await;
         let (mut b, handle_b, _) = pending_peer(Arc::clone(&server), "shared-miner").await;
         seed_session_request(&server, session_a, vec![txid]);
@@ -3102,7 +3066,7 @@ mod tests {
     async fn pending_security_expired_response_rejected() {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
-        let txid = TemplateValidator::compute_txid(&tx);
+        let txid = TemplateValidator::compute_txid(&tx).unwrap();
         insert_pending_request(&server, "miner", 42, 1, vec![txid]).await;
         tokio::time::advance(Duration::from_secs(31)).await;
         assert!(
@@ -3239,7 +3203,7 @@ mod tests {
     async fn pending_security_template_update_during_reply_rejects_transaction_admission() {
         let server = pending_test_server().await;
         let tx = minimal_tx_with_script(&[0x52]);
-        let txid = TemplateValidator::compute_txid(&tx);
+        let txid = TemplateValidator::compute_txid(&tx).unwrap();
         insert_pending_request(&server, "miner", 42, 1, vec![txid]).await;
         let validator = server.validator.read().await;
         let reply = server.handle_provide_missing_transactions(
@@ -3298,7 +3262,7 @@ mod tests {
         let tx_data = vec![minimal_tx(), minimal_tx_with_script(&[0x52])];
         let expected_txids = tx_data
             .iter()
-            .map(|tx| TemplateValidator::compute_txid(tx))
+            .map(|tx| TemplateValidator::compute_txid(tx).unwrap())
             .collect();
         insert_pending_request(&server, "test-client", 42, 1, expected_txids).await;
 
@@ -3348,7 +3312,7 @@ mod tests {
         let server = JdServer::new(config, payout_tracker);
 
         let tx_data = minimal_tx();
-        let expected_txid = TemplateValidator::compute_txid(&tx_data);
+        let expected_txid = TemplateValidator::compute_txid(&tx_data).unwrap();
         insert_pending_request(&server, "test-client", 42, 1, vec![expected_txid]).await;
 
         let msg = ProvideMissingTransactions {
@@ -3377,7 +3341,7 @@ mod tests {
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        let expected_txid = TemplateValidator::compute_txid(&minimal_tx());
+        let expected_txid = TemplateValidator::compute_txid(&minimal_tx()).unwrap();
         insert_pending_request(&server, "test-client", 42, 1, vec![expected_txid]).await;
 
         let msg = ProvideMissingTransactions {
@@ -3398,7 +3362,7 @@ mod tests {
         let payout_tracker = Arc::new(PayoutTracker::default());
         let server = JdServer::new(config, payout_tracker);
 
-        let expected_txid = TemplateValidator::compute_txid(&minimal_tx());
+        let expected_txid = TemplateValidator::compute_txid(&minimal_tx()).unwrap();
         insert_pending_request(&server, "test-client", 42, 1, vec![expected_txid]).await;
 
         let msg = ProvideMissingTransactions {
