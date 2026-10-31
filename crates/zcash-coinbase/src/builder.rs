@@ -1,15 +1,21 @@
 //! Pool-side coinbase construction.
 //!
-//! Injects a pool tag into the coinbase scriptSig and reserializes the transaction.
+//! Injects a pool tag into the coinbase scriptSig.
+//!
+//! Only input 0's scriptSig bytes are replaced; every other byte of the
+//! transaction, including any shielded bundles, is copied unchanged. That keeps
+//! one code path for v4, v5 and v6, whose field orders differ.
 
-use crate::auth_digest;
-use crate::tx_parse::{self, ParsedTx, push_compact_size};
+use crate::digest;
+use crate::tx_parse::{self, push_compact_size};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum BuilderError {
     #[error("parse error: {0}")]
     Parse(#[from] tx_parse::ParseError),
+    #[error("tagged coinbase has no valid txid: {0}")]
+    Digest(#[from] digest::DigestError),
     #[error("coinbase has no inputs")]
     NoInputs,
     #[error("coinbase scriptSig too large after tag injection: {0} bytes")]
@@ -62,74 +68,24 @@ pub fn build_coinbase(raw_coinbase: &[u8], pool_tag: &[u8]) -> Result<BuiltCoinb
         return Err(BuilderError::ScriptSigTooLarge(new_script.len()));
     }
 
-    let tx_bytes = reserialize_with_script(&parsed, &new_script);
-    let txid = auth_digest::compute_v4_txid(&tx_bytes);
+    let (script_start, script_end) = parsed
+        .input0_script_span
+        .expect("a parsed input 0 has a scriptSig span");
+    let raw = &parsed.raw;
+    let mut tx_bytes = Vec::with_capacity(raw.len() + pool_tag.len());
+    tx_bytes.extend_from_slice(&raw[..script_start]);
+    push_compact_size(&mut tx_bytes, new_script.len() as u64);
+    tx_bytes.extend_from_slice(&new_script);
+    tx_bytes.extend_from_slice(&raw[script_end..]);
+
+    let txid = digest::txid(&tx_bytes)?;
 
     Ok(BuiltCoinbase { tx_bytes, txid })
-}
-
-/// Reserialize a parsed transaction, replacing input 0's scriptSig.
-fn reserialize_with_script(parsed: &ParsedTx, new_script: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(parsed.raw.len() + new_script.len());
-
-    // Version (with overwinter flag if applicable)
-    let header = if parsed.is_overwinter_plus {
-        parsed.version | (1 << 31)
-    } else {
-        parsed.version
-    };
-    buf.extend_from_slice(&header.to_le_bytes());
-
-    // Version group ID
-    if let Some(vgid) = parsed.version_group_id {
-        buf.extend_from_slice(&vgid.to_le_bytes());
-    }
-
-    // Inputs
-    push_compact_size(&mut buf, parsed.inputs.len() as u64);
-    for (i, input) in parsed.inputs.iter().enumerate() {
-        buf.extend_from_slice(&input.prevout_hash);
-        buf.extend_from_slice(&input.prevout_index.to_le_bytes());
-
-        let script = if i == 0 {
-            new_script
-        } else {
-            &input.script_sig
-        };
-        push_compact_size(&mut buf, script.len() as u64);
-        buf.extend_from_slice(script);
-
-        buf.extend_from_slice(&input.sequence.to_le_bytes());
-    }
-
-    // Outputs
-    push_compact_size(&mut buf, parsed.outputs.len() as u64);
-    for output in &parsed.outputs {
-        buf.extend_from_slice(&output.value.to_le_bytes());
-        push_compact_size(&mut buf, output.script_pubkey.len() as u64);
-        buf.extend_from_slice(&output.script_pubkey);
-    }
-
-    // Lock time
-    buf.extend_from_slice(&parsed.lock_time.to_le_bytes());
-
-    // Expiry height
-    if let Some(expiry) = parsed.expiry_height {
-        buf.extend_from_slice(&expiry.to_le_bytes());
-    }
-
-    // Copy trailing data (Sapling, JoinSplit, etc.) from original raw bytes
-    if let Some(offset) = parsed.trailing_data_offset {
-        buf.extend_from_slice(&parsed.raw[offset..]);
-    }
-
-    buf
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth_digest;
     use crate::tx_parse;
 
     #[test]
@@ -148,7 +104,7 @@ mod tests {
     fn built_coinbase_has_valid_txid() {
         let original = tx_parse::minimal_v4_coinbase();
         let result = build_coinbase(&original, b"/Sovright/").unwrap();
-        let expected = auth_digest::compute_v4_txid(&result.tx_bytes);
+        let expected = digest::txid(&result.tx_bytes).unwrap();
         assert_eq!(result.txid, expected);
     }
 
