@@ -10,8 +10,9 @@ use std::future::Future;
 use std::pin::Pin;
 
 use sovright_relay::{
-    BlockHash, CompactBlock, CompactBlockReconstructor, GetBlockTxn, MempoolProvider,
-    ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display,
+    BlockBodyError, BlockHash, CompactBlock, CompactBlockReconstructor, GetBlockTxn,
+    MempoolProvider, ReconstructionResult, ShortId, WtxId, ZCASH_FULL_HEADER_SIZE,
+    consensus_block_hash_display, validate_block_body, validate_block_transactions,
     zcash_block_hash,
 };
 
@@ -211,7 +212,7 @@ pub enum RelayBlockError {
         bytes: usize,
     },
     RawBlockHashMismatch,
-    InvalidCompactSize,
+    InvalidBlockBody(BlockBodyError),
     SubmitFailed(String),
     SubmitRejected(String, SubmitRejectionClass),
 }
@@ -256,9 +257,7 @@ impl fmt::Display for RelayBlockError {
             RelayBlockError::RawBlockHashMismatch => {
                 write!(f, "raw block header hash does not match relay metadata")
             }
-            RelayBlockError::InvalidCompactSize => {
-                write!(f, "invalid transaction count compactSize")
-            }
+            RelayBlockError::InvalidBlockBody(error) => write!(f, "invalid block body: {error}"),
             RelayBlockError::SubmitFailed(error) => write!(f, "submitblock RPC failed: {error}"),
             RelayBlockError::SubmitRejected(reason, class) => {
                 write!(f, "submitblock rejected: {reason} ({})", class.as_str())
@@ -319,6 +318,12 @@ pub fn build_submission_candidate(
         next_position = position as usize + 1;
     }
 
+    // Each slice, not the joined block: shifted boundaries can join into valid
+    // bytes that this compact block did not actually carry.
+    let tx_count =
+        validate_block_transactions(&compact.header, txs.iter().map(|tx| tx.tx_data.as_slice()))
+            .map_err(RelayBlockError::InvalidBlockBody)?;
+
     let mut block = Vec::with_capacity(
         compact.header.len()
             + compact_size_len(txs.len())
@@ -334,7 +339,7 @@ pub fn build_submission_candidate(
         block_hash: compact.header_hash().to_string(),
         consensus_block_hash: consensus_block_hash_display(&compact.header),
         block_hex: hex::encode(&block),
-        tx_count: txs.len(),
+        tx_count,
         block_bytes: block.len(),
     })
 }
@@ -422,13 +427,10 @@ pub fn build_raw_block_submission_candidate(
         return Err(RelayBlockError::RawBlockHashMismatch);
     }
 
-    let mut cursor = ZCASH_FULL_HEADER_SIZE;
-    let tx_count = decode_compact_size(raw_block, &mut cursor)?;
-    if tx_count == 0 {
-        return Err(RelayBlockError::EmptyTransactions);
-    }
-    let tx_count = usize::try_from(tx_count)
-        .map_err(|_| RelayBlockError::TooManyTransactions { count: usize::MAX })?;
+    let tx_count = validate_block_body(raw_block).map_err(|error| match error {
+        BlockBodyError::EmptyTransactions => RelayBlockError::EmptyTransactions,
+        error => RelayBlockError::InvalidBlockBody(error),
+    })?;
 
     Ok(SubmissionCandidate {
         block_hash: hex::encode(block_hash),
@@ -720,37 +722,6 @@ fn encode_compact_size(count: usize, out: &mut Vec<u8>) -> Result<(), RelayBlock
     Ok(())
 }
 
-fn decode_compact_size(input: &[u8], cursor: &mut usize) -> Result<u64, RelayBlockError> {
-    let Some(tag) = input.get(*cursor).copied() else {
-        return Err(RelayBlockError::InvalidCompactSize);
-    };
-    *cursor += 1;
-    match tag {
-        0x00..=0xfc => Ok(tag as u64),
-        0xfd => {
-            let bytes = input
-                .get(*cursor..*cursor + 2)
-                .ok_or(RelayBlockError::InvalidCompactSize)?;
-            *cursor += 2;
-            Ok(u16::from_le_bytes(bytes.try_into().unwrap()) as u64)
-        }
-        0xfe => {
-            let bytes = input
-                .get(*cursor..*cursor + 4)
-                .ok_or(RelayBlockError::InvalidCompactSize)?;
-            *cursor += 4;
-            Ok(u32::from_le_bytes(bytes.try_into().unwrap()) as u64)
-        }
-        0xff => {
-            let bytes = input
-                .get(*cursor..*cursor + 8)
-                .ok_or(RelayBlockError::InvalidCompactSize)?;
-            *cursor += 8;
-            Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
-        }
-    }
-}
-
 fn raw_block_header_hash(header: &[u8]) -> [u8; 32] {
     zcash_block_hash(header)
 }
@@ -771,33 +742,25 @@ mod tests {
 
     #[test]
     fn submission_candidate_decodes_differential_prefilled_indices() {
-        let header = vec![0xab; 2189];
+        use sovright_relay::test_support::{committed_header, parseable_transaction, raw_block};
+        let txs: Vec<Vec<u8>> = (1..=3).map(parseable_transaction).collect();
+        let header = committed_header(0xab, &txs);
         let compact = CompactBlock::new(
             header.clone(),
             0,
             Vec::new(),
-            vec![
-                PrefilledTx {
+            txs.iter()
+                .map(|tx| PrefilledTx {
                     index: 0,
-                    tx_data: vec![0x01],
-                },
-                PrefilledTx {
-                    index: 0,
-                    tx_data: vec![0x02, 0x03],
-                },
-                PrefilledTx {
-                    index: 0,
-                    tx_data: vec![0x04],
-                },
-            ],
+                    tx_data: tx.clone(),
+                })
+                .collect(),
         );
 
         let candidate = build_submission_candidate(&compact).unwrap();
         let block = hex::decode(&candidate.block_hex).unwrap();
 
-        let mut expected = header;
-        expected.push(3);
-        expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        let expected = raw_block(&header, &txs);
 
         assert_eq!(candidate.tx_count, 3);
         assert_eq!(candidate.block_bytes, expected.len());

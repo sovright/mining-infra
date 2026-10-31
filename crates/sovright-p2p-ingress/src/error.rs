@@ -17,6 +17,9 @@ pub enum IngressError {
     #[error("relay error: {0}")]
     Relay(String),
 
+    #[error("invalid block body: {0}")]
+    InvalidBlockBody(sovright_relay::BlockBodyError),
+
     #[error("peers exhausted: {0}")]
     PeersExhausted(String),
 }

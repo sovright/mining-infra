@@ -3344,6 +3344,7 @@ dependencies = [
  "zakura-equihash",
  "zcash-equihash-validator",
  "zcash-pool-common",
+ "zcash_encoding",
  "zcash_primitives",
  "zcash_protocol",
 ]

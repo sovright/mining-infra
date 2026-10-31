@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use sovright_relay::{
-    BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_PAYLOAD_SIZE, RawBlockSegment,
-    RelayClient, TransportError, split_raw_block,
+    BlockBodyError, BlockChunker, BlockSender, ClientConfig, CompactBlock, MAX_PAYLOAD_SIZE,
+    RawBlockSegment, RelayClient, TransportError, split_raw_block, validate_block_body,
 };
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -245,6 +245,10 @@ impl RelayBridge {
                 });
             }
         }
+        // After the dedup check, so a known header costs no hashing and a bad copy
+        // of one is skipped unsent; before any send, so a body that fails is
+        // neither forwarded nor recorded and cannot hide a good copy.
+        check_forwarded_body(block_payload, &compact)?;
         if let Err(error) = self.preflight_chunks(&compact) {
             let text = error.to_string();
             if text.contains("all-prefilled compact block too large") {
@@ -425,6 +429,20 @@ impl RelayBridge {
     }
 }
 
+/// Strictly validate a block about to be forwarded (#130). `compact` comes from
+/// the block parser and the check from the transaction reader, so their counts
+/// are compared too.
+fn check_forwarded_body(block_payload: &[u8], compact: &CompactBlock) -> Result<()> {
+    let parsed = validate_block_body(block_payload).map_err(IngressError::InvalidBlockBody)?;
+    let declared = compact.tx_count();
+    if parsed != declared {
+        return Err(IngressError::InvalidBlockBody(
+            BlockBodyError::CountMismatch { parsed, declared },
+        ));
+    }
+    Ok(())
+}
+
 pub struct ForwardedBlock {
     pub tx_count: usize,
     pub bytes: usize,
@@ -506,10 +524,10 @@ mod tests {
     }
 
     fn two_tx_raw_block() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-        let header = vec![0xab; ZCASH_FULL_HEADER_SIZE];
         let tx0 = minimal_v1_tx(0x11);
         let tx1 = minimal_v1_tx(0x22);
-        let mut block = header;
+        let mut block =
+            sovright_relay::test_support::committed_header(0xab, &[tx0.clone(), tx1.clone()]);
         crate::wire::encode_compact_size(2, &mut block);
         block.extend_from_slice(&tx0);
         block.extend_from_slice(&tx1);
@@ -517,15 +535,15 @@ mod tests {
     }
 
     fn large_raw_block() -> Vec<u8> {
-        let mut block = vec![0xab; ZCASH_FULL_HEADER_SIZE];
-        crate::wire::encode_compact_size(2_000, &mut block);
-        for _ in 0..2_000 {
-            block.extend_from_slice(&1u32.to_le_bytes());
-            crate::wire::encode_compact_size(0, &mut block);
-            crate::wire::encode_compact_size(0, &mut block);
-            block.extend_from_slice(&0u32.to_le_bytes());
-        }
-        block
+        let txs: Vec<Vec<u8>> = (0..2_000u32)
+            .map(|lock_time| {
+                let mut tx = minimal_v1_tx(0);
+                tx[6..10].copy_from_slice(&lock_time.to_le_bytes());
+                tx
+            })
+            .collect();
+        let header = sovright_relay::test_support::committed_header(0xab, &txs);
+        sovright_relay::test_support::raw_block(&header, &txs)
     }
 
     #[tokio::test]
@@ -563,10 +581,12 @@ mod tests {
 
         let mut blocks = Vec::new();
         for tag in 0u8..6 {
+            let tx = minimal_v1_tx(tag);
             let mut block = vec![0xab; ZCASH_FULL_HEADER_SIZE];
             block[0] = tag; // distinct hash per block so dedup never triggers
+            sovright_relay::test_support::commit_header(&mut block, std::slice::from_ref(&tx));
             crate::wire::encode_compact_size(1, &mut block);
-            block.extend_from_slice(&minimal_v1_tx(tag));
+            block.extend_from_slice(&tx);
             blocks.push(block);
         }
 
@@ -1243,6 +1263,10 @@ mod nu7_fixture;
 #[cfg(test)]
 #[path = "nu7_transport_tests.rs"]
 mod nu7_transport_tests;
+
+#[cfg(test)]
+#[path = "block_body_tests.rs"]
+mod block_body_tests;
 
 #[cfg(test)]
 #[path = "nu7_relay_path_tests.rs"]

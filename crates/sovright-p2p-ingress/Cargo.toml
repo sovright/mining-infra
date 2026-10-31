@@ -24,4 +24,5 @@ zcash_primitives = { workspace = true }
 zcash_protocol = { workspace = true }
 
 [dev-dependencies]
+sovright-relay = { path = "../sovright-relay", features = ["test-support"] }
 zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }

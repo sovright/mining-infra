@@ -2,9 +2,9 @@
 
 use clap::Parser;
 use sovright_relay::{
-    ArrivalSink, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment, RelayPayload,
-    TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord, WtxId,
-    ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
+    ArrivalSink, BlockBodyError, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment,
+    RelayPayload, TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord,
+    WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
 };
 use std::collections::HashMap;
 use std::fs;
@@ -1484,6 +1484,10 @@ fn log_submission_outcome(
                 metrics.inc_submit_rpc_failures();
                 warn!(%error, "Relay block submitblock RPC failed");
             }
+            RelayBlockError::InvalidBlockBody(error) => {
+                metrics.inc_block_body_rejected(&error);
+                warn!(%error, "Relay block body refused before submitblock");
+            }
             error => {
                 metrics.inc_not_submit_candidates();
                 warn!(%error, "Relay block is not a submit candidate");
@@ -1590,6 +1594,7 @@ struct SidecarMetrics {
     compact_reconstruction_invalids_out_of_bounds: AtomicU64,
     compact_reconstruction_invalids_merkle_mismatch: AtomicU64,
     compact_reconstruction_invalids_other: AtomicU64,
+    block_body_rejections: [AtomicU64; BlockBodyError::LABELS.len()],
     compact_reconstruction_errors: AtomicU64,
     compact_reconstruction_missing_wtxids: AtomicU64,
     compact_reconstruction_unresolved_short_ids: AtomicU64,
@@ -1696,6 +1701,10 @@ impl SidecarMetrics {
     fn inc_compact_reconstruction_errors(&self) {
         self.compact_reconstruction_errors
             .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn inc_block_body_rejected(&self, error: &BlockBodyError) {
+        self.block_body_rejections[error.label_index()].fetch_add(1, Ordering::Relaxed);
     }
 
     fn inc_compact_reconstruction_invalids(&self, kind: &str) {
@@ -1981,7 +1990,7 @@ impl SidecarMetrics {
         let tx_feed_dropped_too_large = self.tx_feed_dropped_too_large.load(Ordering::Relaxed);
         let zebra_mempool_sync_inserts = self.zebra_mempool_sync_inserts.load(Ordering::Relaxed);
 
-        format!(
+        let mut text = format!(
             concat!(
                 "# TYPE sovright_relay_sidecar_relay_compact_blocks_received_total counter\n",
                 "sovright_relay_sidecar_relay_compact_blocks_received_total {compact_blocks_received}\n",
@@ -2145,7 +2154,18 @@ impl SidecarMetrics {
             submit_gate_rejected_unknown_parent = submit_gate_rejected_unknown_parent,
             submit_gate_rejected_out_of_window = submit_gate_rejected_out_of_window,
             submit_gate_rejected_duplicate = submit_gate_rejected_duplicate,
-        )
+        );
+        text.push_str("# TYPE sovright_relay_sidecar_relay_block_body_rejected_total counter\n");
+        for (label, count) in BlockBodyError::LABELS
+            .iter()
+            .zip(&self.block_body_rejections)
+        {
+            text.push_str(&format!(
+                "sovright_relay_sidecar_relay_block_body_rejected_total{{reason=\"{label}\"}} {}\n",
+                count.load(Ordering::Relaxed)
+            ));
+        }
+        text
     }
 }
 
@@ -2191,6 +2211,7 @@ mod tests {
     };
     use std::sync::atomic::Ordering;
 
+    use sovright_relay::test_support::{committed_header, parseable_transaction};
     use sovright_relay_sidecar::submit::{SubmitBlock, SubmitFuture};
 
     #[derive(Default)]
@@ -2226,6 +2247,117 @@ mod tests {
         let root = sovright_relay::merkle_root(&txids).expect("tests commit to >=1 tx");
         header[36..68].copy_from_slice(&root);
         header
+    }
+
+    /// Block 3470793 with a transaction changed: still parses, new txid.
+    fn bad_mainnet_transactions() -> Vec<Vec<u8>> {
+        let mut txs = zcash_pool_common::fixtures::mainnet_transactions();
+        txs[3][60] ^= 0x01;
+        txs
+    }
+
+    fn mainnet_compact(txs: &[Vec<u8>]) -> CompactBlock {
+        CompactBlock::new(
+            zcash_pool_common::fixtures::mainnet_serialized_header(),
+            0,
+            Vec::new(),
+            txs.iter()
+                .map(|tx| PrefilledTx {
+                    index: 0,
+                    tx_data: tx.clone(),
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn a_block_body_rejection_is_counted_by_reason() {
+        let metrics = SidecarMetrics::default();
+
+        log_submission_outcome(
+            Err(RelayBlockError::InvalidBlockBody(
+                BlockBodyError::MerkleMismatch,
+            )),
+            &metrics,
+            None,
+        );
+
+        let text = metrics.render_prometheus_text();
+        let name = "sovright_relay_sidecar_relay_block_body_rejected_total";
+        assert!(text.contains(&format!("{name}{{reason=\"merkle_mismatch\"}} 1")));
+        assert!(text.contains(&format!("{name}{{reason=\"duplicate_txid\"}} 0")));
+    }
+
+    /// A rejected body must not take the header's slot in the fast-path dedup,
+    /// in dry-run or live mode.
+    #[tokio::test]
+    async fn a_bad_body_does_not_take_the_fast_path_slot() {
+        for mode in [SubmitBlockMode::DryRun, SubmitBlockMode::Live] {
+            let submitter = CountingSubmitter::default();
+            let metrics = SidecarMetrics::default();
+            let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+            let mempool = TestMempool::new();
+            let now = Instant::now();
+
+            for txs in [
+                bad_mainnet_transactions(),
+                zcash_pool_common::fixtures::mainnet_transactions(),
+            ] {
+                submit_compact_fast_path(
+                    &submitter,
+                    &mainnet_compact(&txs),
+                    mode,
+                    false,
+                    &mempool,
+                    &metrics,
+                    &mut dedup,
+                    now,
+                    false,
+                )
+                .await;
+            }
+
+            assert_eq!(metrics.full_block_deduplicated.load(Ordering::Relaxed), 0);
+            let good_calls = usize::from(matches!(mode, SubmitBlockMode::Live));
+            assert_eq!(submitter.calls.load(Ordering::SeqCst), good_calls);
+        }
+    }
+
+    /// Through the reassembly buffer: the bad body completes and is refused,
+    /// then the good one completes and is submitted byte for byte.
+    #[tokio::test]
+    async fn reassembled_raw_bodies_are_validated() {
+        let good = zcash_pool_common::fixtures::mainnet_raw_block();
+        let mut bad = good.clone();
+        let tx = bad_mainnet_transactions().swap_remove(3);
+        let genuine = zcash_pool_common::fixtures::mainnet_transactions().swap_remove(3);
+        let offset = good
+            .windows(genuine.len())
+            .position(|window| window == genuine.as_slice())
+            .unwrap();
+        bad[offset..offset + tx.len()].copy_from_slice(&tx);
+        let hash = zcash_block_hash(&good[..ZCASH_FULL_HEADER_SIZE]);
+        let submitter = CountingSubmitter::default();
+        let mut buffer =
+            RawSegmentBuffer::new(buffer_config(8, 1024 * 1024, Duration::from_secs(60)));
+        let frame = RawBlockSegment::HEADER_LEN + 8 * 1024;
+
+        for (raw, submitted) in [(&bad, 0), (&good, 1)] {
+            let mut complete = None;
+            for segment in sovright_relay::split_raw_block(hash, raw, frame).unwrap() {
+                if let RawSegmentInsert::Complete { segments, .. } =
+                    buffer.insert(segment, Instant::now())
+                {
+                    complete = Some(segments);
+                }
+            }
+            let block = reassemble_raw_block(&complete.expect("all segments arrived")).unwrap();
+            assert_eq!(&block, raw);
+            let outcome =
+                handle_relay_raw_block(&submitter, &block, Some(hash), SubmitBlockMode::Live).await;
+            assert_eq!(outcome.is_ok(), submitted == 1);
+            assert_eq!(submitter.calls.load(Ordering::SeqCst), submitted);
+        }
     }
 
     fn buffer_config(
@@ -2591,10 +2723,10 @@ mod tests {
         let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
         let now = Instant::now();
 
-        let header = vec![0xcd; 2189];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
+        let header = committed_header(0xcd, &[coinbase.clone(), tx1.clone()]);
         let nonce = 3;
-        let coinbase = vec![0x01];
-        let tx1 = vec![0x02, 0x03];
         let short_id = ShortId::compute(&make_wtxid(0x21), &zcash_block_hash(&header), nonce);
         let empty_mempool = TestMempool::new();
 
@@ -2670,10 +2802,10 @@ mod tests {
         let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
         let now = Instant::now();
 
-        let header = vec![0xef; 2189];
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
+        let header = committed_header(0xef, &[coinbase.clone(), tx1.clone()]);
         let nonce = 5;
-        let coinbase = vec![0x01];
-        let tx1 = vec![0x02, 0x03];
         let wtxid = make_wtxid(0x31);
         let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
 

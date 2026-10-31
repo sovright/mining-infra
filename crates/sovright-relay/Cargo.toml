@@ -23,6 +23,7 @@ subtle = "2.5"
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 equihash-verifier.workspace = true
+zcash_encoding = { workspace = true }
 zcash_primitives = { workspace = true }
 zcash_protocol = { workspace = true }
 socket2 = "0.5"
@@ -31,6 +32,8 @@ arbitrary = { version = "1", features = ["derive"], optional = true }
 [features]
 arbitrary = ["dep:arbitrary"]
 generate-corpus = []
+# Body-validation test blocks for downstream crates' tests.
+test-support = []
 
 [dev-dependencies]
 equihash.workspace = true

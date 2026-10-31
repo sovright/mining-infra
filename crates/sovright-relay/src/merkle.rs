@@ -25,9 +25,12 @@
 //! all internal (wire) order. Zebra's RPC and explorers display the byte
 //! reversal of each. Nothing here reverses anything; the fixture test pins it.
 
+use std::collections::HashSet;
 use std::io::Cursor;
 
+use crate::ZCASH_FULL_HEADER_SIZE;
 use sha2::{Digest, Sha256};
+use zcash_encoding::CompactSize;
 use zcash_primitives::transaction::{Transaction, TxVersion};
 use zcash_protocol::consensus::BranchId;
 
@@ -36,7 +39,7 @@ use zcash_protocol::consensus::BranchId;
 /// Header layout: version(4) prev(32) merkle(32) commitments(32) time(4)
 /// bits(4) nonce(32) then the Equihash solution. Verified against mainnet
 /// block 3470793 in the tests.
-const MERKLE_ROOT_RANGE: std::ops::Range<usize> = 36..68;
+pub(crate) const MERKLE_ROOT_RANGE: std::ops::Range<usize> = 36..68;
 
 /// Branch id handed to `zcash_primitives::transaction::Transaction::read`, and
 /// the only definition of it in the workspace: `sovright-p2p-ingress` re-exports
@@ -121,8 +124,8 @@ pub fn header_merkle_root(header: &[u8]) -> Option<[u8; 32]> {
 /// Whether `transactions` (in block order, wire bytes) are exactly the
 /// transactions `header` commits to.
 ///
-/// Fails closed: a header too short to carry a merkle root, or an empty
-/// transaction list, is a mismatch rather than a pass.
+/// Fails closed: a header too short to carry a merkle root, an empty transaction
+/// list, or a repeated txid is a mismatch rather than a pass.
 pub fn transactions_match_merkle_root(header: &[u8], transactions: &[Vec<u8>]) -> bool {
     let Some(expected) = header_merkle_root(header) else {
         return false;
@@ -131,10 +134,173 @@ pub fn transactions_match_merkle_root(header: &[u8], transactions: &[Vec<u8>]) -
         .iter()
         .map(|tx| txid_from_tx_bytes(tx))
         .collect();
+    if first_repeated_txid(&txids).is_some() {
+        return false;
+    }
     match merkle_root(&txids) {
         Some(actual) => actual == expected,
         None => false,
     }
+}
+
+/// Largest serialized block, in bytes (Zebra's `MAX_BLOCK_BYTES`). This bounds
+/// the input, not the time spent parsing it.
+pub const MAX_BLOCK_BYTES: usize = 2_000_000;
+
+/// Why a block body failed [`validate_block_body`] or
+/// [`validate_block_transactions`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum BlockBodyError {
+    #[error("block is {bytes} bytes, over the limit")]
+    TooLarge { bytes: usize },
+    #[error("block header has the wrong length")]
+    InvalidHeaderLength,
+    #[error("invalid transaction count")]
+    InvalidCount,
+    #[error("block has no transactions")]
+    EmptyTransactions,
+    #[error("transaction {index} does not parse")]
+    Transaction { index: usize },
+    #[error("transaction slice {index} is not exactly one transaction")]
+    TransactionBoundary { index: usize },
+    #[error("{bytes} bytes follow the last transaction")]
+    TrailingBytes { bytes: usize },
+    #[error("transaction {index} repeats an earlier txid")]
+    DuplicateTxid { index: usize },
+    #[error("merkle root mismatch")]
+    MerkleMismatch,
+    #[error("parsed {parsed} transactions, the relay object declared {declared}")]
+    CountMismatch { parsed: usize, declared: usize },
+}
+
+impl BlockBodyError {
+    /// Every metric label, in `label_index` order.
+    pub const LABELS: [&'static str; 10] = [
+        "too_large",
+        "invalid_header_length",
+        "invalid_count",
+        "empty_transactions",
+        "transaction",
+        "transaction_boundary",
+        "trailing_bytes",
+        "duplicate_txid",
+        "merkle_mismatch",
+        "count_mismatch",
+    ];
+
+    /// Position of this error's label in [`Self::LABELS`].
+    pub fn label_index(&self) -> usize {
+        match self {
+            Self::TooLarge { .. } => 0,
+            Self::InvalidHeaderLength => 1,
+            Self::InvalidCount => 2,
+            Self::EmptyTransactions => 3,
+            Self::Transaction { .. } => 4,
+            Self::TransactionBoundary { .. } => 5,
+            Self::TrailingBytes { .. } => 6,
+            Self::DuplicateTxid { .. } => 7,
+            Self::MerkleMismatch => 8,
+            Self::CountMismatch { .. } => 9,
+        }
+    }
+}
+
+/// Strictly parse a serialized block and check its body against its header.
+/// Returns the transaction count.
+///
+/// Unlike [`transactions_match_merkle_root`], a transaction that does not parse
+/// is refused rather than hashed: a block is only valid here if the reader
+/// consumes it exactly. This does not check proofs, signatures or which
+/// transaction versions an upgrade allows; those stay with the node.
+pub fn validate_block_body(raw_block: &[u8]) -> Result<usize, BlockBodyError> {
+    if raw_block.len() > MAX_BLOCK_BYTES {
+        return Err(BlockBodyError::TooLarge {
+            bytes: raw_block.len(),
+        });
+    }
+    let (header, body) = raw_block
+        .split_at_checked(ZCASH_FULL_HEADER_SIZE)
+        .ok_or(BlockBodyError::InvalidHeaderLength)?;
+    let mut cursor = Cursor::new(body);
+    let count = CompactSize::read(&mut cursor).map_err(|_| BlockBodyError::InvalidCount)?;
+    if count == 0 {
+        return Err(BlockBodyError::EmptyTransactions);
+    }
+    // The declared count is not trusted for allocation; reading stops at the
+    // first transaction the bytes cannot supply.
+    let mut txids = Vec::new();
+    for index in 0..count as usize {
+        let tx = Transaction::read(&mut cursor, TX_READER_BRANCH_HINT)
+            .map_err(|_| BlockBodyError::Transaction { index })?;
+        txids.push(*tx.txid().as_ref());
+    }
+    let trailing = body.len() - cursor.position() as usize;
+    if trailing != 0 {
+        return Err(BlockBodyError::TrailingBytes { bytes: trailing });
+    }
+    check_txids(header, &txids)?;
+    Ok(txids.len())
+}
+
+/// The rules of [`validate_block_body`] for transactions that already have their
+/// own boundaries: each slice must be exactly one transaction. Concatenating the
+/// slices and validating the result would not show that, because shifted
+/// boundaries can join into a valid block.
+pub fn validate_block_transactions<'a>(
+    header: &[u8],
+    transactions: impl ExactSizeIterator<Item = &'a [u8]>,
+) -> Result<usize, BlockBodyError> {
+    if header.len() != ZCASH_FULL_HEADER_SIZE {
+        return Err(BlockBodyError::InvalidHeaderLength);
+    }
+    if transactions.len() == 0 {
+        return Err(BlockBodyError::EmptyTransactions);
+    }
+    // What the block serializes to, so the count is included. `bytes` is within
+    // the limit before each addition, so the sum cannot overflow.
+    let mut bytes = header.len() + CompactSize::serialized_size(transactions.len());
+    let mut txids = Vec::with_capacity(transactions.len());
+    for (index, slice) in transactions.enumerate() {
+        bytes += slice.len();
+        if bytes > MAX_BLOCK_BYTES {
+            return Err(BlockBodyError::TooLarge { bytes });
+        }
+        let mut cursor = Cursor::new(slice);
+        let tx = Transaction::read(&mut cursor, TX_READER_BRANCH_HINT)
+            .map_err(|_| BlockBodyError::Transaction { index })?;
+        if cursor.position() as usize != slice.len() {
+            return Err(BlockBodyError::TransactionBoundary { index });
+        }
+        txids.push(*tx.txid().as_ref());
+    }
+    check_txids(header, &txids)?;
+    Ok(txids.len())
+}
+
+fn check_txids(header: &[u8], txids: &[[u8; 32]]) -> Result<(), BlockBodyError> {
+    if let Some(index) = first_repeated_txid(txids) {
+        return Err(BlockBodyError::DuplicateTxid { index });
+    }
+    let root = merkle_root(txids);
+    if root.is_none() || root != header_merkle_root(header) {
+        return Err(BlockBodyError::MerkleMismatch);
+    }
+    Ok(())
+}
+
+/// The index of the first txid that repeats an earlier one, at any position.
+///
+/// The tree pairs an odd last node with itself, so repeating the tail of a block
+/// keeps the root. Equal roots therefore do not show that a list is the one the
+/// header commits to; a repeated txid must be refused separately.
+///
+/// The rule is wider than the shapes that keep the root. It refuses any repeat,
+/// adjacent or not, and it compares txids, so two encodings of one transaction
+/// count as a repeat even when their authorizing data differs. This is a relay
+/// rule; whether it matches consensus on every block is still open in #130.
+fn first_repeated_txid(txids: &[[u8; 32]]) -> Option<usize> {
+    let mut seen = HashSet::with_capacity(txids.len());
+    txids.iter().position(|txid| !seen.insert(txid))
 }
 
 #[cfg(test)]
@@ -433,5 +599,370 @@ mod diagnostic_tests {
     fn digest_is_empty_when_everything_was_prefilled() {
         let txs = vec![vec![0x01], vec![0x02]];
         assert_eq!(mempool_slot_digest(&txs, &[0, 1]), "");
+    }
+}
+
+#[cfg(test)]
+mod body_tests {
+    use super::*;
+    use crate::test_support::{
+        committed_header, parseable_transaction, parseable_transaction_with_script, raw_block,
+    };
+
+    fn real_block() -> (Vec<u8>, Vec<Vec<u8>>, Vec<u8>) {
+        let header = zcash_pool_common::fixtures::mainnet_serialized_header();
+        let txs = zcash_pool_common::fixtures::mainnet_transactions();
+        let raw = raw_block(&header, &txs);
+        assert_eq!(raw, zcash_pool_common::fixtures::mainnet_raw_block());
+        (header, txs, raw)
+    }
+
+    fn test_block(count: u32) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let txs: Vec<Vec<u8>> = (0..count).map(parseable_transaction).collect();
+        (committed_header(0xcd, &txs), txs)
+    }
+
+    #[test]
+    fn validates_the_real_block() {
+        let (header, txs, raw) = real_block();
+        assert_eq!(validate_block_body(&raw), Ok(7));
+        assert_eq!(
+            validate_block_transactions(&header, txs.iter().map(Vec::as_slice)),
+            Ok(7)
+        );
+    }
+
+    /// The tree pairs block 3470793's odd last transaction with itself, so a
+    /// second copy of it keeps the root the real header commits to.
+    #[test]
+    fn a_repeated_final_transaction_keeps_the_root_and_is_refused() {
+        let (header, mut txs, _) = real_block();
+        let last = txs[6].clone();
+        txs.push(last);
+        let txids: Vec<[u8; 32]> = txs.iter().map(|tx| txid_from_tx_bytes(tx)).collect();
+        assert_eq!(merkle_root(&txids), header_merkle_root(&header));
+
+        assert!(!transactions_match_merkle_root(&header, &txs));
+        assert_eq!(
+            validate_block_body(&raw_block(&header, &txs)),
+            Err(BlockBodyError::DuplicateTxid { index: 7 })
+        );
+        assert_eq!(
+            validate_block_transactions(&header, txs.iter().map(Vec::as_slice)),
+            Err(BlockBodyError::DuplicateTxid { index: 7 })
+        );
+    }
+
+    #[test]
+    fn a_repeated_final_pair_keeps_the_root_and_is_refused() {
+        let (header, mut txs) = test_block(6);
+        txs.extend_from_slice(&txs.clone()[4..]);
+        let txids: Vec<[u8; 32]> = txs.iter().map(|tx| txid_from_tx_bytes(tx)).collect();
+        assert_eq!(merkle_root(&txids), header_merkle_root(&header));
+        assert_eq!(
+            validate_block_body(&raw_block(&header, &txs)),
+            Err(BlockBodyError::DuplicateTxid { index: 6 })
+        );
+    }
+
+    /// Position does not matter, and neither does the root: each header here
+    /// commits to the list that repeats a transaction.
+    #[test]
+    fn a_repeat_at_any_position_is_refused() {
+        let (_, txs) = test_block(3);
+        let at = |positions: &[usize]| -> Vec<Vec<u8>> {
+            positions.iter().map(|&index| txs[index].clone()).collect()
+        };
+        for (list, index) in [
+            (at(&[0, 0, 1]), 1),
+            (at(&[0, 1, 0]), 2),
+            (at(&[0, 1, 2, 1]), 3),
+        ] {
+            let header = committed_header(0xcd, &list);
+            let expected = Err(BlockBodyError::DuplicateTxid { index });
+            assert!(!transactions_match_merkle_root(&header, &list));
+            assert_eq!(validate_block_body(&raw_block(&header, &list)), expected);
+            assert_eq!(
+                validate_block_transactions(&header, list.iter().map(Vec::as_slice)),
+                expected
+            );
+        }
+    }
+
+    /// A v6 txid leaves out the scriptSig, so these two encodings share a txid.
+    /// The rule compares txids, not bytes.
+    #[test]
+    fn a_repeat_is_a_repeated_txid_not_repeated_bytes() {
+        let (header, mut txs, _) = real_block();
+        let mut other_encoding = txs[2].clone();
+        other_encoding[70] ^= 0x01;
+        assert_ne!(other_encoding, txs[2]);
+        assert_eq!(
+            txid_from_tx_bytes(&other_encoding),
+            txid_from_tx_bytes(&txs[2])
+        );
+        txs.insert(3, other_encoding);
+
+        let expected = Err(BlockBodyError::DuplicateTxid { index: 3 });
+        assert_eq!(validate_block_body(&raw_block(&header, &txs)), expected);
+        assert_eq!(
+            validate_block_transactions(&header, txs.iter().map(Vec::as_slice)),
+            expected
+        );
+    }
+
+    #[test]
+    fn a_changed_transaction_fails_the_root() {
+        let (header, mut txs, _) = real_block();
+        txs[3][60] ^= 0x01; // inside tx 3's scriptSig: still parses, new txid
+        assert_eq!(
+            validate_block_body(&raw_block(&header, &txs)),
+            Err(BlockBodyError::MerkleMismatch)
+        );
+    }
+
+    /// `txid_from_tx_bytes` hashes what it cannot parse, so a header can commit
+    /// to bytes that are not a transaction. The merkle-only check passes them;
+    /// validation must not.
+    #[test]
+    fn an_unparseable_transaction_is_refused_even_if_the_root_matches() {
+        let garbage = vec![0xff; 40];
+        let txs = vec![parseable_transaction(1), garbage];
+        let header = committed_header(0xcd, &txs);
+        assert!(transactions_match_merkle_root(&header, &txs));
+        assert_eq!(
+            validate_block_body(&raw_block(&header, &txs)),
+            Err(BlockBodyError::Transaction { index: 1 })
+        );
+        assert_eq!(
+            validate_block_transactions(&header, txs.iter().map(Vec::as_slice)),
+            Err(BlockBodyError::Transaction { index: 1 })
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_count_is_refused() {
+        let (header, txs, _) = real_block();
+        let mut raw = header;
+        raw.extend_from_slice(&[0xfd, 7, 0]);
+        txs.iter().for_each(|tx| raw.extend_from_slice(tx));
+        assert_eq!(validate_block_body(&raw), Err(BlockBodyError::InvalidCount));
+    }
+
+    /// 252 is the last count that fits one byte; 253 needs `fd fd 00`.
+    #[test]
+    fn the_count_encoding_changes_between_252_and_253() {
+        let (header, txs) = test_block(252);
+        let raw = raw_block(&header, &txs);
+        assert_eq!(raw[ZCASH_FULL_HEADER_SIZE], 0xfc);
+        assert_eq!(validate_block_body(&raw), Ok(252));
+
+        let mut padded = header.clone();
+        padded.extend_from_slice(&[0xfd, 0xfc, 0x00]);
+        txs.iter().for_each(|tx| padded.extend_from_slice(tx));
+        assert_eq!(
+            validate_block_body(&padded),
+            Err(BlockBodyError::InvalidCount)
+        );
+
+        let (header, txs) = test_block(253);
+        let raw = raw_block(&header, &txs);
+        assert_eq!(
+            raw[ZCASH_FULL_HEADER_SIZE..ZCASH_FULL_HEADER_SIZE + 3],
+            [0xfd, 0xfd, 0x00]
+        );
+        assert_eq!(validate_block_body(&raw), Ok(253));
+    }
+
+    #[test]
+    fn trailing_bytes_are_refused() {
+        let (_, _, mut raw) = real_block();
+        raw.push(0);
+        assert_eq!(
+            validate_block_body(&raw),
+            Err(BlockBodyError::TrailingBytes { bytes: 1 })
+        );
+    }
+
+    /// A stride, the lengths around the end, and both sides of each edge the
+    /// parser turns on: parsing each of the 36,000 prefixes takes minutes in a
+    /// debug build.
+    #[test]
+    fn no_prefix_of_the_real_block_validates() {
+        let (_, txs, raw) = real_block();
+        let first_tx = raw.len() - txs.iter().map(Vec::len).sum::<usize>();
+        let tx_starts: Vec<usize> = txs
+            .iter()
+            .scan(first_tx, |next, tx| {
+                Some(std::mem::replace(next, *next + tx.len()))
+            })
+            .collect();
+        assert_eq!(
+            validate_block_body(&raw[..ZCASH_FULL_HEADER_SIZE]),
+            Err(BlockBodyError::InvalidCount)
+        );
+        for (index, &start) in tx_starts.iter().enumerate() {
+            assert_eq!(
+                validate_block_body(&raw[..start]),
+                Err(BlockBodyError::Transaction { index })
+            );
+        }
+        let around_edges = tx_starts
+            .iter()
+            .chain([&ZCASH_FULL_HEADER_SIZE])
+            .flat_map(|edge| edge - 1..=edge + 1);
+        let near_the_end = raw.len() - 64..raw.len();
+        let lengths = (0..raw.len()).step_by(499).chain(near_the_end);
+        for len in lengths.chain(around_edges) {
+            assert!(validate_block_body(&raw[..len]).is_err(), "prefix {len}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_count_is_refused() {
+        let (header, txs, _) = real_block();
+        let with_count = |count: u8, txs: &[Vec<u8>]| {
+            let mut raw = header.clone();
+            raw.push(count);
+            txs.iter().for_each(|tx| raw.extend_from_slice(tx));
+            raw
+        };
+        assert_eq!(
+            validate_block_body(&with_count(8, &txs)),
+            Err(BlockBodyError::Transaction { index: 7 })
+        );
+        assert_eq!(
+            validate_block_body(&with_count(6, &txs)),
+            Err(BlockBodyError::TrailingBytes {
+                bytes: txs[6].len()
+            })
+        );
+        assert_eq!(
+            validate_block_body(&with_count(0, &[])),
+            Err(BlockBodyError::EmptyTransactions)
+        );
+    }
+
+    #[test]
+    fn oversized_blocks_and_wrong_headers_are_refused() {
+        assert_eq!(
+            validate_block_body(&vec![0; MAX_BLOCK_BYTES + 1]),
+            Err(BlockBodyError::TooLarge {
+                bytes: MAX_BLOCK_BYTES + 1
+            })
+        );
+        assert_eq!(
+            validate_block_transactions(&[0; 80], [[0u8; 1].as_slice()].into_iter()),
+            Err(BlockBodyError::InvalidHeaderLength)
+        );
+    }
+
+    /// `count` transactions, the first padded so the block serializes to exactly
+    /// `block_bytes`.
+    fn block_of_size(count: usize, block_bytes: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
+        let small: Vec<Vec<u8>> = (1..count as u32).map(parseable_transaction).collect();
+        let padding_overhead = parseable_transaction_with_script(0, 65_536).len() - 65_536;
+        let padded_bytes = block_bytes
+            - ZCASH_FULL_HEADER_SIZE
+            - CompactSize::serialized_size(count)
+            - small.iter().map(Vec::len).sum::<usize>();
+        let mut txs = vec![parseable_transaction_with_script(
+            0,
+            padded_bytes - padding_overhead,
+        )];
+        txs.extend(small);
+        (committed_header(0xcd, &txs), txs)
+    }
+
+    /// Both entry points limit what the block serializes to, which includes the
+    /// transaction count, and that count takes more bytes from 253 transactions.
+    #[test]
+    fn both_entry_points_limit_the_serialized_block() {
+        let mut disagreements = Vec::new();
+        for count in [1, 252, 253] {
+            for block_bytes in [MAX_BLOCK_BYTES, MAX_BLOCK_BYTES + 1] {
+                let (header, txs) = block_of_size(count, block_bytes);
+                let raw = raw_block(&header, &txs);
+                assert_eq!(raw.len(), block_bytes);
+
+                let expected = if block_bytes > MAX_BLOCK_BYTES {
+                    Err(BlockBodyError::TooLarge { bytes: block_bytes })
+                } else {
+                    Ok(count)
+                };
+                let from_raw = validate_block_body(&raw);
+                let from_slices =
+                    validate_block_transactions(&header, txs.iter().map(Vec::as_slice));
+                if from_raw != expected || from_slices != expected {
+                    disagreements.push((count, block_bytes, from_raw, from_slices));
+                }
+            }
+        }
+        assert!(disagreements.is_empty(), "{disagreements:#?}");
+    }
+
+    /// Without the limit this would pass: the one oversized transaction parses
+    /// and the header commits to it.
+    #[test]
+    fn oversized_transaction_slices_are_refused() {
+        let tx = parseable_transaction_with_script(1, MAX_BLOCK_BYTES);
+        let header = committed_header(0xcd, std::slice::from_ref(&tx));
+        assert_eq!(
+            validate_block_transactions(&header, [tx.as_slice()].into_iter()),
+            Err(BlockBodyError::TooLarge {
+                bytes: raw_block(&header, std::slice::from_ref(&tx)).len()
+            })
+        );
+    }
+
+    /// Each slice must be one transaction, even when the joined bytes would
+    /// parse: this is what validating the concatenated block cannot see.
+    #[test]
+    fn slices_must_each_be_exactly_one_transaction() {
+        let (header, txs) = test_block(3);
+        let two_in_one = [txs[0].concat_with(&txs[1]), txs[2].clone()];
+        assert_eq!(
+            validate_block_transactions(&header, two_in_one.iter().map(Vec::as_slice)),
+            Err(BlockBodyError::TransactionBoundary { index: 0 })
+        );
+
+        let mut extra_byte = txs.clone();
+        extra_byte[1].push(0);
+        assert_eq!(
+            validate_block_transactions(&header, extra_byte.iter().map(Vec::as_slice)),
+            Err(BlockBodyError::TransactionBoundary { index: 1 })
+        );
+
+        let (head, tail) = txs[1].split_at(10);
+        let shifted = [
+            txs[0].clone(),
+            head.to_vec(),
+            tail.iter().chain(&txs[2]).copied().collect::<Vec<u8>>(),
+        ];
+        assert_eq!(
+            raw_block(&header, &shifted)[..],
+            raw_block(&header, &txs)[..],
+            "the joined bytes are the valid block"
+        );
+        assert_eq!(
+            validate_block_transactions(&header, shifted.iter().map(Vec::as_slice)),
+            Err(BlockBodyError::Transaction { index: 1 })
+        );
+    }
+
+    #[test]
+    fn labels_are_distinct() {
+        let labels: HashSet<&str> = BlockBodyError::LABELS.iter().copied().collect();
+        assert_eq!(labels.len(), BlockBodyError::LABELS.len());
+    }
+
+    trait ConcatWith {
+        fn concat_with(&self, other: &[u8]) -> Vec<u8>;
+    }
+
+    impl ConcatWith for Vec<u8> {
+        fn concat_with(&self, other: &[u8]) -> Vec<u8> {
+            [self.as_slice(), other].concat()
+        }
     }
 }

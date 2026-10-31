@@ -14,6 +14,8 @@ pub mod messages;
 pub mod reconstructor;
 pub mod relay;
 pub mod segmented_block;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod transport;
 pub mod tx_feed;
 pub mod types;
@@ -28,8 +30,9 @@ pub use mempool::{
     TxCacheSnapshot,
 };
 pub use merkle::{
-    TX_READER_BRANCH_HINT, header_merkle_root, merkle_root, transactions_match_merkle_root,
-    txid_from_tx_bytes,
+    BlockBodyError, MAX_BLOCK_BYTES, TX_READER_BRANCH_HINT, header_merkle_root, merkle_root,
+    transactions_match_merkle_root, txid_from_tx_bytes, validate_block_body,
+    validate_block_transactions,
 };
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
