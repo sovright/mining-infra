@@ -195,6 +195,59 @@ fn a_refusal_below_writes_nothing_and_the_object_goes_in_once_there_is_room() {
     assert_eq!(rig.budget.used().spare_bytes, 0);
 }
 
+/// One chunk each of as many objects as it takes to fill the normal places and the shelf,
+/// with whatever is on the shelf already taking the last of it.
+fn crowd(rig: &mut Rig, count: usize, now: Instant) {
+    for fill in 0..count {
+        let stopped = object(MSG_BLOCK, 6, 4, fill as u8, 40);
+        let step = rig
+            .bridge
+            .take(&mut rig.session, &datagrams(&stopped)[0], now);
+        assert!(
+            matches!(step, Step::Chunk(Arrival::Pending { .. })),
+            "{step:?}"
+        );
+    }
+}
+
+/// An object on its way through, with everything full as its last chunk comes. A client's
+/// way to what a node does in `tests/assembler.rs`.
+#[test]
+fn the_chunk_that_finishes_an_object_on_a_full_shelf_hands_it_over() {
+    let mut rig = Rig::new(ledger_limits(16));
+    let now = Instant::now();
+    let (_, objects, segments) = carried_body(10);
+    rig.send(&objects[0], &[0, 1, 2], now);
+    crowd(&mut rig, 16 + 16 - 1, now);
+    assert_eq!(rig.session.state().spares, 16);
+
+    let step = rig.send(&objects[0], &[3], now);
+
+    assert!(matches!(step, Step::Handed(Handoff::Held(_))), "{step:?}");
+    assert_eq!(rig.ledger.observe(&segments[0]), Some(Phase::Held));
+}
+
+/// A sweep that hands over a decoded object from a full shelf.
+#[test]
+fn a_sweep_with_everything_full_keeps_what_it_hands_over() {
+    let mut rig = Rig::new(ledger_limits(1));
+    let now = Instant::now();
+    let (_, objects, segments) = carried_body(10);
+    let room = ticket(&rig.ledger, [9; 32], SEGMENT, now);
+    assert!(matches!(
+        rig.deliver(&objects[0], now),
+        Handoff::Refused(Refusal::Bytes)
+    ));
+    crowd(&mut rig, 16 + 16 - 1, now);
+    assert_eq!(rig.session.state().spares, 16);
+    drop(room);
+
+    let handed = rig.bridge.sweep(&mut rig.session, now);
+
+    assert!(matches!(&handed[..], [Handoff::Held(_)]), "{handed:?}");
+    assert_eq!(rig.ledger.observe(&segments[0]), Some(Phase::Held));
+}
+
 /// A chunk of it does the same as a sweep.
 #[test]
 fn a_chunk_of_a_refused_object_offers_it_again() {

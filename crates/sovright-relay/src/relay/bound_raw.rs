@@ -25,6 +25,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -41,7 +42,7 @@ use delivery_lease::{
     DeliveryLedger, Limits as LedgerLimits, Refusal as LedgerRefusal, Snapshot, Transit,
 };
 use tokio::sync::mpsc::{self, error::TrySendError};
-use tracing::warn;
+use tracing::{error, warn};
 
 use crate::transport::{PowResult, ZCASH_FULL_HEADER_SIZE};
 
@@ -63,6 +64,18 @@ pub const BOUND_SEND_BURST_DELAY: Duration = Duration::from_millis(1);
 /// The most a node reads of one datagram.
 pub(crate) const MAX_READ_BYTES: usize = 2048;
 const RELEASED_TTL: Duration = Duration::from_secs(60);
+
+/// Why this build cannot run the bound raw path, if it cannot. Panics on the path are only
+/// caught by unwinding, so a build that aborts would lose the process to one, the legacy path
+/// with it. What is asked to turn the path on has to refuse with this, and never go on without
+/// it. A build that leaves the path off is not affected.
+pub fn bound_raw_refused() -> Option<&'static str> {
+    refused_by(cfg!(panic = "unwind"))
+}
+
+fn refused_by(unwinds: bool) -> Option<&'static str> {
+    (!unwinds).then_some("the bound raw path needs panic = \"unwind\", and this build aborts")
+}
 
 fn hash_header(header: &[u8]) -> [u8; 32] {
     crate::zcash_block_hash(header)
@@ -371,6 +384,7 @@ counters!(
     sets_open,
     segments_buffered,
     waiting_for_channel,
+    panics_contained,
 );
 
 impl LiveHandoffs {
@@ -470,6 +484,8 @@ pub(crate) struct BoundReceiver {
     consumer: mpsc::Sender<BoundBlock>,
     look_again: bool,
     progress: Arc<LiveProgress>,
+    #[cfg(test)]
+    pub(crate) trip_next: bool,
 }
 
 impl BoundReceiver {
@@ -488,6 +504,38 @@ impl BoundReceiver {
             consumer,
             look_again: false,
             progress: Arc::default(),
+            #[cfg(test)]
+            trip_next: false,
+        })
+    }
+
+    /// After a panic. The session and bridge go and give back all they held, blocks waiting
+    /// for the channel included, so a copy of those is welcome. The stack stays: blocks with
+    /// the consumer keep their owners in its ledger, so a copy of one is turned away while it
+    /// is held, and a record of one finished with stands for as long as it would have.
+    fn start_over(self) -> Option<Self> {
+        add(&self.progress.handoffs.panics_contained, 1);
+        let Self {
+            session,
+            bridge,
+            stack,
+            consumer,
+            progress,
+            ..
+        } = self;
+        drop(session);
+        drop(bridge);
+        let bridge = stack.bridge().ok()?;
+        let session = stack.session().ok()?;
+        Some(Self {
+            session,
+            bridge,
+            stack,
+            consumer,
+            look_again: false,
+            progress,
+            #[cfg(test)]
+            trip_next: false,
         })
     }
 
@@ -534,6 +582,8 @@ impl BoundReceiver {
     /// One datagram, all the way to the channel if it finished a block. False once the
     /// consumer is gone.
     pub(crate) fn take(&mut self, datagram: &[u8], now: Instant) -> bool {
+        #[cfg(test)]
+        assert!(!std::mem::take(&mut self.trip_next), "tripped");
         match self.bridge.take(&mut self.session, datagram, now) {
             Step::Handed(handoff) => {
                 add(&self.progress.arrivals.datagrams, 1);
@@ -594,6 +644,28 @@ impl BoundReceiver {
             }
         }
         !self.consumer.is_closed()
+    }
+}
+
+/// One step of a client's way in, on the client's task. This is the only way to take one: a
+/// panic left alone would end that task, and the legacy path and keepalives with it. Only the
+/// step is caught, and sending from that task is not one. A step
+/// that says the consumer is gone ends the path, and so does a stack with no place to start
+/// over in, which a start that worked rules out.
+pub(crate) fn contain(
+    bound: &mut Option<BoundReceiver>,
+    step: impl FnOnce(&mut BoundReceiver) -> bool,
+) {
+    let Some(receiver) = bound else {
+        return;
+    };
+    match catch_unwind(AssertUnwindSafe(|| step(receiver))) {
+        Ok(true) => {}
+        Ok(false) => *bound = None,
+        Err(_) => {
+            error!("Bound path panicked, starting it over");
+            *bound = bound.take().and_then(BoundReceiver::start_over);
+        }
     }
 }
 
@@ -791,6 +863,10 @@ pub struct BoundNodeUsage {
     pub objects_sent_on: u64,
     pub objects_waiting_for_segment_0: usize,
     pub waiting_pushed_out: u64,
+    /// Sessions that lost what they held here to a panic. See [`BoundForwarder`].
+    pub sessions_lost_to_a_panic: u64,
+    /// Times everything here went because of a panic nobody could be held to.
+    pub panic_resets: u64,
     pub ingress: BoundIngress,
 }
 
@@ -800,6 +876,19 @@ pub(crate) enum BoundStep {
     Invalid,
     /// Objects to send on, all `n` shards of each.
     Forward(Vec<Encoded>),
+    /// A panic took the session it came from.
+    Lost,
+}
+
+/// Where a test stops a step with a panic, after what that step changes. Each one fires once.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Trip {
+    Arrived(SocketAddr),
+    GaveWay(SocketAddr),
+    BetweenSteps,
+    Drained,
+    Noted(SocketAddr),
 }
 
 /// A node's way through. An object is forwarded whole, after it decoded and its set's
@@ -832,6 +921,23 @@ pub(crate) enum BoundStep {
 ///
 /// A real header with a body of someone's own passes here as its own set. Telling such a
 /// body from the real one is for strict validation and the node behind the consumer.
+///
+/// Catching a panic says nothing by itself about what it left half done. So each step here
+/// belongs to one session, whose content it works on, and that session goes if the step
+/// panics: all it held comes back by the same `Drop` as any other end, and what it sends next
+/// starts again. This has been tried at the points in [`Trip`] and nowhere else, and it covers
+/// no other code on the path. Stopped at those points, others were left with this:
+///
+/// | Stopped after                 | What stays                                         |
+/// |-------------------------------|----------------------------------------------------|
+/// | A session moved its objects   | Moved. They can still finish on its shelf          |
+/// | An anchor went in             | True, since its PoW check passed                   |
+/// | Waiting objects were gathered | Those objects are gone, and their sessions can resend |
+/// | A send was recorded           | The record goes with its session                   |
+///
+/// A panic between those steps belongs to nobody, so everything on this path goes
+/// ([`Self::start_over`]). That costs every session what it had open, and nothing here stops
+/// it being repeated. No datagram is known to reach it, which rests on reading the code.
 #[derive(Debug)]
 pub(crate) struct BoundForwarder {
     config: BoundForwardConfig,
@@ -846,6 +952,10 @@ pub(crate) struct BoundForwarder {
     pow_indeterminate: u64,
     objects_sent_on: u64,
     waiting_pushed_out: u64,
+    sessions_lost_to_a_panic: u64,
+    panic_resets: u64,
+    #[cfg(test)]
+    pub(crate) trips: Vec<Trip>,
 }
 
 impl BoundForwarder {
@@ -863,7 +973,44 @@ impl BoundForwarder {
             pow_indeterminate: 0,
             objects_sent_on: 0,
             waiting_pushed_out: 0,
+            sessions_lost_to_a_panic: 0,
+            panic_resets: 0,
+            #[cfg(test)]
+            trips: Vec::new(),
         })
+    }
+
+    #[cfg(test)]
+    fn trip(&mut self, at: Trip) {
+        if let Some(found) = self.trips.iter().position(|trip| *trip == at) {
+            self.trips.remove(found);
+            panic!("tripped at {at:?}");
+        }
+    }
+
+    /// Everything but the counts. Every reservation comes back with the sessions, and the
+    /// node's sessions are not here, so they stay, and what they send next starts again.
+    pub(crate) fn start_over(&mut self) {
+        error!(
+            sessions = self.peers.len(),
+            "Bound path panicked outside any one session, starting it over"
+        );
+        self.peers.clear();
+        self.anchors = Recent::new(self.config.max_anchors);
+        self.panic_resets += 1;
+    }
+
+    /// `step`, which works on what `session` holds. See the note on [`BoundForwarder`].
+    fn only_for<T>(&mut self, session: SocketAddr, step: impl FnOnce(&mut Self) -> T) -> Option<T> {
+        match catch_unwind(AssertUnwindSafe(|| step(self))) {
+            Ok(result) => Some(result),
+            Err(_) => {
+                error!(peer = %session, "Bound path panicked, dropping what this session held");
+                self.peers.remove(&session);
+                self.sessions_lost_to_a_panic += 1;
+                None
+            }
+        }
     }
 
     pub(crate) fn usage(&self) -> BoundNodeUsage {
@@ -879,6 +1026,8 @@ impl BoundForwarder {
             objects_sent_on: self.objects_sent_on,
             objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
             waiting_pushed_out: self.waiting_pushed_out,
+            sessions_lost_to_a_panic: self.sessions_lost_to_a_panic,
+            panic_resets: self.panic_resets,
             ingress: BoundIngress::default(),
         }
     }
@@ -925,7 +1074,7 @@ impl BoundForwarder {
             unanchored,
             ..
         } = self.peer(src, key)?;
-        Some(session.receive_if(datagram, now, |object| {
+        let arrival = session.receive_if(datagram, now, |object| {
             let waiting = unanchored
                 .iter()
                 .any(|(_, kept)| kept.object_id() == *object);
@@ -934,15 +1083,34 @@ impl BoundForwarder {
             } else {
                 Interest::Done
             }
-        }))
+        });
+        #[cfg(test)]
+        if !matches!(arrival, Arrival::Refused(_)) {
+            self.trip(Trip::Arrived(src));
+        }
+        Some(arrival)
     }
 
     /// The pool had no room for `src`. See the note on [`BoundForwarder`].
     fn someone_heavier_gives_way(&mut self, src: SocketAddr) -> bool {
         let own = self.peers.get(&src).map_or(0, BoundPeer::holds);
-        let others = self.peers.iter_mut().filter(|(addr, _)| **addr != src);
-        let heaviest = others.max_by_key(|(_, peer)| peer.holds());
-        heaviest.is_some_and(|(_, peer)| peer.holds() > own && peer.give_way())
+        let others = self.peers.iter().filter(|(addr, _)| **addr != src);
+        let Some((heaviest, peer)) = others.max_by_key(|(_, peer)| peer.holds()) else {
+            return false;
+        };
+        if peer.holds() <= own {
+            return false;
+        }
+        let heaviest = *heaviest;
+        let give_way = |this: &mut Self| {
+            let peer = this.peers.get_mut(&heaviest);
+            let moved = peer.is_some_and(BoundPeer::give_way);
+            #[cfg(test)]
+            this.trip(Trip::GaveWay(heaviest));
+            moved
+        };
+        // If it panicked, what it held is back in the pool, and that is room as well.
+        self.only_for(heaviest, give_way).unwrap_or(true)
     }
 
     pub(crate) fn take(
@@ -953,19 +1121,29 @@ impl BoundForwarder {
         now: Instant,
         validate: impl Fn(&[u8]) -> PowResult,
     ) -> BoundStep {
-        let mut arrival = self.arrive(src, key, datagram, now);
+        let arrive = |this: &mut Self| this.arrive(src, key, datagram, now);
+        let Some(mut arrival) = self.only_for(src, arrive) else {
+            return BoundStep::Lost;
+        };
         if matches!(arrival, Some(Arrival::Refused(Refusal::Shared)))
             && self.someone_heavier_gives_way(src)
         {
-            arrival = self.arrive(src, key, datagram, now);
+            let Some(again) = self.only_for(src, arrive) else {
+                return BoundStep::Lost;
+            };
+            arrival = again;
         }
         if let Some(arrival) = &arrival {
             self.arrivals.note(arrival);
         }
+        #[cfg(test)]
+        self.trip(Trip::BetweenSteps);
         match arrival {
             Some(Arrival::Invalid(_)) => BoundStep::Invalid,
             Some(Arrival::Decoded(decoded)) => {
-                BoundStep::Forward(self.admit(src, decoded, now, validate))
+                let admit = |this: &mut Self| this.admit(src, decoded, now, validate);
+                let ready = self.only_for(src, admit).unwrap_or_default();
+                BoundStep::Forward(self.send_on_each(ready, now))
             }
             _ => BoundStep::Forward(Vec::new()),
         }
@@ -977,13 +1155,14 @@ impl BoundForwarder {
         }
     }
 
+    /// What `decoded` lets go on, each with the session it came from.
     fn admit(
         &mut self,
         src: SocketAddr,
         decoded: DecodedObject,
         now: Instant,
         validate: impl Fn(&[u8]) -> PowResult,
-    ) -> Vec<Encoded> {
+    ) -> Vec<(SocketAddr, DecodedObject)> {
         if decoded.msg_type() != MSG_RAW_SEGMENT {
             return Vec::new();
         }
@@ -995,7 +1174,7 @@ impl BoundForwarder {
         let key = segment.key();
         if segment.index() != 0 {
             if self.anchors.contains(&key) {
-                return self.send_on(src, decoded, now).into_iter().collect();
+                return vec![(src, decoded)];
             }
             if let Some(peer) = self.peers.get_mut(&src) {
                 if peer.unanchored.len() >= self.config.max_unanchored {
@@ -1027,10 +1206,22 @@ impl BoundForwarder {
             peer.unanchored = rest;
             ready.extend(anchored.into_iter().map(|(_, object)| (*addr, object)));
         }
+        #[cfg(test)]
+        self.trip(Trip::Drained);
         ready
-            .into_iter()
-            .filter_map(|(from, object)| self.send_on(from, object, now))
-            .collect()
+    }
+
+    fn send_on_each(
+        &mut self,
+        ready: Vec<(SocketAddr, DecodedObject)>,
+        now: Instant,
+    ) -> Vec<Encoded> {
+        let mut objects = Vec::with_capacity(ready.len());
+        for (from, object) in ready {
+            let send = |this: &mut Self| this.send_on(from, object, now);
+            objects.extend(self.only_for(from, send).flatten());
+        }
+        objects
     }
 
     fn send_on(
@@ -1047,6 +1238,8 @@ impl BoundForwarder {
             return None;
         }
         forwarded.note(id, now, &self.config);
+        #[cfg(test)]
+        self.trip(Trip::Noted(from));
         self.objects_sent_on += 1;
         self.keep_records_within_limit();
         Some(object)
@@ -1167,6 +1360,7 @@ mod tests {
             .map(|step| match step {
                 BoundStep::Forward(objects) => objects.len(),
                 BoundStep::Invalid => panic!("a sealed datagram is valid"),
+                BoundStep::Lost => 0,
             })
             .sum()
     }
@@ -1381,6 +1575,377 @@ mod tests {
         assert_eq!(send(bound, src, &later, now), 0);
         assert_eq!(bound.peers[&src].session.state().open, 0);
         assert_eq!(bound.peers[&src].unanchored.len(), 1);
+    }
+
+    #[test]
+    fn a_build_that_aborts_is_refused_and_one_that_unwinds_is_not() {
+        assert!(refused_by(false).is_some());
+        assert!(refused_by(true).is_none());
+        assert!(bound_raw_refused().is_none(), "tests always unwind");
+    }
+
+    /// Nine chunks of an object, as many others as fill both its places, and its tenth. At
+    /// the limits a node has today, and the object is sent on.
+    #[test]
+    fn a_full_table_and_shelf_cost_a_node_no_object() {
+        let config = BoundForwardConfig::default();
+        let limits = config.session_budget;
+        let crowd = limits.max_objects + limits.max_spare_objects - 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let object = body(200);
+
+        assert_eq!(send(&mut bound, addr(1), &object[..9], now), 0);
+        for fill in 0..crowd {
+            open_one(&mut bound, addr(1), fill as u8, now);
+        }
+        assert_eq!(bound.peers[&addr(1)].session.state().spares, 8);
+
+        assert_eq!(send(&mut bound, addr(1), &object[9..10], now), 1);
+    }
+
+    fn a_client() -> (BoundReceiver, mpsc::Receiver<BoundBlock>, usize) {
+        let config = BoundRawConfig::default();
+        let limits = config.stack.budget;
+        let (consumer, blocks) = mpsc::channel(config.channel_blocks);
+        let receiver = BoundReceiver::new(KEY, &config, consumer).unwrap();
+        let crowd = limits.max_objects + limits.max_spare_objects - 1;
+        (receiver, blocks, crowd)
+    }
+
+    #[test]
+    fn a_full_table_and_shelf_cost_a_client_no_object() {
+        let (mut receiver, mut blocks, crowd) = a_client();
+        let now = Instant::now();
+        let object = body(200);
+
+        for datagram in &object[..9] {
+            assert!(receiver.take(datagram, now));
+        }
+        for fill in 0..crowd {
+            assert!(receiver.take(&body(fill as u8)[0], now));
+        }
+        assert!(receiver.take(&object[9], now));
+
+        assert_eq!(blocks.try_recv().unwrap().raw(), [200; 5000]);
+    }
+
+    /// A block given back with its spares on a full shelf, and the timer finds them.
+    #[test]
+    fn a_full_table_and_shelf_cost_a_client_no_recovery() {
+        let (mut receiver, mut blocks, crowd) = a_client();
+        let now = Instant::now();
+        let object = body(200);
+        for datagram in &object {
+            assert!(receiver.take(datagram, now));
+        }
+        let first = blocks.try_recv().unwrap();
+        for datagram in &object {
+            assert!(receiver.take(datagram, now));
+        }
+        for fill in 0..crowd {
+            assert!(receiver.take(&body(fill as u8)[0], now));
+        }
+
+        first.give_back();
+        assert!(receiver.look(now));
+
+        assert_eq!(blocks.try_recv().unwrap().raw(), [200; 5000]);
+    }
+
+    // A panic on a node. Each of these stops a step just after what it changes, and looks at
+    // what everyone else is left with.
+
+    /// What the pool holds is what the sessions it still has hold, to the byte.
+    fn pool_is_what_the_sessions_hold(bound: &BoundForwarder) {
+        let mut sum = BoundUsed::default();
+        for peer in bound.peers.values() {
+            let used = peer.budget.used();
+            sum.sessions += used.sessions;
+            sum.objects += used.objects;
+            sum.held_bytes += used.held_bytes;
+            sum.work_bytes += used.work_bytes;
+            sum.spare_objects += used.spare_objects;
+            sum.spare_bytes += used.spare_bytes;
+        }
+        assert_eq!(bound.usage().pool, sum);
+    }
+
+    /// Two frames of one body, each sealed.
+    fn two_frames(fill: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
+        let frames = body_frames(&vec![fill; 2 * SEGMENT_BYTES as usize]).unwrap();
+        (
+            sealed_frame(&frames[0], &KEY).unwrap(),
+            sealed_frame(&frames[1], &KEY).unwrap(),
+        )
+    }
+
+    /// It decoded, and what it had open, waiting and on its shelf goes with it. The panic is
+    /// right after the decode, with the most held.
+    #[test]
+    fn a_panic_costs_its_session_what_it_held_and_nobody_else_anything() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (honest, other) = (body(1), body(2));
+        assert_eq!(send(&mut bound, addr(1), &honest[..9], now), 0);
+        hold_decoded(&mut bound, addr(2), 3, now);
+        assert_eq!(send(&mut bound, addr(2), &other[..9], now), 0);
+        assert!(bound.peers[&addr(2)].holds() > bound.peers[&addr(1)].holds());
+        bound.trips = vec![Trip::Arrived(addr(2))];
+
+        assert_eq!(send(&mut bound, addr(2), &other[9..10], now), 0);
+
+        assert!(!bound.peers.contains_key(&addr(2)));
+        pool_is_what_the_sessions_hold(&bound);
+        assert_eq!(bound.usage().sessions_lost_to_a_panic, 1);
+        assert_eq!(bound.usage().panic_resets, 0);
+        assert_eq!(send(&mut bound, addr(1), &honest[9..10], now), 1);
+
+        assert_eq!(send(&mut bound, addr(2), &other, now), 1, "it starts again");
+        pool_is_what_the_sessions_hold(&bound);
+    }
+
+    /// Stopped once `place` has moved an object and pushed another off a full shelf.
+    #[test]
+    fn a_panic_with_the_shelf_half_moved_goes_with_its_session() {
+        let config = BoundForwardConfig::default();
+        let limits = config.session_budget;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &body(250)[..9], now), 0);
+        for fill in 0..limits.max_objects + limits.max_spare_objects {
+            open_one(&mut bound, addr(2), fill as u8, now);
+        }
+        assert_eq!(bound.peers[&addr(2)].session.state().spares, 8);
+        bound.trips = vec![Trip::Arrived(addr(2))];
+
+        open_one(&mut bound, addr(2), 200, now);
+
+        assert!(!bound.peers.contains_key(&addr(2)));
+        pool_is_what_the_sessions_hold(&bound);
+        assert_eq!(send(&mut bound, addr(1), &body(250)[9..10], now), 1);
+    }
+
+    /// The session asked to move is the one whose objects stopped it, and what it held is
+    /// the room that was asked for.
+    #[test]
+    fn a_panic_while_giving_way_costs_the_session_that_gave_way() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(4, 256)).unwrap(),
+            Instant::now(),
+        );
+        for fill in 1..=4 {
+            open_one(&mut bound, addr(1), fill, now);
+        }
+        bound.trips = vec![Trip::GaveWay(addr(1))];
+
+        open_one(&mut bound, addr(2), 9, now);
+
+        assert!(!bound.peers.contains_key(&addr(1)));
+        assert_eq!(bound.peers[&addr(2)].session.state().open, 1);
+        pool_is_what_the_sessions_hold(&bound);
+    }
+
+    /// Another session moved an object for this one, and this one panicked. The move stands
+    /// and is a state like any other: the object finishes from the shelf.
+    #[test]
+    fn an_object_moved_for_a_session_that_panicked_can_still_finish() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(4, 256)).unwrap(),
+            Instant::now(),
+        );
+        let honest = body(1);
+        assert_eq!(send(&mut bound, addr(1), &honest[..9], now), 0);
+        for fill in 2..=4 {
+            open_one(&mut bound, addr(1), fill, now);
+        }
+        bound.trips = vec![Trip::Arrived(addr(2))];
+
+        open_one(&mut bound, addr(2), 9, now);
+
+        assert!(!bound.peers.contains_key(&addr(2)));
+        assert_eq!(bound.peers[&addr(1)].session.state().open, 3);
+        assert_eq!(bound.peers[&addr(1)].session.state().spares, 1);
+        pool_is_what_the_sessions_hold(&bound);
+        assert_eq!(send(&mut bound, addr(1), &honest[9..10], now), 1);
+    }
+
+    /// The anchor is in, and what waited for it had been gathered. Those objects are gone
+    /// and nobody else's state says otherwise: no record was written, so a resend goes
+    /// straight through, and the anchor stays true.
+    #[test]
+    fn a_panic_with_waiting_objects_gathered_costs_them_a_resend() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 0);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+        bound.trips = vec![Trip::Drained];
+
+        assert_eq!(send(&mut bound, addr(2), &first[..10], now), 0);
+
+        assert!(!bound.peers.contains_key(&addr(2)));
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 0);
+        pool_is_what_the_sessions_hold(&bound);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 1);
+    }
+
+    /// One send fails with its record written. The sends around it go on, and the record
+    /// goes with its session, so nothing says that object went when it did not.
+    #[test]
+    fn a_panic_on_one_send_leaves_the_others_and_no_false_record() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 0);
+        assert_eq!(send(&mut bound, addr(3), &later, now), 0);
+        bound.trips = vec![Trip::Noted(addr(1))];
+
+        assert_eq!(send(&mut bound, addr(2), &first, now), 2);
+
+        assert!(!bound.peers.contains_key(&addr(1)));
+        assert_eq!(bound.usage().objects_sent_on, 2);
+        pool_is_what_the_sessions_hold(&bound);
+
+        assert_eq!(send(&mut bound, addr(1), &later, now), 1);
+    }
+
+    /// A session that panics on every datagram: what it pays is its own, so nothing has to
+    /// hold it off, and everyone else carries on through it.
+    #[test]
+    fn a_session_that_always_panics_wears_out_only_itself() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let honest = body(1);
+        assert_eq!(send(&mut bound, addr(1), &honest[..9], now), 0);
+        let held = bound.peers[&addr(1)].budget.used();
+
+        for datagram in body(2).iter().cycle().take(50) {
+            bound.trips = vec![Trip::Arrived(addr(2))];
+            let step = bound.take(addr(2), KEY, datagram, now, |_| PowResult::Valid);
+            assert!(matches!(step, BoundStep::Lost));
+        }
+
+        assert_eq!(bound.usage().sessions_lost_to_a_panic, 50);
+        assert_eq!(bound.usage().panic_resets, 0);
+        assert_eq!(bound.peers.len(), 1);
+        assert_eq!(bound.peers[&addr(1)].budget.used(), held);
+        pool_is_what_the_sessions_hold(&bound);
+        assert_eq!(send(&mut bound, addr(1), &honest[9..10], now), 1);
+    }
+
+    /// Everything goes and every reservation with it. Anchors and records are gone as well,
+    /// and the counts are what they were.
+    #[test]
+    fn starting_over_gives_everything_back_and_keeps_the_counts() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+        let (_, waiting) = two_frames(2);
+        assert_eq!(send(&mut bound, addr(1), &waiting, now), 0);
+        assert_eq!(send(&mut bound, addr(2), &body(3)[..9], now), 0);
+
+        bound.start_over();
+
+        let usage = bound.usage();
+        assert_eq!(usage.pool, BoundUsed::default());
+        assert_eq!(usage.peers, 0);
+        assert_eq!(usage.forwarded_records, 0);
+        assert_eq!(usage.objects_waiting_for_segment_0, 0);
+        assert_eq!(usage.objects_sent_on, 1);
+        assert_eq!(usage.panic_resets, 1);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 0, "no anchor now");
+    }
+
+    /// What a reset costs. It is for a panic nobody can be held to, and it takes what every
+    /// session had open. If anything a session sends could reach it, that would stop other
+    /// sessions' objects from ever finishing, however often they were sent, and nothing here
+    /// limits how often. Nothing known reaches it.
+    #[test]
+    fn known_gap_a_reset_costs_every_session_what_it_had_open() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let honest = body(1);
+        assert_eq!(send(&mut bound, addr(1), &honest[..9], now), 0);
+
+        bound.start_over();
+
+        assert_eq!(send(&mut bound, addr(1), &honest[9..10], now), 0);
+        assert_eq!(
+            send(&mut bound, addr(1), &honest[..9], now),
+            1,
+            "from the start"
+        );
+    }
+
+    // A panic on a client.
+
+    /// What it held goes, and a copy of the block it could not hand over is welcome. The
+    /// block with the consumer keeps its owners: no second copy of it gets out while it is
+    /// held or after it is finished with.
+    #[test]
+    fn a_panic_on_a_client_keeps_what_the_consumer_has() {
+        let config = BoundRawConfig {
+            channel_blocks: 1,
+            ..Default::default()
+        };
+        let (consumer, mut blocks) = mpsc::channel(config.channel_blocks);
+        let receiver = BoundReceiver::new(KEY, &config, consumer).unwrap();
+        let probe = receiver.probe();
+        let mut bound = Some(receiver);
+        let now = Instant::now();
+        let (with_consumer, waiting, open) = (body(1), body(2), body(3));
+        let idle = probe.used();
+        let feed = |bound: &mut Option<BoundReceiver>, datagrams: &[Vec<u8>]| {
+            for datagram in datagrams {
+                contain(bound, |receiver| receiver.take(datagram, now));
+            }
+        };
+
+        feed(&mut bound, &with_consumer);
+        feed(&mut bound, &waiting);
+        feed(&mut bound, &open[..9]);
+        assert_eq!(bound.as_ref().unwrap().bridge.waiting(), 1);
+        // The block with the consumer has a record of its own beside its segment's.
+        assert_eq!(probe.ledger().held, 3);
+        assert_ne!(probe.used(), idle);
+
+        contain(&mut bound, |_| panic!("stopped on purpose"));
+
+        assert_eq!(probe.progress().handoffs.panics_contained, 1);
+        assert_eq!(
+            probe.used(),
+            idle,
+            "the block with the consumer is not here"
+        );
+        assert_eq!(probe.ledger().held, 2);
+        assert_eq!(probe.ledger().released, 1);
+        assert_eq!(bound.as_ref().unwrap().bridge.waiting(), 0);
+
+        feed(&mut bound, &with_consumer);
+        let block = blocks.try_recv().unwrap();
+        assert_eq!(block.raw(), [1; 5000]);
+        assert!(blocks.try_recv().is_err(), "held, so no second copy");
+
+        feed(&mut bound, &waiting);
+        block.finish();
+        assert!(contain_pump(&mut bound));
+        assert_eq!(blocks.try_recv().unwrap().raw(), [2; 5000]);
+        feed(&mut bound, &with_consumer);
+        assert!(
+            blocks.try_recv().is_err(),
+            "finished with, so no second copy"
+        );
+    }
+
+    fn contain_pump(bound: &mut Option<BoundReceiver>) -> bool {
+        contain(bound, |receiver| receiver.pump(Instant::now()));
+        bound.is_some()
+    }
+
+    /// A consumer that went still ends the path, and nothing else does.
+    #[test]
+    fn a_client_whose_consumer_went_still_lets_go() {
+        let (receiver, blocks, _) = a_client();
+        drop(blocks);
+        let mut bound = Some(receiver);
+
+        contain(&mut bound, |receiver| receiver.pump(Instant::now()));
+
+        assert!(bound.is_none());
     }
 
     /// Only a session holding less asks anyone to move: this one has nothing of its own to

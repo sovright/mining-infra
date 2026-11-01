@@ -33,7 +33,9 @@
 //!
 //! 7. The shelf has a budget of its own, so no normal object ever waits for a spare.
 //! 8. It keeps at most `k` shards of an object, so it never holds more than a decode needs.
-//! 9. When it is full the oldest object on it goes, which costs only that spare.
+//! 9. When it is full the oldest object on it goes, which costs only that spare. A spare
+//!    on its way to a normal place keeps its own until it has that place: making one can
+//!    move an object here, and that object must not push out the spare that asked.
 //! 10. Only verified chunks get there, and a spare is decoded only when the layer above
 //!     says nobody owns the object, so it can bring an object back and do nothing else.
 //! 11. A decoded object the layer below had no room for goes back on the shelf as it is,
@@ -286,7 +288,7 @@ impl Assembler {
             return Arrival::Refused(Refusal::NeverFits);
         }
         let hold = if filled == 0 {
-            match self.place(held_bytes(&shape)) {
+            match self.place(held_bytes(&shape), &id) {
                 Ok(hold) => Some(hold),
                 Err(refusal) => return Arrival::Refused(refusal),
             }
@@ -331,8 +333,9 @@ impl Assembler {
     }
 
     /// A normal place for `bytes`, moving objects that have stopped to the shelf until
-    /// there is one. Rule 6.
-    fn place(&mut self, bytes: usize) -> Result<Hold, Refusal> {
+    /// there is one. Rule 6. `keep` is the object the place is for: what moves does not
+    /// take its place on the shelf from it.
+    fn place(&mut self, bytes: usize, keep: &Node) -> Result<Hold, Refusal> {
         loop {
             match self.budget.hold(bytes) {
                 Err(Refusal::Objects | Refusal::HeldBytes | Refusal::Shared) => {}
@@ -341,7 +344,7 @@ impl Assembler {
             let Some(stopped) = self.longest_waiting() else {
                 return self.budget.hold(bytes);
             };
-            self.open_to_shelf(&stopped);
+            self.open_to_shelf(&stopped, keep);
         }
     }
 
@@ -351,7 +354,7 @@ impl Assembler {
         let Some(stopped) = self.longest_waiting() else {
             return false;
         };
-        self.open_to_shelf(&stopped);
+        self.open_to_shelf(&stopped, &stopped);
         true
     }
 
@@ -362,14 +365,14 @@ impl Assembler {
             .map(|(id, _)| *id)
     }
 
-    /// An open object leaves its normal place with all it has, or goes if the shelf could
-    /// never take it.
-    fn open_to_shelf(&mut self, id: &Node) -> bool {
+    /// An open object leaves its normal place with all it has, or goes if the shelf has
+    /// nothing it can give up for it.
+    fn open_to_shelf(&mut self, id: &Node, keep: &Node) -> bool {
         let assembly = self.open.get(id).expect("this object is open");
         let (shape, filled) = (assembly.shape, assembly.filled);
         let list = held_bytes(&shape) - usize::from(shape.k) * usize::from(shape.s);
         let bytes = list + filled * usize::from(shape.s);
-        let shelved = self.shelf_place(&shape, bytes, id);
+        let shelved = self.shelf_place(&shape, bytes, keep);
         let assembly = self.open.remove(id).expect("this object is open");
         let Some(shelved) = shelved else {
             return false;
@@ -517,7 +520,7 @@ impl Assembler {
     /// stops holding a normal place, and moves to the shelf with all it has.
     fn shelve_open(&mut self, chunk: VerifiedChunk<'_>, now: Instant) -> Arrival {
         let id = chunk.object_id();
-        if self.spares.contains_key(&id) || !self.open_to_shelf(&id) {
+        if self.spares.contains_key(&id) || !self.open_to_shelf(&id, &id) {
             return Arrival::NotWanted;
         }
         self.shelve(chunk, now, false)
@@ -525,7 +528,7 @@ impl Assembler {
 
     fn decode_spare(&mut self, id: Node, now: Instant) -> Arrival {
         let shape = self.spares[&id].shape;
-        let hold = match self.place(held_bytes(&shape)) {
+        let hold = match self.place(held_bytes(&shape), &id) {
             Ok(hold) => hold,
             Err(refusal) => return Arrival::Refused(refusal),
         };
@@ -566,7 +569,7 @@ impl Assembler {
 
     fn release_decoded(&mut self, id: Node) -> Arrival {
         let bytes = self.spares[&id].decoded.as_ref().map_or(0, Vec::len);
-        let mut hold = match self.place(bytes) {
+        let mut hold = match self.place(bytes, &id) {
             Ok(hold) => hold,
             Err(refusal) => return Arrival::Refused(refusal),
         };
@@ -592,6 +595,10 @@ impl Assembler {
         let ids: Vec<Node> = self.spare_order.iter().copied().collect();
         let mut arrivals = Vec::new();
         for id in ids {
+            // A decode further up this list may have cost this spare its place.
+            if !self.spares.contains_key(&id) {
+                continue;
+            }
             let answer = interest(&id);
             if answer == Interest::Done {
                 self.remove_spare(&id);

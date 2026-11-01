@@ -36,8 +36,12 @@ arbitrary = ["dep:arbitrary"]
 generate-corpus = []
 # Body-validation test blocks for downstream crates' tests.
 test-support = []
+# Lets a test wait for exact datagrams on a node. Nothing else should turn this on. The
+# dependency on this crate below does so for its own tests.
+handled-log = []
 
 [dev-dependencies]
+sovright-relay = { path = ".", features = ["handled-log"] }
 equihash.workspace = true
 zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
 proptest = "1.4"

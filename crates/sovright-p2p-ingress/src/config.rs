@@ -288,6 +288,13 @@ impl Config {
                 )));
             }
         };
+        if relay_raw_wire != crate::relay_bridge::RawWire::Legacy
+            && let Some(reason) = sovright_relay::bound_raw_refused()
+        {
+            return Err(IngressError::Config(format!(
+                "SOVRIGHT_P2P_RELAY_RAW_WIRE is not legacy: {reason}"
+            )));
+        }
         let relay_bodies_per_header = env_usize("SOVRIGHT_P2P_RELAY_BODIES_PER_HEADER", 4)?;
         if relay_bodies_per_header == 0 {
             return Err(IngressError::Config(

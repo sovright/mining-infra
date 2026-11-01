@@ -206,6 +206,11 @@ impl RelayClient {
                 e
             )));
         }
+        if config.bound_raw.is_some()
+            && let Some(reason) = bound_raw::bound_raw_refused()
+        {
+            return Err(FecError::InvalidConfiguration(reason.to_string()));
+        }
 
         let chunker = BlockChunker::new(config.data_shards, config.parity_shards)?;
         let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
@@ -359,15 +364,11 @@ impl RelayClient {
                 _ = bound_raw::wait_for_room(consumer.as_ref()),
                     if bound.as_ref().is_some_and(BoundReceiver::has_waiting) =>
                 {
-                    if bound.as_mut().is_some_and(|bound| !bound.pump(Instant::now())) {
-                        bound = None;
-                    }
+                    bound_raw::contain(&mut bound, |bound| bound.pump(Instant::now()));
                 }
 
                 _ = bound_interval.tick(), if bound.is_some() => {
-                    if bound.as_mut().is_some_and(|bound| !bound.look(Instant::now())) {
-                        bound = None;
-                    }
+                    bound_raw::contain(&mut bound, |bound| bound.look(Instant::now()));
                 }
 
                 // Register/refresh this client as a relay session, including
@@ -391,12 +392,9 @@ impl RelayClient {
                         Ok((len, _src)) => {
                             let datagram = &recv_buf[..len];
                             if bound.is_some() && bound_raw::is_bound(datagram) {
-                                if bound
-                                    .as_mut()
-                                    .is_some_and(|bound| !bound.take(datagram, Instant::now()))
-                                {
-                                    bound = None;
-                                }
+                                bound_raw::contain(&mut bound, |bound| {
+                                    bound.take(datagram, Instant::now())
+                                });
                             } else if let Ok(chunk) = Chunk::from_bytes(datagram) {
                                 self.handle_incoming_chunk(
                                     chunk,
@@ -992,7 +990,76 @@ mod known_gap_resource_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hash::zcash_block_hash;
+    use crate::relay::node::RelayNode;
+    use crate::segmented_block::split_raw_block;
+    use crate::transport::{AuthKey, RelayConfig, StubPowValidator, ZCASH_FULL_HEADER_SIZE};
     use tokio::time::{Duration, timeout};
+
+    /// A panic on the bound path on the client's real loop. The datagram it stopped on is one
+    /// of thirteen, so the rest still make the block, and the legacy path on the same task
+    /// never hears of it.
+    #[tokio::test]
+    async fn a_panic_on_the_bound_path_leaves_the_client_running() {
+        let key = [0x42; 32];
+        let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+            .with_authorized_keys(vec![AuthKey::new("fleet", key)])
+            .with_fec(10, 3)
+            .with_bound_raw(Default::default());
+        let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+        node.bind().await.unwrap();
+        let addr = node.local_addr().unwrap();
+        let node = Arc::new(node);
+        let running = Arc::clone(&node);
+        tokio::spawn(async move { running.run().await });
+
+        let config = ClientConfig::new(vec![addr], key)
+            .with_bind_addr("127.0.0.1:0".parse().unwrap())
+            .with_auth_required(true)
+            .with_fec(10, 3);
+        let mut client =
+            RelayClient::new(config.clone().with_bound_raw(Default::default())).unwrap();
+        client.bind().await.unwrap();
+        let (mut receiver, outgoing) = client.take_receiver().unwrap();
+        let mut blocks = receiver.take_bound_blocks().unwrap();
+        let probe = receiver.bound_probe().unwrap();
+        client.bound.as_mut().unwrap().trip_next = true;
+        tokio::spawn(async move { client.run_with_outgoing(outgoing).await });
+
+        let mut other = RelayClient::new(config).unwrap();
+        other.bind().await.unwrap();
+        let sender = other.sender();
+        tokio::spawn(async move { other.run().await });
+        let wait = Duration::from_secs(10);
+        timeout(wait, async {
+            while node.session_count().await < 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let raw = vec![1u8; 5000];
+        sender
+            .send_bound_raw_block(Arc::new(raw.clone()))
+            .await
+            .unwrap();
+        let block = timeout(wait, blocks.recv()).await.unwrap().unwrap();
+        assert_eq!(block.raw(), raw);
+        assert_eq!(probe.progress().handoffs.panics_contained, 1);
+
+        let legacy = vec![0xab; ZCASH_FULL_HEADER_SIZE + 4096];
+        let hash = zcash_block_hash(&legacy[..ZCASH_FULL_HEADER_SIZE]);
+        let segments = split_raw_block(hash, &legacy, 2_000).unwrap();
+        let count = segments.len();
+        for segment in segments {
+            sender.send_raw_block_segment(segment).await.unwrap();
+        }
+        for _ in 0..count {
+            let segment = timeout(wait, receiver.recv_raw_block_segment()).await;
+            assert!(segment.unwrap().is_some());
+        }
+    }
 
     #[test]
     fn client_creation() {

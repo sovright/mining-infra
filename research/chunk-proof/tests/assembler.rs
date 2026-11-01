@@ -14,7 +14,7 @@ use chunk_proof::object::{
     Encoded, MSG_BLOCK, MSG_RAW_SEGMENT, MSG_SKELETON, ObjectError, Profile, Shape, encode,
     held_bytes, work_bytes,
 };
-use chunk_proof::tree::{empty_leaf, levels, proof};
+use chunk_proof::tree::{Node, empty_leaf, levels, proof};
 use common::{
     ASSEMBLY_TTL, KEY, REJECTED_TTL, assembler_limits, assembler_on, budget_with, content,
     datagram, datagrams, decoded, later, object, pending, roomy, roomy_limits, verifier,
@@ -928,6 +928,172 @@ fn known_gap_a_flood_of_new_objects_can_push_an_open_object_off_the_shelf() {
 
     pending(assembler.receive(&datagram(&object(RAW, 6, 4, 200, 40), 0), now));
     assert_eq!(assembler.have(&honest.object_id), 0);
+}
+
+// A spare's own way out. Making its place moves a stopped object to a full shelf, and the
+// shelf's oldest goes then, which is often the spare that asked.
+
+/// The places of one session on a node, as the relay has them today.
+fn a_nodes_session() -> (Budget, Assembler) {
+    let budget = Budget::new(Limits {
+        max_sessions: 2,
+        max_objects: 32,
+        max_held_bytes: 1 << 20,
+        max_work_bytes: 1 << 20,
+        max_spare_objects: 8,
+        max_spare_bytes: 1 << 18,
+    })
+    .unwrap();
+    let assembler = assembler_on(&budget);
+    (budget, assembler)
+}
+
+fn whole_object() -> Encoded {
+    object(RAW, 13, 10, 250, 4000)
+}
+
+/// One chunk each of `count` objects that go no further.
+fn crowd(assembler: &mut Assembler, count: usize, now: Instant) {
+    for fill in 0..count {
+        let stopped = object(RAW, 13, 10, fill as u8, 4000);
+        pending(assembler.receive(&datagram(&stopped, 0), now));
+    }
+}
+
+/// Spares with all it takes, kept for an owner.
+fn shelve_whole(assembler: &mut Assembler, object: &Encoded, now: Instant) {
+    for frame in &datagrams(object)[..usize::from(object.shape.k)] {
+        let arrival = assembler.receive_if(frame, now, |_| Interest::Spare);
+        assert!(matches!(arrival, Arrival::Spare { .. }), "{arrival:?}");
+    }
+}
+
+fn due_only<'a>(wanted: &'a [Node]) -> impl FnMut(&Node) -> Interest + 'a {
+    |id| {
+        if wanted.contains(id) {
+            Interest::Due
+        } else {
+            Interest::Spare
+        }
+    }
+}
+
+/// Nine chunks of an object, thirty-nine of others, and its tenth: everything is full, and
+/// the object is the shelf's oldest as its last chunk comes.
+#[test]
+fn the_chunk_that_finishes_a_spare_does_not_push_it_off_the_shelf() {
+    let (budget, mut assembler) = a_nodes_session();
+    let now = Instant::now();
+    let target = whole_object();
+    let frames = datagrams(&target);
+    for frame in &frames[..9] {
+        pending(assembler.receive(frame, now));
+    }
+    crowd(&mut assembler, 39, now);
+    assert_eq!(assembler.state().open, 32);
+    assert_eq!(assembler.state().spares, 8);
+    assert_eq!(assembler.have(&target.object_id), 9);
+
+    let arrival = decoded(assembler.receive(&frames[9], now));
+
+    assert_eq!(arrival.content(), &content(250, 4000)[..]);
+    assert_eq!(assembler.state().open, 31, "one stopped object moved");
+    assert_eq!(
+        assembler.state().spares,
+        7,
+        "and the oldest other spare went"
+    );
+    assert_eq!(budget.used().objects, 31);
+    assert_eq!(budget.used().spare_objects, 7);
+}
+
+#[test]
+fn a_decoded_object_stays_on_the_shelf_until_it_has_its_place() {
+    let (_budget, mut assembler) = a_nodes_session();
+    let now = Instant::now();
+    let target = whole_object();
+    let frames = datagrams(&target);
+    let first = decoded(feed(
+        &mut assembler,
+        &frames,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+        now,
+    ));
+    assert!(assembler.shelve_decoded(first, now));
+    crowd(&mut assembler, 39, now);
+    assert_eq!(assembler.state().spares, 8);
+
+    let again = decoded(assembler.receive_if(&frames[0], now, |_| Interest::Due));
+
+    assert_eq!(again.content(), &content(250, 4000)[..]);
+}
+
+#[test]
+fn a_look_over_the_shelf_keeps_the_spare_it_is_decoding() {
+    let (_budget, mut assembler) = a_nodes_session();
+    let now = Instant::now();
+    let target = whole_object();
+    shelve_whole(&mut assembler, &target, now);
+    crowd(&mut assembler, 39, now);
+    assert_eq!(assembler.state().spares, 8);
+
+    let wanted = [target.object_id];
+    let mut arrivals = assembler.revive(now, due_only(&wanted));
+
+    assert_eq!(arrivals.len(), 1);
+    let arrival = decoded(arrivals.pop().unwrap());
+    assert_eq!(arrival.content(), &content(250, 4000)[..]);
+}
+
+/// The first decode's place costs the next spare on the list its own.
+#[test]
+fn a_look_over_the_shelf_passes_over_a_spare_that_has_gone() {
+    let (budget, mut assembler) = a_nodes_session();
+    let now = Instant::now();
+    let (first, second) = (whole_object(), object(RAW, 13, 10, 251, 4000));
+    shelve_whole(&mut assembler, &first, now);
+    shelve_whole(&mut assembler, &second, now);
+    crowd(&mut assembler, 38, now);
+    assert_eq!(assembler.state().spares, 8);
+
+    let wanted = [first.object_id, second.object_id];
+    let mut arrivals = assembler.revive(now, due_only(&wanted));
+
+    assert_eq!(arrivals.len(), 1);
+    let arrival = decoded(arrivals.pop().unwrap());
+    assert_eq!(arrival.object_id(), first.object_id);
+    assert_eq!(assembler.have(&second.object_id), 0);
+    assert_eq!(budget.used().spare_objects, assembler.state().spares);
+}
+
+/// A refusal is no reason to lose a place: the spare stays on the shelf with its shards and
+/// its age, and the next look decodes it.
+#[test]
+fn a_decode_with_no_room_leaves_the_spare_where_it_was() {
+    let (budget, mut assembler) = a_nodes_session();
+    let now = Instant::now();
+    let (first, second) = (whole_object(), object(RAW, 13, 10, 251, 4000));
+    shelve_whole(&mut assembler, &first, now);
+    shelve_whole(&mut assembler, &second, now);
+    let on_the_shelf = budget.used();
+    let room = budget.hold(budget.limits().max_held_bytes).unwrap();
+
+    let wanted = [first.object_id];
+    assert!(assembler.revive(now, due_only(&wanted)).is_empty());
+
+    assert_eq!(assembler.have(&first.object_id), 10);
+    assert_eq!(budget.used().spare_bytes, on_the_shelf.spare_bytes);
+    assert_eq!(budget.used().spare_objects, on_the_shelf.spare_objects);
+
+    drop(room);
+    crowd(&mut assembler, 32 + 6, now);
+    pending(assembler.receive(&datagram(&object(RAW, 13, 10, 252, 4000), 0), now));
+    assert_eq!(
+        assembler.have(&first.object_id),
+        0,
+        "it was still the oldest"
+    );
+    assert_eq!(assembler.have(&second.object_id), 10);
 }
 
 // Everything comes back.
