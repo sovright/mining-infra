@@ -55,6 +55,13 @@ const SHARDS: u16 = 13;
 const DATA_SHARDS: u16 = 10;
 /// Copies of one object past the first, in a window, on a receiver and on a node alike.
 const RESENDS: u32 = 2;
+/// A sender's pace on this path: one object, then a pause. A node decodes, encodes again and
+/// sends on inside its receive loop, and a burst has only the socket's buffer to wait in for as
+/// long as that takes. A research value, and it adds to how long a large body takes to send.
+pub const BOUND_SEND_BURST_PACKETS: usize = SHARDS as usize;
+pub const BOUND_SEND_BURST_DELAY: Duration = Duration::from_millis(1);
+/// The most a node reads of one datagram.
+pub(crate) const MAX_READ_BYTES: usize = 2048;
 const RELEASED_TTL: Duration = Duration::from_secs(60);
 
 fn hash_header(header: &[u8]) -> [u8; 32] {
@@ -161,6 +168,18 @@ pub struct BoundForwardConfig {
     pub max_anchors: usize,
     /// Decoded objects of one session that wait for their segment 0.
     pub max_unanchored: usize,
+    /// Datagrams a node holds between its socket and its work, so that slow work does not
+    /// leave the socket's buffer as all a burst has. Past this they stay in the socket. Zero
+    /// leaves the receive loop as it is on the legacy path.
+    ///
+    /// This comes ahead of every check, so it holds whatever anyone sends to the port, and it
+    /// is no part of [`Self::pool`]: its memory adds to the pool's, and one source can fill it.
+    /// It takes up a burst and adds no capacity. Traffic beyond what a node can work through
+    /// fills it, and then loss is back at the socket.
+    pub max_queued_datagrams: usize,
+    /// The bytes of those datagrams. This counts payload only: each entry costs a vector and
+    /// an address on top, and the allocator its share.
+    pub max_queued_bytes: usize,
 }
 
 impl Default for BoundForwardConfig {
@@ -190,6 +209,8 @@ impl Default for BoundForwardConfig {
             max_resends: RESENDS,
             max_anchors: 256,
             max_unanchored: 64,
+            max_queued_datagrams: 8192,
+            max_queued_bytes: 8192 * MAX_READ_BYTES,
         }
     }
 }
@@ -264,12 +285,12 @@ macro_rules! counters {
         }
 
         #[derive(Debug, Default)]
-        struct $live {
+        pub(crate) struct $live {
             $($field: AtomicU64,)+
         }
 
         impl $live {
-            fn read(&self) -> $read {
+            pub(crate) fn read(&self) -> $read {
                 $read {
                     $($field: self.$field.load(Ordering::Relaxed),)+
                 }
@@ -369,6 +390,35 @@ impl LiveHandoffs {
             Handoff::NotASegment(_) => &self.not_a_segment,
         };
         add(count, 1);
+    }
+}
+
+counters!(
+    /// A node's receive loop: the most datagrams waiting between its socket and its work, how
+    /// many it handled from there, and how long that took. The longest one is the longest the
+    /// socket went with nothing reading it. Empty with no queue.
+    BoundIngress,
+    LiveIngress,
+    queue_peak,
+    queue_peak_bytes,
+    handled,
+    handling_micros,
+    longest_handling_micros,
+);
+
+impl LiveIngress {
+    pub(crate) fn note_queue(&self, queue: &IngressQueue) {
+        let (datagrams, bytes) = (queue.datagrams() as u64, queue.bytes() as u64);
+        self.queue_peak.fetch_max(datagrams, Ordering::Relaxed);
+        self.queue_peak_bytes.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    pub(crate) fn note_handled(&self, took: Duration) {
+        let micros = u64::try_from(took.as_micros()).unwrap_or(u64::MAX);
+        add(&self.handled, 1);
+        add(&self.handling_micros, micros);
+        self.longest_handling_micros
+            .fetch_max(micros, Ordering::Relaxed);
     }
 }
 
@@ -555,6 +605,52 @@ pub(crate) async fn wait_for_room(consumer: Option<&mpsc::Sender<BoundBlock>>) {
     }
 }
 
+/// What a node has read from its socket and not yet worked on, in order. See
+/// [`BoundForwardConfig::max_queued_datagrams`]. A datagram cannot be put back once it is read,
+/// so room is asked for at the most one can be.
+#[derive(Debug)]
+pub(crate) struct IngressQueue {
+    max_datagrams: usize,
+    max_bytes: usize,
+    bytes: usize,
+    waiting: VecDeque<(Vec<u8>, SocketAddr)>,
+}
+
+impl IngressQueue {
+    /// With no config it never has room, and the socket stays as the only buffer.
+    pub(crate) fn new(config: Option<&BoundForwardConfig>) -> Self {
+        Self {
+            max_datagrams: config.map_or(0, |config| config.max_queued_datagrams),
+            max_bytes: config.map_or(0, |config| config.max_queued_bytes),
+            bytes: 0,
+            waiting: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn has_room(&self) -> bool {
+        self.waiting.len() < self.max_datagrams && self.bytes + MAX_READ_BYTES <= self.max_bytes
+    }
+
+    pub(crate) fn push(&mut self, datagram: &[u8], src: SocketAddr) {
+        self.bytes += datagram.len();
+        self.waiting.push_back((datagram.to_vec(), src));
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<(Vec<u8>, SocketAddr)> {
+        let (datagram, src) = self.waiting.pop_front()?;
+        self.bytes -= datagram.len();
+        Some((datagram, src))
+    }
+
+    pub(crate) fn datagrams(&self) -> usize {
+        self.waiting.len()
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
 /// Bounded and first in, first out.
 #[derive(Debug)]
 struct Recent<T> {
@@ -695,6 +791,7 @@ pub struct BoundNodeUsage {
     pub objects_sent_on: u64,
     pub objects_waiting_for_segment_0: usize,
     pub waiting_pushed_out: u64,
+    pub ingress: BoundIngress,
 }
 
 /// What a datagram came to on a node.
@@ -782,6 +879,7 @@ impl BoundForwarder {
             objects_sent_on: self.objects_sent_on,
             objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
             waiting_pushed_out: self.waiting_pushed_out,
+            ingress: BoundIngress::default(),
         }
     }
 
@@ -1390,6 +1488,98 @@ mod tests {
         assert_eq!(bound.usage().pool.held_bytes, frames[1].len());
         bound.tidy(now, |_| false);
         assert_eq!(bound.usage().pool.held_bytes, 0);
+    }
+
+    /// Two bodies of the largest size, so a node takes both in whatever its work is doing.
+    #[test]
+    fn a_nodes_queue_holds_two_bodies_of_the_largest_size() {
+        let config = BoundForwardConfig::default();
+        let body = sealed_body(&vec![7u8; MAX_BODY_BYTES as usize], &KEY).unwrap();
+        let bytes: usize = body.iter().map(Vec::len).sum();
+        assert!(config.max_queued_datagrams >= 2 * body.len());
+        assert!(config.max_queued_bytes >= 2 * bytes);
+    }
+
+    fn queue_of(datagrams: usize, bytes: usize) -> IngressQueue {
+        let config = BoundForwardConfig {
+            max_queued_datagrams: datagrams,
+            max_queued_bytes: bytes,
+            ..config()
+        };
+        IngressQueue::new(Some(&config))
+    }
+
+    fn fill(queue: &mut IngressQueue, each: usize) {
+        let datagram = vec![0u8; each];
+        while queue.has_room() {
+            queue.push(&datagram, addr(1));
+        }
+    }
+
+    #[test]
+    fn the_queue_stops_at_its_number_of_datagrams() {
+        let mut queue = queue_of(3, 1 << 20);
+        fill(&mut queue, 100);
+
+        assert_eq!(queue.datagrams(), 3);
+        assert_eq!(queue.bytes(), 300);
+    }
+
+    /// The longest a read can be, past any datagram this path sends, because the queue comes
+    /// ahead of every check.
+    #[test]
+    fn the_queue_stops_at_its_bytes_with_the_longest_datagrams() {
+        let mut queue = queue_of(100, 3 * MAX_READ_BYTES);
+        fill(&mut queue, MAX_READ_BYTES);
+
+        assert_eq!(queue.datagrams(), 3);
+        assert_eq!(queue.bytes(), 3 * MAX_READ_BYTES);
+    }
+
+    /// Room is asked for before a read, when its length is not known yet.
+    #[test]
+    fn the_queue_never_passes_its_bytes_with_short_datagrams() {
+        let limit = 3 * MAX_READ_BYTES;
+        let mut queue = queue_of(usize::MAX, limit);
+        fill(&mut queue, 1);
+
+        assert!(queue.bytes() <= limit);
+        assert!(!queue.has_room());
+    }
+
+    #[test]
+    fn a_full_queue_of_the_longest_datagrams_keeps_to_the_research_limits() {
+        let config = BoundForwardConfig::default();
+        let mut queue = IngressQueue::new(Some(&config));
+        fill(&mut queue, MAX_READ_BYTES);
+
+        assert_eq!(queue.datagrams(), config.max_queued_datagrams);
+        assert_eq!(queue.bytes(), config.max_queued_bytes);
+        assert_eq!(queue.bytes(), 16 << 20);
+    }
+
+    #[test]
+    fn a_datagram_taken_out_gives_its_room_back_in_order() {
+        let mut queue = queue_of(2, 1 << 20);
+        queue.push(&[1], addr(1));
+        queue.push(&[2, 2], addr(2));
+        assert!(!queue.has_room());
+
+        assert_eq!(queue.pop(), Some((vec![1], addr(1))));
+
+        assert!(queue.has_room());
+        assert_eq!(queue.bytes(), 2);
+        assert_eq!(queue.pop(), Some((vec![2, 2], addr(2))));
+        assert_eq!(queue.pop(), None);
+        assert_eq!(queue.bytes(), 0);
+    }
+
+    /// The legacy path's loop, with the bound path off or the queue turned down.
+    #[test]
+    fn a_queue_with_no_limit_never_reads_ahead() {
+        assert!(!IngressQueue::new(None).has_room());
+        assert!(!queue_of(0, 1 << 20).has_room());
+        assert!(!queue_of(8, 0).has_room());
     }
 
     #[test]

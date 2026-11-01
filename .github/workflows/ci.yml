@@ -55,32 +55,105 @@ jobs:
 
   bound-path-diagnostic:
     # Temporary, for #134. `cargo test` shows nobody the output of a test that passes, so this
-    # keeps the hop-by-hop report of the largest bound body either way, alone and among the
-    # tests it failed with. `set -o pipefail` keeps cargo's exit code through `tee`, so a
-    # failure here fails the job. The `test` job above is left as it is.
+    # keeps the hop-by-hop report either way, alone and among the tests the largest body failed
+    # with. The `test` job above is left as it is.
+    #
+    # Each test step keeps cargo's exit code through `tee` and lets the next one run, and the
+    # verdict at the end decides. A build failure stops the job in every case. The cases that
+    # turn a part of the change off may lose the largest body, and nothing else: any other
+    # failure fails them too. In the others, a datagram dropped at a socket fails the job even
+    # if FEC made up for it.
     name: Bound path diagnostic (${{ matrix.run }})
     runs-on: ubuntu-latest
+    env:
+      BOUND_PATH_CASE: ${{ matrix.case }}
     strategy:
       fail-fast: false
       matrix:
         include:
           - run: alone
-            args: a_body_of_nearly_the_largest_size -- --nocapture --test-threads=1
+            case: defaults
+            may_lose_the_block: false
+            measure: true
+            largest: a_body_of_nearly_the_largest_size -- --nocapture --test-threads=1
           - run: with-the-rest
-            args: -- --nocapture
+            case: defaults
+            may_lose_the_block: false
+            measure: false
+            largest: -- --nocapture
+          - run: before
+            case: before
+            may_lose_the_block: true
+            measure: true
+            largest: a_body_of_nearly_the_largest_size -- --nocapture --test-threads=1
+          - run: drain-only
+            case: drain-only
+            may_lose_the_block: true
+            measure: true
+            largest: a_body_of_nearly_the_largest_size -- --nocapture --test-threads=1
+          - run: pacing-only
+            case: pacing-only
+            may_lose_the_block: true
+            measure: true
+            largest: a_body_of_nearly_the_largest_size -- --nocapture --test-threads=1
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Run
+      - name: Build
+        id: build
+        run: cargo test --locked -p sovright-relay-sidecar --bin relay-sidecar --no-run
+      - name: Largest body
+        id: largest
+        continue-on-error: true
         shell: bash
         run: |
           set -o pipefail
-          cargo test --locked -p sovright-relay-sidecar --bin relay-sidecar ${{ matrix.args }} 2>&1 | tee diagnostic.log
-      - name: Keep the log
+          cargo test --locked -p sovright-relay-sidecar --bin relay-sidecar ${{ matrix.largest }} 2>&1 | tee largest.log
+      - name: Usual block
+        id: usual
+        if: ${{ matrix.measure }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p sovright-relay-sidecar --bin relay-sidecar a_block_of_the_usual_size -- --nocapture --test-threads=1 2>&1 | tee usual.log
+      - name: Dual send
+        id: dual
+        if: ${{ matrix.measure }}
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p sovright-relay-sidecar --bin relay-sidecar a_dual_send_reports -- --ignored --nocapture --test-threads=1 2>&1 | tee dual.log
+      - name: Keep the logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bound-path-diagnostic-${{ matrix.run }}
-          path: diagnostic.log
-          if-no-files-found: error
+          path: '*.log'
+          if-no-files-found: warn
+      - name: Verdict
+        if: ${{ !cancelled() && steps.build.outcome == 'success' }}
+        shell: bash
+        env:
+          LARGEST: ${{ steps.largest.outcome }}
+          USUAL: ${{ steps.usual.outcome }}
+          DUAL: ${{ steps.dual.outcome }}
+          MAY_LOSE: ${{ matrix.may_lose_the_block }}
+        run: |
+          stop() { echo "::error::$1"; exit 1; }
+          [ "$USUAL" = success ] || [ "$USUAL" = skipped ] || stop "the usual block failed"
+          [ "$DUAL" = success ] || [ "$DUAL" = skipped ] || stop "the dual measurement failed"
+          if [ "$LARGEST" != success ]; then
+            [ "$MAY_LOSE" = true ] || stop "the largest body failed"
+            grep -q 'gave up waiting for the block' largest.log || stop "failed, and not by losing the block"
+            grep -q '^test result: FAILED. 0 passed; 1 failed;' largest.log || stop "more failed than the one test"
+            echo "::notice::this case lost the largest body, as it may"
+            exit 0
+          fi
+          dropped='queued and dropped Some\(\([0-9]+, [1-9][0-9]*\)\)'
+          if grep -E "$dropped" ./*.log; then
+            [ "$MAY_LOSE" = true ] || stop "a socket dropped datagrams"
+            echo "::notice::a socket dropped datagrams in this case, as it may"
+          fi

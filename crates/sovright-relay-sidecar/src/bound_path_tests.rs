@@ -19,9 +19,10 @@ use sovright_relay::test_support::{
     committed_header, parseable_transaction, parseable_transaction_with_script, raw_block,
 };
 use sovright_relay::{
-    AuthKey, BlockSender, BoundForwardConfig, BoundNodeUsage, BoundProbe, ClientConfig,
-    MetricsSnapshot, RelayClient, RelayConfig, RelayNode, StubPowValidator, TransportError,
-    body_frames, consensus_block_hash_display, sealed_body, sealed_frame, split_raw_block,
+    AuthKey, BOUND_SEND_BURST_DELAY, BOUND_SEND_BURST_PACKETS, BlockSender, BoundForwardConfig,
+    BoundNodeUsage, BoundProbe, ClientConfig, MetricsSnapshot, RelayClient, RelayConfig, RelayNode,
+    StubPowValidator, TransportError, body_frames, consensus_block_hash_display, sealed_body,
+    sealed_frame, split_raw_block,
 };
 use sovright_relay_sidecar::chain_view::ZebraChainViewConfig;
 use sovright_relay_sidecar::submit_gate::{DEFAULT_STRICT_BODIES_PER_BLOCK, GateConfig};
@@ -280,7 +281,13 @@ fn client_config(node: SocketAddr) -> ClientConfig {
 }
 
 async fn start_sender(node: SocketAddr) -> (BlockSender, JoinHandle<Result<(), TransportError>>) {
-    let mut client = RelayClient::new(client_config(node)).unwrap();
+    start_sender_with(client_config(node)).await
+}
+
+async fn start_sender_with(
+    config: ClientConfig,
+) -> (BlockSender, JoinHandle<Result<(), TransportError>>) {
+    let mut client = RelayClient::new(config).unwrap();
     client.bind().await.unwrap();
     let sender = client.sender();
     let task = tokio::spawn(async move { client.run().await });
@@ -1184,22 +1191,105 @@ async fn an_evicted_body_lets_go_and_can_come_again() {
 /// is a few segments, so this is the one test of those values at the size they are for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_body_of_nearly_the_largest_size_crosses_with_the_research_values() {
+    let block = a_block_of_nearly_the_largest_size();
+    let frames = body_frames(&block).unwrap();
+    assert!(frames.len() > 190, "{} segments", frames.len());
+    cross_and_report(block).await;
+}
+
+fn a_block_of_nearly_the_largest_size() -> Vec<u8> {
     let txs: Vec<Vec<u8>> = (0..470)
         .map(|at| parseable_transaction_with_script(at, 4096))
         .collect();
-    let block = raw_block(&committed_header(7, &txs), &txs);
-    let frames = body_frames(&block).unwrap();
-    assert!(frames.len() > 190, "{} segments", frames.len());
-    let node = stub_pow_node(true).await;
+    raw_block(&committed_header(7, &txs), &txs)
+}
+
+/// The same way across for the block the repository has, so the cost of how it is sent can be
+/// read at the size most blocks are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_block_of_the_usual_size_is_timed_the_same_way() {
+    cross_and_report(the_real_block()).await;
+}
+
+/// What a dual sender costs its legacy copy: an ingress sends the bound copy first, on the one
+/// task that sends, so the legacy copy waits for all of its pacing. A legacy receiver, because
+/// that is who gets it. This reports and asserts nothing, and the CI job reads the numbers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a measurement, run by the bound path diagnostic job"]
+async fn a_dual_send_reports_how_long_the_legacy_copy_waits() {
+    let blocks = [
+        ("usual", the_real_block()),
+        ("largest", a_block_of_nearly_the_largest_size()),
+    ];
+    for (name, block) in blocks {
+        let alone = legacy_copy_reaches_zebra(&block, false).await;
+        let behind_bound = legacy_copy_reaches_zebra(&block, true).await;
+        println!("{name}: legacy alone {alone:?}, legacy behind a bound copy {behind_bound:?}");
+    }
+}
+
+async fn legacy_copy_reaches_zebra(block: &[u8], behind_bound: bool) -> Option<Duration> {
+    let (forward, burst, gap) = crossing_case();
+    let node = stub_pow_node_with(forward).await;
+    let sidecar = start_sidecar(node.addr, None).await;
+    sidecar.zebra.knows_of(block);
+    node.has_a_receiver().await;
+    let config = client_config(node.addr)
+        .with_send_pacing(0, Duration::ZERO)
+        .with_bound_send_pacing(burst, gap);
+    let (sender, sender_task) = start_sender_with(config).await;
+
+    let started = std::time::Instant::now();
+    if behind_bound {
+        send_bound(&sender, block).await;
+    }
+    send_legacy(&sender, block).await;
+    let mut taken = None;
+    while taken.is_none() && started.elapsed() < WAIT {
+        if sidecar.zebra.took(block) {
+            taken = Some(started.elapsed());
+        }
+        sleep(Duration::from_millis(1)).await;
+    }
+
+    stop(node, [sidecar.client_task, sender_task]);
+    taken
+}
+
+/// How a body is sent and taken in. Unset is what a real sender and relay do with their
+/// defaults, with no send pacing configured. The others are for the comparison the CI job
+/// runs, to show what each part does alone. `before` is the sender of the test as it was.
+fn crossing_case() -> (BoundForwardConfig, usize, Duration) {
+    let queued = BoundForwardConfig::default();
+    let unqueued = BoundForwardConfig {
+        max_queued_datagrams: 0,
+        ..queued
+    };
+    let paced = (BOUND_SEND_BURST_PACKETS, BOUND_SEND_BURST_DELAY);
+    let (node, (burst, gap)) = match std::env::var("BOUND_PATH_CASE").as_deref() {
+        Ok("before") => (unqueued, (32, Duration::from_micros(200))),
+        Ok("drain-only") => (queued, (0, Duration::ZERO)),
+        Ok("pacing-only") => (unqueued, paced),
+        _ => (queued, paced),
+    };
+    (node, burst, gap)
+}
+
+async fn cross_and_report(block: Vec<u8>) {
+    let (forward, burst, gap) = crossing_case();
+    let node = stub_pow_node_with(forward).await;
     let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
     sidecar.zebra.knows_of(&block);
     node.has_a_receiver().await;
-    let (sender, sender_task) = start_sender(node.addr).await;
+    let config = client_config(node.addr)
+        .with_send_pacing(0, Duration::ZERO)
+        .with_bound_send_pacing(burst, gap);
+    let (sender, sender_task) = start_sender_with(config).await;
     let watch = PathWatch {
         node: &node,
         sidecar: &sidecar,
         sender: &sender,
-        segments: frames.len(),
+        segments: body_frames(&block).unwrap().len(),
         datagrams: sealed_body(&block, &KEY).unwrap().len(),
         udp_before: kernel_udp_errors(),
         backlog_before: kernel_backlog_drops(),
@@ -1301,14 +1391,21 @@ impl PathWatch<'_> {
         )
     }
 
-    fn report(&self, timeline: &[String]) -> String {
+    fn report(
+        &self,
+        timeline: &[String],
+        sender_done: Option<Duration>,
+        taken: Option<Duration>,
+    ) -> String {
         let view = self.node.node.view();
         let metrics = &view.metrics;
         let usage = view.usage.unwrap_or_default();
         let probe = self.sidecar.probe();
         let zebra = &self.sidecar.zebra;
         format!(
-            "expected: {segments} segments, {datagrams} datagrams from the sender\n\
+            "case: {case}\n\
+             expected: {segments} segments, {datagrams} datagrams from the sender\n\
+             timing: sender done {sender_done:?}, block taken {taken:?}\n\
              scope: since each socket or node started. Counters are read one at a time, so no \
              line is a single instant. `sent` is what a socket took. Sizes the system reports \
              for a receive buffer on Linux are twice the usable size.\n\
@@ -1324,6 +1421,7 @@ impl PathWatch<'_> {
              node, every packet: received {received} invalid {invalid} auth failures {auth} \
              rate limited {limited} receive errors {receive_errors}\n\
              node, this path: {arrivals:?}\n\
+             node queue, in microseconds: {ingress:?}\n\
              node frames: rejected {frames} pow refused {pow} pow indeterminate {unsure} \
              pushed out waiting for segment 0 {pushed}\n\
              \nnode to client\n\
@@ -1338,6 +1436,7 @@ impl PathWatch<'_> {
              ledger: {ledger:?}\n\
              zebra: calls {calls} held back {held}\n\
              \ntimeline\n{timeline}",
+            case = std::env::var("BOUND_PATH_CASE").unwrap_or_else(|_| "defaults".to_string()),
             segments = self.segments,
             datagrams = self.datagrams,
             rmem_max = kernel_limit("rmem_max"),
@@ -1356,6 +1455,7 @@ impl PathWatch<'_> {
             limited = metrics.unauth_rate_limited,
             receive_errors = metrics.socket_receive_errors,
             arrivals = usage.arrivals,
+            ingress = usage.ingress,
             frames = usage.frames_rejected,
             pow = usage.pow_refused,
             unsure = usage.pow_indeterminate,
@@ -1383,11 +1483,16 @@ impl PathWatch<'_> {
     async fn wait_for_the_block(&self, raw: &[u8]) {
         let started = std::time::Instant::now();
         let mut timeline = Vec::new();
+        let mut sender_done = None;
         while started.elapsed() < WAIT {
             if self.sidecar.zebra.took(raw) {
-                timeline.push(self.line(started.elapsed()));
-                println!("{}", self.report(&timeline));
+                let taken = started.elapsed();
+                timeline.push(self.line(taken));
+                println!("{}", self.report(&timeline, sender_done, Some(taken)));
                 return;
+            }
+            if sender_done.is_none() && self.sender.sends().sent as usize >= self.datagrams {
+                sender_done = Some(started.elapsed());
             }
             if started.elapsed() >= Duration::from_secs(timeline.len() as u64) {
                 timeline.push(self.line(started.elapsed()));
@@ -1395,7 +1500,10 @@ impl PathWatch<'_> {
             sleep(Duration::from_millis(5)).await;
         }
         timeline.push(self.line(started.elapsed()));
-        panic!("gave up waiting for the block\n{}", self.report(&timeline));
+        panic!(
+            "gave up waiting for the block\n{}",
+            self.report(&timeline, sender_done, None)
+        );
     }
 }
 

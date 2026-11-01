@@ -1,6 +1,7 @@
 //! Relay node server implementation
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +25,9 @@ use crate::transport::{
     TransportError, ZCASH_FULL_HEADER_SIZE,
 };
 
-use super::bound_raw::{self, BoundForwarder, BoundNodeUsage, BoundStep};
+use super::bound_raw::{
+    self, BoundForwarder, BoundNodeUsage, BoundStep, IngressQueue, LiveIngress, MAX_READ_BYTES,
+};
 use super::forwarding::ForwardOrder;
 use super::metrics::RelayMetrics;
 use super::{ArrivalSink, ReceiptObject};
@@ -116,6 +119,7 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     /// The bound raw path, if the config asks for it. A plain lock: nothing here awaits
     /// while holding it.
     bound: Option<Mutex<BoundForwarder>>,
+    ingress: LiveIngress,
 }
 
 impl RelayNode<EquihashPowValidator> {
@@ -170,6 +174,7 @@ impl<V: PowValidator> RelayNode<V> {
             unauth_limiter,
             active_keys,
             bound,
+            ingress: LiveIngress::default(),
         })
     }
 
@@ -255,7 +260,9 @@ impl<V: PowValidator> RelayNode<V> {
     /// What this node holds on the bound path, if it has it.
     pub fn bound_usage(&self) -> Option<BoundNodeUsage> {
         let bound = self.bound.as_ref()?;
-        Some(bound.lock().expect("bound forwarder poisoned").usage())
+        let mut usage = bound.lock().expect("bound forwarder poisoned").usage();
+        usage.ingress = self.ingress.read();
+        Some(usage)
     }
 
     /// Get the number of active sessions
@@ -315,30 +322,51 @@ impl<V: PowValidator> RelayNode<V> {
 
         self.running.store(true, Ordering::SeqCst);
 
-        let mut buf = vec![0u8; 2048];
+        let mut buf = vec![0u8; MAX_READ_BYTES];
         let mut cleanup_counter: u32 = 0;
+        // Bound objects are decoded and encoded again in this loop, and nothing reads the
+        // socket meanwhile. So with the bound path on, the socket is emptied into this between
+        // datagrams. In order, one at a time, as before. Off, this stays empty.
+        let mut waiting = IngressQueue::new(self.config.bound_raw.as_ref());
 
         loop {
             if !self.running.load(Ordering::SeqCst) {
                 break;
             }
 
-            let recv_result =
-                tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf)).await;
+            if let Err(e) = self.empty_socket(socket, &mut buf, &mut waiting) {
+                self.metrics.inc_socket_receive_errors();
+                self.running.store(false, Ordering::SeqCst);
+                return Err(TransportError::Io(e));
+            }
 
-            match recv_result {
-                Ok(Ok((len, src_addr))) => {
-                    if let Err(e) = self.handle_packet(&buf[..len], src_addr).await {
-                        debug!(peer = %src_addr, error = ?e, "Error handling packet");
+            if let Some((datagram, src_addr)) = waiting.pop() {
+                let started = Instant::now();
+                if let Err(e) = self.handle_packet(&datagram, src_addr).await {
+                    debug!(peer = %src_addr, error = ?e, "Error handling packet");
+                }
+                self.ingress.note_handled(started.elapsed());
+                // Lets the runtime look at its sockets, or this one reads as empty.
+                tokio::task::yield_now().await;
+            } else {
+                let recv_result =
+                    tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut buf))
+                        .await;
+
+                match recv_result {
+                    Ok(Ok((len, src_addr))) => {
+                        if let Err(e) = self.handle_packet(&buf[..len], src_addr).await {
+                            debug!(peer = %src_addr, error = ?e, "Error handling packet");
+                        }
                     }
-                }
-                Ok(Err(e)) => {
-                    self.metrics.inc_socket_receive_errors();
-                    self.running.store(false, Ordering::SeqCst);
-                    return Err(TransportError::Io(e));
-                }
-                Err(_) => {
-                    // Timeout - continue
+                    Ok(Err(e)) => {
+                        self.metrics.inc_socket_receive_errors();
+                        self.running.store(false, Ordering::SeqCst);
+                        return Err(TransportError::Io(e));
+                    }
+                    Err(_) => {
+                        // Timeout - continue
+                    }
                 }
             }
 
@@ -350,6 +378,25 @@ impl<V: PowValidator> RelayNode<V> {
             }
         }
 
+        Ok(())
+    }
+
+    /// Move what the socket holds into `waiting`, as far as it has room. The rest stays in the
+    /// socket.
+    fn empty_socket(
+        &self,
+        socket: &UdpSocket,
+        buf: &mut [u8],
+        waiting: &mut IngressQueue,
+    ) -> std::io::Result<()> {
+        while waiting.has_room() {
+            match socket.try_recv_from(buf) {
+                Ok((len, src_addr)) => waiting.push(&buf[..len], src_addr),
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(e) => return Err(e),
+            }
+        }
+        self.ingress.note_queue(waiting);
         Ok(())
     }
 

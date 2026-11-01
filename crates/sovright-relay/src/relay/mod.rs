@@ -12,9 +12,10 @@ mod ratelimit;
 
 pub use arrival::{ArrivalSink, ReceiptObject};
 pub use bound_raw::{
-    BoundArrivals, BoundBlock, BoundForwardConfig, BoundHandoffs, BoundNodeUsage, BoundProbe,
-    BoundProgress, BoundRawConfig, BoundUsed, MAX_BODY_BYTES, SEGMENT_BYTES, body_frames,
-    frame_rules, is_bound, sealed_body, sealed_frame,
+    BOUND_SEND_BURST_DELAY, BOUND_SEND_BURST_PACKETS, BoundArrivals, BoundBlock,
+    BoundForwardConfig, BoundHandoffs, BoundIngress, BoundNodeUsage, BoundProbe, BoundProgress,
+    BoundRawConfig, BoundUsed, MAX_BODY_BYTES, SEGMENT_BYTES, body_frames, frame_rules, is_bound,
+    sealed_body, sealed_frame,
 };
 pub use client::{BlockReceiver, BlockSender, RelayClient, RelayPayload, SendReport};
 pub use metrics::{MetricsSnapshot, RelayMetrics, render_prometheus_text};

@@ -287,6 +287,10 @@ pub struct ClientConfig {
     pub send_burst_packets: usize,
     /// Optional delay after each outbound packet burst.
     pub send_burst_delay: Duration,
+    /// Datagrams of a bound body sent before each pause, and that pause. The bound path does
+    /// not use `send_burst_packets`, because what paces it is a relay's work on each object.
+    pub bound_send_burst_packets: usize,
+    pub bound_send_burst_delay: Duration,
     /// Emit adaptive (version-3) FEC chunks sized per block on the send path.
     ///
     /// When false (default) the client emits fixed-profile version-2 chunks.
@@ -311,6 +315,8 @@ impl ClientConfig {
             auth_required: false,
             send_burst_packets: 0,
             send_burst_delay: Duration::ZERO,
+            bound_send_burst_packets: crate::relay::BOUND_SEND_BURST_PACKETS,
+            bound_send_burst_delay: crate::relay::BOUND_SEND_BURST_DELAY,
             adaptive_fec: false,
             bound_raw: None,
         }
@@ -351,6 +357,13 @@ impl ClientConfig {
     pub fn with_send_pacing(mut self, burst_packets: usize, burst_delay: Duration) -> Self {
         self.send_burst_packets = burst_packets;
         self.send_burst_delay = burst_delay;
+        self
+    }
+
+    /// Builder method: set the pacing of the bound path
+    pub fn with_bound_send_pacing(mut self, burst_packets: usize, burst_delay: Duration) -> Self {
+        self.bound_send_burst_packets = burst_packets;
+        self.bound_send_burst_delay = burst_delay;
         self
     }
 

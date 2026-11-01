@@ -473,7 +473,11 @@ impl RelayClient {
             TransportError::InvalidChunk("raw block does not fit the bound format".into())
         })?;
         let object_hash = crate::zcash_block_hash(&raw[..crate::ZCASH_FULL_HEADER_SIZE]);
-        self.send_datagrams_internal(socket, &object_hash, datagrams, "bound raw block")
+        let pacing = SendPacing::new(
+            self.config.bound_send_burst_packets,
+            self.config.bound_send_burst_delay,
+        );
+        self.send_datagrams_internal(socket, &object_hash, datagrams, "bound raw block", pacing)
             .await
     }
 
@@ -635,7 +639,8 @@ impl RelayClient {
             payloads.push(Chunk::new(auth_header, chunk.payload).to_bytes());
         }
 
-        self.send_datagrams_internal(socket, object_hash, payloads, label)
+        let pacing = SendPacing::new(self.config.send_burst_packets, self.config.send_burst_delay);
+        self.send_datagrams_internal(socket, object_hash, payloads, label, pacing)
             .await
     }
 
@@ -645,9 +650,9 @@ impl RelayClient {
         object_hash: &[u8; 32],
         payloads: Vec<Vec<u8>>,
         label: &str,
+        pacing: SendPacing,
     ) -> Result<(), TransportError> {
         let payloads = Arc::new(payloads);
-        let pacing = SendPacing::new(self.config.send_burst_packets, self.config.send_burst_delay);
         let mut tasks = tokio::task::JoinSet::new();
         for relay_addr in self.config.relay_addrs.iter().copied() {
             tasks.spawn(send_payloads_to_relay(
