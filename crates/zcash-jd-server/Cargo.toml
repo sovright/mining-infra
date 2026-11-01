@@ -24,4 +24,6 @@ sovright-noise = { path = "../sovright-noise" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 
 [dev-dependencies]
+zcash-coinbase = { path = "../zcash-coinbase", features = ["test-support"] }
+zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

@@ -33,6 +33,7 @@ sovright-noise = { path = "../sovright-noise" }
 zcash-pool-common = { path = "../zcash-pool-common" }
 
 [dev-dependencies]
+zcash-coinbase = { path = "../zcash-coinbase", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tempfile = "3"
 # Tier-2 full-chain integration test (tests/tier2_chain_test.rs) drives a real

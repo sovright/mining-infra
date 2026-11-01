@@ -189,7 +189,12 @@ impl TemplateValidator {
             if let Err(err) = Self::parse_transaction(tx_data) {
                 return ValidationResult::Invalid(format!("invalid transaction data: {}", err));
             }
-            let txid = Self::compute_txid(tx_data);
+            let txid = match Self::compute_txid(tx_data) {
+                Ok(txid) => txid,
+                Err(err) => {
+                    return ValidationResult::Invalid(format!("invalid transaction data: {}", err));
+                }
+            };
             if !job.tx_short_ids.contains(&txid) {
                 return ValidationResult::Invalid("transaction data not referenced".into());
             }
@@ -209,14 +214,14 @@ impl TemplateValidator {
         }
 
         match Self::compute_merkle_root(&job.coinbase_tx, &job.tx_short_ids) {
-            Some(root) => {
+            Ok(root) => {
                 if root != job.merkle_root {
                     return ValidationResult::Invalid("invalid merkle root".into());
                 }
             }
-            None => {
-                // Empty coinbase in Standard/Strict mode is invalid
-                return ValidationResult::Invalid("empty coinbase transaction".into());
+            Err(err) => {
+                // An empty or unreadable coinbase is invalid in Standard/Strict mode.
+                return ValidationResult::Invalid(err);
             }
         }
 
@@ -236,7 +241,12 @@ impl TemplateValidator {
             if tx_data.is_empty() {
                 return ValidationResult::Invalid("empty transaction data".into());
             }
-            let txid = Self::compute_txid(tx_data);
+            let txid = match Self::compute_txid(tx_data) {
+                Ok(txid) => txid,
+                Err(err) => {
+                    return ValidationResult::Invalid(format!("invalid transaction data: {}", err));
+                }
+            };
             if !txid_set.contains(&txid) {
                 return ValidationResult::Invalid("transaction data not referenced".into());
             }
@@ -245,88 +255,45 @@ impl TemplateValidator {
         ValidationResult::Valid
     }
 
+    /// Structural check of the transparent fields, in the field order of the
+    /// transaction's version (v4, or v5/v6).
     pub(crate) fn parse_transaction(data: &[u8]) -> Result<(), String> {
-        if data.len() < 4 {
-            return Err("transaction too short".into());
-        }
-
-        let mut cursor = 0usize;
-        let version = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-        cursor += 4;
-        if (version & 0x8000_0000) != 0 {
-            if cursor + 4 > data.len() {
-                return Err("missing version group id".into());
-            }
-            cursor += 4;
-        }
-
-        let vin_count = Self::read_compact_size(data, &mut cursor)?;
-        for _ in 0..vin_count {
-            if cursor + 36 > data.len() {
-                return Err("input out of bounds".into());
-            }
-            cursor += 36;
-            let script_len = Self::read_compact_size(data, &mut cursor)? as usize;
-            if cursor + script_len + 4 > data.len() {
-                return Err("scriptSig out of bounds".into());
-            }
-            cursor += script_len;
-            cursor += 4;
-        }
-
-        let vout_count = Self::read_compact_size(data, &mut cursor)?;
-        for _ in 0..vout_count {
-            if cursor + 8 > data.len() {
-                return Err("output value out of bounds".into());
-            }
-            cursor += 8;
-            let script_len = Self::read_compact_size(data, &mut cursor)? as usize;
-            if cursor + script_len > data.len() {
-                return Err("output script out of bounds".into());
-            }
-            cursor += script_len;
-        }
-
-        if cursor + 4 > data.len() {
-            return Err("missing lock_time".into());
-        }
-        cursor += 4;
-        if (version & 0x8000_0000) != 0 {
-            if cursor + 4 > data.len() {
-                return Err("missing expiry_height".into());
-            }
-            cursor += 4;
-        }
-
-        if cursor > data.len() {
-            return Err("transaction parse overflow".into());
-        }
-
-        Ok(())
+        zcash_coinbase::tx_parse::parse_transaction(data)
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 
-    fn read_compact_size(data: &[u8], cursor: &mut usize) -> Result<u64, String> {
-        zcash_pool_common::read_compact_size(data, cursor).map_err(|e| e.to_string())
+    /// Internal-order txid: SHA256d for v4, ZIP 244 for v5 and later. A v5+
+    /// transaction that zcash_primitives cannot read has no txid.
+    pub(crate) fn compute_txid(data: &[u8]) -> Result<[u8; 32], String> {
+        zcash_coinbase::digest::txid(data).map_err(|e| e.to_string())
     }
 
-    pub(crate) fn compute_txid(data: &[u8]) -> [u8; 32] {
+    /// SHA256d, the hash of block Merkle tree nodes.
+    fn sha256d(data: &[u8]) -> [u8; 32] {
         let hash1 = Sha256::digest(data);
         let hash2 = Sha256::digest(hash1);
-        let mut txid = [0u8; 32];
-        txid.copy_from_slice(&hash2);
-        txid
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&hash2);
+        out
     }
 
-    pub(crate) fn compute_merkle_root(coinbase: &[u8], txids: &[[u8; 32]]) -> Option<[u8; 32]> {
+    pub(crate) fn compute_merkle_root(
+        coinbase: &[u8],
+        txids: &[[u8; 32]],
+    ) -> Result<[u8; 32], String> {
         if coinbase.is_empty() {
-            return None;
+            return Err("coinbase transaction is empty".into());
         }
 
         let mut all_txids = Vec::with_capacity(1 + txids.len());
-        all_txids.push(Self::compute_txid(coinbase));
+        all_txids.push(
+            Self::compute_txid(coinbase)
+                .map_err(|e| format!("invalid coinbase transaction: {}", e))?,
+        );
         all_txids.extend_from_slice(txids);
 
-        Some(Self::merkle_root_from_txids(&all_txids))
+        Ok(Self::merkle_root_from_txids(&all_txids))
     }
 
     fn merkle_root_from_txids(txids: &[[u8; 32]]) -> [u8; 32] {
@@ -348,7 +315,7 @@ impl TemplateValidator {
                 let mut data = [0u8; 64];
                 data[..32].copy_from_slice(&left);
                 data[32..].copy_from_slice(&right);
-                next.push(Self::compute_txid(&data));
+                next.push(Self::sha256d(&data));
                 i += 2;
             }
             layer = next;
@@ -466,14 +433,14 @@ mod tests {
             tx_short_ids: vec![],
             tx_data: vec![],
         };
-        if let Some(root) = TemplateValidator::compute_merkle_root(&job.coinbase_tx, &[]) {
+        if let Ok(root) = TemplateValidator::compute_merkle_root(&job.coinbase_tx, &[]) {
             job.merkle_root = root;
         }
         job
     }
 
     fn update_merkle_root(job: &mut SetFullTemplateJob) {
-        if let Some(root) =
+        if let Ok(root) =
             TemplateValidator::compute_merkle_root(&job.coinbase_tx, &job.tx_short_ids)
         {
             job.merkle_root = root;
@@ -522,8 +489,8 @@ mod tests {
         let tx1 = minimal_tx();
         let tx2 = minimal_tx_with_script(&[0x52]);
         job.tx_short_ids = vec![
-            TemplateValidator::compute_txid(&tx1),
-            TemplateValidator::compute_txid(&tx2),
+            TemplateValidator::compute_txid(&tx1).unwrap(),
+            TemplateValidator::compute_txid(&tx2).unwrap(),
         ];
         job.tx_data = vec![tx1, tx2];
         update_merkle_root(&mut job);
@@ -650,6 +617,75 @@ mod tests {
                 assert_eq!(missing[0], [0x22; 32]);
             }
             _ => panic!("Expected NeedTransactions for partial known txids"),
+        }
+    }
+
+    // v5/v6 coverage. The parser used to read every version in v4 field order
+    // and txids were SHA256d, so no v6 coinbase could be declared.
+
+    fn v6_job(coinbase: Vec<u8>) -> SetFullTemplateJob {
+        let mut job = make_test_job();
+        job.coinbase_tx = coinbase;
+        update_merkle_root(&mut job);
+        job
+    }
+
+    #[test]
+    fn parses_v6_coinbases() {
+        for coinbase in [
+            zcash_pool_common::fixtures::mainnet_transactions().remove(0),
+            zcash_coinbase::fixtures::testnet_nu7_coinbase(),
+        ] {
+            TemplateValidator::parse_transaction(&coinbase).expect("v6 coinbase parses");
+        }
+    }
+
+    #[test]
+    fn txid_of_a_shielded_nu7_coinbase_matches_both_nodes() {
+        let coinbase = zcash_coinbase::fixtures::testnet_nu7_coinbase();
+        assert_eq!(
+            TemplateValidator::compute_txid(&coinbase).unwrap(),
+            zcash_coinbase::fixtures::internal_from_display(
+                zcash_coinbase::fixtures::TESTNET_4465026_COINBASE_TXID_DISPLAY
+            )
+        );
+    }
+
+    #[test]
+    fn mainnet_block_txids_make_its_merkle_root() {
+        let mut txs = zcash_pool_common::fixtures::mainnet_transactions();
+        let coinbase = txs.remove(0);
+        let txids: Vec<[u8; 32]> = txs
+            .iter()
+            .map(|tx| TemplateValidator::compute_txid(tx).unwrap())
+            .collect();
+        let header = zcash_pool_common::fixtures::mainnet_serialized_header();
+        assert_eq!(
+            TemplateValidator::compute_merkle_root(&coinbase, &txids).unwrap(),
+            header[36..68]
+        );
+    }
+
+    #[test]
+    fn standard_validation_accepts_a_v6_coinbase() {
+        let validator = TemplateValidator::new(ValidationLevel::Standard, vec![], 0);
+        let job = v6_job(zcash_coinbase::fixtures::testnet_nu7_coinbase());
+        assert_eq!(validator.validate(&job), ValidationResult::Valid);
+    }
+
+    #[test]
+    fn standard_validation_rejects_an_unreadable_v6_transaction() {
+        let validator = TemplateValidator::new(ValidationLevel::Standard, vec![], 0);
+        let mut job = v6_job(zcash_coinbase::fixtures::testnet_nu7_coinbase());
+        let mut truncated = zcash_coinbase::fixtures::testnet_nu7_coinbase();
+        truncated.truncate(truncated.len() - 1);
+        job.tx_short_ids = vec![[0x11; 32]];
+        job.tx_data = vec![truncated];
+        match validator.validate(&job) {
+            ValidationResult::Invalid(reason) => {
+                assert!(reason.contains("invalid transaction data"), "{reason}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
         }
     }
 }
