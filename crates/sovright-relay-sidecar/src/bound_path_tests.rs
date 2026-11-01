@@ -19,9 +19,9 @@ use sovright_relay::test_support::{
     committed_header, parseable_transaction, parseable_transaction_with_script, raw_block,
 };
 use sovright_relay::{
-    AuthKey, BlockSender, BoundForwardConfig, BoundProbe, ClientConfig, RelayClient, RelayConfig,
-    RelayNode, StubPowValidator, TransportError, body_frames, consensus_block_hash_display,
-    sealed_body, sealed_frame, split_raw_block,
+    AuthKey, BlockSender, BoundForwardConfig, BoundNodeUsage, BoundProbe, ClientConfig,
+    MetricsSnapshot, RelayClient, RelayConfig, RelayNode, StubPowValidator, TransportError,
+    body_frames, consensus_block_hash_display, sealed_body, sealed_frame, split_raw_block,
 };
 use sovright_relay_sidecar::chain_view::ZebraChainViewConfig;
 use sovright_relay_sidecar::submit_gate::{DEFAULT_STRICT_BODIES_PER_BLOCK, GateConfig};
@@ -170,6 +170,14 @@ type Sessions<'a> = Pin<Box<dyn Future<Output = usize> + Send + 'a>>;
 trait LiveNode: Send + Sync {
     fn halt(&self);
     fn sessions(&self) -> Sessions<'_>;
+    fn view(&self) -> NodeView;
+}
+
+/// What a node reports of itself.
+struct NodeView {
+    metrics: MetricsSnapshot,
+    usage: Option<BoundNodeUsage>,
+    recv_buffer: Option<usize>,
 }
 
 impl<V: sovright_relay::PowValidator + Send + Sync> LiveNode for RelayNode<V> {
@@ -179,6 +187,14 @@ impl<V: sovright_relay::PowValidator + Send + Sync> LiveNode for RelayNode<V> {
 
     fn sessions(&self) -> Sessions<'_> {
         Box::pin(self.session_count())
+    }
+
+    fn view(&self) -> NodeView {
+        NodeView {
+            metrics: self.metrics().snapshot(),
+            usage: self.bound_usage(),
+            recv_buffer: self.recv_buffer_bytes(),
+        }
     }
 }
 
@@ -275,6 +291,7 @@ async fn start_sender(node: SocketAddr) -> (BlockSender, JoinHandle<Result<(), T
 struct Sidecar {
     zebra: Arc<Zebra>,
     client_addr: SocketAddr,
+    recv_buffer: Option<usize>,
     client_task: JoinHandle<Result<(), TransportError>>,
     handler_task: JoinHandle<()>,
     metrics: Arc<SidecarMetrics>,
@@ -297,6 +314,7 @@ async fn start_sidecar_with(
     let mut client = RelayClient::new(config).unwrap();
     client.bind().await.unwrap();
     let client_addr = client.local_addr().unwrap();
+    let recv_buffer = client.recv_buffer_bytes();
     let (receiver, outgoing) = client.take_receiver().unwrap();
     let probe = receiver.bound_probe();
     let client_task = tokio::spawn(async move { client.run_with_outgoing(outgoing).await });
@@ -328,6 +346,7 @@ async fn start_sidecar_with(
     Sidecar {
         zebra,
         client_addr,
+        recv_buffer,
         client_task,
         handler_task,
         metrics,
@@ -1176,15 +1195,219 @@ async fn a_body_of_nearly_the_largest_size_crosses_with_the_research_values() {
     sidecar.zebra.knows_of(&block);
     node.has_a_receiver().await;
     let (sender, sender_task) = start_sender(node.addr).await;
+    let watch = PathWatch {
+        node: &node,
+        sidecar: &sidecar,
+        sender: &sender,
+        segments: frames.len(),
+        datagrams: sealed_body(&block, &KEY).unwrap().len(),
+        udp_before: kernel_udp_errors(),
+        backlog_before: kernel_backlog_drops(),
+    };
 
     send_bound(&sender, &block).await;
 
-    let zebra = Arc::clone(&sidecar.zebra);
-    let wanted = block.clone();
-    until("the block", move || zebra.took(&wanted)).await;
+    watch.wait_for_the_block(&block).await;
     assert_eq!(sidecar.zebra.calls_for(&block), 1);
     sidecar.ledger_settled().await;
     stop(node, [sidecar.client_task, sender_task]);
+}
+
+// What a run of that body came to, hop by hop, because it has failed on Linux with nothing to
+// say why. This changes nothing about the run. A counter says what one side saw, so a gap
+// between two of them is no proof of loss: a datagram can still be queued or being worked on.
+// What says a socket lost something is the kernel's count for that socket, on Linux only.
+
+/// A socket's line of a `/proc/net/udp` table: bytes waiting to be read, and what the kernel
+/// dropped for it since it opened.
+fn udp_table_line(table: &str, port: u16) -> Option<(u64, u64)> {
+    table.lines().skip(1).find_map(|line| {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (_, local_port) = fields.get(1)?.split_once(':')?;
+        if u16::from_str_radix(local_port, 16).ok()? != port {
+            return None;
+        }
+        let (_, queued) = fields.get(4)?.split_once(':')?;
+        let queued = u64::from_str_radix(queued, 16).ok()?;
+        Some((queued, fields.last()?.parse().ok()?))
+    })
+}
+
+fn kernel_socket(port: u16) -> Option<(u64, u64)> {
+    udp_table_line(&std::fs::read_to_string("/proc/net/udp").ok()?, port)
+}
+
+/// The UDP error counters of the whole machine, so every test running now is in them.
+fn kernel_udp_errors() -> Option<Vec<(String, u64)>> {
+    let table = std::fs::read_to_string("/proc/net/snmp").ok()?;
+    let mut udp = table.lines().filter(|line| line.starts_with("Udp:"));
+    let (names, values) = (udp.next()?, udp.next()?);
+    let pairs = names.split_whitespace().zip(values.split_whitespace());
+    Some(
+        pairs
+            .filter(|(name, _)| name.ends_with("Errors"))
+            .filter_map(|(name, value)| Some((name.to_string(), value.parse().ok()?)))
+            .collect(),
+    )
+}
+
+/// Packets dropped in the queue ahead of every socket, for the whole machine. Loopback traffic
+/// passes through it, and a drop here shows in no socket's count.
+fn kernel_backlog_drops() -> Option<u64> {
+    let table = std::fs::read_to_string("/proc/net/softnet_stat").ok()?;
+    table
+        .lines()
+        .map(|line| u64::from_str_radix(line.split_whitespace().nth(1)?, 16).ok())
+        .sum()
+}
+
+fn kernel_limit(name: &str) -> String {
+    std::fs::read_to_string(format!("/proc/sys/net/core/{name}")).map_or_else(
+        |_| "not available".to_string(),
+        |value| value.trim().to_string(),
+    )
+}
+
+struct PathWatch<'a> {
+    node: &'a Node,
+    sidecar: &'a Sidecar,
+    sender: &'a BlockSender,
+    segments: usize,
+    datagrams: usize,
+    udp_before: Option<Vec<(String, u64)>>,
+    backlog_before: Option<u64>,
+}
+
+impl PathWatch<'_> {
+    /// One line of the timeline. Whether these still move tells a slow run from a stopped one.
+    fn line(&self, at: Duration) -> String {
+        let view = self.node.node.view();
+        let usage = view.usage.unwrap_or_default();
+        let client = self.sidecar.probe().progress();
+        let (node_queue, node_drops) = kernel_socket(self.node.addr.port()).unzip();
+        let (client_queue, client_drops) = kernel_socket(self.sidecar.client_addr.port()).unzip();
+        format!(
+            "{at:>7.1?} sent {} | node took {} queued {node_queue:?} dropped {node_drops:?} \
+             decoded {} forwarded {} | client took {} queued {client_queue:?} \
+             dropped {client_drops:?} decoded {} held {} blocks {}",
+            self.sender.sends().sent,
+            usage.arrivals.datagrams,
+            usage.arrivals.decoded,
+            view.metrics.packets_forwarded,
+            client.arrivals.datagrams,
+            client.arrivals.decoded,
+            client.handoffs.segments_held,
+            client.handoffs.blocks_to_consumer,
+        )
+    }
+
+    fn report(&self, timeline: &[String]) -> String {
+        let view = self.node.node.view();
+        let metrics = &view.metrics;
+        let usage = view.usage.unwrap_or_default();
+        let probe = self.sidecar.probe();
+        let zebra = &self.sidecar.zebra;
+        format!(
+            "expected: {segments} segments, {datagrams} datagrams from the sender\n\
+             scope: since each socket or node started. Counters are read one at a time, so no \
+             line is a single instant. `sent` is what a socket took. Sizes the system reports \
+             for a receive buffer on Linux are twice the usable size.\n\
+             limits: rmem_max {rmem_max} rmem_default {rmem_default} \
+             netdev_max_backlog {backlog}\n\
+             machine-wide UDP errors, every running test included: before {before:?} \
+             after {after:?}\n\
+             machine-wide drops ahead of every socket: before {backlog_before:?} \
+             after {backlog_after:?}\n\
+             \nsender to node\n\
+             sender socket: {sends:?}\n\
+             node socket: granted {node_buffer:?}, queued and dropped {node_socket:?}\n\
+             node, every packet: received {received} invalid {invalid} auth failures {auth} \
+             rate limited {limited} receive errors {receive_errors}\n\
+             node, this path: {arrivals:?}\n\
+             node frames: rejected {frames} pow refused {pow} pow indeterminate {unsure} \
+             pushed out waiting for segment 0 {pushed}\n\
+             \nnode to client\n\
+             node sent on: objects {objects} packets {forwarded} send errors {send_errors} \
+             no peer {no_peer} no pool place {no_place}\n\
+             client socket: granted {client_buffer:?}, queued and dropped {client_socket:?}\n\
+             client, this path: {client_arrivals:?}\n\
+             client hand-over: {handoffs:?}\n\
+             \nstill open at this point\n\
+             node: {pool:?}, waiting for segment 0 {waiting}\n\
+             client: {used:?}\n\
+             ledger: {ledger:?}\n\
+             zebra: calls {calls} held back {held}\n\
+             \ntimeline\n{timeline}",
+            segments = self.segments,
+            datagrams = self.datagrams,
+            rmem_max = kernel_limit("rmem_max"),
+            rmem_default = kernel_limit("rmem_default"),
+            backlog = kernel_limit("netdev_max_backlog"),
+            before = self.udp_before,
+            after = kernel_udp_errors(),
+            backlog_before = self.backlog_before,
+            backlog_after = kernel_backlog_drops(),
+            sends = self.sender.sends(),
+            node_buffer = view.recv_buffer,
+            node_socket = kernel_socket(self.node.addr.port()),
+            received = metrics.packets_received,
+            invalid = metrics.invalid_chunks,
+            auth = metrics.auth_failures,
+            limited = metrics.unauth_rate_limited,
+            receive_errors = metrics.socket_receive_errors,
+            arrivals = usage.arrivals,
+            frames = usage.frames_rejected,
+            pow = usage.pow_refused,
+            unsure = usage.pow_indeterminate,
+            pushed = usage.waiting_pushed_out,
+            objects = usage.objects_sent_on,
+            forwarded = metrics.packets_forwarded,
+            send_errors = metrics.packet_send_errors,
+            no_peer = metrics.forward_no_peer_chunks,
+            no_place = usage.datagrams_without_a_place,
+            client_buffer = self.sidecar.recv_buffer,
+            client_socket = kernel_socket(self.sidecar.client_addr.port()),
+            client_arrivals = probe.progress().arrivals,
+            handoffs = probe.progress().handoffs,
+            pool = usage.pool,
+            waiting = usage.objects_waiting_for_segment_0,
+            used = probe.used(),
+            ledger = probe.ledger(),
+            calls = zebra.calls(),
+            held = zebra.waiting(),
+            timeline = timeline.join("\n"),
+        )
+    }
+
+    /// `until` for the block, with the same wait, and a report of how far it got.
+    async fn wait_for_the_block(&self, raw: &[u8]) {
+        let started = std::time::Instant::now();
+        let mut timeline = Vec::new();
+        while started.elapsed() < WAIT {
+            if self.sidecar.zebra.took(raw) {
+                timeline.push(self.line(started.elapsed()));
+                println!("{}", self.report(&timeline));
+                return;
+            }
+            if started.elapsed() >= Duration::from_secs(timeline.len() as u64) {
+                timeline.push(self.line(started.elapsed()));
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        timeline.push(self.line(started.elapsed()));
+        panic!("gave up waiting for the block\n{}", self.report(&timeline));
+    }
+}
+
+#[test]
+fn a_socket_is_found_in_the_kernels_table_by_its_port() {
+    let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   \
+                 uid  timeout inode ref pointer drops\n\
+                 123: 0100007F:1F90 00000000:0000 07 00000000:00000A00 00:00000000 00000000 \
+                 1000 0 4242 2 0000000000000000 37\n";
+
+    assert_eq!(udp_table_line(table, 0x1f90), Some((0xa00, 37)));
+    assert_eq!(udp_table_line(table, 0x1f91), None);
 }
 
 // Consecutive honest traffic.

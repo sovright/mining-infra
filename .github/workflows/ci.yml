@@ -52,3 +52,35 @@ jobs:
         run: cargo build --workspace --all-targets
       - name: Run tier-2 chain test
         run: cargo test -p zcash-jd-client --test tier2_chain_test -- --ignored --nocapture
+
+  bound-path-diagnostic:
+    # Temporary, for #134. `cargo test` shows nobody the output of a test that passes, so this
+    # keeps the hop-by-hop report of the largest bound body either way, alone and among the
+    # tests it failed with. `set -o pipefail` keeps cargo's exit code through `tee`, so a
+    # failure here fails the job. The `test` job above is left as it is.
+    name: Bound path diagnostic (${{ matrix.run }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - run: alone
+            args: a_body_of_nearly_the_largest_size -- --nocapture --test-threads=1
+          - run: with-the-rest
+            args: -- --nocapture
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test --locked -p sovright-relay-sidecar --bin relay-sidecar ${{ matrix.args }} 2>&1 | tee diagnostic.log
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bound-path-diagnostic-${{ matrix.run }}
+          path: diagnostic.log
+          if-no-files-found: error

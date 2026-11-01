@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use chunk_proof::datagram::Verifier;
 use chunk_proof::object::{Encoded, Profile};
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
@@ -293,6 +293,13 @@ impl<V: PowValidator> RelayNode<V> {
     /// Get the actual bound address (useful when binding to port 0)
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.socket.as_ref().and_then(|s| s.local_addr().ok())
+    }
+
+    /// The receive buffer the system gave this socket, which can differ from what `bind`
+    /// asked for, with no error.
+    pub fn recv_buffer_bytes(&self) -> Option<usize> {
+        let socket = self.socket.as_ref()?;
+        SockRef::from(&**socket).recv_buffer_size().ok()
     }
 
     /// Run the relay node

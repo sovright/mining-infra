@@ -25,6 +25,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chunk_proof::assembler::{Arrival, Assembler, AssemblerLimits, DecodedObject, Interest};
@@ -35,7 +37,9 @@ use chunk_proof::object::{Encoded, MSG_RAW_SEGMENT, Profile, encode};
 use chunk_proof::tree::Node;
 use delivery_lease::body_buffer::{AssembledBlock, BufferLimits};
 use delivery_lease::segment_frame::{FrameRules, SetKey, build, verify};
-use delivery_lease::{DeliveryLedger, Limits as LedgerLimits, Snapshot, Transit};
+use delivery_lease::{
+    DeliveryLedger, Limits as LedgerLimits, Refusal as LedgerRefusal, Snapshot, Transit,
+};
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::warn;
 
@@ -248,11 +252,145 @@ impl BoundBlock {
     }
 }
 
+/// A plain struct to read, and a live one to count in. Counting is a relaxed atomic, so it
+/// takes no lock on the path being measured. Reading goes field by field, so one read is no
+/// single instant: a later count can sit next to an earlier one.
+macro_rules! counters {
+    ($(#[$doc:meta])* $read:ident, $live:ident, $($field:ident),+ $(,)?) => {
+        $(#[$doc])*
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+        pub struct $read {
+            $(pub $field: u64,)+
+        }
+
+        #[derive(Debug, Default)]
+        struct $live {
+            $($field: AtomicU64,)+
+        }
+
+        impl $live {
+            fn read(&self) -> $read {
+                $read {
+                    $($field: self.$field.load(Ordering::Relaxed),)+
+                }
+            }
+        }
+    };
+}
+
+fn add(count: &AtomicU64, by: u64) {
+    count.fetch_add(by, Ordering::Relaxed);
+}
+
+counters!(
+    /// What the datagrams that reached this code came to, on one node or one receiver. It says
+    /// nothing of a datagram that never got here, so a gap between what one side sent and this
+    /// count is no proof of loss on its own: the socket's queue and the kernel's drops say that.
+    BoundArrivals,
+    LiveArrivals,
+    datagrams,
+    invalid,
+    known_bad,
+    repeats,
+    other_shape,
+    not_wanted,
+    spares,
+    pending,
+    decoded,
+    rejected,
+    refused_for_objects,
+    refused_for_bytes,
+    refused_for_work,
+    refused_by_pool,
+    refused_otherwise,
+);
+
+impl LiveArrivals {
+    fn note(&self, arrival: &Arrival) {
+        add(&self.datagrams, 1);
+        let count = match arrival {
+            Arrival::Invalid(_) => &self.invalid,
+            Arrival::Repeat => &self.repeats,
+            Arrival::KnownBad => &self.known_bad,
+            Arrival::OtherShape => &self.other_shape,
+            Arrival::NotWanted => &self.not_wanted,
+            Arrival::Spare { .. } => &self.spares,
+            Arrival::Pending { .. } => &self.pending,
+            Arrival::Decoded(_) => &self.decoded,
+            Arrival::Rejected(_) => &self.rejected,
+            Arrival::Refused(Refusal::Objects) => &self.refused_for_objects,
+            Arrival::Refused(Refusal::HeldBytes) => &self.refused_for_bytes,
+            Arrival::Refused(Refusal::WorkBytes) => &self.refused_for_work,
+            Arrival::Refused(Refusal::Shared) => &self.refused_by_pool,
+            Arrival::Refused(_) => &self.refused_otherwise,
+        };
+        add(count, 1);
+    }
+}
+
+counters!(
+    /// What became of the objects a receiver decoded. The last three say what it held at its
+    /// last timed look, not now.
+    BoundHandoffs,
+    LiveHandoffs,
+    segments_held,
+    sets_whole,
+    already_held,
+    not_wanted,
+    refused_for_room,
+    refused_repeat_budget,
+    bad_content,
+    too_long,
+    not_a_segment,
+    sets_evicted,
+    sets_expired,
+    objects_expired,
+    blocks_to_consumer,
+    assembly_failures,
+    sets_open,
+    segments_buffered,
+    waiting_for_channel,
+);
+
+impl LiveHandoffs {
+    fn note(&self, handoff: &Handoff) {
+        let count = match handoff {
+            Handoff::Held(evicted) => {
+                add(&self.sets_evicted, evicted.len() as u64);
+                &self.segments_held
+            }
+            Handoff::Whole(_) => &self.sets_whole,
+            Handoff::AlreadyHeld(_) => &self.already_held,
+            Handoff::NotWanted => &self.not_wanted,
+            Handoff::Refused(LedgerRefusal::RepeatBudget) => &self.refused_repeat_budget,
+            Handoff::Refused(_) => &self.refused_for_room,
+            Handoff::BadContent(_) => &self.bad_content,
+            Handoff::TooLong(_) => &self.too_long,
+            Handoff::NotASegment(_) => &self.not_a_segment,
+        };
+        add(count, 1);
+    }
+}
+
+/// How far a receiver has got, for diagnosing a run.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoundProgress {
+    pub arrivals: BoundArrivals,
+    pub handoffs: BoundHandoffs,
+}
+
+#[derive(Debug, Default)]
+struct LiveProgress {
+    arrivals: LiveArrivals,
+    handoffs: LiveHandoffs,
+}
+
 /// A read of the counters of a running receiver, for tests and metrics.
 #[derive(Clone, Debug)]
 pub struct BoundProbe {
     budget: Budget,
     ledger: DeliveryLedger,
+    progress: Arc<LiveProgress>,
 }
 
 impl BoundProbe {
@@ -262,6 +400,14 @@ impl BoundProbe {
 
     pub fn ledger(&self) -> Snapshot {
         self.ledger.snapshot()
+    }
+
+    /// Read field by field, so no single instant.
+    pub fn progress(&self) -> BoundProgress {
+        BoundProgress {
+            arrivals: self.progress.arrivals.read(),
+            handoffs: self.progress.handoffs.read(),
+        }
     }
 }
 
@@ -273,6 +419,7 @@ pub(crate) struct BoundReceiver {
     stack: Stack,
     consumer: mpsc::Sender<BoundBlock>,
     look_again: bool,
+    progress: Arc<LiveProgress>,
 }
 
 impl BoundReceiver {
@@ -290,6 +437,7 @@ impl BoundReceiver {
             stack,
             consumer,
             look_again: false,
+            progress: Arc::default(),
         })
     }
 
@@ -297,7 +445,17 @@ impl BoundReceiver {
         BoundProbe {
             budget: self.stack.budget().clone(),
             ledger: self.stack.ledger().clone(),
+            progress: Arc::clone(&self.progress),
         }
+    }
+
+    /// On the timer and not for each datagram, so the measured path does none of this work.
+    fn note_what_it_holds(&self) {
+        let (buffer, handoffs) = (self.bridge.buffer(), &self.progress.handoffs);
+        let store = |count: &AtomicU64, value: usize| count.store(value as u64, Ordering::Relaxed);
+        store(&handoffs.sets_open, buffer.sets());
+        store(&handoffs.segments_buffered, buffer.segments());
+        store(&handoffs.waiting_for_channel, self.bridge.waiting());
     }
 
     pub(crate) fn consumer(&self) -> mpsc::Sender<BoundBlock> {
@@ -309,6 +467,7 @@ impl BoundReceiver {
     }
 
     fn settle(&mut self, handoff: Handoff, now: Instant) {
+        self.progress.handoffs.note(&handoff);
         match handoff {
             Handoff::Whole(set) => self.bridge.wait_for_consumer(set, now),
             Handoff::Held(evicted) if !evicted.is_empty() => self.look_again = true,
@@ -325,8 +484,13 @@ impl BoundReceiver {
     /// One datagram, all the way to the channel if it finished a block. False once the
     /// consumer is gone.
     pub(crate) fn take(&mut self, datagram: &[u8], now: Instant) -> bool {
-        if let Step::Handed(handoff) = self.bridge.take(&mut self.session, datagram, now) {
-            self.settle(handoff, now);
+        match self.bridge.take(&mut self.session, datagram, now) {
+            Step::Handed(handoff) => {
+                add(&self.progress.arrivals.datagrams, 1);
+                add(&self.progress.arrivals.decoded, 1);
+                self.settle(handoff, now);
+            }
+            Step::Chunk(arrival) => self.progress.arrivals.note(&arrival),
         }
         if std::mem::take(&mut self.look_again) {
             self.sweep(now);
@@ -342,10 +506,18 @@ impl BoundReceiver {
 
     /// The timers and the shelf. False once the consumer is gone.
     pub(crate) fn look(&mut self, now: Instant) -> bool {
-        self.bridge.expire(now);
-        self.session.expire(now);
+        add(
+            &self.progress.handoffs.sets_expired,
+            self.bridge.expire(now).len() as u64,
+        );
+        add(
+            &self.progress.handoffs.objects_expired,
+            self.session.expire(now).len() as u64,
+        );
         self.sweep(now);
-        self.pump(now)
+        let live = self.pump(now);
+        self.note_what_it_holds();
+        live
     }
 
     /// What is waiting, as far as the channel has room. Room is asked for first, so a block
@@ -354,8 +526,14 @@ impl BoundReceiver {
         while self.has_waiting() {
             match self.consumer.try_reserve() {
                 Ok(permit) => match self.bridge.next_block(now) {
-                    Some(Ok(block)) => permit.send(BoundBlock(block)),
-                    Some(Err(error)) => warn!(?error, "Bound block did not assemble"),
+                    Some(Ok(block)) => {
+                        permit.send(BoundBlock(block));
+                        add(&self.progress.handoffs.blocks_to_consumer, 1);
+                    }
+                    Some(Err(error)) => {
+                        warn!(?error, "Bound block did not assemble");
+                        add(&self.progress.handoffs.assembly_failures, 1);
+                    }
                     None => break,
                 },
                 Err(TrySendError::Full(())) => break,
@@ -509,6 +687,14 @@ pub struct BoundNodeUsage {
     pub forwarded_records: usize,
     /// Datagrams dropped because their session has no place in the pool.
     pub datagrams_without_a_place: u64,
+    /// What the datagrams that reached this code came to, over all sessions.
+    pub arrivals: BoundArrivals,
+    pub frames_rejected: u64,
+    pub pow_refused: u64,
+    pub pow_indeterminate: u64,
+    pub objects_sent_on: u64,
+    pub objects_waiting_for_segment_0: usize,
+    pub waiting_pushed_out: u64,
 }
 
 /// What a datagram came to on a node.
@@ -557,6 +743,12 @@ pub(crate) struct BoundForwarder {
     peers: HashMap<SocketAddr, BoundPeer>,
     anchors: Recent<SetKey>,
     datagrams_without_a_place: u64,
+    arrivals: LiveArrivals,
+    frames_rejected: u64,
+    pow_refused: u64,
+    pow_indeterminate: u64,
+    objects_sent_on: u64,
+    waiting_pushed_out: u64,
 }
 
 impl BoundForwarder {
@@ -568,6 +760,12 @@ impl BoundForwarder {
             peers: HashMap::new(),
             anchors: Recent::new(config.max_anchors),
             datagrams_without_a_place: 0,
+            arrivals: LiveArrivals::default(),
+            frames_rejected: 0,
+            pow_refused: 0,
+            pow_indeterminate: 0,
+            objects_sent_on: 0,
+            waiting_pushed_out: 0,
         })
     }
 
@@ -577,6 +775,13 @@ impl BoundForwarder {
             peers: self.peers.len(),
             forwarded_records: self.forwarded_records(),
             datagrams_without_a_place: self.datagrams_without_a_place,
+            arrivals: self.arrivals.read(),
+            frames_rejected: self.frames_rejected,
+            pow_refused: self.pow_refused,
+            pow_indeterminate: self.pow_indeterminate,
+            objects_sent_on: self.objects_sent_on,
+            objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
+            waiting_pushed_out: self.waiting_pushed_out,
         }
     }
 
@@ -656,6 +861,9 @@ impl BoundForwarder {
         {
             arrival = self.arrive(src, key, datagram, now);
         }
+        if let Some(arrival) = &arrival {
+            self.arrivals.note(arrival);
+        }
         match arrival {
             Some(Arrival::Invalid(_)) => BoundStep::Invalid,
             Some(Arrival::Decoded(decoded)) => {
@@ -682,6 +890,7 @@ impl BoundForwarder {
             return Vec::new();
         }
         let Ok(segment) = verify(decoded.content(), &self.rules) else {
+            self.frames_rejected += 1;
             self.reject(src, decoded.object_id(), now);
             return Vec::new();
         };
@@ -693,6 +902,7 @@ impl BoundForwarder {
             if let Some(peer) = self.peers.get_mut(&src) {
                 if peer.unanchored.len() >= self.config.max_unanchored {
                     peer.unanchored.pop_front();
+                    self.waiting_pushed_out += 1;
                 }
                 peer.unanchored.push_back((key, decoded));
             }
@@ -701,10 +911,14 @@ impl BoundForwarder {
         match validate(&segment.payload()[..ZCASH_FULL_HEADER_SIZE]) {
             PowResult::Valid => {}
             PowResult::Invalid => {
+                self.pow_refused += 1;
                 self.reject(src, decoded.object_id(), now);
                 return Vec::new();
             }
-            PowResult::Indeterminate => return Vec::new(),
+            PowResult::Indeterminate => {
+                self.pow_indeterminate += 1;
+                return Vec::new();
+            }
         }
         self.anchors.insert(key);
         let mut ready = vec![(src, decoded)];
@@ -735,6 +949,7 @@ impl BoundForwarder {
             return None;
         }
         forwarded.note(id, now, &self.config);
+        self.objects_sent_on += 1;
         self.keep_records_within_limit();
         Some(object)
     }

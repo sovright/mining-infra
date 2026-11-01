@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use socket2::{Domain, Protocol, Socket, Type};
+use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -46,12 +47,39 @@ pub enum RelayPayload {
 #[derive(Clone)]
 pub struct BlockSender {
     tx: mpsc::Sender<RelayPayload>,
+    sends: Arc<SendCounts>,
+}
+
+/// `send_to` calls of one client, for every path. A datagram counted here is one the socket
+/// took, which says nothing of whether it arrived.
+#[derive(Debug, Default)]
+struct SendCounts {
+    sent: AtomicU64,
+    errors: AtomicU64,
+}
+
+/// A read of [`SendCounts`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendReport {
+    pub sent: u64,
+    pub errors: u64,
 }
 
 impl BlockSender {
     /// A sender on a channel of the caller's, with no client behind it.
     pub fn for_tests(tx: mpsc::Sender<RelayPayload>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            sends: Arc::default(),
+        }
+    }
+
+    /// What this client's socket has taken so far.
+    pub fn sends(&self) -> SendReport {
+        SendReport {
+            sent: self.sends.sent.load(Ordering::Relaxed),
+            errors: self.sends.errors.load(Ordering::Relaxed),
+        }
     }
 
     /// Send a block to be relayed
@@ -159,6 +187,7 @@ pub struct RelayClient {
     /// Channel for outgoing blocks
     outgoing_tx: mpsc::Sender<RelayPayload>,
     outgoing_rx: Option<mpsc::Receiver<RelayPayload>>,
+    sends: Arc<SendCounts>,
     /// The bound path, from `take_receiver` until the run loop owns it.
     bound: Option<BoundReceiver>,
     /// Channel for delivering received blocks to user
@@ -187,6 +216,7 @@ impl RelayClient {
             chunker,
             outgoing_tx,
             outgoing_rx: Some(outgoing_rx),
+            sends: Arc::default(),
             bound: None,
             incoming_tx: None,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -204,11 +234,13 @@ impl RelayClient {
         socket.set_nonblocking(true)?;
         socket.set_recv_buffer_size(CLIENT_RECV_BUFFER_BYTES)?;
         socket.bind(&self.config.bind_addr.into())?;
+        let granted = socket.recv_buffer_size()?;
 
         let socket = UdpSocket::from_std(socket.into())?;
         info!(
             local_addr = ?socket.local_addr().ok(),
             recv_buffer_bytes = CLIENT_RECV_BUFFER_BYTES,
+            recv_buffer_granted_bytes = granted,
             "Relay client socket bound"
         );
         self.socket = Some(Arc::new(socket));
@@ -220,10 +252,18 @@ impl RelayClient {
         self.socket.as_ref().and_then(|s| s.local_addr().ok())
     }
 
+    /// The receive buffer the system gave this socket, which can differ from what `bind`
+    /// asked for, with no error.
+    pub fn recv_buffer_bytes(&self) -> Option<usize> {
+        let socket = self.socket.as_ref()?;
+        SockRef::from(&**socket).recv_buffer_size().ok()
+    }
+
     /// Get a sender handle for sending blocks
     pub fn sender(&self) -> BlockSender {
         BlockSender {
             tx: self.outgoing_tx.clone(),
+            sends: self.sends.clone(),
         }
     }
 
@@ -615,6 +655,7 @@ impl RelayClient {
                 relay_addr,
                 payloads.clone(),
                 pacing,
+                self.sends.clone(),
             ));
         }
         while let Some(result) = tasks.join_next().await {
@@ -910,11 +951,16 @@ async fn send_payloads_to_relay(
     relay_addr: SocketAddr,
     payloads: Arc<Vec<Vec<u8>>>,
     pacing: SendPacing,
+    sends: Arc<SendCounts>,
 ) -> Result<(), TransportError> {
     let packet_count = payloads.len();
     let mut sent_since_delay = 0usize;
     for (idx, data) in payloads.iter().enumerate() {
-        socket.send_to(data, relay_addr).await?;
+        if let Err(error) = socket.send_to(data, relay_addr).await {
+            sends.errors.fetch_add(1, Ordering::Relaxed);
+            return Err(error.into());
+        }
+        sends.sent.fetch_add(1, Ordering::Relaxed);
         if pacing.should_delay(idx, packet_count, &mut sent_since_delay) {
             sleep(pacing.delay).await;
         }
