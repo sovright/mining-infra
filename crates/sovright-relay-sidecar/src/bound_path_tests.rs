@@ -1681,3 +1681,12 @@ async fn bound_sender_new_hop_legacy_receiver_delivers_nothing() {
 async fn bound_sender_legacy_hop_legacy_receiver_delivers_nothing() {
     assert_eq!(mixed(false, false, Wire::Bound).await, 0);
 }
+
+/// The relay turns away bodies past what the gate would take, so neither runs out first.
+#[test]
+fn the_relay_and_the_gate_take_as_many_bodies_for_a_block() {
+    assert_eq!(
+        sovright_relay::BoundForwardConfig::default().max_bodies_per_block,
+        DEFAULT_STRICT_BODIES_PER_BLOCK
+    );
+}

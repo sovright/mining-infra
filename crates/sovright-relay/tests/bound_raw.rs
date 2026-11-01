@@ -4,14 +4,15 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::RecvTimeoutError;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use sovright_relay::{
     AuthKey, BlockSender, BoundBlock, BoundForwardConfig, BoundRawConfig, BoundUsed, Chunk,
-    ChunkHeader, ClientConfig, KeyRole, PowResult, PowValidator, RejectAllValidator, RelayClient,
-    RelayConfig, RelayNode, RelaySession, StubPowValidator, body_frames, is_bound, sealed_body,
-    sealed_frame,
+    ChunkHeader, ClientConfig, EquihashPowValidator, KeyRole, PowResult, PowValidator,
+    RejectAllValidator, RelayClient, RelayConfig, RelayNode, RelaySession, StubPowValidator,
+    body_frames, is_bound, sealed_body, sealed_frame,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -106,16 +107,19 @@ where
     .expect("the sessions never came");
 }
 
+fn keepalive_bytes(key: [u8; 32]) -> Vec<u8> {
+    let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), "watcher", key);
+    let hmac = session.compute_hmac(&[0; 32], 0, 0, 0, &[]);
+    Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new()).to_bytes()
+}
+
 /// A socket that only watches: a real session by its keepalive, and every datagram it gets.
 struct Watcher(UdpSocket);
 
 impl Watcher {
     async fn start(node: SocketAddr, key: [u8; 32]) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let session = RelaySession::new("0.0.0.0:0".parse().unwrap(), "watcher", key);
-        let hmac = session.compute_hmac(&[0; 32], 0, 0, 0, &[]);
-        let keepalive = Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new());
-        socket.send_to(&keepalive.to_bytes(), node).await.unwrap();
+        socket.send_to(&keepalive_bytes(key), node).await.unwrap();
         Self(socket)
     }
 
@@ -169,16 +173,22 @@ async fn finished_within<V>(
 where
     V: PowValidator + Send + Sync + 'static,
 {
-    let done = || {
-        let mut left = wanted.iter();
-        left.all(|(datagram, times)| node.times_finished(from, datagram) >= *times)
-    };
     timeout(wait, async {
-        while !done() {
+        while !all_finished(node, from, wanted) {
             sleep(Duration::from_millis(5)).await;
         }
     })
     .await
+}
+
+/// Whether [`finished_within`] would be done. This one needs no timer, so it can be asked with
+/// the gate shut.
+fn all_finished<V>(node: &RelayNode<V>, from: SocketAddr, wanted: &HashMap<&[u8], u64>) -> bool
+where
+    V: PowValidator + Send + Sync + 'static,
+{
+    let mut left = wanted.iter();
+    left.all(|(datagram, times)| node.times_finished(from, datagram) >= *times)
 }
 
 fn the_block() -> Vec<u8> {
@@ -495,37 +505,104 @@ async fn a_node_without_the_path_drops_it_at_decode() {
 
 /// Stops a node inside its PoW check until it is told to go on, so a test knows which packet
 /// the node is on.
+///
+/// This holds a worker of the runtime, synchronously. While it does, nothing may be asked of
+/// the runtime that needs that worker: a new socket's readiness, or a timer, comes from a
+/// worker polling the driver. If this one was the one, nobody is, and a test waiting on it
+/// never opens the gate. So with the gate shut a test does only what needs no runtime: it
+/// sends on a [`PlainSocket`], looks at counters and waits at [`reaches_gate`]. These tests run
+/// on one worker, so that anything else fails every time and not once in a while.
+///
+/// A gate left shut gives up in the end. That frees the worker, and the node gets over it and
+/// goes on, so the stop could pass unseen. So the gate says it gave up, and the test hears it.
 struct Gate {
-    reached: UnboundedSender<()>,
+    reached: UnboundedSender<AtGate>,
     open: Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+/// What a [`Gate`] tells its test.
+#[derive(Debug, PartialEq)]
+enum AtGate {
+    Reached,
+    GaveUp,
 }
 
 impl PowValidator for Gate {
     fn validate(&self, _header: &[u8]) -> PowResult {
-        self.reached.send(()).unwrap();
-        self.open.lock().unwrap().recv().unwrap();
-        PowResult::Valid
+        // A test that went wrong has dropped its end, and that lets the node go as well.
+        let _ = self.reached.send(AtGate::Reached);
+        let open = self.open.lock().unwrap_or_else(PoisonError::into_inner);
+        match open.recv_timeout(WAIT) {
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => PowResult::Valid,
+            Err(RecvTimeoutError::Timeout) => {
+                let _ = self.reached.send(AtGate::GaveUp);
+                panic!("the test did not open the gate")
+            }
+        }
     }
 }
 
-/// How these tests used to wait: two more packets counted, read after everything was sent.
-async fn two_more_packets_counted<V>(node: &RelayNode<V>, addr: SocketAddr, socket: &UdpSocket)
+/// A socket that sends with the runtime held: a send here returns by itself, with nothing to
+/// wait for from a driver. The tokio one is the same socket, for all that needs waiting.
+struct PlainSocket(std::net::UdpSocket);
+
+impl PlainSocket {
+    fn bind() -> (Self, UdpSocket) {
+        let plain = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        plain.set_nonblocking(true).unwrap();
+        let socket = UdpSocket::from_std(plain.try_clone().unwrap()).unwrap();
+        (Self(plain), socket)
+    }
+
+    fn send(&self, to: SocketAddr, datagrams: &[Vec<u8>]) {
+        for datagram in datagrams {
+            self.0.send_to(datagram, to).unwrap();
+        }
+    }
+}
+
+/// A keepalive to send with the gate shut, on a socket bound before it was.
+fn keepalive_ready() -> (PlainSocket, Vec<u8>) {
+    let (plain, _) = PlainSocket::bind();
+    (plain, keepalive_bytes(KEY))
+}
+
+/// What a test that is stuck can say of how far the node got. The node holds the bound path's
+/// lock at the gate, so this reads nothing behind it: `bound_usage` here would stick as well.
+fn progress<V>(node: &RelayNode<V>) -> String
 where
     V: PowValidator + Send + Sync + 'static,
 {
-    let before = received(node);
-    socket.send_to(b"not a chunk", addr).await.unwrap();
-    socket.send_to(b"not a chunk", addr).await.unwrap();
-    timeout(WAIT, async {
-        while received(node) < before + 2 {
-            sleep(Duration::from_millis(5)).await;
-        }
-    })
-    .await
-    .expect("the node stopped reading");
+    let metrics = node.metrics().snapshot();
+    format!(
+        "{} packets received, {} forwarded, {} invalid chunks",
+        metrics.packets_received, metrics.packets_forwarded, metrics.invalid_chunks
+    )
 }
 
-fn gated() -> (Gate, UnboundedReceiver<()>, std::sync::mpsc::Sender<()>) {
+/// Waits for the node to reach the gate, no longer than any other wait here. `stage` says
+/// which arrival this was meant to be.
+async fn reaches_gate<V>(at_gate: &mut UnboundedReceiver<AtGate>, node: &RelayNode<V>, stage: &str)
+where
+    V: PowValidator + Send + Sync + 'static,
+{
+    match timeout(WAIT, at_gate.recv()).await {
+        Ok(Some(AtGate::Reached)) => {}
+        Ok(Some(AtGate::GaveUp)) => {
+            panic!(
+                "{stage}: the gate gave up with the test away, {}",
+                progress(node)
+            )
+        }
+        Ok(None) => panic!("{stage}: the gate is gone, {}", progress(node)),
+        Err(_) => panic!(
+            "{stage}: no arrival at the gate in {WAIT:?}, {}",
+            progress(node)
+        ),
+    }
+}
+
+fn gated() -> (Gate, UnboundedReceiver<AtGate>, std::sync::mpsc::Sender<()>) {
     let (reached, at_gate) = unbounded_channel();
     let (open, gate) = std::sync::mpsc::channel();
     let gate = Gate {
@@ -539,29 +616,31 @@ fn sealed(fill: u8) -> Vec<Vec<u8>> {
     sealed_body(&[fill; 5000], &KEY).unwrap()
 }
 
-/// The node is held on its twentieth packet with nine more behind it, and the old wait comes
-/// back all the same: packets already queued gave it its two. A test that looked then for
-/// something not sent on would have passed with the packets that matter still unread. The
-/// wait these tests use holds on until those packets are finished.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+/// The node is held on its twentieth packet with nine more behind it, and the old wait, two
+/// more packets counted, would be back all the same: packets already queued gave it its two. A
+/// test that looked then for something not sent on would have passed with the packets that
+/// matter still unread. The wait these tests use holds on until those packets are finished.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn two_more_packets_counted_can_leave_the_rest_unread() {
     let (gate, mut at_gate, open) = gated();
     let (node, addr) = start_node(gate, fleet()).await;
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (plain, socket) = PlainSocket::bind();
     let from = socket.local_addr().unwrap();
     let (first, second, third) = (sealed(1), sealed(2), sealed(3));
     let wanted = once_finished(&node, from, second[..10].iter().chain(&third[..9]));
 
     send_all(&socket, addr, &first[..10]).await;
-    at_gate.recv().await.unwrap();
+    reaches_gate(&mut at_gate, &node, "the first body's segment 0").await;
     assert_eq!(received(&node), 10);
-    send_all(&socket, addr, &second[..10]).await;
-    send_all(&socket, addr, &third[..9]).await;
+    plain.send(addr, &second[..10]);
+    plain.send(addr, &third[..9]);
+    plain.send(addr, &[b"not a chunk".to_vec(), b"not a chunk".to_vec()]);
+    let old_wait_ends_at = received(&node) + 2;
 
-    tokio::join!(two_more_packets_counted(&node, addr, &socket), async {
-        open.send(()).unwrap();
-        at_gate.recv().await.unwrap();
-    });
+    open.send(()).unwrap();
+    reaches_gate(&mut at_gate, &node, "the second body's segment 0").await;
+
+    assert!(received(&node) >= old_wait_ends_at, "the old wait is over");
     assert_eq!(received(&node), 20, "and 11 of what was sent still unread");
     assert_eq!(node.times_finished(from, &second[8]), 1);
     assert_eq!(
@@ -569,13 +648,19 @@ async fn two_more_packets_counted_can_leave_the_rest_unread() {
         0,
         "started, not done"
     );
-
-    let mut waiting = Box::pin(finished_within(&node, from, &wanted, WAIT));
-    let held = timeout(STILL_WAITING, &mut waiting).await;
-    assert!(held.is_err(), "the node has not been let on");
+    assert!(
+        !all_finished(&node, from, &wanted),
+        "the node has not been let on"
+    );
 
     open.send(()).unwrap();
-    waiting.await.unwrap();
+    let finished = finished_within(&node, from, &wanted, WAIT).await;
+    assert!(
+        finished.is_ok(),
+        "the packets behind the gate never finished: {}",
+        progress(&node)
+    );
+    assert_eq!(at_gate.try_recv().ok(), None, "no gate gave up at the end");
     assert_eq!(node.times_finished(from, &third[8]), 1);
     assert_eq!(node.bound_usage().unwrap().pool.objects, 1);
 }
@@ -583,11 +668,12 @@ async fn two_more_packets_counted_can_leave_the_rest_unread() {
 /// A test sends two packets, and a keepalive it knows nothing of takes the place of one in the
 /// count. The count says done with the second one still unread, and one of them a repeat of
 /// something already finished. Waiting for the packets themselves is not fooled by either.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 async fn a_keepalive_can_fill_a_count_and_not_this_wait() {
     let (gate, mut at_gate, open) = gated();
     let (node, addr) = start_node(gate, fleet()).await;
-    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (plain, socket) = PlainSocket::bind();
+    let (watcher, keepalive) = keepalive_ready();
     let from = socket.local_addr().unwrap();
     let (first, second, third) = (sealed(1), sealed(2), sealed(3));
     let repeated = third[0].clone();
@@ -595,16 +681,16 @@ async fn a_keepalive_can_fill_a_count_and_not_this_wait() {
     send_again(&node, addr, &socket, &second[..9]).await;
 
     send_all(&socket, addr, &first[..10]).await;
-    at_gate.recv().await.unwrap();
+    reaches_gate(&mut at_gate, &node, "the first body's segment 0").await;
     let (held_on, sent) = (second[9].clone(), [second[9].clone(), repeated.clone()]);
     let count_met_at = received(&node) + sent.len() as u64;
     let wanted = once_finished(&node, from, &sent);
     assert_eq!(wanted[repeated.as_slice()], 2);
 
-    let _keepalive = Watcher::start(addr, KEY).await;
-    send_all(&socket, addr, &sent).await;
+    watcher.send(addr, std::slice::from_ref(&keepalive));
+    plain.send(addr, &sent);
     open.send(()).unwrap();
-    at_gate.recv().await.unwrap();
+    reaches_gate(&mut at_gate, &node, "the second body, behind the keepalive").await;
 
     assert_eq!(received(&node), count_met_at, "the count says done");
     assert_eq!(
@@ -618,12 +704,50 @@ async fn a_keepalive_can_fill_a_count_and_not_this_wait() {
         1,
         "the first copy only"
     );
-    let mut waiting = Box::pin(finished_within(&node, from, &wanted, WAIT));
-    let held = timeout(STILL_WAITING, &mut waiting).await;
-    assert!(held.is_err(), "those two are not finished");
+    assert!(
+        !all_finished(&node, from, &wanted),
+        "those two are not finished"
+    );
 
     open.send(()).unwrap();
-    waiting.await.unwrap();
+    let finished = finished_within(&node, from, &wanted, WAIT).await;
+    assert!(
+        finished.is_ok(),
+        "the two packets behind the gate never finished: {}",
+        progress(&node)
+    );
+    assert_eq!(at_gate.try_recv().ok(), None, "no gate gave up at the end");
+}
+
+/// The node gets over a gate that gave up, so without this nobody would know it had.
+#[test]
+fn a_gate_that_gives_up_tells_its_test() {
+    let (gate, mut at_gate, open) = gated();
+    let held = std::thread::spawn(move || gate.validate(&[]));
+
+    assert_eq!(at_gate.blocking_recv(), Some(AtGate::Reached));
+    assert_eq!(at_gate.blocking_recv(), Some(AtGate::GaveUp));
+
+    assert!(held.join().is_err(), "and the node's worker is let go");
+    drop(open);
+}
+
+/// A test that goes wrong with the gate shut must not leave the node stopped behind it.
+#[test]
+fn a_gate_lets_the_node_go_when_its_test_has_gone() {
+    let (gate, mut at_gate, open) = gated();
+    let held = std::thread::spawn(move || [gate.validate(&[]), gate.validate(&[])]);
+    at_gate.blocking_recv().unwrap();
+
+    // One was inside when the test left, and one comes after it.
+    drop((at_gate, open));
+
+    let results = held.join().unwrap();
+    assert!(
+        results
+            .iter()
+            .all(|result| matches!(result, PowResult::Valid))
+    );
 }
 
 /// One that never came runs the wait out, and so does the same bytes from another socket.
@@ -1081,4 +1205,121 @@ async fn a_session_that_times_out_gives_its_key_room_back() {
 
     send_again(&node, addr, &late, &body).await;
     assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+}
+
+/// Real headers from genesis on, each with its real proof of work. The node has no way to
+/// tell how old they are, so each opens an anchor. See the plan's recent parent decision.
+fn old_headers() -> Vec<Vec<u8>> {
+    let listed: Vec<serde_json::Value> =
+        serde_json::from_str(fixtures::EQUIHASH_MAINNET_HEADERS).unwrap();
+    listed
+        .iter()
+        .map(|entry| hex::decode(entry["header"].as_str().unwrap()).unwrap())
+        .collect()
+}
+
+fn on_a_header(header: &[u8], length: usize) -> Vec<u8> {
+    let mut raw = header.to_vec();
+    raw.resize(length, 7);
+    raw
+}
+
+/// The review's finding, with what it takes to carry it out: real old headers, through the
+/// real check. A body in flight goes on with its anchor.
+#[tokio::test]
+async fn old_headers_cannot_take_an_active_bodys_anchor() {
+    let limits = BoundForwardConfig {
+        max_anchors: 4,
+        max_anchors_per_key: 2,
+        ..Default::default()
+    };
+    let keys = vec![AuthKey::new("fleet", KEY), AuthKey::new("alice", OTHER_KEY)];
+    let (node, addr) = start_config(relay_for(keys, limits), EquihashPowValidator).await;
+    let raw = on_a_header(&fixtures::mainnet_serialized_header(), 12_000);
+    let frames = body_frames(&raw).unwrap();
+    let first = sealed_frame(&frames[0], &KEY).unwrap();
+    let later = sealed_frame(&frames[1], &KEY).unwrap();
+    let honest = raw_session(&node, addr, &first).await;
+    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+
+    let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    for header in old_headers() {
+        let sealed = sealed_body(&on_a_header(&header, 5000), &OTHER_KEY).unwrap();
+        send_again(&node, addr, &flood, &sealed).await;
+    }
+    let sent = node.bound_usage().unwrap().objects_sent_on;
+
+    send_again(&node, addr, &honest, &later).await;
+
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_sent_on, sent + 1, "{usage:?}");
+    assert_eq!(usage.objects_waiting_for_segment_0, 0);
+}
+
+/// What stays open until there is a chain source: the check says nothing of a header's age.
+#[tokio::test]
+async fn known_gap_an_old_header_still_opens_an_anchor() {
+    let (node, addr) = start_node(EquihashPowValidator, fleet()).await;
+    let headers = old_headers();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    for header in &headers {
+        let sealed = sealed_body(&on_a_header(header, 5000), &KEY).unwrap();
+        send_again(&node, addr, &socket, &sealed).await;
+    }
+
+    assert_eq!(node.bound_usage().unwrap().anchors, headers.len());
+}
+
+#[tokio::test]
+async fn a_block_takes_only_so_many_bodies_at_a_real_node() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let limit = BoundForwardConfig::default().max_bodies_per_block;
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    for mark in 0..=limit {
+        let mut raw = vec![1u8; 5000];
+        raw[4000] = mark as u8;
+        send_again(&node, addr, &socket, &sealed_body(&raw, &KEY).unwrap()).await;
+    }
+
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_sent_on, limit as u64);
+    assert_eq!(usage.anchors_refused_for_bodies, 1);
+}
+
+/// Revoking a key does not take back what its anchors prove, or free what they hold. A key
+/// that comes back answers for them until they lapse, and then it has its share again.
+#[tokio::test]
+async fn a_revoked_key_answers_for_its_anchors_until_they_lapse() {
+    let limits = BoundForwardConfig {
+        max_anchors_per_key: 1,
+        anchor_ttl: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let (node, addr) = start_config(relay_for(fleet(), limits), StubPowValidator).await;
+    let body = |fill: u8| sealed_body(&[fill; 5000], &KEY).unwrap();
+    let socket = raw_session(&node, addr, &body(1)).await;
+    send_again(&node, addr, &socket, &body(2)).await;
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_sent_on, 1);
+    assert_eq!(usage.anchors_refused_for_room, 1);
+
+    node.apply_active_keys(Vec::new()).await;
+    assert_eq!(node.bound_usage().unwrap().anchors, 1, "it stays");
+    node.apply_active_keys(fleet()).await;
+
+    let again = raw_session(&node, addr, &body(3)).await;
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_sent_on, 1, "the key still pays: {usage:?}");
+    assert_eq!(usage.anchors_refused_for_room, 2);
+
+    timeout(WAIT, async {
+        while node.bound_usage().unwrap().objects_sent_on < 2 {
+            send_again(&node, addr, &again, &body(3)).await;
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the key never had its share again");
 }

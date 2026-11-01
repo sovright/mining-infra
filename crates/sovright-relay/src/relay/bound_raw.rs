@@ -23,7 +23,7 @@
 //! fits. None of them is a setting anyone decided, and [`SEGMENT_BYTES`] is the design's
 //! placeholder.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -181,9 +181,19 @@ pub struct BoundForwardConfig {
     /// Sends of one object past the first in a window. Past this its chunks are dropped
     /// until the window ends.
     pub max_resends: u32,
-    /// Sets whose segment 0 passed the PoW check.
+    /// Bodies whose segment 0 passed the PoW check.
     pub max_anchors: usize,
-    /// Decoded objects of one session that wait for their segment 0.
+    /// Of those, how many one key pays for at a time. A research value like the rest.
+    pub max_anchors_per_key: usize,
+    /// Bodies a block can have here, over all keys, the same number the gate takes. This is
+    /// no part of the budgets: a key inside all of its limits can use up what a block has, and
+    /// then the right body is refused until those anchors lapse, for as long as they are used.
+    pub max_bodies_per_block: usize,
+    /// How long a key's payment for an anchor lasts from that key's last use. As long as a
+    /// resend can come.
+    pub anchor_ttl: Duration,
+    /// Decoded objects of one session that wait for their segment 0, each for as long as an
+    /// open object lasts.
     pub max_unanchored: usize,
     /// Datagrams a node holds between its socket and its work, so that slow work does not
     /// leave the socket's buffer as all a burst has. Past this they stay in the socket. Zero
@@ -233,6 +243,9 @@ impl Default for BoundForwardConfig {
             resend_window: Duration::from_secs(90),
             max_resends: RESENDS,
             max_anchors: 256,
+            max_anchors_per_key: 64,
+            max_bodies_per_block: 4,
+            anchor_ttl: Duration::from_secs(90),
             max_unanchored: 64,
             max_queued_datagrams: 8192,
             max_queued_bytes: 8192 * MAX_READ_BYTES,
@@ -735,37 +748,146 @@ impl IngressQueue {
     }
 }
 
-/// Bounded and first in, first out.
+/// One body whose segment 0 passed the PoW check.
 #[derive(Debug)]
-struct Recent<T> {
-    max: usize,
-    known: HashSet<T>,
-    order: VecDeque<T>,
+struct Anchor {
+    body_id: [u8; 32],
+    /// The keys that pay for its place in the table, each up to a time of its own.
+    paid_until: HashMap<String, Instant>,
 }
 
-impl<T: Copy + Eq + std::hash::Hash> Recent<T> {
-    fn new(max: usize) -> Self {
-        Self {
-            max,
-            known: HashSet::new(),
-            order: VecDeque::new(),
+impl Anchor {
+    /// With nobody paying there is no anchor.
+    fn stands(&self, now: Instant) -> bool {
+        self.paid_until.values().any(|until| now < *until)
+    }
+
+    fn paid_by(&self, key_id: &str, now: Instant) -> bool {
+        let until = self.paid_until.get(key_id);
+        until.is_some_and(|until| now < *until)
+    }
+}
+
+/// Why a segment 0 gets no anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AnchorRefusal {
+    /// Its block has all the bodies it can have.
+    Bodies,
+    /// Its key or the table has no room.
+    Room,
+}
+
+/// Anchors by block, so a block's bodies can be counted. What one opens is the one body whose
+/// segment 0 passed: the same header says nothing about a rival body of that block.
+///
+/// Nothing here pushes anything out. With no room a new anchor is refused, so a flood of
+/// headers, old or new, cannot take an anchor a body is using, and it costs what it opened and
+/// no more.
+///
+/// An anchor stands as long as a key pays for it, and in no other way, so everything in the
+/// table is inside some key's share. [`BoundForwardConfig::max_anchors`] is a limit of its own
+/// on top of that, not what holds the keys to their shares.
+///
+/// - The key that opens an anchor pays for it, and so does any key that uses it and has room,
+///   each for [`BoundForwardConfig::anchor_ttl`] from its own last use. So a key with room has
+///   the same hold on a body under way whoever opened it.
+/// - A payment is its key's own. Another key's use neither extends it nor ends it, and neither
+///   does a session going or the key being revoked, so leaving and coming back frees nothing.
+/// - A key with no room gets through on what others pay and extends nothing, and each such use
+///   is counted. When the last payment ends the anchor goes, whoever is still using it. What
+///   comes next of that body waits for its segment 0, and a copy of that opens the anchor again
+///   once the key has room.
+///
+/// That last rule has a price: a key at its share can have a body under way stopped, however
+/// sound its anchor, when whoever paid moves on. Keeping the anchor would have to put it on
+/// nobody or past a share, and making room would push out another body of that key. Keys that
+/// work together then stay inside their shares, and so a full table takes as many keys as the
+/// table has shares.
+#[derive(Debug, Default)]
+struct Anchors {
+    blocks: HashMap<[u8; 32], Vec<Anchor>>,
+    /// Uses by a key with no room to pay. They renewed nothing.
+    uses_without_room: u64,
+}
+
+impl Anchors {
+    fn len(&self) -> usize {
+        self.blocks.values().map(Vec::len).sum()
+    }
+
+    /// What `key_id` pays for now.
+    fn of_key(&self, key_id: &str, now: Instant) -> usize {
+        let pays = |anchor: &&Anchor| anchor.paid_by(key_id, now);
+        self.blocks.values().flatten().filter(pays).count()
+    }
+
+    fn find(&mut self, key: &SetKey, now: Instant) -> Option<&mut Anchor> {
+        let bodies = self.blocks.get_mut(&key.block_hash)?;
+        let this_body = |anchor: &&mut Anchor| anchor.body_id == key.body_id && anchor.stands(now);
+        bodies.iter_mut().find(this_body)
+    }
+
+    /// Whether this very body has an anchor, used now by `key_id`, which pays for it if it can.
+    fn used(
+        &mut self,
+        key: &SetKey,
+        key_id: &str,
+        now: Instant,
+        config: &BoundForwardConfig,
+    ) -> bool {
+        let room = self.of_key(key_id, now) < config.max_anchors_per_key;
+        let Some(anchor) = self.find(key, now) else {
+            return false;
+        };
+        if room || anchor.paid_by(key_id, now) {
+            let until = now + config.anchor_ttl;
+            anchor.paid_until.insert(key_id.to_string(), until);
+        } else {
+            self.uses_without_room += 1;
         }
+        true
     }
 
-    fn contains(&self, item: &T) -> bool {
-        self.known.contains(item)
+    fn refusal(
+        &mut self,
+        key: &SetKey,
+        key_id: &str,
+        now: Instant,
+        config: &BoundForwardConfig,
+    ) -> Option<AnchorRefusal> {
+        self.forget_lapsed(now);
+        if self.find(key, now).is_some() {
+            return None;
+        }
+        let bodies = self.blocks.get(&key.block_hash).map_or(0, Vec::len);
+        if bodies >= config.max_bodies_per_block {
+            return Some(AnchorRefusal::Bodies);
+        }
+        let room = self.len() < config.max_anchors
+            && self.of_key(key_id, now) < config.max_anchors_per_key;
+        (!room).then_some(AnchorRefusal::Room)
     }
 
-    fn insert(&mut self, item: T) {
-        if !self.known.insert(item) {
+    /// Whoever opens an anchor pays for it. A key that brings a body with one has used it.
+    fn add(&mut self, key: SetKey, key_id: &str, now: Instant, config: &BoundForwardConfig) {
+        if self.used(&key, key_id, now, config) {
             return;
         }
-        self.order.push_back(item);
-        if self.order.len() > self.max
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.known.remove(&oldest);
+        let until = now + config.anchor_ttl;
+        self.blocks.entry(key.block_hash).or_default().push(Anchor {
+            body_id: key.body_id,
+            paid_until: HashMap::from([(key_id.to_string(), until)]),
+        });
+    }
+
+    fn forget_lapsed(&mut self, now: Instant) {
+        for bodies in self.blocks.values_mut() {
+            for anchor in bodies.iter_mut() {
+                anchor.paid_until.retain(|_, until| now < *until);
+            }
+            bodies.retain(|anchor| !anchor.paid_until.is_empty());
         }
+        self.blocks.retain(|_, bodies| !bodies.is_empty());
     }
 }
 
@@ -847,7 +969,15 @@ struct BoundPeer {
     budget: Budget,
     session: Assembler,
     forwarded: Forwarded,
-    unanchored: VecDeque<(SetKey, DecodedObject)>,
+    unanchored: VecDeque<Waiting>,
+}
+
+/// A decoded object whose segment 0 has not passed.
+#[derive(Debug)]
+struct Waiting {
+    key: SetKey,
+    object: DecodedObject,
+    since: Instant,
 }
 
 /// What a budget has here, on the shelf as well: moving there is no way of looking light.
@@ -883,6 +1013,16 @@ pub struct BoundNodeUsage {
     pub objects_sent_on: u64,
     pub objects_waiting_for_segment_0: usize,
     pub waiting_pushed_out: u64,
+    /// Objects that waited for their segment 0 until their time was up.
+    pub waiting_expired: u64,
+    pub anchors: usize,
+    /// Segments 0 refused because their block had all the bodies it can have.
+    pub anchors_refused_for_bodies: u64,
+    /// Segments 0 refused because their key or the table had no room for an anchor.
+    pub anchors_refused_for_room: u64,
+    /// Uses of an anchor by a key with no room to pay for it. They got through and renewed
+    /// nothing, so what they used can go while they are using it.
+    pub anchor_uses_without_room: u64,
     /// Sessions that lost what they held here to a panic. See [`BoundForwarder`].
     pub sessions_lost_to_a_panic: u64,
     /// Times everything here went because of a panic nobody could be held to.
@@ -955,7 +1095,12 @@ pub(crate) enum Trip {
 /// nothing waits for what the pool holds to finish or expire.
 ///
 /// A real header with a body of someone's own passes here as its own set. Telling such a
-/// body from the real one is for strict validation and the node behind the consumer.
+/// body from the real one is for strict validation and the node behind the consumer. Each
+/// such body takes one of its block's places, so the right one can be turned away once they
+/// are gone. See [`Anchors`] and [`BoundForwardConfig::max_bodies_per_block`].
+///
+/// The PoW check says nothing of a header's age, and the node has no chain source to ask, so
+/// any old header with a valid proof opens an anchor. Limits bound that and do not stop it.
 ///
 /// Catching a panic says nothing by itself about what it left half done. So each step here
 /// belongs to one session, whose content it works on, and that session goes if the step
@@ -979,7 +1124,7 @@ pub(crate) struct BoundForwarder {
     rules: FrameRules,
     pool: Budget,
     peers: HashMap<SocketAddr, BoundPeer>,
-    anchors: Recent<SetKey>,
+    anchors: Anchors,
     datagrams_without_a_place: u64,
     arrivals: LiveArrivals,
     frames_rejected: u64,
@@ -987,6 +1132,9 @@ pub(crate) struct BoundForwarder {
     pow_indeterminate: u64,
     objects_sent_on: u64,
     waiting_pushed_out: u64,
+    waiting_expired: u64,
+    anchors_refused_for_bodies: u64,
+    anchors_refused_for_room: u64,
     sessions_lost_to_a_panic: u64,
     panic_resets: u64,
     #[cfg(test)]
@@ -995,6 +1143,15 @@ pub(crate) struct BoundForwarder {
 
 impl BoundForwarder {
     pub(crate) fn new(config: BoundForwardConfig) -> Result<Self, InvalidLimits> {
+        if config.max_anchors == 0 {
+            return Err(InvalidLimits("max_anchors"));
+        }
+        if config.max_anchors_per_key == 0 {
+            return Err(InvalidLimits("max_anchors_per_key"));
+        }
+        if config.max_bodies_per_block == 0 {
+            return Err(InvalidLimits("max_bodies_per_block"));
+        }
         Ok(Self {
             config,
             rules: frame_rules(),
@@ -1003,7 +1160,7 @@ impl BoundForwarder {
                 Budget::new(config.pool)?
             },
             peers: HashMap::new(),
-            anchors: Recent::new(config.max_anchors),
+            anchors: Anchors::default(),
             datagrams_without_a_place: 0,
             arrivals: LiveArrivals::default(),
             frames_rejected: 0,
@@ -1011,6 +1168,9 @@ impl BoundForwarder {
             pow_indeterminate: 0,
             objects_sent_on: 0,
             waiting_pushed_out: 0,
+            waiting_expired: 0,
+            anchors_refused_for_bodies: 0,
+            anchors_refused_for_room: 0,
             sessions_lost_to_a_panic: 0,
             panic_resets: 0,
             #[cfg(test)]
@@ -1034,7 +1194,7 @@ impl BoundForwarder {
             "Bound path panicked outside any one session, starting it over"
         );
         self.peers.clear();
-        self.anchors = Recent::new(self.config.max_anchors);
+        self.anchors.blocks.clear();
         self.panic_resets += 1;
     }
 
@@ -1071,6 +1231,11 @@ impl BoundForwarder {
             objects_sent_on: self.objects_sent_on,
             objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
             waiting_pushed_out: self.waiting_pushed_out,
+            waiting_expired: self.waiting_expired,
+            anchors: self.anchors.len(),
+            anchors_refused_for_bodies: self.anchors_refused_for_bodies,
+            anchors_refused_for_room: self.anchors_refused_for_room,
+            anchor_uses_without_room: self.anchors.uses_without_room,
             sessions_lost_to_a_panic: self.sessions_lost_to_a_panic,
             panic_resets: self.panic_resets,
             ingress: BoundIngress::default(),
@@ -1135,7 +1300,7 @@ impl BoundForwarder {
         let arrival = session.receive_if(datagram, now, |object| {
             let waiting = unanchored
                 .iter()
-                .any(|(_, kept)| kept.object_id() == *object);
+                .any(|kept| kept.object.object_id() == *object);
             if !waiting && forwarded.allows(object, now, &config) {
                 Interest::New
             } else {
@@ -1243,8 +1408,11 @@ impl BoundForwarder {
             return Vec::new();
         };
         let key = segment.key();
+        let Some(key_id) = self.peers.get(&src).map(|peer| peer.key_id.clone()) else {
+            return Vec::new();
+        };
         if segment.index() != 0 {
-            if self.anchors.contains(&key) {
+            if self.anchors.used(&key, &key_id, now, &self.config) {
                 return vec![(src, decoded)];
             }
             if let Some(peer) = self.peers.get_mut(&src) {
@@ -1252,9 +1420,26 @@ impl BoundForwarder {
                     peer.unanchored.pop_front();
                     self.waiting_pushed_out += 1;
                 }
-                peer.unanchored.push_back((key, decoded));
+                peer.unanchored.push_back(Waiting {
+                    key,
+                    object: decoded,
+                    since: now,
+                });
             }
             return Vec::new();
+        }
+        // Ahead of the PoW check, which is the costly part. A body turned away leaves no
+        // record: nothing is wrong with it, and it can come again when there is room.
+        match self.anchors.refusal(&key, &key_id, now, &self.config) {
+            Some(AnchorRefusal::Bodies) => {
+                self.anchors_refused_for_bodies += 1;
+                return Vec::new();
+            }
+            Some(AnchorRefusal::Room) => {
+                self.anchors_refused_for_room += 1;
+                return Vec::new();
+            }
+            None => {}
         }
         match validate(&segment.payload()[..ZCASH_FULL_HEADER_SIZE]) {
             PowResult::Valid => {}
@@ -1268,14 +1453,14 @@ impl BoundForwarder {
                 return Vec::new();
             }
         }
-        self.anchors.insert(key);
+        self.anchors.add(key, &key_id, now, &self.config);
         let mut ready = vec![(src, decoded)];
         for (addr, peer) in &mut self.peers {
             let (anchored, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut peer.unanchored)
                 .into_iter()
-                .partition(|(waiting, _)| *waiting == key);
+                .partition(|waiting| waiting.key == key);
             peer.unanchored = rest;
-            ready.extend(anchored.into_iter().map(|(_, object)| (*addr, object)));
+            ready.extend(anchored.into_iter().map(|waiting| (*addr, waiting.object)));
         }
         #[cfg(test)]
         self.trip(Trip::Drained);
@@ -1329,10 +1514,16 @@ impl BoundForwarder {
     pub(crate) fn tidy(&mut self, now: Instant, is_live: impl Fn(&SocketAddr) -> bool) {
         self.peers.retain(|addr, _| is_live(addr));
         let window = self.config.resend_window;
+        let can_wait = assembler_limits().assembly_ttl;
         for peer in self.peers.values_mut() {
             peer.session.expire(now);
             peer.forwarded.forget_lapsed(now, window);
+            let waiting = peer.unanchored.len();
+            let in_time = |kept: &Waiting| now.saturating_duration_since(kept.since) < can_wait;
+            peer.unanchored.retain(in_time);
+            self.waiting_expired += (waiting - peer.unanchored.len()) as u64;
         }
+        self.anchors.forget_lapsed(now);
     }
 
     /// Datagrams of `object` for one session's key.
@@ -2706,5 +2897,822 @@ mod tests {
 
         assert_eq!(bound.usage().objects_sent_on, 0);
         assert_eq!(bound.usage().pool.objects, 0);
+    }
+
+    // Anchors, and what waits for them. A valid header proves nothing about how recent it is,
+    // and the node has no chain source, so anyone with a key can open anchors with old headers.
+
+    /// A body of its own under a header nobody else has, in one segment.
+    fn one_segment(mark: u32) -> Vec<Vec<u8>> {
+        let mut raw = vec![0u8; 5000];
+        raw[..4].copy_from_slice(&mark.to_le_bytes());
+        sealed_body(&raw, &KEY).unwrap()
+    }
+
+    /// A body of block 1 in one segment: the header is the same for all of them, the rest is
+    /// not, so they share a block hash and each has a body id of its own.
+    fn body_of_a_block(mark: u8) -> Vec<Vec<u8>> {
+        let mut raw = vec![1u8; 5000];
+        raw[4000] = mark;
+        sealed_body(&raw, &KEY).unwrap()
+    }
+
+    fn three_frames(fill: u8) -> SealedFrames {
+        let frames = body_frames(&vec![fill; 3 * SEGMENT_BYTES as usize]).unwrap();
+        let sealed = frames
+            .iter()
+            .map(|frame| sealed_frame(frame, &KEY).unwrap());
+        sealed.collect()
+    }
+
+    #[test]
+    fn an_active_body_keeps_its_anchor_through_a_flood() {
+        let config = config();
+        let flood = config.max_anchors as u32 + 8;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        for mark in 0..flood {
+            send_as(&mut bound, OTHER, addr(2), &one_segment(mark), now);
+        }
+
+        assert_eq!(send(&mut bound, addr(1), &later, now), 1);
+    }
+
+    /// One key for everybody is as good a layout as any, so this holds there too.
+    #[test]
+    fn a_flood_under_the_same_key_costs_an_active_body_nothing() {
+        let config = config();
+        let flood = config.max_anchors as u32 + 8;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        for mark in 0..flood {
+            send(&mut bound, addr(2), &one_segment(mark), now);
+        }
+
+        assert_eq!(send(&mut bound, addr(1), &later, now), 1);
+    }
+
+    /// One key cannot fill the table, so this is what it takes: as many keys as fill it, and
+    /// more. The body's anchor stays, and what comes past the table is turned away.
+    #[test]
+    fn a_flood_from_many_keys_costs_an_active_body_nothing() {
+        let config = config();
+        let (table, share) = (config.max_anchors, config.max_anchors_per_key);
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        for mark in 0..table + 8 {
+            let key_id = format!("key{}", mark / share);
+            let port = 100 + (mark / share) as u16;
+            send_as(
+                &mut bound,
+                &key_id,
+                addr(port),
+                &one_segment(mark as u32),
+                now,
+            );
+        }
+
+        assert_eq!(bound.usage().anchors, table, "the flood filled the table");
+        assert!(bound.usage().anchors_refused_for_room > 0);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 1);
+    }
+
+    /// Closing every session and coming back is no way round a key's share. What it opened
+    /// is still in the table, and the table is what the share is there to protect.
+    #[test]
+    fn a_key_cannot_fill_the_table_by_leaving_and_coming_back() {
+        let mut config = config();
+        config.max_anchors = 16;
+        config.max_anchors_per_key = 2;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+
+        let mut mark = 0;
+        for round in 0..8u16 {
+            for _ in 0..2 {
+                mark += 1;
+                send(&mut bound, addr(round + 1), &one_segment(mark), now);
+            }
+            bound.tidy(now, |_| false);
+        }
+
+        assert_eq!(bound.usage().anchors, 2);
+        assert_eq!(bound.anchors.of_key(FLEET, now), 2);
+    }
+
+    #[test]
+    fn a_key_that_comes_back_answers_for_what_it_opened() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        bound.tidy(now, |_| false);
+
+        assert_eq!(send(&mut bound, addr(2), &one_segment(2), now), 0);
+
+        assert_eq!(bound.usage().anchors_refused_for_room, 1);
+    }
+
+    #[test]
+    fn a_key_stops_at_its_share_of_the_anchors() {
+        let mut config = config();
+        config.max_anchors_per_key = 2;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        assert_eq!(send(&mut bound, addr(2), &one_segment(2), now), 1);
+
+        assert_eq!(send(&mut bound, addr(3), &one_segment(3), now), 0);
+
+        assert_eq!(bound.usage().anchors, 2);
+        assert_eq!(bound.usage().anchors_refused_for_room, 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(4), &one_segment(4), now), 1);
+    }
+
+    #[test]
+    fn a_full_table_refuses_a_new_anchor_and_keeps_the_ones_it_has() {
+        let mut config = config();
+        config.max_anchors = 2;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &one_segment(2), now), 1);
+
+        assert_eq!(
+            send_as(&mut bound, "third", addr(3), &one_segment(3), now),
+            0
+        );
+
+        assert_eq!(bound.usage().anchors, 2);
+        assert_eq!(bound.usage().anchors_refused_for_room, 1);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 1);
+    }
+
+    /// A body that keeps crossing keeps its anchor, past the time its segment 0 alone gives it.
+    #[test]
+    fn a_used_anchor_lasts_from_its_last_use() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let frames = three_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &frames[0], now), 1);
+
+        let used = now + ttl - Duration::from_secs(1);
+        assert_eq!(send(&mut bound, addr(1), &frames[1], used), 1);
+
+        let later = now + ttl + Duration::from_secs(30);
+        bound.tidy(later, |_| true);
+        assert_eq!(send(&mut bound, addr(1), &frames[2], later), 1);
+    }
+
+    #[test]
+    fn an_anchor_nobody_uses_goes_at_its_time() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        bound.tidy(now + ttl - Duration::from_secs(1), |_| true);
+        assert_eq!(bound.usage().anchors, 1);
+        bound.tidy(now + ttl, |_| true);
+        assert_eq!(bound.usage().anchors, 0);
+
+        assert_eq!(send(&mut bound, addr(1), &later, now + ttl), 0);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+    }
+
+    /// With no tidy since, an anchor past its time is no anchor either.
+    #[test]
+    fn an_anchor_past_its_time_opens_nothing_before_the_next_tidy() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        assert_eq!(send(&mut bound, addr(1), &later, now + ttl), 0);
+    }
+
+    #[test]
+    fn an_anchor_that_went_comes_back_with_its_segment_0() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+        bound.tidy(now + ttl, |_| true);
+        assert_eq!(send(&mut bound, addr(1), &later, now + ttl), 0);
+
+        assert_eq!(send(&mut bound, addr(1), &first, now + ttl), 2);
+
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 0);
+    }
+
+    /// Room in the table comes back with time, and a key has its share again.
+    #[test]
+    fn a_keys_share_of_the_anchors_comes_back_at_their_time() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        assert_eq!(send(&mut bound, addr(1), &one_segment(2), now), 0);
+
+        assert_eq!(send(&mut bound, addr(1), &one_segment(2), now + ttl), 1);
+    }
+
+    /// Each frame of a body, as its datagrams.
+    type SealedFrames = Vec<Vec<Vec<u8>>>;
+
+    /// Two bodies of one block: the same header, and so the same hash, in two segments each.
+    fn rivals() -> (SealedFrames, SealedFrames) {
+        let size = 2 * SEGMENT_BYTES as usize;
+        let (mut honest, mut rival) = (vec![1u8; size], vec![1u8; size]);
+        honest[size - 1] = 2;
+        rival[size - 1] = 3;
+        let frames = |raw: &[u8]| -> SealedFrames {
+            let frames = body_frames(raw).unwrap();
+            let sealed = frames
+                .iter()
+                .map(|frame| sealed_frame(frame, &KEY).unwrap());
+            sealed.collect()
+        };
+        (frames(&honest), frames(&rival))
+    }
+
+    /// A body's own segment 0 is what opens its way. Another body's, under the same header,
+    /// proves nothing about this one.
+    #[test]
+    fn a_rival_body_does_not_inherit_an_anchor() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (honest, rival) = rivals();
+        assert_eq!(send(&mut bound, addr(1), &honest[0], now), 1);
+
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &rival[1], now), 0);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+
+        assert_eq!(send(&mut bound, addr(1), &honest[1], now), 1);
+        assert_eq!(
+            bound.usage().objects_waiting_for_segment_0,
+            1,
+            "still waiting"
+        );
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &rival[0], now), 2);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 0);
+    }
+
+    #[test]
+    fn a_block_takes_only_so_many_bodies_at_a_relay() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let limit = bound.config.max_bodies_per_block as u8;
+
+        for mark in 0..limit {
+            let key_id = format!("key{mark}");
+            assert_eq!(
+                send_as(
+                    &mut bound,
+                    &key_id,
+                    addr(u16::from(mark) + 1),
+                    &body_of_a_block(mark),
+                    now
+                ),
+                1
+            );
+        }
+        let past = send_as(&mut bound, "last", addr(99), &body_of_a_block(limit), now);
+
+        assert_eq!(past, 0);
+        assert_eq!(bound.usage().anchors, usize::from(limit));
+        assert_eq!(bound.usage().anchors_refused_for_bodies, 1);
+    }
+
+    /// A body already here is not one more body, so a resend of it gets through.
+    #[test]
+    fn a_body_that_has_its_anchor_can_come_again_with_the_block_full() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let limit = bound.config.max_bodies_per_block as u8;
+        for mark in 0..limit {
+            send(&mut bound, addr(1), &body_of_a_block(mark), now);
+        }
+
+        let resent = send(
+            &mut bound,
+            addr(1),
+            &body_of_a_block(0),
+            now + Duration::from_secs(3),
+        );
+
+        assert_eq!(resent, 1);
+        assert_eq!(bound.usage().anchors_refused_for_bodies, 0);
+    }
+
+    /// A body turned away is no bad body: it leaves no record, and once a place is free it
+    /// gets through.
+    #[test]
+    fn a_body_turned_away_can_cross_when_its_block_has_room() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let limit = bound.config.max_bodies_per_block as u8;
+        for mark in 0..limit {
+            send(&mut bound, addr(1), &body_of_a_block(mark), now);
+        }
+        assert_eq!(send(&mut bound, addr(2), &body_of_a_block(limit), now), 0);
+
+        bound.tidy(now + ttl, |_| true);
+
+        assert_eq!(
+            send(&mut bound, addr(2), &body_of_a_block(limit), now + ttl),
+            1
+        );
+    }
+
+    /// What the limit on bodies and the limits on keys have to do with each other: nothing
+    /// yet. A key inside all of its limits can take every body a block has, and a real
+    /// body under that block is refused until those anchors go.
+    #[test]
+    fn known_gap_one_key_inside_its_limits_can_use_up_a_blocks_bodies() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let limit = bound.config.max_bodies_per_block as u8;
+        for mark in 0..limit {
+            assert_eq!(
+                send_as(&mut bound, OTHER, addr(1), &body_of_a_block(mark), now),
+                1
+            );
+        }
+        let key = bound.key_used(OTHER);
+        assert!(key.objects < bound.config.key_budget.max_objects);
+        assert!(bound.usage().anchors < bound.config.max_anchors_per_key);
+
+        assert_eq!(send(&mut bound, addr(2), &body_of_a_block(limit), now), 0);
+    }
+
+    #[test]
+    fn a_frame_waiting_for_segment_0_gives_its_room_back() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let time = assembler_limits().assembly_ttl;
+        hold_decoded(&mut bound, addr(1), 1, now);
+        let held = bound.usage().pool.held_bytes;
+        assert!(held > 0);
+
+        bound.tidy(now + time - Duration::from_secs(1), |_| true);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+        assert_eq!(bound.usage().pool.held_bytes, held);
+
+        bound.tidy(now + time, |_| true);
+
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 0);
+        assert_eq!(bound.usage().pool.held_bytes, 0);
+        assert_eq!(bound.key_used(FLEET).held_bytes, 0);
+        assert_eq!(bound.usage().waiting_expired, 1);
+    }
+
+    /// Its time up, the object is not refused: a copy can wait again.
+    #[test]
+    fn a_frame_that_stopped_waiting_can_come_again() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let time = assembler_limits().assembly_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 0);
+        bound.tidy(now + time, |_| true);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 0);
+
+        let again = now + time + Duration::from_secs(1);
+        assert_eq!(send(&mut bound, addr(1), &later, again), 0);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+        assert_eq!(send(&mut bound, addr(1), &first, again), 2);
+    }
+
+    /// A session waits for no more than its limit, whatever its budget has room for.
+    #[test]
+    fn a_session_keeps_only_so_many_objects_waiting() {
+        let mut config = config();
+        config.max_unanchored = 2;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+
+        for fill in 1..=3 {
+            assert_eq!(send(&mut bound, addr(1), &two_frames(fill).1, now), 0);
+        }
+
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 2);
+        assert_eq!(bound.usage().waiting_pushed_out, 1);
+    }
+
+    #[test]
+    fn a_rival_segment_0_does_not_release_another_bodys_frames() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (honest, rival) = rivals();
+        assert_eq!(send(&mut bound, addr(1), &honest[1], now), 0);
+
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &rival[0], now), 1);
+
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+        assert_eq!(bound.usage().anchors, 1);
+        assert_eq!(send(&mut bound, addr(1), &honest[0], now), 2);
+        assert_eq!(bound.usage().anchors, 2);
+    }
+
+    /// One body is one anchor, however many keys bring it, and each key with room pays for it.
+    #[test]
+    fn a_body_from_two_keys_is_one_anchor_both_pay_for() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (first, _) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &first, now), 1);
+
+        assert_eq!(bound.usage().anchors, 1);
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+        assert_eq!(bound.anchors.of_key(OTHER, now), 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &one_segment(2), now), 0);
+    }
+
+    #[test]
+    fn a_key_at_its_share_can_still_bring_a_body_with_an_anchor() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &one_segment(2), now), 1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &first, now), 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &later, now), 1);
+
+        assert_eq!(bound.usage().anchors_refused_for_room, 0);
+        assert_eq!(bound.usage().anchor_uses_without_room, 2);
+        assert_eq!(bound.anchors.of_key(OTHER, now), 1);
+    }
+
+    /// Using a body's anchor keeps it, at the cost of the key that used it. The first key's
+    /// time stays its own.
+    #[test]
+    fn another_keys_use_keeps_an_anchor_at_its_own_cost() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        let used = now + ttl - Duration::from_secs(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &later, used), 1);
+        let first_time_up = now + ttl;
+        bound.tidy(first_time_up, |_| true);
+
+        assert_eq!(bound.usage().anchors, 1);
+        assert_eq!(bound.anchors.of_key(FLEET, first_time_up), 0);
+        assert_eq!(bound.anchors.of_key(OTHER, first_time_up), 1);
+    }
+
+    /// A payment does not end with its key's sessions, so the anchor stays and its key goes on
+    /// paying to the end of it.
+    #[test]
+    fn a_key_with_no_session_left_keeps_paying_and_its_anchors_stay() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+        open_as(&mut bound, OTHER, addr(2), 9, now);
+
+        bound.tidy(now, |src| *src != addr(1));
+
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+        assert_eq!(bound.usage().anchors, 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &later, now), 1);
+        assert_eq!(bound.anchors.of_key(OTHER, now), 1);
+        assert_eq!(send(&mut bound, addr(3), &one_segment(3), now), 0);
+
+        let lapsed = now + ttl;
+        assert_eq!(send(&mut bound, addr(3), &one_segment(3), lapsed), 1);
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+        assert_eq!(bound.usage().anchors, 1);
+    }
+
+    /// One opens, another goes on using, the first uses it no more. The body under way keeps
+    /// its anchor, and nobody's use holds down the share of a key that has moved on.
+    #[test]
+    fn a_key_stops_paying_when_only_another_key_uses_its_anchor() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let frames: Vec<_> = body_frames(&vec![1u8; 4 * SEGMENT_BYTES as usize])
+            .unwrap()
+            .iter()
+            .map(|frame| sealed_frame(frame, &KEY).unwrap())
+            .collect();
+        assert_eq!(send(&mut bound, addr(1), &frames[0], now), 1);
+
+        let renewed = now + ttl - Duration::from_secs(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &frames[1], renewed), 1);
+
+        let past_its_own_time = now + ttl;
+        assert_eq!(
+            send(&mut bound, addr(1), &one_segment(2), past_its_own_time),
+            1
+        );
+        let still_under_way = renewed + ttl - Duration::from_secs(1);
+        assert_eq!(
+            send_as(&mut bound, OTHER, addr(2), &frames[2], still_under_way),
+            1
+        );
+    }
+
+    /// Using an anchor is not ending someone else's charge either.
+    #[test]
+    fn another_keys_use_does_not_end_a_charge_early() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        let used = now + ttl - Duration::from_secs(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &later, used), 1);
+
+        assert_eq!(send(&mut bound, addr(1), &one_segment(2), used), 0);
+        assert_eq!(bound.anchors.of_key(FLEET, used), 1);
+    }
+
+    /// A key's own use goes on costing it.
+    #[test]
+    fn a_key_that_keeps_using_what_it_opened_keeps_paying() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &first, now), 1);
+
+        let used = now + ttl - Duration::from_secs(1);
+        assert_eq!(send(&mut bound, addr(1), &later, used), 1);
+
+        let its_first_time_up = now + ttl;
+        assert_eq!(bound.anchors.of_key(FLEET, its_first_time_up), 1);
+        assert_eq!(
+            send(&mut bound, addr(3), &one_segment(2), its_first_time_up),
+            0
+        );
+    }
+
+    /// The first key's time runs out, and the key still using the anchor has paid for it since
+    /// it first did. The first has its share back, and the body has lost nothing.
+    #[test]
+    fn a_key_still_using_an_anchor_holds_it_after_the_first_stops() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let frames = three_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &frames[0], now), 1);
+        let renewed = now + ttl - Duration::from_secs(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &frames[1], renewed), 1);
+
+        let later = now + ttl + Duration::from_secs(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &frames[2], later), 1);
+
+        assert_eq!(bound.anchors.of_key(FLEET, later), 0);
+        assert_eq!(bound.anchors.of_key(OTHER, later), 1);
+        assert_eq!(
+            send_as(&mut bound, OTHER, addr(2), &one_segment(3), later),
+            0
+        );
+    }
+
+    /// What cannot all be had. `OTHER` is at its share with a body of its own, and uses a body
+    /// `FLEET` opened, which gets through on what `FLEET` pays and extends nothing. When `FLEET`
+    /// stops the anchor could stay only with nobody paying or with `OTHER` past its share, and
+    /// making room would cost `OTHER` its own body. So it goes. What comes next of that body
+    /// waits, and a copy of its segment 0 opens the way once `OTHER` has room.
+    #[test]
+    fn a_body_under_way_waits_when_its_key_has_no_room_and_nobody_pays() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let frames = three_frames(1);
+        let (own, own_later) = two_frames(2);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &own, now), 1);
+        assert_eq!(send(&mut bound, addr(1), &frames[0], now), 1);
+        let renewed = now + Duration::from_secs(10);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &own_later, renewed), 1);
+
+        let used = now + ttl - Duration::from_secs(1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &frames[1], used), 1);
+        assert_eq!(bound.usage().anchor_uses_without_room, 1);
+
+        let stopped = now + ttl;
+        assert_eq!(bound.anchors.of_key(FLEET, stopped), 0);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &frames[2], stopped), 0);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &frames[0], stopped), 0);
+        assert_eq!(bound.usage().anchors_refused_for_room, 1);
+        assert_eq!(bound.anchors.of_key(OTHER, stopped), 1, "its own, no more");
+
+        let room_back = renewed + ttl;
+        bound.tidy(room_back, |_| true);
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
+        assert_eq!(
+            send_as(&mut bound, OTHER, addr(2), &frames[0], room_back),
+            2
+        );
+        assert_eq!(bound.usage().objects_waiting_for_segment_0, 0);
+    }
+
+    /// What two keys came to against a table of four shares: the anchors after each time the
+    /// first opened, then at the end those in the table, those the three keys pay for, what a
+    /// third key got through and how often the table turned something away.
+    type TwoKeys = (Vec<usize>, usize, usize, usize, u64);
+
+    /// Each opens no more than its share and they work together. `FLEET` opens its share each
+    /// time its last payment runs out and `OTHER` uses all of it, from the opening on if
+    /// `other_opens`, in time for nothing to lapse. If `leave`, every session goes each round.
+    fn two_keys_against_the_table(other_opens: bool, rounds: usize, leave: bool) -> TwoKeys {
+        let mut config = config();
+        config.max_anchors = 8;
+        config.max_anchors_per_key = 2;
+        let share = config.max_anchors_per_key;
+        let (mut bound, start) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        let bodies: Vec<SealedFrames> = (1..=12u8)
+            .map(|fill| {
+                let frames = body_frames(&vec![fill; 6 * SEGMENT_BYTES as usize]).unwrap();
+                let sealed = frames
+                    .iter()
+                    .map(|frame| sealed_frame(frame, &KEY).unwrap());
+                sealed.collect()
+            })
+            .collect();
+        let mut fresh = bodies.iter();
+        let mut opened = Vec::new();
+        if other_opens {
+            for body in fresh.by_ref().take(share) {
+                send_as(&mut bound, OTHER, addr(2), &body[0], start);
+                opened.push(body);
+            }
+        }
+        let (mut standing, mut end) = (Vec::new(), start);
+        for round in 0..rounds {
+            let at = start + ttl * round as u32;
+            for body in fresh.by_ref().take(share) {
+                send_as(&mut bound, FLEET, addr(1), &body[0], at);
+                opened.push(body);
+            }
+            standing.push(bound.usage().anchors);
+            end = at + ttl - Duration::from_secs(1 + round as u64);
+            for body in &opened {
+                send_as(&mut bound, OTHER, addr(2), &body[round + 1], end);
+            }
+            if leave {
+                bound.tidy(end, |_| false);
+            }
+        }
+        let third = send_as(&mut bound, "third", addr(3), &one_segment(99), end);
+        let usage = bound.usage();
+        let keys = [FLEET, OTHER, "third"];
+        let paid = keys.map(|key_id| bound.anchors.of_key(key_id, end));
+        (
+            standing,
+            usage.anchors,
+            paid.iter().sum(),
+            third,
+            usage.anchors_refused_for_room,
+        )
+    }
+
+    #[test]
+    fn two_keys_cannot_fill_the_table_past_their_shares() {
+        assert_eq!(
+            two_keys_against_the_table(true, 3, false),
+            (vec![4, 4, 4], 5, 5, 1, 0)
+        );
+    }
+
+    #[test]
+    fn two_keys_leaving_and_coming_back_stay_inside_their_shares() {
+        assert_eq!(
+            two_keys_against_the_table(true, 3, true),
+            (vec![4, 4, 4], 5, 5, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_key_that_opens_nothing_adds_no_more_than_its_share() {
+        assert_eq!(
+            two_keys_against_the_table(false, 4, false),
+            (vec![2, 4, 4, 4], 5, 5, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_key_with_a_session_left_keeps_paying() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        open_one(&mut bound, addr(2), 9, now);
+
+        bound.tidy(now, |src| *src != addr(1));
+
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+    }
+
+    /// With no session left an anchor still goes at its time, and its charge with it.
+    #[test]
+    fn an_anchor_of_a_key_with_no_session_goes_at_its_time() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        bound.tidy(now, |_| false);
+        assert_eq!(bound.usage().anchors, 1);
+
+        bound.tidy(now + ttl, |_| false);
+
+        assert_eq!(bound.usage().anchors, 0);
+        assert_eq!(bound.anchors.of_key(FLEET, now), 0);
+        assert!(bound.anchors.blocks.is_empty());
+    }
+
+    #[test]
+    fn an_anchor_that_goes_takes_its_charge_and_its_block_with_it() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let ttl = bound.config.anchor_ttl;
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+
+        bound.tidy(now + ttl, |_| true);
+
+        assert_eq!(bound.anchors.of_key(FLEET, now), 0);
+        assert!(bound.anchors.blocks.is_empty());
+    }
+
+    /// A panic takes a session and not what its key has opened, nor what that costs.
+    #[test]
+    fn a_panic_does_not_free_what_its_key_opened() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        bound.trips = vec![Trip::Arrived(addr(1))];
+
+        open_one(&mut bound, addr(1), 9, now);
+
+        assert!(bound.trips.is_empty(), "it never got as far as the panic");
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+        bound.tidy(now, |_| true);
+        assert_eq!(bound.anchors.of_key(FLEET, now), 1);
+        assert_eq!(bound.usage().anchors, 1);
+    }
+
+    #[test]
+    fn starting_over_forgets_every_anchor_and_who_paid() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &one_segment(2), now), 1);
+        assert_eq!(send_as(&mut bound, OTHER, addr(2), &one_segment(1), now), 1);
+
+        bound.start_over();
+
+        let usage = bound.usage();
+        assert_eq!(usage.anchors, 0);
+        assert_eq!(usage.anchor_uses_without_room, 1, "the count stays");
+        assert_eq!(bound.anchors.of_key(FLEET, now), 0);
+    }
+
+    #[test]
+    fn anchor_limits_of_zero_do_not_start() {
+        for limit in 0..3 {
+            let mut config = config();
+            match limit {
+                0 => config.max_anchors = 0,
+                1 => config.max_anchors_per_key = 0,
+                _ => config.max_bodies_per_block = 0,
+            }
+            assert!(BoundForwarder::new(config).is_err());
+        }
+    }
+
+    /// Asking again takes a look at the table. It costs the PoW check nothing, so a segment 0
+    /// turned away is not worth a flood.
+    #[test]
+    fn a_body_turned_away_costs_no_pow_check() {
+        let mut config = config();
+        config.max_anchors_per_key = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        assert_eq!(send(&mut bound, addr(1), &one_segment(1), now), 1);
+        let checks = std::cell::Cell::new(0);
+        let count = |_: &[u8]| {
+            checks.set(checks.get() + 1);
+            PowResult::Valid
+        };
+
+        for datagram in one_segment(2) {
+            bound.take(addr(1), KEY, FLEET, &datagram, now, count);
+        }
+
+        assert_eq!(checks.get(), 0);
+        assert_eq!(bound.usage().anchors_refused_for_room, 1);
     }
 }
