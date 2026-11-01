@@ -689,13 +689,12 @@ fn a_full_table_moves_the_object_that_stopped_and_it_can_still_finish() {
 }
 
 /// The object that waited longest is the one to move, so an object still taking chunks
-/// keeps its place. With no room on the shelf a move is a loss, which shows which one went.
+/// keeps its place.
 #[test]
 fn the_object_still_taking_chunks_keeps_its_place() {
     let (first, second, third) = (honest(), other(), object(RAW, 6, 4, 3, 40));
     let budget = Budget::new(Limits {
         max_objects: 2,
-        max_spare_bytes: 1,
         ..*roomy().limits()
     })
     .unwrap();
@@ -710,7 +709,9 @@ fn the_object_still_taking_chunks_keeps_its_place() {
 
     pending(assembler.receive(&datagram(&third, 0), now));
 
-    assert_eq!(assembler.have(&second.object_id), 0, "the one that waited");
+    assert_eq!(assembler.state().spares, 1, "the one that waited moved");
+    assert_eq!(assembler.state().open, 2);
+    assert_eq!(assembler.have(&second.object_id), 2);
     assert_eq!(assembler.have(&first.object_id), 3);
     let done = decoded(assembler.receive(&frames[3], now));
     assert_eq!(done.content(), content(10, 40));
@@ -899,11 +900,11 @@ fn own_objects_that_stopped_cannot_hold_the_budget() {
     assert_eq!(done.content(), content(10, 40));
 }
 
-/// What rule 6 costs. A sender with the key that opens new objects faster than an honest
-/// object's chunks come pushes it out of its place and then off the shelf, and what it had
-/// is gone. It takes as many new objects as there are places on both, between two chunks.
+/// A sender with the key that opens new objects faster than an honest object's chunks come
+/// can push it out of its place and onto the shelf, and no further: past as many new objects
+/// as there are places on both, the new ones are refused.
 #[test]
-fn known_gap_a_flood_of_new_objects_can_push_an_open_object_off_the_shelf() {
+fn a_flood_of_new_objects_cannot_push_an_open_object_off_the_shelf() {
     let (normal, shelf) = (2, 2);
     let budget = Budget::new(Limits {
         max_objects: normal,
@@ -926,8 +927,12 @@ fn known_gap_a_flood_of_new_objects_can_push_an_open_object_off_the_shelf() {
         "one short of the limit"
     );
 
-    pending(assembler.receive(&datagram(&object(RAW, 6, 4, 200, 40), 0), now));
-    assert_eq!(assembler.have(&honest.object_id), 0);
+    let refused = assembler.receive(&datagram(&object(RAW, 6, 4, 200, 40), 0), now);
+    assert!(
+        matches!(refused, Arrival::Refused(Refusal::Objects)),
+        "{refused:?}"
+    );
+    assert_eq!(assembler.have(&honest.object_id), 2);
 }
 
 // A spare's own way out. Making its place moves a stopped object to a full shelf, and the
@@ -997,13 +1002,9 @@ fn the_chunk_that_finishes_a_spare_does_not_push_it_off_the_shelf() {
     let arrival = decoded(assembler.receive(&frames[9], now));
 
     assert_eq!(arrival.content(), &content(250, 4000)[..]);
-    assert_eq!(assembler.state().open, 31, "one stopped object moved");
-    assert_eq!(
-        assembler.state().spares,
-        7,
-        "and the oldest other spare went"
-    );
-    assert_eq!(budget.used().objects, 31);
+    assert_eq!(assembler.state().open, 32, "nothing moved for it");
+    assert_eq!(assembler.state().spares, 7, "and only it left the shelf");
+    assert_eq!(budget.used().objects, 32);
     assert_eq!(budget.used().spare_objects, 7);
 }
 
@@ -1045,12 +1046,18 @@ fn a_look_over_the_shelf_keeps_the_spare_it_is_decoding() {
     assert_eq!(arrival.content(), &content(250, 4000)[..]);
 }
 
-/// The first decode's place costs the next spare on the list its own.
+/// With the bytes short too, the first decode's place moves a stopped object, and that
+/// costs the next spare on the list its own.
 #[test]
 fn a_look_over_the_shelf_passes_over_a_spare_that_has_gone() {
-    let (budget, mut assembler) = a_nodes_session();
-    let now = Instant::now();
     let (first, second) = (whole_object(), object(RAW, 13, 10, 251, 4000));
+    let budget = Budget::new(Limits {
+        max_held_bytes: 32 * held_bytes(&first.shape),
+        ..*a_nodes_session().0.limits()
+    })
+    .unwrap();
+    let mut assembler = assembler_on(&budget);
+    let now = Instant::now();
     shelve_whole(&mut assembler, &first, now);
     shelve_whole(&mut assembler, &second, now);
     crowd(&mut assembler, 38, now);

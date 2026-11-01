@@ -23,6 +23,9 @@ pub enum Profile {
     /// The fixed `13 / 10` and the formulas in `fec/mod.rs` today: `max(1, ceil(k / 8))`
     /// parity, and `max(2, ceil(k / 4))` for a skeleton.
     Research,
+    /// The one shape a bound sender uses for a segment, `13 / 10`. What a datagram declares
+    /// here stays near what it costs to send, and a frame has one encoding and so one id.
+    BoundSegment,
     /// Whatever the format can express, for vectors and for adversarial tests. Nothing
     /// bounds the cost of this one but the budget.
     EveryShape,
@@ -37,6 +40,7 @@ impl Profile {
         };
         match self {
             Self::Research => fixed || shape.n == shape.k + parity,
+            Self::BoundSegment => fixed && shape.msg_type == MSG_RAW_SEGMENT,
             Self::EveryShape => true,
         }
     }
@@ -73,6 +77,13 @@ impl Shape {
 pub fn held_bytes(shape: &Shape) -> usize {
     let (n, k, s) = shape.sizes();
     k * s + n * size_of::<Option<Vec<u8>>>()
+}
+
+/// The shortest content this shape can carry by D2: anything shorter would fit in a smaller
+/// `s`, and no canonical sender does that.
+pub fn least_content(shape: &Shape) -> usize {
+    let (_, k, s) = shape.sizes();
+    (k * (s - 1) + 1).saturating_sub(LENGTH_LEN).max(1)
 }
 
 /// What the budget charges for one [`decode`], on top of the held shards. Each term is

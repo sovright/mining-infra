@@ -158,9 +158,13 @@ impl Default for BoundRawConfig {
 /// A node's research values, for one session and for the node.
 #[derive(Clone, Copy, Debug)]
 pub struct BoundForwardConfig {
-    /// What one session can hold. Only a session holding less can push it, and only when
-    /// the pool is full. See [`BoundForwarder`].
+    /// What one session can hold. See [`BoundForwarder`] for when another can ask it to
+    /// make room.
     pub session_budget: BudgetLimits,
+    /// What all sessions of one verified key can hold together, and how many there can be.
+    /// Like every value here this is for research, and it assumes nothing about how a fleet
+    /// lays out its keys: with one key for everybody, this binds them all as one.
+    pub key_budget: BudgetLimits,
     /// What all sessions together can hold, and how many there can be on this path. Every
     /// reservation of a session counts here too.
     pub pool: BudgetLimits,
@@ -205,6 +209,14 @@ impl Default for BoundForwardConfig {
                 max_work_bytes: 1 << 20,
                 max_spare_objects: 8,
                 max_spare_bytes: 1 << 18,
+            },
+            key_budget: BudgetLimits {
+                max_sessions: 64,
+                max_objects: 512,
+                max_held_bytes: 4 << 20,
+                max_work_bytes: 1 << 20,
+                max_spare_objects: 64,
+                max_spare_bytes: 1 << 20,
             },
             pool: BudgetLimits {
                 max_sessions: 256,
@@ -355,7 +367,7 @@ impl LiveArrivals {
             Arrival::Refused(Refusal::Objects) => &self.refused_for_objects,
             Arrival::Refused(Refusal::HeldBytes) => &self.refused_for_bytes,
             Arrival::Refused(Refusal::WorkBytes) => &self.refused_for_work,
-            Arrival::Refused(Refusal::Shared) => &self.refused_by_pool,
+            Arrival::Refused(Refusal::Shared | Refusal::Outer) => &self.refused_by_pool,
             Arrival::Refused(_) => &self.refused_otherwise,
         };
         add(count, 1);
@@ -494,7 +506,7 @@ impl BoundReceiver {
         config: &BoundRawConfig,
         consumer: mpsc::Sender<BoundBlock>,
     ) -> Option<Self> {
-        let stack = Stack::new(key, Profile::Research, frame_rules(), config.stack).ok()?;
+        let stack = Stack::new(key, Profile::BoundSegment, frame_rules(), config.stack).ok()?;
         let bridge = stack.bridge().ok()?;
         let session = stack.session().ok()?;
         Some(Self {
@@ -830,19 +842,27 @@ impl Forwarded {
 #[derive(Debug)]
 struct BoundPeer {
     key: [u8; 32],
+    key_id: String,
+    key_budget: Budget,
     budget: Budget,
     session: Assembler,
     forwarded: Forwarded,
     unanchored: VecDeque<(SetKey, DecodedObject)>,
 }
 
+/// What a budget has here, on the shelf as well: moving there is no way of looking light.
+fn share_of(budget: &Budget) -> usize {
+    let used = budget.used();
+    used.held_bytes + used.spare_bytes
+}
+
 impl BoundPeer {
-    fn holds(&self) -> usize {
-        self.budget.used().held_bytes
+    fn share(&self) -> usize {
+        share_of(&self.budget)
     }
 
-    fn give_way(&mut self) -> bool {
-        self.session.give_way() || self.unanchored.pop_front().is_some()
+    fn key_share(&self) -> usize {
+        share_of(&self.key_budget)
     }
 }
 
@@ -912,12 +932,27 @@ pub(crate) enum Trip {
 /// one session is at most `1 + max_resends` sends in a window, at any rate of resending.
 /// The receiver counts for itself, so what gets through is the lower of the two.
 ///
-/// All sessions share a pool, and each has limits of its own inside it. Sharing costs what
-/// separate budgets gave, that one session cannot touch another, so a session the pool
-/// refuses can ask for room: the session holding the most moves its longest-waiting object
-/// aside, as long as that is more than the one asking holds. So a session is only ever
-/// pushed by one holding less, and however many sessions fill the pool, each keeps about
-/// its share. A session the pool has no place for gets nothing here.
+/// All sessions share a pool, and each has limits of its own inside it. Between the two
+/// stands the budget of the verified key, which all sessions of that key share: a source port
+/// costs nothing, so a limit has to hold to the key. How many keys a fleet has is not known
+/// here, and with a single key its limit binds everybody as one. Sessions that came in
+/// without authentication are one key.
+///
+/// Sharing costs what separate budgets gave, that one session cannot touch another, so a
+/// session that is refused can ask for room, on these terms:
+///
+/// - It holds something itself, open, decoded or on its shelf. A session holding nothing
+///   earns nothing, or anybody could push with no cost at all.
+/// - If the pool refused, the one that moves belongs to the key with the largest share, as
+///   long as that is more than the share of the key asking, shelves and all sessions
+///   counted. Failing that it is a session of its own key.
+/// - If its key refused, only a session of that key holding more than it does can move.
+/// - What moves is the longest-waiting open object, to its own session's shelf, where it can
+///   still finish. If the shelf cannot take it, nothing moves and the newcomer is refused.
+///   Nothing already here is deleted, and that goes for decoded objects waiting too.
+///
+/// A session the pool or its key has no place for gets nothing here, and a session holding
+/// nothing waits for what the pool holds to finish or expire.
 ///
 /// A real header with a body of someone's own passes here as its own set. Telling such a
 /// body from the real one is for strict validation and the node behind the consumer.
@@ -963,7 +998,10 @@ impl BoundForwarder {
         Ok(Self {
             config,
             rules: frame_rules(),
-            pool: Budget::new(config.pool)?,
+            pool: {
+                Budget::new(config.key_budget)?;
+                Budget::new(config.pool)?
+            },
             peers: HashMap::new(),
             anchors: Recent::new(config.max_anchors),
             datagrams_without_a_place: 0,
@@ -1013,6 +1051,13 @@ impl BoundForwarder {
         }
     }
 
+    /// What all sessions of a key hold.
+    #[cfg(test)]
+    fn key_used(&self, key_id: &str) -> BoundUsed {
+        let peer = self.peers.values().find(|peer| peer.key_id == key_id);
+        peer.map_or_else(BoundUsed::default, |peer| peer.key_budget.used())
+    }
+
     pub(crate) fn usage(&self) -> BoundNodeUsage {
         BoundNodeUsage {
             pool: self.pool.used(),
@@ -1037,19 +1082,31 @@ impl BoundForwarder {
         peers.map(|peer| peer.forwarded.len()).sum()
     }
 
-    fn peer(&mut self, src: SocketAddr, key: [u8; 32]) -> Option<&mut BoundPeer> {
-        if self.peers.get(&src).is_some_and(|peer| peer.key != key) {
+    /// The budget all sessions of `key_id` share. It lasts as long as they do.
+    fn key_budget(&self, key_id: &str) -> Option<Budget> {
+        match self.peers.values().find(|peer| peer.key_id == key_id) {
+            Some(peer) => Some(peer.key_budget.clone()),
+            None => Budget::within(self.config.key_budget, &self.pool).ok(),
+        }
+    }
+
+    fn peer(&mut self, src: SocketAddr, key: [u8; 32], key_id: &str) -> Option<&mut BoundPeer> {
+        let moved_on = |peer: &BoundPeer| peer.key != key || peer.key_id != key_id;
+        if self.peers.get(&src).is_some_and(moved_on) {
             self.peers.remove(&src);
         }
         if !self.peers.contains_key(&src) {
-            let budget = Budget::within(self.config.session_budget, &self.pool).ok()?;
-            let verifier = Verifier::new(key, Profile::Research);
+            let key_budget = self.key_budget(key_id)?;
+            let budget = Budget::within(self.config.session_budget, &key_budget).ok()?;
+            let verifier = Verifier::new(key, Profile::BoundSegment);
             let Ok(session) = Assembler::new(verifier, budget.clone(), assembler_limits()) else {
                 self.datagrams_without_a_place += 1;
                 return None;
             };
             let peer = BoundPeer {
                 key,
+                key_id: key_id.to_string(),
+                key_budget,
                 budget,
                 session,
                 forwarded: Forwarded::default(),
@@ -1064,6 +1121,7 @@ impl BoundForwarder {
         &mut self,
         src: SocketAddr,
         key: [u8; 32],
+        key_id: &str,
         datagram: &[u8],
         now: Instant,
     ) -> Option<Arrival> {
@@ -1073,7 +1131,7 @@ impl BoundForwarder {
             forwarded,
             unanchored,
             ..
-        } = self.peer(src, key)?;
+        } = self.peer(src, key, key_id)?;
         let arrival = session.receive_if(datagram, now, |object| {
             let waiting = unanchored
                 .iter()
@@ -1091,20 +1149,32 @@ impl BoundForwarder {
         Some(arrival)
     }
 
-    /// The pool had no room for `src`. See the note on [`BoundForwarder`].
-    fn someone_heavier_gives_way(&mut self, src: SocketAddr) -> bool {
-        let own = self.peers.get(&src).map_or(0, BoundPeer::holds);
-        let others = self.peers.iter().filter(|(addr, _)| **addr != src);
-        let Some((heaviest, peer)) = others.max_by_key(|(_, peer)| peer.holds()) else {
+    /// The pool, or `src`'s key, had no room for it. See the note on [`BoundForwarder`].
+    fn someone_heavier_gives_way(&mut self, src: SocketAddr, refusal: Refusal) -> bool {
+        let Some(asking) = self.peers.get(&src).filter(|peer| peer.share() > 0) else {
             return false;
         };
-        if peer.holds() <= own {
+        let (own, own_key) = (asking.share(), asking.key_share());
+        let heavier = |peer: &BoundPeer| {
+            if peer.key_id == asking.key_id {
+                peer.share() > own
+            } else {
+                refusal == Refusal::Outer && peer.key_share() > own_key
+            }
+        };
+        let others = self
+            .peers
+            .iter()
+            .filter(|(addr, peer)| **addr != src && peer.session.has_open() && heavier(peer));
+        let weight =
+            |peer: &BoundPeer| (peer.key_id != asking.key_id, peer.key_share(), peer.share());
+        let Some((heaviest, _)) = others.max_by_key(|(_, peer)| weight(peer)) else {
             return false;
-        }
+        };
         let heaviest = *heaviest;
         let give_way = |this: &mut Self| {
             let peer = this.peers.get_mut(&heaviest);
-            let moved = peer.is_some_and(BoundPeer::give_way);
+            let moved = peer.is_some_and(|peer| peer.session.give_way());
             #[cfg(test)]
             this.trip(Trip::GaveWay(heaviest));
             moved
@@ -1117,16 +1187,17 @@ impl BoundForwarder {
         &mut self,
         src: SocketAddr,
         key: [u8; 32],
+        key_id: &str,
         datagram: &[u8],
         now: Instant,
         validate: impl Fn(&[u8]) -> PowResult,
     ) -> BoundStep {
-        let arrive = |this: &mut Self| this.arrive(src, key, datagram, now);
+        let arrive = |this: &mut Self| this.arrive(src, key, key_id, datagram, now);
         let Some(mut arrival) = self.only_for(src, arrive) else {
             return BoundStep::Lost;
         };
-        if matches!(arrival, Some(Arrival::Refused(Refusal::Shared)))
-            && self.someone_heavier_gives_way(src)
+        if let Some(Arrival::Refused(refusal @ (Refusal::Shared | Refusal::Outer))) = arrival
+            && self.someone_heavier_gives_way(src, refusal)
         {
             let Some(again) = self.only_for(src, arrive) else {
                 return BoundStep::Lost;
@@ -1320,13 +1391,13 @@ mod tests {
         let mut bound = BoundForwarder::new(BoundForwardConfig::default()).unwrap();
         let accept = |_: &[u8]| PowResult::Valid;
         assert!(matches!(
-            bound.take(src, [1; 32], &datagrams[0], now, accept),
+            bound.take(src, [1; 32], FLEET, &datagrams[0], now, accept),
             BoundStep::Forward(_)
         ));
         assert_eq!(bound.peers.len(), 1);
 
         assert!(matches!(
-            bound.take(src, [2; 32], &datagrams[1], now, accept),
+            bound.take(src, [2; 32], FLEET, &datagrams[1], now, accept),
             BoundStep::Invalid
         ));
         assert_eq!(bound.peers[&src].key, [2; 32]);
@@ -1336,6 +1407,7 @@ mod tests {
     }
 
     const KEY: [u8; 32] = [1; 32];
+    const FLEET: &str = "fleet";
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::from(([127, 0, 0, 1], port))
@@ -1352,10 +1424,21 @@ mod tests {
         datagrams: &[Vec<u8>],
         now: Instant,
     ) -> usize {
+        send_as(bound, FLEET, src, datagrams, now)
+    }
+
+    /// [`send`] from a session verified as `key_id`.
+    fn send_as(
+        bound: &mut BoundForwarder,
+        key_id: &str,
+        src: SocketAddr,
+        datagrams: &[Vec<u8>],
+        now: Instant,
+    ) -> usize {
         let accept = |_: &[u8]| PowResult::Valid;
         let steps = datagrams
             .iter()
-            .map(|datagram| bound.take(src, KEY, datagram, now, accept));
+            .map(|datagram| bound.take(src, KEY, key_id, datagram, now, accept));
         steps
             .map(|step| match step {
                 BoundStep::Forward(objects) => objects.len(),
@@ -1529,24 +1612,6 @@ mod tests {
         assert_eq!(bound.usage().pool.objects, 4);
     }
 
-    /// A session that holds nothing gets a place, from the one holding the most.
-    #[test]
-    fn a_session_with_less_makes_the_heaviest_give_way() {
-        let (mut bound, now) = (
-            BoundForwarder::new(pool_config(4, 256)).unwrap(),
-            Instant::now(),
-        );
-        for fill in 1..=4 {
-            open_one(&mut bound, addr(1), fill, now);
-        }
-
-        open_one(&mut bound, addr(2), 9, now);
-
-        assert_eq!(bound.peers[&addr(2)].session.state().open, 1);
-        assert_eq!(bound.peers[&addr(1)].session.state().open, 3);
-        assert_eq!(bound.usage().pool.objects, 4);
-    }
-
     /// A session with open objects of its own moves those, so a flood from one session
     /// comes out of that session and another's stay where they are.
     #[test]
@@ -1570,9 +1635,19 @@ mod tests {
     /// Leave a session with nothing open and nothing of its own to move: one decoded object
     /// waiting for its segment 0. What it holds is the frame's length.
     fn hold_decoded(bound: &mut BoundForwarder, src: SocketAddr, fill: u8, now: Instant) {
+        hold_decoded_as(bound, FLEET, src, fill, now);
+    }
+
+    fn hold_decoded_as(
+        bound: &mut BoundForwarder,
+        key_id: &str,
+        src: SocketAddr,
+        fill: u8,
+        now: Instant,
+    ) {
         let frames = body_frames(&vec![fill; 2 * SEGMENT_BYTES as usize]).unwrap();
         let later = sealed_frame(&frames[1], &KEY).unwrap();
-        assert_eq!(send(bound, src, &later, now), 0);
+        assert_eq!(send_as(bound, key_id, src, &later, now), 0);
         assert_eq!(bound.peers[&src].session.state().open, 0);
         assert_eq!(bound.peers[&src].unanchored.len(), 1);
     }
@@ -1688,7 +1763,7 @@ mod tests {
         assert_eq!(send(&mut bound, addr(1), &honest[..9], now), 0);
         hold_decoded(&mut bound, addr(2), 3, now);
         assert_eq!(send(&mut bound, addr(2), &other[..9], now), 0);
-        assert!(bound.peers[&addr(2)].holds() > bound.peers[&addr(1)].holds());
+        assert!(bound.peers[&addr(2)].share() > bound.peers[&addr(1)].share());
         bound.trips = vec![Trip::Arrived(addr(2))];
 
         assert_eq!(send(&mut bound, addr(2), &other[9..10], now), 0);
@@ -1703,21 +1778,32 @@ mod tests {
         pool_is_what_the_sessions_hold(&bound);
     }
 
-    /// Stopped once `place` has moved an object and pushed another off a full shelf.
+    /// Stopped once `place` has moved an object to the last place on the shelf.
     #[test]
     fn a_panic_with_the_shelf_half_moved_goes_with_its_session() {
-        let config = BoundForwardConfig::default();
-        let limits = config.session_budget;
-        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
-        assert_eq!(send(&mut bound, addr(1), &body(250)[..9], now), 0);
-        for fill in 0..limits.max_objects + limits.max_spare_objects {
-            open_one(&mut bound, addr(2), fill as u8, now);
-        }
-        assert_eq!(bound.peers[&addr(2)].session.state().spares, 8);
+        let now = Instant::now();
+        let crowded = || {
+            let config = BoundForwardConfig::default();
+            let limits = config.session_budget;
+            let mut bound = BoundForwarder::new(config).unwrap();
+            assert_eq!(send(&mut bound, addr(1), &body(250)[..9], now), 0);
+            for fill in 0..limits.max_objects + limits.max_spare_objects - 1 {
+                open_one(&mut bound, addr(2), fill as u8, now);
+            }
+            assert_eq!(bound.peers[&addr(2)].session.state().spares, 7);
+            bound
+        };
+        // The same step with nothing to stop it: this is what the panic lands after.
+        let mut unstopped = crowded();
+        open_one(&mut unstopped, addr(2), 200, now);
+        assert_eq!(unstopped.peers[&addr(2)].session.state().spares, 8);
+        let mut bound = crowded();
         bound.trips = vec![Trip::Arrived(addr(2))];
 
         open_one(&mut bound, addr(2), 200, now);
 
+        assert!(bound.trips.is_empty(), "it never got as far as the panic");
+        assert_eq!(bound.usage().sessions_lost_to_a_panic, 1);
         assert!(!bound.peers.contains_key(&addr(2)));
         pool_is_what_the_sessions_hold(&bound);
         assert_eq!(send(&mut bound, addr(1), &body(250)[9..10], now), 1);
@@ -1731,6 +1817,7 @@ mod tests {
             BoundForwarder::new(pool_config(4, 256)).unwrap(),
             Instant::now(),
         );
+        keep_a_little(&mut bound, FLEET, addr(2), 8, 1, now);
         for fill in 1..=4 {
             open_one(&mut bound, addr(1), fill, now);
         }
@@ -1738,6 +1825,8 @@ mod tests {
 
         open_one(&mut bound, addr(2), 9, now);
 
+        assert!(bound.trips.is_empty(), "it never got as far as the panic");
+        assert_eq!(bound.usage().sessions_lost_to_a_panic, 1);
         assert!(!bound.peers.contains_key(&addr(1)));
         assert_eq!(bound.peers[&addr(2)].session.state().open, 1);
         pool_is_what_the_sessions_hold(&bound);
@@ -1752,6 +1841,7 @@ mod tests {
             Instant::now(),
         );
         let honest = body(1);
+        keep_a_little(&mut bound, FLEET, addr(2), 8, 1, now);
         assert_eq!(send(&mut bound, addr(1), &honest[..9], now), 0);
         for fill in 2..=4 {
             open_one(&mut bound, addr(1), fill, now);
@@ -1760,6 +1850,8 @@ mod tests {
 
         open_one(&mut bound, addr(2), 9, now);
 
+        assert!(bound.trips.is_empty(), "it never got as far as the panic");
+        assert_eq!(bound.usage().sessions_lost_to_a_panic, 1);
         assert!(!bound.peers.contains_key(&addr(2)));
         assert_eq!(bound.peers[&addr(1)].session.state().open, 3);
         assert_eq!(bound.peers[&addr(1)].session.state().spares, 1);
@@ -1816,7 +1908,7 @@ mod tests {
 
         for datagram in body(2).iter().cycle().take(50) {
             bound.trips = vec![Trip::Arrived(addr(2))];
-            let step = bound.take(addr(2), KEY, datagram, now, |_| PowResult::Valid);
+            let step = bound.take(addr(2), KEY, FLEET, datagram, now, |_| PowResult::Valid);
             assert!(matches!(step, BoundStep::Lost));
         }
 
@@ -1958,7 +2050,7 @@ mod tests {
         );
         hold_decoded(&mut bound, addr(1), 1, now);
         open_one(&mut bound, addr(2), 2, now);
-        assert!(bound.peers[&addr(1)].holds() > bound.peers[&addr(2)].holds());
+        assert!(bound.peers[&addr(1)].share() > bound.peers[&addr(2)].share());
 
         open_one(&mut bound, addr(1), 3, now);
 
@@ -1978,33 +2070,12 @@ mod tests {
         let (mut bound, now) = (BoundForwarder::new(limits).unwrap(), Instant::now());
         hold_decoded(&mut bound, addr(1), 1, now);
         hold_decoded(&mut bound, addr(2), 2, now);
-        assert_eq!(bound.peers[&addr(1)].holds(), bound.peers[&addr(2)].holds());
+        assert_eq!(bound.peers[&addr(1)].share(), bound.peers[&addr(2)].share());
 
         open_one(&mut bound, addr(1), 3, now);
 
         assert_eq!(bound.peers[&addr(1)].session.state().open, 0);
         assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
-    }
-
-    /// What is decoded and waiting gives way as well, when that is all the heavier one has.
-    #[test]
-    fn a_heavier_session_with_nothing_open_gives_up_what_waits() {
-        let frames = body_frames(&vec![1u8; 2 * SEGMENT_BYTES as usize]).unwrap();
-        let object = encode(MSG_RAW_SEGMENT, SHARDS, DATA_SHARDS, &frames[1]).unwrap();
-        let mut limits = config();
-        limits.pool.max_held_bytes = chunk_proof::object::held_bytes(&object.shape);
-        let (mut bound, now) = (BoundForwarder::new(limits).unwrap(), Instant::now());
-        hold_decoded(&mut bound, addr(1), 1, now);
-
-        let _ = send(
-            &mut bound,
-            addr(2),
-            &sealed_frame(&frames[0], &KEY).unwrap()[..1],
-            now,
-        );
-
-        assert_eq!(bound.peers[&addr(1)].unanchored.len(), 0);
-        assert_eq!(bound.peers[&addr(2)].session.state().open, 1);
     }
 
     #[test]
@@ -2150,11 +2221,17 @@ mod tests {
     #[test]
     fn the_research_values_of_a_session_fit_the_pool() {
         let config = BoundForwardConfig::default();
-        let (session, pool) = (config.session_budget, config.pool);
-        assert!(session.max_held_bytes <= pool.max_held_bytes);
-        assert!(session.max_objects <= pool.max_objects);
-        assert!(session.max_work_bytes <= pool.max_work_bytes);
-        assert!(session.max_spare_bytes <= pool.max_spare_bytes);
+        let (session, key, pool) = (config.session_budget, config.key_budget, config.pool);
+        for (inner, outer) in [(session, key), (key, pool)] {
+            assert!(inner.max_held_bytes <= outer.max_held_bytes);
+            assert!(inner.max_objects <= outer.max_objects);
+            assert!(inner.max_work_bytes <= outer.max_work_bytes);
+            assert!(inner.max_spare_objects <= outer.max_spare_objects);
+            assert!(inner.max_spare_bytes <= outer.max_spare_bytes);
+        }
+        assert!(key.max_sessions < pool.max_sessions);
+        assert!(key.max_objects < pool.max_objects);
+        assert!(key.max_held_bytes < pool.max_held_bytes);
         assert!(config.max_forwarded <= config.max_forwarded_total);
     }
 
@@ -2171,5 +2248,463 @@ mod tests {
         let datagrams = sealed_body(&[7u8; 5000], &[1; 32]).unwrap();
         assert!(is_bound(&datagrams[0]));
         assert!(crate::Chunk::from_bytes(&datagrams[0]).is_err());
+    }
+
+    // Keys. A source port costs nothing, so what a limit can hold to is the key that was
+    // verified. The values are for research.
+
+    const OTHER: &str = "other";
+
+    fn key_config(sessions: usize, objects: usize) -> BoundForwardConfig {
+        let mut config = config();
+        config.key_budget.max_sessions = sessions;
+        config.key_budget.max_objects = objects;
+        config
+    }
+
+    fn open_as(bound: &mut BoundForwarder, key_id: &str, src: SocketAddr, fill: u8, now: Instant) {
+        let _ = send_as(bound, key_id, src, &body(fill)[..1], now);
+    }
+
+    fn open_in(bound: &BoundForwarder, src: SocketAddr) -> usize {
+        bound.peers[&src].session.state().open
+    }
+
+    #[test]
+    fn one_key_on_many_ports_stops_at_its_limit() {
+        let (mut bound, now) = (
+            BoundForwarder::new(key_config(3, 512)).unwrap(),
+            Instant::now(),
+        );
+
+        for port in 1..=6 {
+            open_one(&mut bound, addr(port), port as u8, now);
+        }
+
+        assert_eq!(bound.usage().peers, 3);
+        assert_eq!(bound.usage().pool.sessions, 3);
+        assert_eq!(bound.usage().datagrams_without_a_place, 3);
+    }
+
+    /// Every limit a key has, over more ports than it may have sessions, at every step.
+    #[test]
+    fn one_key_on_many_ports_stays_inside_every_limit_of_its_own() {
+        let frame = body_frames(&[0; 5000]).unwrap().swap_remove(0);
+        let object = encode(MSG_RAW_SEGMENT, SHARDS, DATA_SHARDS, &frame).unwrap();
+        let mut config = key_config(4, 6);
+        config.key_budget.max_held_bytes = 5 * chunk_proof::object::held_bytes(&object.shape);
+        config.key_budget.max_spare_objects = 3;
+        let limits = config.key_budget;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+
+        for port in 1..=12u16 {
+            for object in 0..8u8 {
+                open_one(&mut bound, addr(port), port as u8 * 16 + object, now);
+                let used = bound.key_used(FLEET);
+                assert!(used.sessions <= limits.max_sessions, "{used:?}");
+                assert!(used.objects <= limits.max_objects, "{used:?}");
+                assert!(used.held_bytes <= limits.max_held_bytes, "{used:?}");
+                assert!(used.spare_objects <= limits.max_spare_objects, "{used:?}");
+                assert_eq!(
+                    used,
+                    bound.usage().pool,
+                    "nothing of it is outside its budget"
+                );
+            }
+        }
+
+        let used = bound.key_used(FLEET);
+        assert_eq!(used.sessions, limits.max_sessions);
+        assert_eq!(used.objects, 5, "the bytes ran out first");
+        assert_eq!(used.spare_objects, limits.max_spare_objects);
+    }
+
+    #[test]
+    fn another_key_gets_a_place_when_one_key_is_at_its_limit() {
+        let mut config = key_config(3, 512);
+        config.pool.max_sessions = 4;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        for port in 1..=6 {
+            open_one(&mut bound, addr(port), port as u8, now);
+        }
+
+        open_as(&mut bound, OTHER, addr(9), 9, now);
+
+        assert_eq!(open_in(&bound, addr(9)), 1);
+    }
+
+    #[test]
+    fn a_keys_sessions_share_one_budget() {
+        let (mut bound, now) = (
+            BoundForwarder::new(key_config(8, 4)).unwrap(),
+            Instant::now(),
+        );
+
+        for fill in 1..=3 {
+            open_one(&mut bound, addr(1), fill, now);
+        }
+        for fill in 4..=6 {
+            open_one(&mut bound, addr(2), fill, now);
+        }
+
+        assert_eq!(bound.key_used(FLEET).sessions, 2);
+        assert_eq!(bound.key_used(FLEET).objects, 4);
+        assert_eq!(bound.usage().pool.objects, 4);
+    }
+
+    #[test]
+    fn a_session_that_goes_gives_its_keys_room_back() {
+        let (mut bound, now) = (
+            BoundForwarder::new(key_config(2, 512)).unwrap(),
+            Instant::now(),
+        );
+        for port in 1..=3 {
+            open_one(&mut bound, addr(port), port as u8, now);
+        }
+        assert!(!bound.peers.contains_key(&addr(3)));
+
+        bound.tidy(now, |src| *src != addr(1));
+        open_one(&mut bound, addr(3), 3, now);
+
+        assert_eq!(open_in(&bound, addr(3)), 1);
+        assert_eq!(bound.key_used(FLEET).sessions, 2);
+    }
+
+    /// A panic takes one session, and all it held comes back to its key as well.
+    #[test]
+    fn a_panic_gives_its_keys_room_back() {
+        let (mut bound, now) = (
+            BoundForwarder::new(key_config(2, 512)).unwrap(),
+            Instant::now(),
+        );
+        open_one(&mut bound, addr(1), 1, now);
+        open_one(&mut bound, addr(2), 2, now);
+        bound.trips = vec![Trip::Arrived(addr(1))];
+
+        open_one(&mut bound, addr(1), 3, now);
+
+        assert!(!bound.peers.contains_key(&addr(1)));
+        assert_eq!(bound.key_used(FLEET).sessions, 1);
+        assert_eq!(bound.key_used(FLEET).objects, 1);
+        pool_is_what_the_sessions_hold(&bound);
+        open_one(&mut bound, addr(3), 4, now);
+        assert_eq!(open_in(&bound, addr(3)), 1);
+    }
+
+    /// A key at its limits, in open objects, on shelves and in what waits. What a session
+    /// held comes back to its key to the byte, and the key can then use all of it again.
+    #[test]
+    fn a_key_at_its_limit_gets_back_exactly_what_a_session_held() {
+        let (mut bound, now) = (
+            BoundForwarder::new(key_config(2, 4)).unwrap(),
+            Instant::now(),
+        );
+        hold_decoded(&mut bound, addr(1), 1, now);
+        for fill in 2..=3 {
+            open_one(&mut bound, addr(1), fill, now);
+        }
+        keep_a_little(&mut bound, FLEET, addr(2), 4, 3, now);
+        for fill in 5..=6 {
+            open_one(&mut bound, addr(2), fill, now);
+        }
+        assert_eq!(bound.key_used(FLEET).sessions, 2);
+        assert_eq!(bound.key_used(FLEET).objects, 4);
+        let stays = bound.peers[&addr(2)].budget.used();
+        open_one(&mut bound, addr(3), 7, now);
+        assert!(!bound.peers.contains_key(&addr(3)), "no place left");
+
+        bound.tidy(now, |src| *src != addr(1));
+
+        let used = bound.key_used(FLEET);
+        assert_eq!(used.objects, stays.objects);
+        assert_eq!(used.held_bytes, stays.held_bytes);
+        assert_eq!(used.spare_objects, stays.spare_objects);
+        assert_eq!(used.spare_bytes, stays.spare_bytes);
+        assert_eq!(used.sessions, 1);
+        assert_eq!(used, bound.usage().pool);
+
+        open_one(&mut bound, addr(3), 7, now);
+        open_one(&mut bound, addr(3), 8, now);
+        assert_eq!(open_in(&bound, addr(3)), 2);
+        assert_eq!(bound.key_used(FLEET).objects, 4);
+
+        bound.tidy(now, |_| false);
+        assert_eq!(bound.usage().pool, BoundUsed::default());
+    }
+
+    /// The last session of a key takes the budget with it, and the pool has it all back.
+    #[test]
+    fn the_last_session_of_a_key_leaves_nothing_of_it() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        open_as(&mut bound, OTHER, addr(1), 1, now);
+
+        bound.tidy(now, |_| false);
+
+        assert_eq!(bound.usage().pool, BoundUsed::default());
+        assert_eq!(bound.key_used(OTHER), BoundUsed::default());
+    }
+
+    /// The same source under another key is another session, of that key.
+    #[test]
+    fn a_source_that_changes_key_moves_to_that_keys_budget() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        open_one(&mut bound, addr(1), 1, now);
+
+        open_as(&mut bound, OTHER, addr(1), 2, now);
+
+        assert_eq!(bound.usage().peers, 1);
+        assert_eq!(bound.key_used(FLEET), BoundUsed::default());
+        assert_eq!(bound.key_used(OTHER).objects, 1);
+    }
+
+    #[test]
+    fn a_key_budget_that_cannot_hold_anything_does_not_start() {
+        let mut config = config();
+        config.key_budget.max_objects = 0;
+        assert!(BoundForwarder::new(config).is_err());
+    }
+
+    /// A key at its limit is its own matter: its sessions sort it out among themselves.
+    #[test]
+    fn a_key_at_its_limit_moves_its_own_session_and_no_other_keys() {
+        let (mut bound, now) = (
+            BoundForwarder::new(key_config(8, 3)).unwrap(),
+            Instant::now(),
+        );
+        hold_decoded_as(&mut bound, OTHER, addr(3), 1, now);
+        for fill in 2..=4 {
+            open_as(&mut bound, OTHER, addr(3), fill, now);
+        }
+        keep_a_little(&mut bound, FLEET, addr(2), 5, 1, now);
+        for fill in 6..=8 {
+            open_one(&mut bound, addr(1), fill, now);
+        }
+        assert!(bound.peers[&addr(3)].key_share() > bound.peers[&addr(1)].key_share());
+
+        open_one(&mut bound, addr(2), 9, now);
+
+        assert_eq!(open_in(&bound, addr(1)), 2);
+        assert_eq!(open_in(&bound, addr(2)), 1);
+        assert_eq!(
+            open_in(&bound, addr(3)),
+            3,
+            "a heavier key, but this is not its limit"
+        );
+        assert_eq!(bound.key_used(FLEET).objects, 3);
+    }
+
+    /// The heaviest may have nothing it could move. That does not stop the next one.
+    #[test]
+    fn a_session_with_nothing_to_move_is_passed_over() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(2, 256)).unwrap(),
+            Instant::now(),
+        );
+        keep_a_little(&mut bound, FLEET, addr(1), 1, 1, now);
+        hold_decoded_as(&mut bound, OTHER, addr(2), 2, now);
+        hold_decoded_as(&mut bound, OTHER, addr(3), 3, now);
+        for fill in 4..=5 {
+            open_as(&mut bound, "third", addr(4), fill, now);
+        }
+
+        open_one(&mut bound, addr(1), 9, now);
+
+        assert_eq!(open_in(&bound, addr(1)), 1);
+        assert_eq!(open_in(&bound, addr(4)), 1);
+        assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
+        assert_eq!(bound.peers[&addr(3)].unanchored.len(), 1);
+    }
+
+    // Who can ask for room, and what it can cost.
+
+    /// Move a session's object of `chunks` chunks to its shelf. It holds little after that,
+    /// and nothing it could move for itself.
+    fn keep_a_little(
+        bound: &mut BoundForwarder,
+        key_id: &str,
+        src: SocketAddr,
+        fill: u8,
+        chunks: usize,
+        now: Instant,
+    ) {
+        let _ = send_as(bound, key_id, src, &body(fill)[..chunks], now);
+        assert!(bound.peers.get_mut(&src).unwrap().session.give_way());
+    }
+
+    #[test]
+    fn a_session_holding_nothing_pushes_nobody() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(4, 256)).unwrap(),
+            Instant::now(),
+        );
+        for fill in 1..=4 {
+            open_as(&mut bound, OTHER, addr(1), fill, now);
+        }
+
+        open_one(&mut bound, addr(2), 9, now);
+
+        assert_eq!(open_in(&bound, addr(1)), 4);
+        assert_eq!(open_in(&bound, addr(2)), 0);
+    }
+
+    /// An object of one data shard decodes, fails and is gone at once, so what sends them
+    /// always holds nothing. They are not let in, and they buy no room.
+    #[test]
+    fn k_one_objects_never_earn_room() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(1, 256)).unwrap(),
+            Instant::now(),
+        );
+        open_as(&mut bound, OTHER, addr(1), 1, now);
+
+        for fill in 0..8u8 {
+            let object = encode(MSG_RAW_SEGMENT, 2, 1, &[fill; 64]).unwrap();
+            for datagram in BoundForwarder::sealed(&KEY, &object) {
+                bound.take(addr(2), KEY, FLEET, &datagram, now, |_| PowResult::Valid);
+            }
+        }
+
+        assert_eq!(open_in(&bound, addr(1)), 1);
+    }
+
+    /// Its shelf is part of what a session holds, so it cannot look light by moving things
+    /// there.
+    #[test]
+    fn share_counts_spares_too() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(2, 256)).unwrap(),
+            Instant::now(),
+        );
+        for fill in 1..=3 {
+            keep_a_little(&mut bound, OTHER, addr(1), fill, 9, now);
+        }
+        hold_decoded_as(&mut bound, OTHER, addr(1), 7, now);
+        for fill in 4..=5 {
+            open_one(&mut bound, addr(2), fill, now);
+        }
+        let (asking, other) = (
+            bound.peers[&addr(1)].budget.used(),
+            bound.peers[&addr(2)].budget.used(),
+        );
+        assert!(asking.held_bytes > 0);
+        assert!(
+            asking.held_bytes < other.held_bytes,
+            "lighter without its shelf"
+        );
+        assert!(asking.held_bytes + asking.spare_bytes > other.held_bytes);
+
+        open_as(&mut bound, OTHER, addr(1), 6, now);
+
+        assert_eq!(open_in(&bound, addr(2)), 2);
+        assert_eq!(open_in(&bound, addr(1)), 0);
+    }
+
+    /// One session on each port looks lighter than it is.
+    #[test]
+    fn a_key_is_weighed_across_its_ports() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(3, 256)).unwrap(),
+            Instant::now(),
+        );
+        hold_decoded_as(&mut bound, OTHER, addr(1), 1, now);
+        hold_decoded_as(&mut bound, OTHER, addr(2), 2, now);
+        for fill in 3..=5 {
+            open_one(&mut bound, addr(3), fill, now);
+        }
+        let held = |port| bound.peers[&addr(port)].budget.used().held_bytes;
+        assert!(held(3) > held(1), "one session of it weighs less");
+        assert!(held(1) + held(2) > held(3), "all of it weighs more");
+
+        open_as(&mut bound, OTHER, addr(1), 9, now);
+
+        assert_eq!(open_in(&bound, addr(3)), 3);
+        assert_eq!(open_in(&bound, addr(1)), 0);
+    }
+
+    /// Holding little still gets a place from a key holding far more.
+    #[test]
+    fn a_lighter_session_that_holds_something_gets_a_place() {
+        let (mut bound, now) = (
+            BoundForwarder::new(pool_config(4, 256)).unwrap(),
+            Instant::now(),
+        );
+        keep_a_little(&mut bound, OTHER, addr(1), 1, 1, now);
+        for fill in 2..=5 {
+            open_one(&mut bound, addr(2), fill, now);
+        }
+
+        open_as(&mut bound, OTHER, addr(1), 9, now);
+
+        assert_eq!(open_in(&bound, addr(1)), 1);
+        assert_eq!(open_in(&bound, addr(2)), 3);
+        assert_eq!(bound.peers[&addr(2)].session.state().spares, 1);
+    }
+
+    #[test]
+    fn a_full_shelf_refuses_the_newcomer_and_deletes_nothing() {
+        let mut config = pool_config(3, 256);
+        config.pool.max_spare_bytes = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        hold_decoded_as(&mut bound, OTHER, addr(1), 1, now);
+        let honest = body(2);
+        assert_eq!(send(&mut bound, addr(2), &honest[..9], now), 0);
+        for fill in 3..=4 {
+            open_one(&mut bound, addr(2), fill, now);
+        }
+
+        open_as(&mut bound, OTHER, addr(1), 9, now);
+
+        assert_eq!(open_in(&bound, addr(2)), 3);
+        assert_eq!(open_in(&bound, addr(1)), 0);
+        assert_eq!(bound.usage().arrivals.refused_by_pool, 1);
+        assert_eq!(send(&mut bound, addr(2), &honest[9..10], now), 1);
+    }
+
+    /// Decoded and waiting for its segment 0 is the only copy here, so it is not given up.
+    #[test]
+    fn what_waits_for_its_segment_0_is_not_given_up() {
+        let frames = body_frames(&vec![1u8; 2 * SEGMENT_BYTES as usize]).unwrap();
+        let mut limits = config();
+        limits.pool.max_held_bytes = frames[1].len() + 1000;
+        let (mut bound, now) = (BoundForwarder::new(limits).unwrap(), Instant::now());
+        keep_a_little(&mut bound, OTHER, addr(1), 1, 1, now);
+        hold_decoded(&mut bound, addr(2), 2, now);
+
+        open_as(&mut bound, OTHER, addr(1), 3, now);
+
+        assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
+        assert_eq!(open_in(&bound, addr(1)), 0);
+    }
+
+    /// Nor does it go in place of an open object that cannot move.
+    #[test]
+    fn what_waits_stays_when_the_open_object_cannot_move() {
+        let mut config = pool_config(1, 256);
+        config.pool.max_spare_bytes = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        hold_decoded_as(&mut bound, OTHER, addr(1), 1, now);
+        hold_decoded(&mut bound, addr(2), 2, now);
+        open_one(&mut bound, addr(2), 3, now);
+
+        open_as(&mut bound, OTHER, addr(1), 9, now);
+
+        assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
+        assert_eq!(open_in(&bound, addr(2)), 1);
+        assert_eq!(open_in(&bound, addr(1)), 0);
+    }
+
+    /// The same frame under a shape of its own would be another object, sent on again.
+    #[test]
+    fn a_frame_under_another_shape_is_refused() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let frame = body_frames(&[7; 5000]).unwrap().swap_remove(0);
+        let other = encode(MSG_RAW_SEGMENT, 14, 12, &frame).unwrap();
+
+        for datagram in BoundForwarder::sealed(&KEY, &other) {
+            bound.take(addr(1), KEY, FLEET, &datagram, now, |_| PowResult::Valid);
+        }
+
+        assert_eq!(bound.usage().objects_sent_on, 0);
+        assert_eq!(bound.usage().pool.objects, 0);
     }
 }

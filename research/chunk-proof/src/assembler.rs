@@ -12,7 +12,8 @@
 //! 2. A chunk of a rejected object, a repeat of a slot, or a chunk whose shape differs from
 //!    its object's changes nothing.
 //! 3. An object's place and all its bytes are taken at its first chunk. Taken piece by
-//!    piece, half-filled objects could use up the bytes so that none could finish.
+//!    piece, half-filled objects could use up the bytes so that none could finish. A shape
+//!    whose shortest content is past `max_content` takes nothing: no such object can pass.
 //! 4. The chunk that would finish an object first takes its decode budget. Without it the
 //!    chunk is refused and not stored, so the object stays as it was and can still finish.
 //! 5. A refused chunk leaves no record, so a copy of it is welcome later.
@@ -20,10 +21,11 @@
 //!    the budget is full, the open object that has waited longest for a chunk moves to the
 //!    shelf with what it has, and can still finish there. So what fills the normal places
 //!    needs no one to recognise it, and that includes parity of an object whose record was
-//!    forgotten. Moving costs an object its normal place and nothing else, unless it does
-//!    not fit on the shelf at all. New objects are refused only when what holds the budget
-//!    is not this session's to move: decoded content, and other sessions' objects. A
-//!    caller that shares a budget between sessions can ask another one to
+//!    forgotten. Moving costs an object its normal place and nothing else, and an object
+//!    that cannot move stays where it is. New objects are refused when what holds the
+//!    budget is not this session's to move: decoded content, other sessions' objects, and
+//!    objects the shelf cannot take. A place made for a new object never costs one that
+//!    is here. A caller that shares a budget between sessions can ask another one to
 //!    [`give way`](Assembler::give_way), by a rule of its own.
 //!
 //! An object this side has already decoded is treated differently: its chunks are spares,
@@ -33,20 +35,23 @@
 //!
 //! 7. The shelf has a budget of its own, so no normal object ever waits for a spare.
 //! 8. It keeps at most `k` shards of an object, so it never holds more than a decode needs.
-//! 9. When it is full the oldest object on it goes, which costs only that spare. A spare
-//!    on its way to a normal place keeps its own until it has that place: making one can
-//!    move an object here, and that object must not push out the spare that asked.
+//! 9. When it is full the oldest spare on it goes, which costs only that spare, since
+//!    somebody has that object. What moved here unfinished and decoded content are the only
+//!    copy, so they stay, and what would have taken their place is refused. A spare on its
+//!    way to a normal place keeps its own until it has that place.
 //! 10. Only verified chunks get there, and a spare is decoded only when the layer above
 //!     says nobody owns the object, so it can bring an object back and do nothing else.
 //! 11. A decoded object the layer below had no room for goes back on the shelf as it is,
 //!     so a moment without room costs neither a copy nor a second decode.
+//! 12. An object here in full needs bytes to become content and no open place, so one on
+//!     the shelf can finish with every open place taken.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
 use super::budget::{Budget, Hold, Refusal, Session, Shelved, Work};
 use super::datagram::{ChunkError, VerifiedChunk, Verifier};
-use super::object::{ObjectError, Shape, decode, held_bytes, work_bytes};
+use super::object::{ObjectError, Shape, decode, held_bytes, least_content, work_bytes};
 use super::tree::Node;
 
 /// Everything here but `max_content` is about this session's own bookkeeping.
@@ -163,7 +168,16 @@ struct Spare {
     slots: Vec<Option<Vec<u8>>>,
     /// Already decoded, waiting for room below. There are no slots then.
     decoded: Option<Vec<u8>>,
+    /// It moved here open, and nobody is known to have it.
+    unfinished: bool,
     _shelved: Shelved,
+}
+
+impl Spare {
+    /// Whether losing this costs only a spare. See rule 9.
+    fn can_go(&self) -> bool {
+        !self.unfinished && self.decoded.is_none()
+    }
 }
 
 #[derive(Debug)]
@@ -258,6 +272,9 @@ impl Assembler {
         if self.is_rejected(&id, now) {
             return Arrival::KnownBad;
         }
+        if least_content(&shape) > (self.limits.max_content)(shape.msg_type) {
+            return Arrival::Refused(Refusal::NeverFits);
+        }
         let filled = match self.open.get(&id) {
             Some(assembly) if assembly.shape != shape => return Arrival::OtherShape,
             Some(assembly) if assembly.slots[index].is_some() => return Arrival::Repeat,
@@ -288,7 +305,7 @@ impl Assembler {
             return Arrival::Refused(Refusal::NeverFits);
         }
         let hold = if filled == 0 {
-            match self.place(held_bytes(&shape), &id) {
+            match self.place(held_bytes(&shape), &id, true) {
                 Ok(hold) => Some(hold),
                 Err(refusal) => return Arrival::Refused(refusal),
             }
@@ -332,30 +349,43 @@ impl Assembler {
         self.finish(id, shape, slots, hold, work, now)
     }
 
-    /// A normal place for `bytes`, moving objects that have stopped to the shelf until
-    /// there is one. Rule 6. `keep` is the object the place is for: what moves does not
-    /// take its place on the shelf from it.
-    fn place(&mut self, bytes: usize, keep: &Node) -> Result<Hold, Refusal> {
+    /// A place for `bytes`, moving objects that have stopped to the shelf until there is
+    /// one. Rule 6. `keep` is the object the place is for: what moves does not take its
+    /// place on the shelf from it. `open` says whether it will wait for chunks, or is here
+    /// in full and needs bytes alone. What cannot move stays, and the place is refused.
+    fn place(&mut self, bytes: usize, keep: &Node, open: bool) -> Result<Hold, Refusal> {
         loop {
-            match self.budget.hold(bytes) {
-                Err(Refusal::Objects | Refusal::HeldBytes | Refusal::Shared) => {}
-                other => return other,
-            }
-            let Some(stopped) = self.longest_waiting() else {
-                return self.budget.hold(bytes);
+            let held = if open {
+                self.budget.hold(bytes)
+            } else {
+                self.budget.hold_settled(bytes)
             };
-            self.open_to_shelf(&stopped, keep);
+            let refusal = match held {
+                Err(
+                    refusal @ (Refusal::Objects
+                    | Refusal::HeldBytes
+                    | Refusal::Shared
+                    | Refusal::Outer),
+                ) => refusal,
+                other => return other,
+            };
+            match self.longest_waiting() {
+                Some(stopped) if self.open_to_shelf(&stopped, keep) => {}
+                _ => return Err(refusal),
+            }
         }
     }
 
     /// What rule 6 does for this session's own new object, at another session's asking.
-    /// False if nothing here is open.
+    /// False if nothing here is open, or the shelf cannot take it, and then nothing changed.
     pub fn give_way(&mut self) -> bool {
-        let Some(stopped) = self.longest_waiting() else {
-            return false;
-        };
-        self.open_to_shelf(&stopped, &stopped);
-        true
+        self.longest_waiting()
+            .is_some_and(|stopped| self.open_to_shelf(&stopped, &stopped))
+    }
+
+    /// Whether there is anything [`Self::give_way`] could move.
+    pub fn has_open(&self) -> bool {
+        !self.open.is_empty()
     }
 
     fn longest_waiting(&self) -> Option<Node> {
@@ -365,24 +395,24 @@ impl Assembler {
             .map(|(id, _)| *id)
     }
 
-    /// An open object leaves its normal place with all it has, or goes if the shelf has
-    /// nothing it can give up for it.
+    /// An open object leaves its normal place with all it has. If the shelf has nothing it
+    /// can give up for it, it stays as it is.
     fn open_to_shelf(&mut self, id: &Node, keep: &Node) -> bool {
         let assembly = self.open.get(id).expect("this object is open");
         let (shape, filled) = (assembly.shape, assembly.filled);
         let list = held_bytes(&shape) - usize::from(shape.k) * usize::from(shape.s);
         let bytes = list + filled * usize::from(shape.s);
-        let shelved = self.shelf_place(&shape, bytes, keep);
-        let assembly = self.open.remove(id).expect("this object is open");
-        let Some(shelved) = shelved else {
+        let Some(shelved) = self.shelf_place(&shape, bytes, keep) else {
             return false;
         };
+        let assembly = self.open.remove(id).expect("this object is open");
         let spare = Spare {
             shape,
             first_seen: assembly.first_seen,
             filled,
             slots: assembly.slots,
             decoded: None,
+            unfinished: true,
             _shelved: shelved,
         };
         self.spares.insert(*id, spare);
@@ -426,8 +456,8 @@ impl Assembler {
     }
 
     /// A place on the shelf for `bytes`, for an object it has none for, giving up the
-    /// oldest spares of other objects to make one. An object that could not fit even on
-    /// an empty shelf gives up nothing.
+    /// oldest spares that can go to make one. An object that could not fit even on an
+    /// empty shelf gives up nothing.
     fn shelf_place(&mut self, shape: &Shape, bytes: usize, keep: &Node) -> Option<Shelved> {
         if held_bytes(shape) > self.budget.limits().max_spare_bytes {
             return None;
@@ -441,7 +471,9 @@ impl Assembler {
     }
 
     fn drop_oldest_spare(&mut self, keep: &Node) -> Option<()> {
-        let oldest = *self.spare_order.iter().find(|id| *id != keep)?;
+        let spares = &self.spares;
+        let can_go = |id: &&Node| *id != keep && spares.get(*id).is_some_and(Spare::can_go);
+        let oldest = *self.spare_order.iter().find(can_go)?;
         self.remove_spare(&oldest).map(drop)
     }
 
@@ -461,6 +493,7 @@ impl Assembler {
                     .take(usize::from(shape.n))
                     .collect(),
                 decoded: None,
+                unfinished: false,
                 _shelved: shelved,
             };
             self.spares.insert(id, spare);
@@ -486,6 +519,10 @@ impl Assembler {
         let (id, shape) = (chunk.object_id(), chunk.shape());
         let index = usize::from(chunk.index());
         let need = usize::from(shape.k);
+        // Somebody owns this now, so it is a spare like any other.
+        if !due && let Some(spare) = self.spares.get_mut(&id) {
+            spare.unfinished = false;
+        }
         if self
             .spares
             .get(&id)
@@ -520,7 +557,11 @@ impl Assembler {
     /// stops holding a normal place, and moves to the shelf with all it has.
     fn shelve_open(&mut self, chunk: VerifiedChunk<'_>, now: Instant) -> Arrival {
         let id = chunk.object_id();
-        if self.spares.contains_key(&id) || !self.open_to_shelf(&id, &id) {
+        if self.spares.contains_key(&id) {
+            return Arrival::NotWanted;
+        }
+        if !self.open_to_shelf(&id, &id) {
+            self.open.remove(&id);
             return Arrival::NotWanted;
         }
         self.shelve(chunk, now, false)
@@ -528,7 +569,7 @@ impl Assembler {
 
     fn decode_spare(&mut self, id: Node, now: Instant) -> Arrival {
         let shape = self.spares[&id].shape;
-        let hold = match self.place(held_bytes(&shape), &id) {
+        let hold = match self.place(held_bytes(&shape), &id, false) {
             Ok(hold) => hold,
             Err(refusal) => return Arrival::Refused(refusal),
         };
@@ -560,6 +601,7 @@ impl Assembler {
             filled: usize::from(shape.k),
             slots: Vec::new(),
             decoded: Some(content),
+            unfinished: false,
             _shelved: shelved,
         };
         self.spares.insert(object_id, spare);
@@ -569,12 +611,11 @@ impl Assembler {
 
     fn release_decoded(&mut self, id: Node) -> Arrival {
         let bytes = self.spares[&id].decoded.as_ref().map_or(0, Vec::len);
-        let mut hold = match self.place(bytes, &id) {
+        let hold = match self.place(bytes, &id, false) {
             Ok(hold) => hold,
             Err(refusal) => return Arrival::Refused(refusal),
         };
         let spare = self.remove_spare(&id).expect("this spare was just read");
-        hold.settle(bytes);
         Arrival::Decoded(DecodedObject {
             content: spare.decoded.expect("this spare was decoded"),
             object_id: id,

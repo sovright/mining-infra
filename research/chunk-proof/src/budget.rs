@@ -48,6 +48,8 @@ pub enum Refusal {
     Spares,
     /// This budget had room, and the budget it sits inside did not.
     Shared,
+    /// Those two had room, and a budget further out did not.
+    Outer,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -135,28 +137,38 @@ impl Budget {
 
     /// One open object and its bytes, all or nothing.
     pub fn hold(&self, bytes: usize) -> Result<Hold, Refusal> {
+        self.reserve(bytes, true)
+    }
+
+    /// Bytes and no open place, for what is here in full and becomes decoded content now.
+    /// Nothing has to wait for chunks in it, so the open places are not what it needs.
+    pub fn hold_settled(&self, bytes: usize) -> Result<Hold, Refusal> {
+        self.reserve(bytes, false)
+    }
+
+    fn reserve(&self, bytes: usize, open: bool) -> Result<Hold, Refusal> {
         if bytes > self.limits.max_held_bytes {
             return Err(Refusal::NeverFits);
         }
         {
             let mut used = self.lock();
-            if used.objects >= self.limits.max_objects {
+            if open && used.objects >= self.limits.max_objects {
                 return Err(Refusal::Objects);
             }
             if used.held_bytes + bytes > self.limits.max_held_bytes {
                 return Err(Refusal::HeldBytes);
             }
-            used.objects += 1;
+            used.objects += usize::from(open);
             used.held_bytes += bytes;
         }
         let mut hold = Hold {
             budget: self.clone(),
             bytes,
-            open: true,
+            open,
             shared: None,
         };
         if let Some(shared) = &self.shared {
-            let inner = shared.hold(bytes).map_err(|_| Refusal::Shared)?;
+            let inner = shared.reserve(bytes, open).map_err(from_further_out)?;
             hold.shared = Some(Box::new(inner));
         }
         Ok(hold)
@@ -202,9 +214,17 @@ impl Budget {
             _shared: None,
         };
         if let Some(shared) = &self.shared {
-            work._shared = Some(Box::new(shared.work(bytes).map_err(|_| Refusal::Shared)?));
+            work._shared = Some(Box::new(shared.work(bytes).map_err(from_further_out)?));
         }
         Ok(work)
+    }
+}
+
+/// What a refusal from the budget around this one says here: whose limit it was.
+fn from_further_out(refusal: Refusal) -> Refusal {
+    match refusal {
+        Refusal::Shared | Refusal::Outer => Refusal::Outer,
+        _ => Refusal::Shared,
     }
 }
 
@@ -237,7 +257,7 @@ impl Hold {
     pub(crate) fn settle(&mut self, bytes: usize) {
         let mut used = self.budget.lock();
         used.held_bytes -= self.bytes - bytes;
-        used.objects -= 1;
+        used.objects -= usize::from(self.open);
         drop(used);
         self.bytes = bytes;
         self.open = false;

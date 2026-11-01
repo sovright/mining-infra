@@ -219,6 +219,76 @@ fn a_session_the_pool_refuses_moves_its_own_stopped_object() {
     assert_eq!(session.state().spares, 1);
 }
 
+/// A budget inside a budget inside the pool: each refusal says whose limit it was, so a
+/// caller can tell a limit of its own group from one of everybody's.
+#[test]
+fn a_refusal_says_whose_limit_it_was() {
+    let small = Limits {
+        max_objects: 1,
+        max_held_bytes: BYTES,
+        max_work_bytes: BYTES,
+        ..limits()
+    };
+    let pool = Budget::new(limits()).unwrap();
+    let group = Budget::within(small, &pool).unwrap();
+    let member = Budget::within(limits(), &group).unwrap();
+    let _held = group.hold(1).unwrap();
+    let _work = group.work(BYTES).unwrap();
+    assert!(matches!(member.hold(1), Err(Refusal::Shared)));
+    assert!(matches!(member.work(1), Err(Refusal::Shared)));
+
+    let tight = Budget::new(Limits {
+        max_objects: 1,
+        max_work_bytes: BYTES,
+        ..limits()
+    })
+    .unwrap();
+    let group = Budget::within(limits(), &tight).unwrap();
+    let member = Budget::within(limits(), &group).unwrap();
+    let _held = tight.hold(1).unwrap();
+    let _work = tight.work(BYTES).unwrap();
+    assert!(matches!(member.hold(1), Err(Refusal::Outer)));
+    assert!(matches!(member.work(1), Err(Refusal::Outer)));
+    assert_eq!(member.used(), Used::default());
+    assert_eq!(group.used(), Used::default());
+}
+
+/// What is here in full takes bytes, in every budget, and no open place in any.
+#[test]
+fn a_settled_hold_takes_bytes_and_no_place() {
+    let pool = Budget::new(Limits {
+        max_objects: 1,
+        ..limits()
+    })
+    .unwrap();
+    let budget = Budget::within(limits(), &pool).unwrap();
+    let _open = budget.hold(BYTES).unwrap();
+
+    let settled = budget.hold_settled(BYTES).unwrap();
+
+    assert_eq!(pool.used().objects, 1);
+    assert_eq!(pool.used().held_bytes, 2 * BYTES);
+    assert_eq!(budget.used().objects, 1);
+    drop(settled);
+    assert_eq!(pool.used().objects, 1);
+    assert_eq!(pool.used().held_bytes, BYTES);
+}
+
+/// Bytes are bytes, for what is here in full too.
+#[test]
+fn a_settled_hold_stops_at_the_byte_limit() {
+    let pool = Budget::new(Limits {
+        max_held_bytes: BYTES,
+        ..limits()
+    })
+    .unwrap();
+    let budget = Budget::within(limits(), &pool).unwrap();
+    let _open = budget.hold(BYTES).unwrap();
+
+    assert!(matches!(budget.hold_settled(1), Err(Refusal::Shared)));
+    assert_eq!(budget.used().held_bytes, BYTES);
+}
+
 /// Another session's object in the pool is not this session's to move.
 #[test]
 fn a_session_cannot_move_another_sessions_object_by_itself() {

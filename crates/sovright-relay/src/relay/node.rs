@@ -1055,7 +1055,7 @@ impl<V: PowValidator> RelayNode<V> {
         self.admit_unknown_source(src_addr)?;
         let keys = self.active_keys();
         let Some(key) = keys.iter().find(|key| {
-            Verifier::new(key.key, Profile::Research)
+            Verifier::new(key.key, Profile::BoundSegment)
                 .verify(data)
                 .is_ok()
         }) else {
@@ -1068,6 +1068,19 @@ impl<V: PowValidator> RelayNode<V> {
             self.metrics.inc_session_limit_rejections();
             return Err(TransportError::ConnectionRefused(
                 "relay session limit reached".into(),
+            ));
+        }
+        // Whatever its role: a session of a ReceiveOnly key never reaches the pool's limits,
+        // and it takes a place in this table all the same.
+        let key_limit = self
+            .config
+            .bound_raw
+            .map(|bound| bound.key_budget.max_sessions);
+        let of_this_key = sessions.values().filter(|s| s.key_id() == key.id).count();
+        if key_limit.is_some_and(|limit| of_this_key >= limit) {
+            self.metrics.inc_session_limit_rejections();
+            return Err(TransportError::ConnectionRefused(
+                "relay session limit for this key reached".into(),
             ));
         }
         sessions.entry(src_addr).or_insert_with(|| {
@@ -1120,7 +1133,10 @@ impl<V: PowValidator> RelayNode<V> {
         // So it stops at its MAC and the session's keepalive. Past here it would share the
         // pool, and its segment 0 would open the way for what Full sessions left waiting.
         if role == KeyRole::ReceiveOnly {
-            if Verifier::new(key, Profile::Research).verify(data).is_err() {
+            if Verifier::new(key, Profile::BoundSegment)
+                .verify(data)
+                .is_err()
+            {
                 self.metrics.inc_invalid_chunks();
                 return Err(TransportError::AuthenticationFailed);
             }
@@ -1131,7 +1147,7 @@ impl<V: PowValidator> RelayNode<V> {
             return Ok(());
         }
         let step = self.with_bound(bound, |forwarder| {
-            forwarder.take(src_addr, key, data, Instant::now(), |header| {
+            forwarder.take(src_addr, key, &key_id, data, Instant::now(), |header| {
                 self.validator.validate(header)
             })
         });

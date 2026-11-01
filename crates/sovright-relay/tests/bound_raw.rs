@@ -802,14 +802,13 @@ async fn sessions_together_cannot_pass_the_nodes_limit() {
 /// on as many sessions as it takes. What was 2.25 MiB a session with nothing over them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_research_pool_holds_however_many_sessions_fill_it() {
-    // New sources are rate limited ahead of all this, and that is not what is under test.
-    let relay = RelayConfig::new("127.0.0.1:0".parse().unwrap())
-        .with_authorized_keys(fleet())
-        .with_fec(10, 3)
-        .with_unauth_rate_limit(100_000.0, 100_000.0)
-        .with_bound_raw(Default::default());
-    let (node, addr) = start_config(relay, StubPowValidator).await;
+    // No key can fill the pool alone, so it takes several.
+    let key_of = |session: u32| [session as u8 % 8 + 1; 32];
+    let keys = (0..8)
+        .map(|at| AuthKey::new(format!("key{at}"), key_of(at)))
+        .collect();
     let config = BoundForwardConfig::default();
+    let (node, addr) = start_config(relay_for(keys, config), StubPowValidator).await;
 
     let mut sockets = Vec::new();
     for session in 0..80u32 {
@@ -818,7 +817,7 @@ async fn the_research_pool_holds_however_many_sessions_fill_it() {
                 let mut raw = vec![0u8; 9000];
                 raw[..4].copy_from_slice(&session.to_le_bytes());
                 raw[4..8].copy_from_slice(&object.to_le_bytes());
-                sealed_body(&raw, &KEY).unwrap().swap_remove(0)
+                sealed_body(&raw, &key_of(session)).unwrap().swap_remove(0)
             })
             .collect();
         sockets.push(raw_session(&node, addr, &firsts).await);
@@ -915,4 +914,171 @@ async fn known_gap_a_full_session_table_turns_a_new_session_away() {
         "{usage:?}"
     );
     drop(late);
+}
+
+fn three_sessions_a_key() -> BoundForwardConfig {
+    let mut config = BoundForwardConfig::default();
+    config.key_budget.max_sessions = 3;
+    config
+}
+
+/// A source port costs nothing, so one key on many of them is still one key.
+#[tokio::test]
+async fn one_key_on_many_real_ports_stops_at_its_limit() {
+    let (node, addr) = start_node_with(StubPowValidator, fleet(), three_sessions_a_key()).await;
+
+    let _sockets = fill_from(&node, addr, 6).await;
+
+    assert_eq!(node.bound_usage().unwrap().peers, 3);
+    assert_eq!(node.session_count().await, 3);
+}
+
+#[tokio::test]
+async fn another_key_gets_through_a_real_node_when_one_key_is_at_its_limit() {
+    let mut limits = three_sessions_a_key();
+    limits.pool.max_sessions = 4;
+    let keys = vec![AuthKey::new("fleet", KEY), AuthKey::new("alice", OTHER_KEY)];
+    let (node, addr) = start_config(relay_for(keys, limits), StubPowValidator).await;
+    let _sockets = fill_from(&node, addr, 6).await;
+
+    let body = sealed_body(&[0xee; 5000], &OTHER_KEY).unwrap();
+    let _alice = raw_session(&node, addr, &body).await;
+
+    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+}
+
+/// A ReceiveOnly key never reaches the pool, and its sessions still take places in the
+/// node's table.
+#[tokio::test]
+async fn a_receive_only_key_on_many_ports_stops_at_its_limit() {
+    let keys = vec![AuthKey::new("invitee", OTHER_KEY).with_role(KeyRole::ReceiveOnly)];
+    let (node, addr) = start_node_with(StubPowValidator, keys, three_sessions_a_key()).await;
+    let body = sealed_body(&[0xee; 5000], &OTHER_KEY).unwrap();
+
+    let mut sockets = Vec::new();
+    for _ in 0..6 {
+        sockets.push(raw_session(&node, addr, &body[..1]).await);
+    }
+
+    assert_eq!(node.session_count().await, 3);
+}
+
+/// About 200 KB declared in one datagram, on the shape no sender uses. It does not start a
+/// session, so it reserves nothing.
+#[tokio::test]
+async fn a_shape_no_sender_uses_makes_no_session() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let large = chunk_proof::object::encode(3, 256, 227, &vec![1; 195_000]).unwrap();
+    let datagram = chunk_proof::datagram::seal(
+        &KEY,
+        &large.shape,
+        &large.object_id,
+        0,
+        &large.proofs[0],
+        &large.shards[0],
+    );
+
+    let _socket = raw_session(&node, addr, &[datagram]).await;
+
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.peers, 0);
+    assert_eq!(usage.pool, BoundUsed::default());
+}
+
+/// With a key at each of its limits, across its ports.
+#[tokio::test]
+async fn one_key_on_many_real_ports_stays_inside_its_budget() {
+    let mut limits = three_sessions_a_key();
+    limits.key_budget.max_objects = 4;
+    limits.key_budget.max_spare_objects = 2;
+    let (node, addr) = start_node_with(StubPowValidator, fleet(), limits).await;
+
+    let _sockets = fill_from(&node, addr, 6).await;
+
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.pool.sessions, 3);
+    assert_eq!(usage.pool.objects, 4);
+    assert_eq!(usage.pool.spare_objects, 2);
+}
+
+/// One object past both the table and the shelf: that one is refused, and the body that was
+/// here loses nothing and goes on.
+#[tokio::test]
+async fn a_full_shelf_on_a_real_node_refuses_the_next_object_and_keeps_the_body() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let mut blocks = start_receiver(addr, KEY).await;
+    sessions_reach(&node, 1).await;
+    let raw = vec![200u8; 5000];
+    let sealed = sealed_body(&raw, &KEY).unwrap();
+    let crowd: Vec<Vec<u8>> = (0..40u8)
+        .map(|fill| sealed_body(&[fill; 5000], &KEY).unwrap().swap_remove(0))
+        .collect();
+
+    let socket = raw_session(&node, addr, &sealed[..9]).await;
+    send_again(&node, addr, &socket, &crowd).await;
+
+    assert_eq!(
+        node.bound_usage().unwrap().arrivals.refused_for_objects,
+        1,
+        "the one past both"
+    );
+    send_again(&node, addr, &socket, &sealed[9..10]).await;
+    assert_eq!(next_block(&mut blocks).await.raw(), raw);
+}
+
+fn relay_for(keys: Vec<AuthKey>, limits: BoundForwardConfig) -> RelayConfig {
+    // New sources are rate limited ahead of all this, and that is not what is under test.
+    RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(keys)
+        .with_fec(10, 3)
+        .with_unauth_rate_limit(100_000.0, 100_000.0)
+        .with_bound_raw(limits)
+}
+
+/// A key at its limit that is revoked leaves nothing, and when it comes back it has all of
+/// its places again.
+#[tokio::test]
+async fn a_revoked_key_gives_all_of_its_limit_back() {
+    let relay = relay_for(fleet(), three_sessions_a_key());
+    let (node, addr) = start_config(relay, StubPowValidator).await;
+    let _first = fill_from(&node, addr, 6).await;
+    assert_eq!(node.bound_usage().unwrap().peers, 3);
+
+    node.apply_active_keys(Vec::new()).await;
+
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.pool, BoundUsed::default());
+    assert_eq!(usage.peers, 0);
+    assert_eq!(node.session_count().await, 0);
+
+    node.apply_active_keys(fleet()).await;
+    let _again = fill_from(&node, addr, 6).await;
+    assert_eq!(node.bound_usage().unwrap().peers, 3);
+    assert_eq!(node.session_count().await, 3);
+}
+
+/// The only place a key has, held by a session that falls silent. Once the node's own cleanup
+/// has been round, another session of that key gets it.
+#[tokio::test]
+async fn a_session_that_times_out_gives_its_key_room_back() {
+    let mut limits = BoundForwardConfig::default();
+    limits.key_budget.max_sessions = 1;
+    let relay = relay_for(fleet(), limits)
+        .with_timeouts(Duration::from_millis(500), Duration::from_secs(30));
+    let (node, addr) = start_config(relay, StubPowValidator).await;
+    let _silent = fill_from(&node, addr, 1).await;
+    let body = sealed_body(&[0xee; 5000], &KEY).unwrap();
+    let late = raw_session(&node, addr, &body).await;
+    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 0);
+
+    timeout(Duration::from_secs(30), async {
+        while node.bound_usage().unwrap().pool != BoundUsed::default() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the place never came back");
+
+    send_again(&node, addr, &late, &body).await;
+    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
 }
