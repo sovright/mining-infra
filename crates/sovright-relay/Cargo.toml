@@ -7,6 +7,8 @@ description = "Fast block relay protocol for the Sovright Zcash mining network"
 repository = "https://github.com/sovright/mining-infra"
 
 [dependencies]
+chunk-proof = { path = "../../research/chunk-proof" }
+delivery-lease = { path = "../../research/delivery-lease" }
 serde_json = { workspace = true }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 zcash-pool-common = { path = "../zcash-pool-common" }

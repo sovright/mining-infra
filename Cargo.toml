@@ -10,6 +10,9 @@ exclude = [
     "crates/bedrock-forge",
     "crates/bedrock-noise",
     "crates/forge-sidecar",
+    # Research crates with workspaces of their own, used by path from the bound raw path.
+    "research/chunk-proof",
+    "research/delivery-lease",
 ]
 
 [workspace.package]

@@ -202,6 +202,7 @@ impl SubmitGateConfig {
             dedup_window: std::time::Duration::from_secs(self.dedup_window_secs),
             dedup_capacity: self.dedup_capacity,
             unreadable_attempts_per_block: self.unreadable_attempts_per_block,
+            ..crate::submit_gate::GateConfig::default()
         }
     }
 }

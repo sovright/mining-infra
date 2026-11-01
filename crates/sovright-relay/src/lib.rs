@@ -37,8 +37,9 @@ pub use merkle::{
 pub use messages::{BlockTxn, GetBlockTxn, SendCmpct};
 pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
-    ArrivalSink, BlockReceiver, BlockSender, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
-    RelayPayload, render_prometheus_text,
+    ArrivalSink, BlockReceiver, BlockSender, BoundBlock, BoundForwardConfig, BoundNodeUsage,
+    BoundProbe, BoundRawConfig, BoundUsed, MetricsSnapshot, RelayClient, RelayMetrics, RelayNode,
+    RelayPayload, body_frames, is_bound, render_prometheus_text, sealed_body, sealed_frame,
 };
 pub use segmented_block::{
     RawBlockSegment, SegmentedBlockError, compact_v3_object_hash, reassemble_raw_block,

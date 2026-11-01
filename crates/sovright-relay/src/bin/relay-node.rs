@@ -6,7 +6,8 @@ use std::time::Duration;
 use std::{env, fs};
 
 use sovright_relay::{
-    ArrivalSink, AuthKey, KeyRole, RelayConfig, RelayNode, render_prometheus_text,
+    ArrivalSink, AuthKey, BoundForwardConfig, KeyRole, RelayConfig, RelayNode,
+    render_prometheus_text,
 };
 use tracing::{error, info, warn};
 
@@ -19,7 +20,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         )
         .init();
 
-    let (config, auth_keys_resolution) = config_from_env()?;
+    let (mut config, auth_keys_resolution) = config_from_env()?;
+    // #130 PR B research, off unless asked for.
+    if env::var_os("SOVRIGHT_RELAY_BOUND_RAW").is_some() {
+        config = config.with_bound_raw(BoundForwardConfig::default());
+    }
     let mut node = RelayNode::new(config)?;
     if let Some(path) = env::var_os("SOVRIGHT_RELAY_ARRIVAL_LOG") {
         let path = PathBuf::from(path);

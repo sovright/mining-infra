@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use chunk_proof::datagram::Verifier;
+use chunk_proof::object::{Encoded, Profile};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -22,6 +24,7 @@ use crate::transport::{
     TransportError, ZCASH_FULL_HEADER_SIZE,
 };
 
+use super::bound_raw::{self, BoundForwarder, BoundNodeUsage, BoundStep};
 use super::forwarding::ForwardOrder;
 use super::metrics::RelayMetrics;
 use super::{ArrivalSink, ReceiptObject};
@@ -110,6 +113,9 @@ pub struct RelayNode<V: PowValidator = EquihashPowValidator> {
     /// in this workspace's Cargo.lock) because critical sections here are
     /// always short, synchronous pointer operations.
     active_keys: StdRwLock<Arc<Vec<AuthKey>>>,
+    /// The bound raw path, if the config asks for it. A plain lock: nothing here awaits
+    /// while holding it.
+    bound: Option<Mutex<BoundForwarder>>,
 }
 
 impl RelayNode<EquihashPowValidator> {
@@ -142,6 +148,15 @@ impl<V: PowValidator> RelayNode<V> {
             config.unauth_rate_limit_burst,
         );
 
+        let bound = config
+            .bound_raw
+            .map(BoundForwarder::new)
+            .transpose()
+            .map_err(|invalid| {
+                FecError::InvalidConfiguration(format!("bound raw limits: {}", invalid.0))
+            })?
+            .map(Mutex::new);
+
         Ok(Self {
             config,
             socket: None,
@@ -154,6 +169,7 @@ impl<V: PowValidator> RelayNode<V> {
             arrival_sink: None,
             unauth_limiter,
             active_keys,
+            bound,
         })
     }
 
@@ -224,6 +240,22 @@ impl<V: PowValidator> RelayNode<V> {
         if evicted > 0 {
             info!(evicted, "Evicted sessions bound to revoked auth keys");
         }
+        self.tidy_bound(&sessions);
+    }
+
+    fn tidy_bound(&self, sessions: &HashMap<SocketAddr, RelaySession>) {
+        if let Some(bound) = &self.bound {
+            bound
+                .lock()
+                .expect("bound forwarder poisoned")
+                .tidy(Instant::now(), |addr| sessions.contains_key(addr));
+        }
+    }
+
+    /// What this node holds on the bound path, if it has it.
+    pub fn bound_usage(&self) -> Option<BoundNodeUsage> {
+        let bound = self.bound.as_ref()?;
+        Some(bound.lock().expect("bound forwarder poisoned").usage())
     }
 
     /// Get the number of active sessions
@@ -327,6 +359,7 @@ impl<V: PowValidator> RelayNode<V> {
                 .add_assembly_misses(stats.expired_incomplete, stats.expired_incomplete_near);
             session.cleanup_recent();
         }
+        self.tidy_bound(&sessions);
         let expired = (before - sessions.len()) as u64;
         if expired > 0 {
             self.metrics.add_sessions_expired(expired);
@@ -576,13 +609,6 @@ impl<V: PowValidator> RelayNode<V> {
         data_shards: u16,
         chunks: &[(u16, Vec<u8>)],
     ) -> Result<(), TransportError> {
-        let socket = self.socket.as_ref().ok_or_else(|| {
-            TransportError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "socket not bound",
-            ))
-        })?;
-
         let sessions = self.sessions.read().await;
         let mut outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = Vec::new();
 
@@ -661,8 +687,49 @@ impl<V: PowValidator> RelayNode<V> {
         }
         drop(sessions);
 
-        if outbound.is_empty() && !chunks.is_empty() {
-            self.metrics.inc_forward_no_peer_chunks(chunks.len() as u64);
+        self.send_outbound(outbound, chunks.len(), msg_type).await
+    }
+
+    /// Bound objects to every other session, each sealed with that session's own key.
+    async fn forward_bound(
+        &self,
+        src_addr: SocketAddr,
+        objects: &[Encoded],
+    ) -> Result<(), TransportError> {
+        let sessions = self.sessions.read().await;
+        let outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = sessions
+            .iter()
+            .filter(|(peer_addr, _)| **peer_addr != src_addr)
+            .map(|(peer_addr, session)| {
+                let key = session.auth_key();
+                let payloads = objects
+                    .iter()
+                    .flat_map(|object| BoundForwarder::sealed(&key, object))
+                    .collect();
+                (*peer_addr, session.key_id().to_string(), payloads)
+            })
+            .collect();
+        drop(sessions);
+        let chunks = objects.iter().map(|object| object.shards.len()).sum();
+        self.send_outbound(outbound, chunks, MessageType::RawBlockSegment)
+            .await
+    }
+
+    async fn send_outbound(
+        &self,
+        outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)>,
+        chunks: usize,
+        msg_type: MessageType,
+    ) -> Result<(), TransportError> {
+        let socket = self.socket.as_ref().ok_or_else(|| {
+            TransportError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotConnected,
+                "socket not bound",
+            ))
+        })?;
+
+        if outbound.is_empty() && chunks > 0 {
+            self.metrics.inc_forward_no_peer_chunks(chunks as u64);
         }
 
         let pacing = ForwardPacing::new(
@@ -899,8 +966,94 @@ impl<V: PowValidator> RelayNode<V> {
         ))
     }
 
+    /// The source of a bound datagram, by its session or by trying the active keys. Only
+    /// a datagram that passes its checks makes a session.
+    async fn bound_source(
+        &self,
+        data: &[u8],
+        src_addr: SocketAddr,
+    ) -> Result<([u8; 32], KeyRole, String), TransportError> {
+        if let Some(session) = self.sessions.read().await.get(&src_addr) {
+            let id = session.key_id().to_string();
+            return Ok((session.auth_key(), session.role(), id));
+        }
+        self.admit_unknown_source(src_addr)?;
+        let keys = self.active_keys();
+        let Some(key) = keys.iter().find(|key| {
+            Verifier::new(key.key, Profile::Research)
+                .verify(data)
+                .is_ok()
+        }) else {
+            warn!(peer = %src_addr, "Authentication failed - no matching key");
+            self.metrics.inc_auth_failures();
+            return Err(TransportError::AuthenticationFailed);
+        };
+        let mut sessions = self.sessions.write().await;
+        if sessions.len() >= self.config.max_sessions {
+            self.metrics.inc_session_limit_rejections();
+            return Err(TransportError::ConnectionRefused(
+                "relay session limit reached".into(),
+            ));
+        }
+        sessions.entry(src_addr).or_insert_with(|| {
+            info!(peer = %src_addr, key_id = %key.id, role = ?key.role, "Authenticated new peer");
+            self.metrics.inc_sessions_created();
+            self.metrics.inc_sessions_created_for_key(&key.id);
+            RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role)
+        });
+        Ok((key.key, key.role, key.id.clone()))
+    }
+
+    async fn handle_bound_packet(
+        &self,
+        bound: &Mutex<BoundForwarder>,
+        data: &[u8],
+        src_addr: SocketAddr,
+    ) -> Result<(), TransportError> {
+        let (key, role, key_id) = self.bound_source(data, src_addr).await?;
+        let step = bound.lock().expect("bound forwarder poisoned").take(
+            src_addr,
+            key,
+            data,
+            Instant::now(),
+            |header| self.validator.validate(header),
+        );
+        let objects = match step {
+            BoundStep::Invalid => {
+                self.metrics.inc_invalid_chunks();
+                return Err(TransportError::AuthenticationFailed);
+            }
+            BoundStep::Forward(objects) => objects,
+        };
+        if let Some(session) = self.sessions.write().await.get_mut(&src_addr) {
+            session.touch();
+        }
+        // The same rule as the legacy path: a ReceiveOnly key's content is never fanned out.
+        if role == KeyRole::ReceiveOnly {
+            let dropped = objects.iter().map(|o| o.shards.len() as u64).sum();
+            if dropped > 0 {
+                self.metrics.inc_receive_only_chunks_dropped(dropped);
+                self.metrics
+                    .inc_receive_only_chunks_dropped_for_key(&key_id, dropped);
+            }
+            return Ok(());
+        }
+        if objects.is_empty() {
+            return Ok(());
+        }
+        let relayed = objects.iter().map(|o| o.shards.len() as u64).sum();
+        self.metrics.inc_chunks_relayed_from_key(&key_id, relayed);
+        self.forward_bound(src_addr, &objects).await
+    }
+
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
         self.metrics.inc_packets_received();
+
+        if let Some(bound) = &self.bound
+            && bound_raw::is_bound(data)
+        {
+            return self.handle_bound_packet(bound, data, src_addr).await;
+        }
 
         let chunk = Chunk::from_bytes(data)?;
 
@@ -1327,6 +1480,10 @@ fn verify_data_chunk_hmac(session: &RelaySession, chunk: &Chunk, block_hash: &[u
         _ => false,
     }
 }
+
+#[cfg(test)]
+#[path = "known_gap_resource_node_tests.rs"]
+mod known_gap_resource_tests;
 
 #[cfg(test)]
 mod tests {

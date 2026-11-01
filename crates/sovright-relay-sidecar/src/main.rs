@@ -2,9 +2,10 @@
 
 use clap::Parser;
 use sovright_relay::{
-    ArrivalSink, BlockBodyError, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment,
-    RelayPayload, TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord,
-    WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
+    ArrivalSink, BlockBodyError, BlockReceiver, BoundBlock, BoundRawConfig, CompactBlock,
+    MempoolProvider, RawBlockSegment, RelayPayload, TxCache, TxCacheConfig, TxCacheInsertOutcome,
+    TxCacheSnapshot, TxFeedRecord, WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
+    zcash_block_hash,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -34,6 +35,7 @@ use sovright_relay_sidecar::submit::{
     SubmitRejectionClass, UnverifiedLimits, handle_relay_compact_block,
     handle_relay_compact_block_with_mempool, handle_relay_raw_block, submit_unverified_raw_block,
     unreadable_body, validate_then_gate_compact_block, validate_then_gate_raw_block,
+    zebra_has_the_block,
 };
 use sovright_relay_sidecar::submit_gate::SubmitGate;
 use tokio::sync::Mutex as TokioMutex;
@@ -393,7 +395,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Initialize relay
+    // Initialize relay. The bound raw path is #130 PR B research, off unless asked for.
+    let bound_raw = std::env::var_os("SOVRIGHT_RELAY_BOUND_RAW").is_some();
     let relay = RelayWrapper::new_with_fec(
         relay_peers.clone(),
         auth_key,
@@ -402,6 +405,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         parity_shards,
         send_burst_packets,
         Duration::from_micros(send_burst_delay_micros),
+        bound_raw.then(BoundRawConfig::default),
     )?;
     relay.init().await?;
     let relay_block_handler = if receive_relay_blocks {
@@ -693,6 +697,122 @@ async fn submit_compact_fast_path<S, M>(
     log_submission_outcome(outcome, metrics, None);
 }
 
+async fn next_bound_block(
+    blocks: &mut Option<tokio::sync::mpsc::Receiver<BoundBlock>>,
+) -> Option<BoundBlock> {
+    match blocks {
+        Some(blocks) => blocks.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The checks a whole raw block goes through, however it got here.
+async fn check_and_submit_raw_block(
+    rpc: &Arc<ZebraRpc>,
+    submitter: &Arc<DualSubmit<Arc<ZebraRpc>>>,
+    raw_block: &[u8],
+    block_hash: [u8; 32],
+    mode: SubmitBlockMode,
+    gate: Option<&Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
+    chain_view: Option<&Arc<ZebraChainView>>,
+) -> Result<SubmissionOutcome, RelayBlockError> {
+    if let (Some(gate), Some(chain_view)) = (gate, chain_view) {
+        validate_then_gate_raw_block(
+            submitter.as_ref(),
+            raw_block,
+            Some(block_hash),
+            mode,
+            gate,
+            || chain_view.observe_candidate_parent(rpc.as_ref(), raw_block),
+        )
+        .await
+    } else {
+        handle_relay_raw_block(submitter.as_ref(), raw_block, Some(block_hash), mode).await
+    }
+}
+
+/// One whole bound block, through the same checks as a reassembled raw block, and then
+/// settled by what came of it. It has no record but its owners, and only an outcome that
+/// says this block is dealt with ends them for good. Any other end lets a copy in.
+#[allow(clippy::too_many_arguments)]
+async fn handle_bound_block(
+    block: BoundBlock,
+    rpc: &Arc<ZebraRpc>,
+    submitter: &Arc<DualSubmit<Arc<ZebraRpc>>>,
+    mode: SubmitBlockMode,
+    gate: Option<&Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
+    chain_view: Option<&Arc<ZebraChainView>>,
+    unreadable_submit: Option<&UnreadableSubmit>,
+    metrics: &Arc<SidecarMetrics>,
+    fast_path_dedup: &mut HashDedupRing,
+) {
+    let first_seen = Instant::now();
+    metrics.inc_raw_segment_sets_completed();
+    let Some(header) = block.raw().get(..ZCASH_FULL_HEADER_SIZE) else {
+        metrics.inc_raw_segment_reassembly_failures();
+        block.give_back();
+        return;
+    };
+    let block_hash = zcash_block_hash(header);
+    let hash_hex = hex::encode(block_hash);
+    if fast_path_dedup.contains(&hash_hex, Instant::now()) {
+        debug!(block_hash = %hash_hex, "bound block already submitted; skipping");
+        block.finish();
+        return;
+    }
+    let outcome = check_and_submit_raw_block(
+        rpc,
+        submitter,
+        block.raw(),
+        block_hash,
+        mode,
+        gate,
+        chain_view,
+    )
+    .await;
+    if let (Some(error), Some(unreadable), Some(gate), Some(chain_view)) = (
+        unreadable_body(&outcome),
+        unreadable_submit,
+        gate,
+        chain_view,
+    ) {
+        unreadable.spawn(UnverifiedSubmission {
+            submitter: Arc::clone(submitter),
+            rpc: Arc::clone(rpc),
+            gate: Arc::clone(gate),
+            chain_view: Arc::clone(chain_view),
+            metrics: Arc::clone(metrics),
+            mode,
+            raw_block: block.raw().to_vec(),
+            error,
+            first_seen,
+        });
+        block.give_back();
+        return;
+    }
+    let delivered = matches!(
+        outcome,
+        Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_))
+    );
+    let known_to_zebra = zebra_has_the_block(&outcome, gate.map(Arc::as_ref)).await;
+    if delivered {
+        if gate.is_some() {
+            metrics.inc_submit_gate_accepted();
+        }
+        fast_path_dedup.record(hash_hex, Instant::now());
+    }
+    let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
+    if matches!(outcome, Ok(SubmissionOutcome::Submitted { .. })) {
+        metrics.observe_first_seen_to_submit_ms(first_seen_to_submit_ms);
+    }
+    log_submission_outcome(outcome, metrics.as_ref(), Some(first_seen_to_submit_ms));
+    if delivered || known_to_zebra {
+        block.finish();
+    } else {
+        block.give_back();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_relay_block_handler<M>(
     mut receiver: BlockReceiver,
@@ -713,6 +833,7 @@ where
     M: MempoolProvider + Send + Sync + 'static,
 {
     tokio::spawn(async move {
+        let mut bound_blocks = receiver.take_bound_blocks();
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
         // Fast-path submit dedup shared by the skeleton and the non-gated
         // compact block paths (see `submit_compact_fast_path`).
@@ -723,12 +844,33 @@ where
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
+                block = next_bound_block(&mut bound_blocks) => {
+                    match block {
+                        Some(block) => {
+                            handle_bound_block(
+                                block,
+                                &rpc,
+                                &submitter,
+                                mode,
+                                gate.as_ref(),
+                                chain_view.as_ref(),
+                                unreadable_submit.as_ref(),
+                                &metrics,
+                                &mut fast_path_dedup,
+                            )
+                            .await;
+                        }
+                        None => bound_blocks = None,
+                    }
+                }
                 payload = receiver.recv_payload() => {
                     let Some(payload) = payload else {
                         warn!("Relay block receiver closed");
                         break;
                     };
                     match payload {
+                        // Outgoing only. What comes in on that path has its own channel.
+                        RelayPayload::BoundRawBlock(_) => {}
                         RelayPayload::CompactBlock(compact) => {
                             metrics.inc_compact_blocks_received();
                             // Gate the candidate when configured and not in
@@ -868,27 +1010,16 @@ where
                                                  );
                                                  continue;
                                              }
-                                             let raw_outcome = if let (Some(gate), Some(chain_view)) =
-                                                 (&gate, &chain_view)
-                                            {
-                                                validate_then_gate_raw_block(
-                                                    submitter.as_ref(),
-                                                    &raw_block,
-                                                    Some(block_hash),
-                                                    mode,
-                                                    gate,
-                                                    || chain_view.observe_candidate_parent(rpc.as_ref(), &raw_block),
-                                                )
-                                                .await
-                                            } else {
-                                                handle_relay_raw_block(
-                                                    submitter.as_ref(),
-                                                    &raw_block,
-                                                    Some(block_hash),
-                                                    mode,
-                                                )
-                                                .await
-                                            };
+                                             let raw_outcome = check_and_submit_raw_block(
+                                                &rpc,
+                                                &submitter,
+                                                &raw_block,
+                                                block_hash,
+                                                mode,
+                                                gate.as_ref(),
+                                                chain_view.as_ref(),
+                                            )
+                                            .await;
                                             if let (
                                                 Some(error),
                                                 Some(unreadable),
@@ -1779,6 +1910,7 @@ struct SidecarMetrics {
     submit_gate_rejected_out_of_window: AtomicU64,
     submit_gate_rejected_duplicate: AtomicU64,
     submit_gate_rejected_unverified_limit: AtomicU64,
+    submit_gate_rejected_strict_limit: AtomicU64,
     block_body_unverified: AtomicU64,
     unreadable_submit_enabled: AtomicBool,
     raw_segment_incomplete_blocks: AtomicUsize,
@@ -1987,6 +2119,9 @@ impl SidecarMetrics {
             }
             sovright_relay_sidecar::submit_gate::RejectReason::UnverifiedLimit => {
                 &self.submit_gate_rejected_unverified_limit
+            }
+            sovright_relay_sidecar::submit_gate::RejectReason::StrictLimit => {
+                &self.submit_gate_rejected_strict_limit
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -2308,6 +2443,11 @@ impl SidecarMetrics {
                 .load(Ordering::Relaxed)
         ));
         text.push_str(&format!(
+            "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"strict_limit\"}} {}\n",
+            self.submit_gate_rejected_strict_limit
+                .load(Ordering::Relaxed)
+        ));
+        text.push_str(&format!(
             "# TYPE sovright_relay_sidecar_relay_block_body_unverified_total counter\n\
              sovright_relay_sidecar_relay_block_body_unverified_total {}\n\
              # TYPE sovright_relay_sidecar_unreadable_block_submit_enabled gauge\n\
@@ -2346,6 +2486,15 @@ fn spawn_metrics_textfile_writer(
         }
     });
 }
+
+#[cfg(test)]
+mod bound_path_tests;
+#[cfg(test)]
+mod known_gap_eviction_tests;
+#[cfg(test)]
+mod known_gap_s10_tests;
+#[cfg(test)]
+mod lease_buffer_harness_tests;
 
 #[cfg(test)]
 mod tests {

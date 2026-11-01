@@ -45,6 +45,7 @@ pub(crate) fn harness() -> Harness {
             64,
             Duration::from_secs(30),
         ))),
+        raw_wire: RawWire::Legacy,
         parse_permits: ParsePermits::new(),
         block_body_rejections: Default::default(),
         peer_pow_limit: None,
@@ -883,12 +884,19 @@ async fn a_dropped_claim_passes_to_a_copy_that_already_validated() {
     let harness = harness();
     let claim = harness
         .bridge
-        .claim_forward(hash, spare_permit().await)
+        .claim_forward(hash, hash, spare_permit().await)
         .await
+        .unwrap()
         .unwrap();
     let bridge = harness.bridge.clone();
     let permit = spare_permit().await;
-    let waiter = tokio::spawn(async move { bridge.claim_forward(hash, permit).await.is_some() });
+    let waiter = tokio::spawn(async move {
+        bridge
+            .claim_forward(hash, hash, permit)
+            .await
+            .unwrap()
+            .is_some()
+    });
     eventually(|| waiting_on(&harness.bridge, &hash) == 1).await;
 
     drop(claim);
@@ -903,12 +911,19 @@ async fn a_committed_claim_settles_a_copy_that_already_validated() {
     let harness = harness();
     let claim = harness
         .bridge
-        .claim_forward(hash, spare_permit().await)
+        .claim_forward(hash, hash, spare_permit().await)
         .await
+        .unwrap()
         .unwrap();
     let bridge = harness.bridge.clone();
     let permit = spare_permit().await;
-    let waiter = tokio::spawn(async move { bridge.claim_forward(hash, permit).await.is_some() });
+    let waiter = tokio::spawn(async move {
+        bridge
+            .claim_forward(hash, hash, permit)
+            .await
+            .unwrap()
+            .is_some()
+    });
     eventually(|| waiting_on(&harness.bridge, &hash) == 1).await;
 
     claim.commit();
@@ -929,13 +944,20 @@ async fn a_copy_waiting_on_a_send_gives_its_permit_back() {
     let harness = harness();
     let claim = harness
         .bridge
-        .claim_forward(hash, spare_permit().await)
+        .claim_forward(hash, hash, spare_permit().await)
         .await
+        .unwrap()
         .unwrap();
     let permits = Arc::new(Semaphore::new(1));
     let permit = hold(&permits).await;
     let bridge = harness.bridge.clone();
-    let waiter = tokio::spawn(async move { bridge.claim_forward(hash, permit).await.is_some() });
+    let waiter = tokio::spawn(async move {
+        bridge
+            .claim_forward(hash, hash, permit)
+            .await
+            .unwrap()
+            .is_some()
+    });
 
     eventually(|| waiting_on(&harness.bridge, &hash) == 1).await;
     assert_eq!(permits.available_permits(), 1);
@@ -1657,4 +1679,223 @@ async fn concurrent_copies_of_an_unreadable_body_are_sent_once() {
         reassemble_raw_block(&raw_segments(harness.sent())).unwrap(),
         raw
     );
+}
+
+/// Known gap for #130 PR B, not a behaviour to preserve. One after the other, with
+/// nothing in flight: the first body to pass the strict reader takes the header, and
+/// the other strict body of that header leaves this ingress with nothing sent. The
+/// gate is not involved, because the second body never reaches a relay.
+#[tokio::test]
+async fn known_gap_a_strict_body_stops_the_other_body_of_its_header_here() {
+    let (real, other) = two_valid_bodies();
+    assert_eq!(
+        real[..ZCASH_FULL_HEADER_SIZE],
+        other[..ZCASH_FULL_HEADER_SIZE]
+    );
+    let transactions = validate_block_body(&real).unwrap();
+    assert_eq!(
+        validate_block_body(&other),
+        Ok(transactions),
+        "the first body must pass the strict reader, or this is not the case under test"
+    );
+    let mut harness = harness();
+    harness.bridge.peer_pow_limit = Some(Target::mainnet_pow_limit());
+
+    let first = harness.bridge.forward_block(&other, None).await.unwrap();
+    assert_eq!(first.mode, ForwardMode::RawBlockSegments);
+
+    let second = harness.bridge.forward_block(&real, None).await.unwrap();
+    assert_eq!(second.mode, ForwardMode::Deduplicated);
+    assert_eq!(second.relay_objects, 0);
+
+    let segments: Vec<RawBlockSegment> = harness
+        .sent()
+        .into_iter()
+        .map(|payload| match payload {
+            RelayPayload::RawBlockSegment(segment) => segment,
+            other => panic!("expected a raw segment, got {other:?}"),
+        })
+        .collect();
+    assert_eq!(reassemble_raw_block(&segments).unwrap(), other);
+    assert!(harness.recorded(&real), "the record is per header");
+}
+
+// #130 PR B: the same bridge with a record per body. `known_gap_a_strict_body_stops_the_
+// other_body_of_its_header_here` above is the legacy wire, and it stays as it is.
+
+fn harness_on(wire: RawWire, bodies_per_header: usize) -> Harness {
+    let mut harness = harness();
+    harness.bridge.raw_wire = wire;
+    harness.bridge.recent_forwarded = Arc::new(std::sync::Mutex::new(
+        RecentForwardedHashes::new(64, Duration::from_secs(30))
+            .with_bodies_per_header(bodies_per_header),
+    ));
+    harness.bridge.peer_pow_limit = Some(Target::mainnet_pow_limit());
+    harness
+}
+
+fn bound_copies(sent: &[RelayPayload]) -> Vec<Vec<u8>> {
+    sent.iter()
+        .filter_map(|payload| match payload {
+            RelayPayload::BoundRawBlock(raw) => Some(raw.to_vec()),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn under_a_record_per_body_both_bodies_of_a_header_go_out() {
+    let (real, other) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Dual, 4);
+
+    let first = harness.bridge.forward_block(&other, None).await.unwrap();
+    let second = harness.bridge.forward_block(&real, None).await.unwrap();
+
+    assert_eq!(first.mode, ForwardMode::RawBlockSegments);
+    assert_eq!(second.mode, ForwardMode::RawBlockSegments);
+    assert_eq!(bound_copies(&harness.sent()), vec![other, real]);
+}
+
+#[tokio::test]
+async fn under_a_record_per_body_the_same_body_is_a_repeat() {
+    let (real, _) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Dual, 4);
+
+    harness.bridge.forward_block(&real, None).await.unwrap();
+    let again = harness.bridge.forward_block(&real, None).await.unwrap();
+
+    assert_eq!(again.mode, ForwardMode::Deduplicated);
+    assert_eq!(bound_copies(&harness.sent()).len(), 1);
+}
+
+/// What brings a copy back on the same connection: another copy from a peer, once the
+/// record of the first has ended. Nothing here asks for one, and a receiver has no way to.
+#[tokio::test]
+async fn the_same_ingress_sends_a_body_again_once_its_record_ends() {
+    let (real, _) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Bound, 4);
+    harness.bridge.recent_forwarded = Arc::new(std::sync::Mutex::new(
+        RecentForwardedHashes::new(64, Duration::ZERO).with_bodies_per_header(4),
+    ));
+
+    harness.bridge.forward_block(&real, None).await.unwrap();
+    let again = harness.bridge.forward_block(&real, None).await.unwrap();
+
+    assert_eq!(again.mode, ForwardMode::RawBlockSegments);
+    assert_eq!(bound_copies(&harness.sent()).len(), 2);
+}
+
+/// Fails closed. Which body gets the last place is the order they came in, and the real
+/// one can be the one turned away.
+#[tokio::test]
+async fn known_gap_a_header_at_its_limit_turns_the_next_body_away() {
+    let (real, other) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Dual, 1);
+
+    harness.bridge.forward_block(&other, None).await.unwrap();
+    let turned_away = harness.bridge.forward_block(&real, None).await;
+
+    assert!(matches!(turned_away, Err(IngressError::Relay(_))));
+    assert_eq!(bound_copies(&harness.sent()), vec![other]);
+}
+
+/// A send that did not finish keeps no place and leaves no record.
+#[tokio::test]
+async fn a_failed_send_gives_its_place_back() {
+    let (real, other) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Dual, 1);
+    let (closed, gone) = tokio::sync::mpsc::channel(1);
+    drop(gone);
+    let working = std::mem::replace(&mut harness.bridge.sender, BlockSender::for_tests(closed));
+
+    assert!(harness.bridge.forward_block(&other, None).await.is_err());
+
+    harness.bridge.sender = working;
+    let next = harness.bridge.forward_block(&real, None).await.unwrap();
+    assert_eq!(next.mode, ForwardMode::RawBlockSegments);
+}
+
+#[tokio::test]
+async fn the_bound_wire_sends_no_legacy_segment() {
+    let (real, _) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Bound, 4);
+
+    harness.bridge.forward_block(&real, None).await.unwrap();
+
+    let sent = harness.sent();
+    assert_eq!(bound_copies(&sent), vec![real]);
+    assert_eq!(sent.len(), 1);
+}
+
+#[tokio::test]
+async fn the_legacy_wire_sends_no_bound_copy() {
+    let (real, _) = two_valid_bodies();
+    let mut harness = harness_on(RawWire::Legacy, 4);
+
+    harness.bridge.forward_block(&real, None).await.unwrap();
+
+    assert!(bound_copies(&harness.sent()).is_empty());
+}
+
+/// The real bridge through a real client and node to a real receiver: both bodies of one
+/// header come out whole. There is no sidecar in this crate, so this stops at the channel.
+#[tokio::test]
+async fn both_bodies_cross_a_real_node_from_the_bridge() {
+    use sovright_relay::{
+        AuthKey, BoundRawConfig, ClientConfig, RelayClient, RelayConfig, RelayNode,
+        StubPowValidator,
+    };
+
+    const KEY: [u8; 32] = [0x42; 32];
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(vec![AuthKey::new("fleet", KEY)])
+        .with_fec(10, 3)
+        .with_bound_raw(Default::default());
+    let mut node = RelayNode::with_validator(config, StubPowValidator).unwrap();
+    node.bind().await.unwrap();
+    let node_addr = node.local_addr().unwrap();
+    let node = Arc::new(node);
+    let running = Arc::clone(&node);
+    tokio::spawn(async move { running.run().await });
+
+    let client_config = || {
+        ClientConfig::new(vec![node_addr], KEY)
+            .with_bind_addr("127.0.0.1:0".parse().unwrap())
+            .with_auth_required(true)
+            .with_send_pacing(32, Duration::from_micros(200))
+    };
+    let mut receiver_client =
+        RelayClient::new(client_config().with_bound_raw(BoundRawConfig::default())).unwrap();
+    receiver_client.bind().await.unwrap();
+    let (mut receiver, outgoing) = receiver_client.take_receiver().unwrap();
+    let mut blocks = receiver.take_bound_blocks().unwrap();
+    tokio::spawn(async move {
+        let _keep = receiver;
+        receiver_client.run_with_outgoing(outgoing).await
+    });
+    finishes(async {
+        while node.session_count().await == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+
+    let mut sending_client = RelayClient::new(client_config()).unwrap();
+    sending_client.bind().await.unwrap();
+    let mut harness = harness_on(RawWire::Bound, 4);
+    harness.bridge.sender = sending_client.sender();
+    tokio::spawn(async move { sending_client.run().await });
+
+    let (real, other) = two_valid_bodies();
+    harness.bridge.forward_block(&other, None).await.unwrap();
+    harness.bridge.forward_block(&real, None).await.unwrap();
+
+    for body in [other, real] {
+        let block = tokio::time::timeout(Duration::from_secs(10), blocks.recv())
+            .await
+            .expect("a body crosses the relay")
+            .unwrap();
+        assert_eq!(block.raw(), body);
+        block.finish();
+    }
 }

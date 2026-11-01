@@ -1,0 +1,19 @@
+[package]
+name = "chunk-proof"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Research prototype for #130 PR B. Not a workspace member."
+
+[dependencies]
+delivery-lease = { path = "../delivery-lease" }
+hmac = "=0.12.1"
+reed-solomon-erasure = "=6.0.0"
+sha2 = "=0.10.9"
+
+[dev-dependencies]
+blake2b_simd = "=1.0.4"
+serde_json = "=1.0.149"
+tokio = { version = "=1.51.1", features = ["macros", "rt", "sync"] }
+
+[workspace]

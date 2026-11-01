@@ -209,6 +209,10 @@ impl RelaySession {
     }
 
     /// The identity label of the key this session is bound to.
+    pub(crate) fn auth_key(&self) -> [u8; 32] {
+        self.auth_key
+    }
+
     pub fn key_id(&self) -> &str {
         &self.key_id
     }
