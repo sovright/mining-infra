@@ -142,11 +142,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("sovright_relay_sidecar=info".parse()?),
+                .add_directive("sovright_relay_sidecar=info".parse()?)
+                .add_directive("sovright_relay::relay::bound_raw=warn".parse()?),
         )
         .init();
 
     let args = Args::parse();
+    // #130 PR B research, off unless asked for.
+    let bound_raw = sovright_relay::bound_raw_switch()?;
+    if bound_raw {
+        info!(target: "sovright_relay_sidecar", "Bound raw switch on");
+    }
 
     // Load config file if specified, CLI args override config
     let (
@@ -267,6 +273,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "disable_template_announcements requires receive_relay_blocks so the sidecar has work"
                 .into(),
         );
+    }
+    if bound_raw && !receive_relay_blocks {
+        warn!("SOVRIGHT_RELAY_BOUND_RAW is on but receive_relay_blocks is off; ignoring");
     }
     if tx_feed_bind_addr.is_some() && !tx_cache_enabled {
         return Err("tx_feed_bind_addr requires tx_cache_enabled".into());
@@ -395,8 +404,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     }
 
-    // Initialize relay. The bound raw path is #130 PR B research, off unless asked for.
-    let bound_raw = std::env::var_os("SOVRIGHT_RELAY_BOUND_RAW").is_some();
+    // Initialize relay.
     let relay = RelayWrapper::new_with_fec(
         relay_peers.clone(),
         auth_key,
@@ -869,8 +877,6 @@ where
                         break;
                     };
                     match payload {
-                        // Outgoing only. What comes in on that path has its own channel.
-                        RelayPayload::BoundRawBlock(_) => {}
                         RelayPayload::CompactBlock(compact) => {
                             metrics.inc_compact_blocks_received();
                             // Gate the candidate when configured and not in

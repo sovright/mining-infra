@@ -77,6 +77,33 @@ fn refused_by(unwinds: bool) -> Option<&'static str> {
     (!unwinds).then_some("the bound raw path needs panic = \"unwind\", and this build aborts")
 }
 
+/// The variable that turns the bound path on, on a relay node and a sidecar.
+const BOUND_RAW_SWITCH: &str = "SOVRIGHT_RELAY_BOUND_RAW";
+
+/// Whether [`BOUND_RAW_SWITCH`] asks for the bound path. Anything it cannot read is an error
+/// for the caller to stop on, and never a yes.
+pub fn bound_raw_switch() -> Result<bool, String> {
+    read_bound_raw_switch(std::env::var_os(BOUND_RAW_SWITCH).as_deref())
+}
+
+/// The words the ingress takes for its switches. Empty counts as off, with a warning, so that
+/// `VAR=` is a way back.
+fn read_bound_raw_switch(value: Option<&std::ffi::OsStr>) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    let text = value.to_str().map(|text| text.trim().to_ascii_lowercase());
+    match text.as_deref() {
+        Some("1" | "true" | "yes" | "on") => Ok(true),
+        Some("0" | "false" | "no" | "off") => Ok(false),
+        Some("") => {
+            warn!("{BOUND_RAW_SWITCH} is set and empty, leaving the bound path off");
+            Ok(false)
+        }
+        _ => Err(format!("invalid {BOUND_RAW_SWITCH}: {}", value.display())),
+    }
+}
+
 fn hash_header(header: &[u8]) -> [u8; 32] {
     crate::zcash_block_hash(header)
 }
@@ -3691,6 +3718,30 @@ mod tests {
                 _ => config.max_bodies_per_block = 0,
             }
             assert!(BoundForwarder::new(config).is_err());
+        }
+    }
+
+    #[test]
+    fn the_bound_switch_means_what_it_says() {
+        let read = |value: &str| read_bound_raw_switch(Some(value.as_ref()));
+
+        assert_eq!(read_bound_raw_switch(None), Ok(false));
+        for value in ["1", "true", "TRUE", " true ", "yes", "on"] {
+            assert_eq!(read(value), Ok(true), "{value:?}");
+        }
+        for value in ["0", "false", "False", " 0 ", "no", "off", "", "   "] {
+            assert_eq!(read(value), Ok(false), "{value:?}");
+        }
+        for value in ["2", "-1", "maybe", "truee", "enabled", "1 0"] {
+            let error = read(value).unwrap_err();
+            assert!(error.contains(BOUND_RAW_SWITCH), "{error}");
+            assert!(error.contains(value), "{error}");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let not_text = std::ffi::OsStr::from_bytes(&[0xff]);
+            assert!(read_bound_raw_switch(Some(not_text)).is_err());
         }
     }
 

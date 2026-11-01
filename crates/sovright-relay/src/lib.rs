@@ -39,9 +39,9 @@ pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
     ArrivalSink, BOUND_SEND_BURST_DELAY, BOUND_SEND_BURST_PACKETS, BlockReceiver, BlockSender,
     BoundArrivals, BoundBlock, BoundForwardConfig, BoundHandoffs, BoundIngress, BoundNodeUsage,
-    BoundProbe, BoundProgress, BoundRawConfig, BoundUsed, MetricsSnapshot, RelayClient,
-    RelayMetrics, RelayNode, RelayPayload, SendReport, body_frames, bound_raw_refused, is_bound,
-    render_prometheus_text, sealed_body, sealed_frame,
+    BoundProbe, BoundProgress, BoundRawConfig, BoundSend, BoundUsed, MetricsSnapshot, RelayClient,
+    RelayMetrics, RelayNode, RelayPayload, SendReport, body_frames, bound_raw_refused,
+    bound_raw_switch, is_bound, render_prometheus_text, sealed_body, sealed_frame,
 };
 pub use segmented_block::{
     RawBlockSegment, SegmentedBlockError, compact_v3_object_hash, reassemble_raw_block,

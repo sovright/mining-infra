@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
@@ -26,6 +28,9 @@ const RECENT_DELIVERED_TTL: Duration = Duration::from_secs(120);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(60);
 const KEEPALIVE_BLOCK_HASH: [u8; 32] = [0u8; 32];
 const CLIENT_RECV_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+/// Whole blocks a client holds for the bound send, behind the one going out. Past this a
+/// caller hears so at once, and nothing else on the client waits for that.
+const BOUND_SENDS_WAITING: usize = 4;
 
 /// Payload delivered through the relay client.
 #[derive(Clone, Debug)]
@@ -38,15 +43,31 @@ pub enum RelayPayload {
     /// sent first and redundantly ahead of the full compact block, routed to
     /// the receiver's skeleton fast path.
     CompactSkeleton(CompactBlock),
-    /// One whole raw block to send in the bound format. Outgoing only: what comes in on
-    /// that path owns itself, and arrives by [`BlockReceiver::recv_bound_block`].
-    BoundRawBlock(Arc<Vec<u8>>),
+}
+
+/// One whole raw block to send in the bound format, and who hears how that went.
+#[derive(Debug)]
+pub struct BoundSend {
+    raw: Arc<Vec<u8>>,
+    done: oneshot::Sender<Result<(), TransportError>>,
+}
+
+impl BoundSend {
+    pub fn raw(&self) -> &[u8] {
+        &self.raw
+    }
+
+    /// Says how it went. Whoever asked may have stopped waiting, and that changes nothing.
+    pub fn finish(self, result: Result<(), TransportError>) {
+        let _ = self.done.send(result);
+    }
 }
 
 /// Handle for sending blocks through the relay client
 #[derive(Clone)]
 pub struct BlockSender {
     tx: mpsc::Sender<RelayPayload>,
+    bound_tx: mpsc::Sender<BoundSend>,
     sends: Arc<SendCounts>,
 }
 
@@ -66,10 +87,11 @@ pub struct SendReport {
 }
 
 impl BlockSender {
-    /// A sender on a channel of the caller's, with no client behind it.
+    /// A sender on a channel of the caller's, with no client behind it and no bound send.
     pub fn for_tests(tx: mpsc::Sender<RelayPayload>) -> Self {
         Self {
             tx,
+            bound_tx: mpsc::channel(1).0,
             sends: Arc::default(),
         }
     }
@@ -101,13 +123,37 @@ impl BlockSender {
             .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
     }
 
-    /// Send one whole raw block in the bound format. Every relay on the way and every
-    /// receiver has to have the bound path on, or this copy goes no further.
+    /// Send one whole raw block in the bound format and wait for how that went here. Every
+    /// relay on the way and every receiver has to have the bound path on, or this copy goes
+    /// no further.
+    ///
+    /// `Ok` says the block was encoded and that one relay's socket took every datagram of
+    /// it. That is as far as this client can see: it says nothing of whether anything arrived.
+    /// An error says it did not fit, no relay took it all, the queue was full or the client
+    /// went. Dropping this does not stop a send the client has taken: a block on its way is
+    /// worth more than a repeat saved.
     pub async fn send_bound_raw_block(&self, raw: Arc<Vec<u8>>) -> Result<(), TransportError> {
-        self.tx
-            .send(RelayPayload::BoundRawBlock(raw))
-            .await
-            .map_err(|_| TransportError::ConnectionRefused("channel closed".into()))
+        let (done, mut finished) = oneshot::channel();
+        self.bound_tx
+            .try_send(BoundSend { raw, done })
+            .map_err(|error| {
+                let reason = match error {
+                    TrySendError::Full(_) => "bound send queue full",
+                    TrySendError::Closed(_) => "channel closed",
+                };
+                TransportError::ConnectionRefused(reason.into())
+            })?;
+        // A send can reach the queue as the queue goes, and nothing then answers it, so the
+        // queue going is an answer too. One given before that comes first.
+        let went = || {
+            let reason = "the client went before the bound send finished";
+            TransportError::ConnectionRefused(reason.into())
+        };
+        tokio::select! {
+            biased;
+            answer = &mut finished => answer.map_err(|_| went())?,
+            () = self.bound_tx.closed() => Err(went()),
+        }
     }
 
     /// Send a compact skeleton to be relayed on the fast path.
@@ -187,6 +233,9 @@ pub struct RelayClient {
     /// Channel for outgoing blocks
     outgoing_tx: mpsc::Sender<RelayPayload>,
     outgoing_rx: Option<mpsc::Receiver<RelayPayload>>,
+    bound_tx: mpsc::Sender<BoundSend>,
+    bound_sends: Option<mpsc::Receiver<BoundSend>>,
+    keepalive_every: Duration,
     sends: Arc<SendCounts>,
     /// The bound path, from `take_receiver` until the run loop owns it.
     bound: Option<BoundReceiver>,
@@ -214,6 +263,7 @@ impl RelayClient {
 
         let chunker = BlockChunker::new(config.data_shards, config.parity_shards)?;
         let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
+        let (bound_tx, bound_sends) = mpsc::channel(BOUND_SENDS_WAITING);
 
         Ok(Self {
             config,
@@ -221,6 +271,9 @@ impl RelayClient {
             chunker,
             outgoing_tx,
             outgoing_rx: Some(outgoing_rx),
+            bound_tx,
+            bound_sends: Some(bound_sends),
+            keepalive_every: KEEPALIVE_INTERVAL,
             sends: Arc::default(),
             bound: None,
             incoming_tx: None,
@@ -268,8 +321,15 @@ impl RelayClient {
     pub fn sender(&self) -> BlockSender {
         BlockSender {
             tx: self.outgoing_tx.clone(),
+            bound_tx: self.bound_tx.clone(),
             sends: self.sends.clone(),
         }
+    }
+
+    /// What is waiting for the bound send, for a caller that answers it instead of this
+    /// client. Taken before `run`, this client sends none of it.
+    pub fn take_bound_sends(&mut self) -> Option<mpsc::Receiver<BoundSend>> {
+        self.bound_sends.take()
     }
 
     /// Take the receiver handle (can only be called once before run())
@@ -343,7 +403,7 @@ impl RelayClient {
         let mut pending_blocks: HashMap<[u8; 32], (BlockAssembly, usize)> = HashMap::new();
         let mut recent_delivered: HashMap<[u8; 32], Instant> = HashMap::new();
         let mut cleanup_counter: u32 = 0;
-        let mut keepalive_interval = tokio::time::interval(KEEPALIVE_INTERVAL);
+        let mut keepalive_interval = tokio::time::interval(self.keepalive_every);
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut bound = self.bound.take();
         let mut bound_interval = tokio::time::interval(
@@ -352,6 +412,22 @@ impl RelayClient {
                 .map_or(KEEPALIVE_INTERVAL, |config| config.look_every),
         );
         bound_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // On a task of its own, so that nothing here waits for it. It goes with this loop, and
+        // whoever waits on it hears so.
+        let mut bound_send = JoinSet::new();
+        if let Some(queue) = self.bound_sends.take() {
+            let sender = BoundSender {
+                socket: socket.clone(),
+                relays: self.config.relay_addrs.clone(),
+                key: self.config.auth_key,
+                pacing: SendPacing::new(
+                    self.config.bound_send_burst_packets,
+                    self.config.bound_send_burst_delay,
+                ),
+                sends: self.sends.clone(),
+            };
+            bound_send.spawn(sender.run(queue));
+        }
 
         loop {
             if !self.running.load(std::sync::atomic::Ordering::SeqCst) {
@@ -457,26 +533,7 @@ impl RelayClient {
             RelayPayload::CompactSkeleton(skeleton) => {
                 self.send_skeleton_internal(socket, skeleton).await
             }
-            RelayPayload::BoundRawBlock(raw) => self.send_bound_raw_internal(socket, raw).await,
         }
-    }
-
-    /// Send one whole raw block in the bound format to all relay nodes.
-    async fn send_bound_raw_internal(
-        &self,
-        socket: Arc<UdpSocket>,
-        raw: &[u8],
-    ) -> Result<(), TransportError> {
-        let datagrams = bound_raw::sealed_body(raw, &self.config.auth_key).ok_or_else(|| {
-            TransportError::InvalidChunk("raw block does not fit the bound format".into())
-        })?;
-        let object_hash = crate::zcash_block_hash(&raw[..crate::ZCASH_FULL_HEADER_SIZE]);
-        let pacing = SendPacing::new(
-            self.config.bound_send_burst_packets,
-            self.config.bound_send_burst_delay,
-        );
-        self.send_datagrams_internal(socket, &object_hash, datagrams, "bound raw block", pacing)
-            .await
     }
 
     /// Send a compact skeleton to all relay nodes on the fast path.
@@ -949,6 +1006,67 @@ impl SendPacing {
     }
 }
 
+/// The bound send of one client: one block at a time, in the order they came, and off the
+/// client's loop, which goes on with legacy traffic, receiving and keepalives meanwhile.
+struct BoundSender {
+    socket: Arc<UdpSocket>,
+    relays: Vec<SocketAddr>,
+    key: [u8; 32],
+    pacing: SendPacing,
+    sends: Arc<SendCounts>,
+}
+
+impl BoundSender {
+    async fn run(self, mut queue: mpsc::Receiver<BoundSend>) {
+        while let Some(send) = queue.recv().await {
+            let result = self.send(Arc::clone(&send.raw)).await;
+            if let Err(error) = &result {
+                warn!(?error, "Error sending a bound raw block");
+            }
+            send.finish(result);
+        }
+    }
+
+    /// Encoded on the blocking pool, as it takes as long as a large body does. One relay that
+    /// took all of it is enough, and one that refused costs the others nothing.
+    async fn send(&self, raw: Arc<Vec<u8>>) -> Result<(), TransportError> {
+        let key = self.key;
+        let encoded = tokio::task::spawn_blocking(move || bound_raw::sealed_body(&raw, &key));
+        let datagrams = encoded
+            .await
+            .map_err(|error| std::io::Error::other(format!("bound encoding failed: {error}")))?
+            .ok_or_else(|| {
+                TransportError::InvalidChunk("raw block does not fit the bound format".into())
+            })?;
+        let datagrams = Arc::new(datagrams);
+        let mut relays = JoinSet::new();
+        for relay_addr in self.relays.iter().copied() {
+            relays.spawn(send_payloads_to_relay(
+                self.socket.clone(),
+                relay_addr,
+                datagrams.clone(),
+                self.pacing,
+                self.sends.clone(),
+            ));
+        }
+        let (mut took_it, mut failure) = (false, None);
+        while let Some(result) = relays.join_next().await {
+            match result {
+                Ok(Ok(())) => took_it = true,
+                Ok(Err(error)) => failure = Some(error),
+                Err(error) => {
+                    let error = format!("relay send task failed: {error}");
+                    failure = Some(std::io::Error::other(error).into());
+                }
+            }
+        }
+        match failure {
+            Some(error) if !took_it => Err(error),
+            _ => Ok(()),
+        }
+    }
+}
+
 async fn send_payloads_to_relay(
     socket: Arc<UdpSocket>,
     relay_addr: SocketAddr,
@@ -986,6 +1104,10 @@ fn log_raw_segment_chunk_drop(chunk: &Chunk, reason: &'static str) {
 #[cfg(test)]
 #[path = "known_gap_resource_client_tests.rs"]
 mod known_gap_resource_tests;
+
+#[cfg(test)]
+#[path = "bound_send_tests.rs"]
+mod bound_send_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1211,8 +1211,8 @@ async fn a_block_of_the_usual_size_is_timed_the_same_way() {
     cross_and_report(the_real_block()).await;
 }
 
-/// What a dual sender costs its legacy copy: an ingress sends the bound copy first, on the one
-/// task that sends, so the legacy copy waits for all of its pacing. A legacy receiver, because
+/// What a dual sender costs its legacy copy: an ingress sends the two side by side, and the
+/// bound copy has a task of its own, so this should say little. A legacy receiver, because
 /// that is who gets it. This reports and asserts nothing, and the CI job reads the numbers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "a measurement, run by the bound path diagnostic job"]
@@ -1223,12 +1223,12 @@ async fn a_dual_send_reports_how_long_the_legacy_copy_waits() {
     ];
     for (name, block) in blocks {
         let alone = legacy_copy_reaches_zebra(&block, false).await;
-        let behind_bound = legacy_copy_reaches_zebra(&block, true).await;
-        println!("{name}: legacy alone {alone:?}, legacy behind a bound copy {behind_bound:?}");
+        let beside_bound = legacy_copy_reaches_zebra(&block, true).await;
+        println!("{name}: legacy alone {alone:?}, legacy beside a bound copy {beside_bound:?}");
     }
 }
 
-async fn legacy_copy_reaches_zebra(block: &[u8], behind_bound: bool) -> Option<Duration> {
+async fn legacy_copy_reaches_zebra(block: &[u8], beside_bound: bool) -> Option<Duration> {
     let (forward, burst, gap) = crossing_case();
     let node = stub_pow_node_with(forward).await;
     let sidecar = start_sidecar(node.addr, None).await;
@@ -1240,17 +1240,22 @@ async fn legacy_copy_reaches_zebra(block: &[u8], behind_bound: bool) -> Option<D
     let (sender, sender_task) = start_sender_with(config).await;
 
     let started = std::time::Instant::now();
-    if behind_bound {
-        send_bound(&sender, block).await;
-    }
-    send_legacy(&sender, block).await;
-    let mut taken = None;
-    while taken.is_none() && started.elapsed() < WAIT {
-        if sidecar.zebra.took(block) {
-            taken = Some(started.elapsed());
+    let bound = async {
+        if beside_bound {
+            send_bound(&sender, block).await;
         }
-        sleep(Duration::from_millis(1)).await;
-    }
+    };
+    let reaches_zebra = async {
+        let mut taken = None;
+        while taken.is_none() && started.elapsed() < WAIT {
+            if sidecar.zebra.took(block) {
+                taken = Some(started.elapsed());
+            }
+            sleep(Duration::from_millis(1)).await;
+        }
+        taken
+    };
+    let (_, (), taken) = tokio::join!(send_legacy(&sender, block), bound, reaches_zebra);
 
     stop(node, [sidecar.client_task, sender_task]);
     taken
@@ -1295,9 +1300,10 @@ async fn cross_and_report(block: Vec<u8>) {
         backlog_before: kernel_backlog_drops(),
     };
 
-    send_bound(&sender, &block).await;
-
-    watch.wait_for_the_block(&block).await;
+    // Side by side, as the send takes as long as it takes and the report is of that time.
+    let sent = timeout(WAIT, sender.send_bound_raw_block(Arc::new(block.clone())));
+    let (sent, ()) = tokio::join!(sent, watch.wait_for_the_block(&block));
+    sent.expect("the send never ended").unwrap();
     assert_eq!(sidecar.zebra.calls_for(&block), 1);
     sidecar.ledger_settled().await;
     stop(node, [sidecar.client_task, sender_task]);
@@ -1563,8 +1569,7 @@ async fn leftovers_never_stop_the_next_honest_block() {
 // `research/real-binaries/matrix.py`, which runs builds of the real tags as processes.
 
 async fn send_dual(sender: &BlockSender, raw: &[u8]) {
-    send_bound(sender, raw).await;
-    send_legacy(sender, raw).await;
+    tokio::join!(send_legacy(sender, raw), send_bound(sender, raw));
 }
 
 /// How many times the block reached Zebra. A stubbed node, so a marker can follow it.
