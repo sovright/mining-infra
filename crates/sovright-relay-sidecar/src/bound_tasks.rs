@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 use tokio::task::{Id, JoinSet};
 use tracing::{debug, error, warn};
 
+use sovright_relay_sidecar::config;
+
 /// A body's exact bytes, for telling copies apart as the gate does.
 pub(crate) type Body = [u8; 32];
 
@@ -27,10 +29,12 @@ pub(crate) fn body_of(raw: &[u8]) -> Body {
     Sha256::digest(raw).into()
 }
 
-/// How much bound work runs at once, and for how long. Research values, past what a parent
-/// lookup and two Zebra calls of 30 s can take, and no setting anyone decided.
+/// How much bound work runs at once, and for how long. The defaults are research values, past
+/// what a parent lookup and two Zebra calls of 30 s can take, and no setting anyone decided.
+/// The sidecar config sets them (`bound_tasks_*`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BoundTaskLimits {
+    /// Tasks at once. At least one.
     pub(crate) running: usize,
     /// A timer, which acts where a task waits. Work that does not wait runs to its end first,
     /// and what a task handed to another task goes on. So this bounds what Zebra can hold up,
@@ -43,10 +47,26 @@ pub(crate) struct BoundTaskLimits {
 impl Default for BoundTaskLimits {
     fn default() -> Self {
         Self {
-            running: 4,
-            budget: Duration::from_secs(120),
-            held: 4,
+            running: config::DEFAULT_BOUND_TASKS_RUNNING,
+            budget: Duration::from_secs(config::DEFAULT_BOUND_TASKS_BUDGET_SECS),
+            held: config::DEFAULT_BOUND_TASKS_HELD,
         }
+    }
+}
+
+impl BoundTaskLimits {
+    /// The limits a config gives, checked as the config is.
+    pub(crate) fn from_config(
+        running: usize,
+        budget_secs: u64,
+        held: usize,
+    ) -> Result<Self, config::ConfigError> {
+        config::validate_bound_task_limits(running, budget_secs, held)?;
+        Ok(Self {
+            running,
+            budget: Duration::from_secs(budget_secs),
+            held,
+        })
     }
 }
 
@@ -510,5 +530,16 @@ mod tests {
             held.task_ended(&running.tasks, &end);
             assert!(held.copies.len() <= RUNNING + ROOM, "{}", held.copies.len());
         }
+    }
+
+    #[test]
+    fn limits_from_a_config_are_checked() {
+        assert!(BoundTaskLimits::from_config(0, 120, 4).is_err());
+        assert!(BoundTaskLimits::from_config(4, 0, 4).is_err());
+        let limits = BoundTaskLimits::from_config(1, 7, 0).unwrap();
+        assert_eq!(
+            (limits.running, limits.budget, limits.held),
+            (1, Duration::from_secs(7), 0)
+        );
     }
 }

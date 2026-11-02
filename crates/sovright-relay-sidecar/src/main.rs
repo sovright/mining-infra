@@ -137,6 +137,18 @@ struct Args {
     /// Optional Prometheus textfile path for sidecar receive metrics
     #[arg(long)]
     metrics_textfile: Option<PathBuf>,
+
+    /// Bound raw path: blocks worked on at once, retried copies included (at least 1)
+    #[arg(long, default_value_t = config::DEFAULT_BOUND_TASKS_RUNNING)]
+    bound_tasks_running: usize,
+
+    /// Bound raw path: seconds one task may wait at the parent lookup, gate and Zebra
+    #[arg(long, default_value_t = config::DEFAULT_BOUND_TASKS_BUDGET_SECS)]
+    bound_tasks_budget_secs: u64,
+
+    /// Bound raw path: other copies of a block under way kept while its task runs
+    #[arg(long, default_value_t = config::DEFAULT_BOUND_TASKS_HELD)]
+    bound_tasks_held: usize,
 }
 
 #[tokio::main]
@@ -183,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         submit_gate_cfg,
         zebra_mempool_sync_enabled,
         zebra_mempool_sync_interval_ms,
+        bound_limits,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -211,6 +224,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(cfg.submit_gate.clone()),
             cfg.zebra_mempool_sync_enabled,
             cfg.zebra_mempool_sync_interval_ms,
+            BoundTaskLimits::from_config(
+                cfg.bound_tasks_running,
+                cfg.bound_tasks_budget_secs,
+                cfg.bound_tasks_held,
+            )?,
         )
     } else {
         // Use CLI args
@@ -264,6 +282,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             None,
             false, // zebra mempool sync is config-only (off for bare CLI)
             2000,
+            BoundTaskLimits::from_config(
+                args.bound_tasks_running,
+                args.bound_tasks_budget_secs,
+                args.bound_tasks_held,
+            )?,
         )
     };
 
@@ -472,7 +495,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             gate,
             chain_view,
             unreadable_submit,
-            BoundTaskLimits::default(),
+            bound_limits,
         ))
     } else {
         relay.start().await?;
