@@ -25,5 +25,7 @@ pub use client::{
     BOUND_ACK_TTL, BOUND_HELLO_WAIT, BlockReceiver, BlockSender, BoundSend, RelayClient,
     RelayPayload, SHARED_EGRESS_BURST, SendReport,
 };
-pub use metrics::{MetricsSnapshot, RelayMetrics, render_prometheus_text};
+pub use metrics::{
+    MetricsSnapshot, RelayMetrics, render_bound_prometheus_text, render_prometheus_text,
+};
 pub use node::RelayNode;

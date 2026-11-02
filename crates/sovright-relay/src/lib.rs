@@ -44,7 +44,7 @@ pub use relay::{
     HELLO_RECEIVES, MAX_BODIES_PER_KEY_PER_BLOCK, MetricsSnapshot, NODE_ASSEMBLY_TTL,
     RELEASE_LEFTOVER, RelayClient, RelayMetrics, RelayNode, RelayPayload, SHARED_EGRESS_BURST,
     SendReport, body_frames, bound_hello, bound_raw_refused, bound_raw_switch, bound_release,
-    is_bound, render_prometheus_text, sealed_body, sealed_frame,
+    is_bound, render_bound_prometheus_text, render_prometheus_text, sealed_body, sealed_frame,
 };
 pub use segmented_block::{
     RawBlockSegment, SegmentedBlockError, compact_v3_object_hash, reassemble_raw_block,
