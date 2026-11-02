@@ -255,6 +255,7 @@ async fn relay_loopback(
             4,
             Duration::from_secs(30),
         ))),
+        raw_wire: RawWire::Legacy,
         parse_permits: ParsePermits::new(),
         block_body_rejections: Default::default(),
         peer_pow_limit: None,

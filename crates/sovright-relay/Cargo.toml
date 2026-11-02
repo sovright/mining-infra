@@ -7,6 +7,8 @@ description = "Fast block relay protocol for the Sovright Zcash mining network"
 repository = "https://github.com/sovright/mining-infra"
 
 [dependencies]
+chunk-proof = { path = "../../research/chunk-proof" }
+delivery-lease = { path = "../../research/delivery-lease" }
 serde_json = { workspace = true }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
 zcash-pool-common = { path = "../zcash-pool-common" }
@@ -34,8 +36,12 @@ arbitrary = ["dep:arbitrary"]
 generate-corpus = []
 # Body-validation test blocks for downstream crates' tests.
 test-support = []
+# Lets a test wait for exact datagrams on a node. Nothing else should turn this on. The
+# dependency on this crate below does so for its own tests.
+handled-log = []
 
 [dev-dependencies]
+sovright-relay = { path = ".", features = ["handled-log"] }
 equihash.workspace = true
 zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
 proptest = "1.4"

@@ -1,0 +1,21 @@
+[package]
+name = "delivery-lease"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Research prototype for #130 PR B. Used by the bound raw path."
+
+[features]
+# Lets a test run another producer at an exact point inside `Intake`. Nothing else should
+# turn this on. The dependency on this crate below does so for its own tests.
+research-steps = []
+
+[dependencies]
+sha2 = { workspace = true }
+
+[dev-dependencies]
+blake2b_simd = { workspace = true }
+delivery-lease = { path = ".", features = ["research-steps"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+tokio-test = "0.4"

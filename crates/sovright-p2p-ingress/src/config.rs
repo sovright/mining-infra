@@ -132,6 +132,11 @@ pub struct Config {
     pub relay_unreadable_bodies_per_header: usize,
     pub relay_raw_segment_send_rounds: usize,
     pub relay_raw_segment_round_delay_millis: u64,
+    /// How raw blocks go out. `legacy` unless asked for: the others are #130 PR B research.
+    pub relay_raw_wire: crate::relay_bridge::RawWire,
+    /// Bodies one header can send in the forward dedup window, when the record is per
+    /// body. A research value, and anyone holding that header can use it up.
+    pub relay_bodies_per_header: usize,
     /// First-seen-wins window for the relay-bridge forward path. If the same
     /// block hash is offered to `forward_block` twice inside this window,
     /// the second call returns `ForwardMode::Deduplicated` without re-encoding
@@ -273,6 +278,29 @@ impl Config {
         }
         let relay_raw_segment_round_delay_millis =
             env_u64("SOVRIGHT_P2P_RELAY_RAW_SEGMENT_ROUND_DELAY_MILLIS", 0)?;
+        let relay_raw_wire = match std::env::var("SOVRIGHT_P2P_RELAY_RAW_WIRE").as_deref() {
+            Err(_) | Ok("legacy") => crate::relay_bridge::RawWire::Legacy,
+            Ok("dual") => crate::relay_bridge::RawWire::Dual,
+            Ok("bound") => crate::relay_bridge::RawWire::Bound,
+            Ok(other) => {
+                return Err(IngressError::Config(format!(
+                    "SOVRIGHT_P2P_RELAY_RAW_WIRE must be legacy, dual or bound, not {other}"
+                )));
+            }
+        };
+        if relay_raw_wire != crate::relay_bridge::RawWire::Legacy
+            && let Some(reason) = sovright_relay::bound_raw_refused()
+        {
+            return Err(IngressError::Config(format!(
+                "SOVRIGHT_P2P_RELAY_RAW_WIRE is not legacy: {reason}"
+            )));
+        }
+        let relay_bodies_per_header = env_usize("SOVRIGHT_P2P_RELAY_BODIES_PER_HEADER", 4)?;
+        if relay_bodies_per_header == 0 {
+            return Err(IngressError::Config(
+                "SOVRIGHT_P2P_RELAY_BODIES_PER_HEADER must be at least 1".to_string(),
+            ));
+        }
         let relay_forward_dedup_window =
             Duration::from_secs(env_u64("SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS", 30)?);
         let relay_forward_dedup_capacity =
@@ -342,6 +370,8 @@ impl Config {
             relay_forward_unreadable_blocks,
             relay_unreadable_bodies_per_header,
             relay_raw_segment_send_rounds,
+            relay_raw_wire,
+            relay_bodies_per_header,
             relay_raw_segment_round_delay_millis,
             relay_forward_dedup_window,
             relay_forward_dedup_capacity,

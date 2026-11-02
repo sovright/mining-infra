@@ -496,6 +496,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "chunk-proof"
+version = "0.0.0"
+dependencies = [
+ "blake2b_simd",
+ "delivery-lease",
+ "hmac 0.12.1",
+ "reed-solomon-erasure",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+]
+
+[[package]]
 name = "ciborium"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -817,6 +830,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "delivery-lease"
+version = "0.0.0"
+dependencies = [
+ "blake2b_simd",
+ "delivery-lease",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tokio-test",
 ]
 
 [[package]]
@@ -3324,7 +3349,9 @@ dependencies = [
  "arbitrary",
  "blake2b_simd",
  "bytes",
+ "chunk-proof",
  "criterion",
+ "delivery-lease",
  "equihash 0.2.2",
  "hex",
  "hmac 0.12.1",
@@ -3335,6 +3362,7 @@ dependencies = [
  "sha2 0.10.9",
  "siphasher",
  "socket2 0.5.10",
+ "sovright-relay",
  "subtle",
  "thiserror 2.0.18",
  "tokio",
