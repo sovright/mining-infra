@@ -5,6 +5,9 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   fuzz-mining-protocol:
     runs-on: ubuntu-latest
@@ -21,14 +24,15 @@ jobs:
           - fuzz_roundtrip_submit_response
           - fuzz_roundtrip_set_target
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/zcash-mining-protocol/fuzz/target
           key: fuzz-mining-${{ matrix.target }}-${{ hashFiles('crates/zcash-mining-protocol/**/*.rs') }}
@@ -45,14 +49,15 @@ jobs:
           - fuzz_chunk
           - fuzz_roundtrip_chunk
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/sovright-relay/fuzz/target
           key: fuzz-relay-${{ matrix.target }}-${{ hashFiles('crates/sovright-relay/**/*.rs') }}
@@ -77,14 +82,15 @@ jobs:
           - fuzz_decode_get_missing_tx
           - fuzz_decode_provide_missing_tx
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/zcash-jd-server/fuzz/target
           key: fuzz-jd-${{ matrix.target }}-${{ hashFiles('crates/zcash-jd-server/**/*.rs') }}
@@ -102,14 +108,15 @@ jobs:
           - fuzz_target_ordering
           - fuzz_verify_solution_rejects
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/zcash-equihash-validator/fuzz/target
           key: fuzz-equihash-${{ matrix.target }}-${{ hashFiles('crates/zcash-equihash-validator/**/*.rs') }}
@@ -126,14 +133,15 @@ jobs:
           - fuzz_read_compact_size
           - fuzz_payout_difficulty
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/zcash-pool-common/fuzz/target
           key: fuzz-pool-common-${{ matrix.target }}-${{ hashFiles('crates/zcash-pool-common/**/*.rs') }}
@@ -151,14 +159,15 @@ jobs:
           - fuzz_assemble_header
           - fuzz_nonce_partitioner
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/zcash-template-provider/fuzz/target
           key: fuzz-template-${{ matrix.target }}-${{ hashFiles('crates/zcash-template-provider/**/*.rs') }}
@@ -175,14 +184,15 @@ jobs:
           - fuzz_build_header
           - fuzz_config_parse
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/sovright-relay-sidecar/fuzz/target
           key: fuzz-sidecar-${{ matrix.target }}-${{ hashFiles('crates/sovright-relay-sidecar/**/*.rs') }}
@@ -199,14 +209,15 @@ jobs:
           - fuzz_private_key_roundtrip
           - fuzz_handshake_message
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/sovright-noise/fuzz/target
           key: fuzz-noise-${{ matrix.target }}-${{ hashFiles('crates/sovright-noise/**/*.rs') }}
@@ -222,14 +233,15 @@ jobs:
           - fuzz_sequence_validator
           - fuzz_connection_tracker
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
         with:
+          toolchain: nightly
           components: rust-src
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@1919c4a95903d2c33e4a221102edca87309fc14b # v2.89.0
         with:
           tool: cargo-fuzz
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: crates/zcash-pool-server/fuzz/target
           key: fuzz-pool-server-${{ matrix.target }}-${{ hashFiles('crates/zcash-pool-server/**/*.rs') }}
