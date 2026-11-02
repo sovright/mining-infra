@@ -1360,6 +1360,9 @@ struct BoundPeer {
     session: Assembler,
     forwarded: Forwarded,
     unanchored: VecDeque<Waiting>,
+    /// A spare here has all it needs and was refused its decode for room. See
+    /// [`BoundForwarder::revive`].
+    stuck: bool,
 }
 
 /// A decoded object whose segment 0 has not passed.
@@ -1368,6 +1371,25 @@ struct Waiting {
     key: SetKey,
     object: DecodedObject,
     since: Instant,
+}
+
+/// What a node wants of an object a session has: nothing once it waits for its segment 0 or
+/// its record holds it back, and otherwise all of it.
+fn interest(
+    unanchored: &VecDeque<Waiting>,
+    forwarded: &Forwarded,
+    object: &Node,
+    now: Instant,
+    config: &BoundForwardConfig,
+) -> Interest {
+    let waiting = unanchored
+        .iter()
+        .any(|kept| kept.object.object_id() == *object);
+    if !waiting && forwarded.allows(object, now, config) {
+        Interest::New
+    } else {
+        Interest::Done
+    }
 }
 
 /// What a budget has here, on the shelf as well: moving there is no way of looking light.
@@ -1405,6 +1427,9 @@ pub struct BoundNodeUsage {
     /// Of those, the ones that went out to at least one peer, every datagram of them. Only
     /// these count against their session's sends.
     pub objects_sent_on: u64,
+    /// Objects whose decode was refused for room when their last chunk came, and that
+    /// decoded later, once there was room.
+    pub spares_revived: u64,
     pub objects_waiting_for_segment_0: usize,
     pub waiting_pushed_out: u64,
     /// Objects that waited for their segment 0 and gave way to a session holding less, when
@@ -1548,6 +1573,7 @@ pub(crate) struct BoundForwarder {
     pow_indeterminate: u64,
     objects_released: u64,
     objects_sent_on: u64,
+    spares_revived: u64,
     waiting_pushed_out: u64,
     waiting_gave_way: u64,
     waiting_expired: u64,
@@ -1590,6 +1616,7 @@ impl BoundForwarder {
             pow_indeterminate: 0,
             objects_released: 0,
             objects_sent_on: 0,
+            spares_revived: 0,
             waiting_pushed_out: 0,
             waiting_gave_way: 0,
             waiting_expired: 0,
@@ -1658,6 +1685,7 @@ impl BoundForwarder {
             pow_indeterminate: self.pow_indeterminate,
             objects_released: self.objects_released,
             objects_sent_on: self.objects_sent_on,
+            spares_revived: self.spares_revived,
             objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
             waiting_pushed_out: self.waiting_pushed_out,
             waiting_gave_way: self.waiting_gave_way,
@@ -1711,6 +1739,7 @@ impl BoundForwarder {
                 session,
                 forwarded: Forwarded::default(),
                 unanchored: VecDeque::new(),
+                stuck: false,
             };
             self.peers.insert(src, peer);
         }
@@ -1733,14 +1762,7 @@ impl BoundForwarder {
             ..
         } = self.peer(src, key, key_id)?;
         let arrival = session.receive_if(datagram, now, |object| {
-            let waiting = unanchored
-                .iter()
-                .any(|kept| kept.object.object_id() == *object);
-            if !waiting && forwarded.allows(object, now, &config) {
-                Interest::New
-            } else {
-                Interest::Done
-            }
+            interest(unanchored, forwarded, object, now, &config)
         });
         #[cfg(test)]
         if !matches!(arrival, Arrival::Refused(_)) {
@@ -1826,6 +1848,11 @@ impl BoundForwarder {
         if let Some(arrival) = &arrival {
             self.arrivals.note(arrival);
         }
+        if let Some(Arrival::Refused(_)) = arrival
+            && let Some(peer) = self.peers.get_mut(&src)
+        {
+            peer.stuck = peer.session.has_ready_spares();
+        }
         #[cfg(test)]
         self.trip(Trip::BetweenSteps);
         match arrival {
@@ -1837,6 +1864,52 @@ impl BoundForwarder {
             }
             _ => BoundStep::Forward(Vec::new()),
         }
+    }
+
+    /// Spares that have all they need and were refused their decode for room, tried again:
+    /// for after something has given room back. Each session's spares stay for the next try
+    /// while there is still no room. What decodes goes on as [`Self::take`]'s would.
+    pub(crate) fn revive(
+        &mut self,
+        now: Instant,
+        validate: impl Fn(&[u8]) -> PowResult,
+    ) -> Vec<Outgoing> {
+        let stuck: Vec<SocketAddr> = self
+            .peers
+            .iter()
+            .filter(|(_, peer)| peer.stuck)
+            .map(|(addr, _)| *addr)
+            .collect();
+        let mut ready = Vec::new();
+        for src in stuck {
+            let config = self.config;
+            let revive = |this: &mut Self| {
+                let peer = this.peers.get_mut(&src)?;
+                let BoundPeer {
+                    session,
+                    forwarded,
+                    unanchored,
+                    stuck,
+                    ..
+                } = peer;
+                let arrivals = session.revive(now, |object| {
+                    interest(unanchored, forwarded, object, now, &config)
+                });
+                *stuck = session.has_ready_spares();
+                Some(arrivals)
+            };
+            let Some(arrivals) = self.only_for(src, revive).flatten() else {
+                continue;
+            };
+            for arrival in arrivals {
+                if let Arrival::Decoded(decoded) = arrival {
+                    self.spares_revived += 1;
+                    let admit = |this: &mut Self| this.admit(src, decoded, now, &validate);
+                    ready.extend(self.only_for(src, admit).unwrap_or_default());
+                }
+            }
+        }
+        self.send_on_each(ready, now)
     }
 
     fn reject(&mut self, src: SocketAddr, object: Node, now: Instant) {
@@ -3325,6 +3398,43 @@ mod tests {
     ) {
         let _ = send_as(bound, key_id, src, &body(fill)[..chunks], now);
         assert!(bound.peers.get_mut(&src).unwrap().session.give_way());
+    }
+
+    /// A spare with all it needs whose decode was refused for room decodes once there is
+    /// room, rather than waiting for its time to run out.
+    #[test]
+    fn a_full_spare_refused_for_room_decodes_once_there_is_room() {
+        let (held, spare) = {
+            let (mut probe, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+            open_one(&mut probe, addr(9), 9, now);
+            keep_a_little(&mut probe, FLEET, addr(1), 1, 9, now);
+            let used = probe.usage().pool;
+            (used.held_bytes, used.spare_bytes)
+        };
+        let mut config = config();
+        // Room for one open object, and a shelf with room for this spare and nothing else.
+        config.pool.max_held_bytes = held + held / 2;
+        config.pool.max_spare_bytes = spare + spare / 9;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let honest = body(1);
+        keep_a_little(&mut bound, FLEET, addr(1), 1, 9, now);
+        open_as(&mut bound, OTHER, addr(2), 2, now);
+
+        assert_eq!(send(&mut bound, addr(1), &honest[9..10], now), 0);
+        assert_eq!(bound.usage().arrivals.refused_by_pool, 1);
+        assert!(bound.peers[&addr(1)].stuck);
+        let accept = |_: &[u8]| PowResult::Valid;
+        assert!(bound.revive(now, accept).is_empty(), "still no room");
+        assert!(bound.peers[&addr(1)].stuck);
+
+        bound.tidy(now, |peer| *peer != addr(2));
+        let revived = bound.revive(now, accept);
+
+        assert_eq!(revived.len(), 1);
+        assert_eq!(revived[0].from, addr(1));
+        assert_eq!(bound.usage().spares_revived, 1);
+        assert!(!bound.peers[&addr(1)].stuck);
+        assert_eq!(bound.peers[&addr(1)].session.state().spares, 0);
     }
 
     #[test]

@@ -388,6 +388,14 @@ impl Assembler {
         !self.open.is_empty()
     }
 
+    /// Whether a spare has all it needs, so that [`Self::revive`] would decode or release it
+    /// for an interest that is not [`Interest::Spare`]. One left so after a chunk was refused
+    /// for room waits for that.
+    pub fn has_ready_spares(&self) -> bool {
+        let ready = |spare: &Spare| spare.filled >= usize::from(spare.shape.k);
+        self.spares.values().any(ready)
+    }
+
     fn longest_waiting(&self) -> Option<Node> {
         self.open
             .iter()

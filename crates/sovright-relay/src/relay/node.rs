@@ -467,10 +467,29 @@ impl<V: PowValidator> RelayNode<V> {
         }
         self.tidy_bound(&sessions);
         let expired = (before - sessions.len()) as u64;
+        drop(sessions);
         if expired > 0 {
             self.metrics.add_sessions_expired(expired);
         }
         self.cleanup_validated_raw_blocks();
+        if let Some(bound) = &self.bound
+            && let Err(error) = self.revive_bound(bound).await
+        {
+            debug!(?error, "Error sending revived bound objects");
+        }
+    }
+
+    /// Spares a session had in full but no room to decode, tried again once something may
+    /// have given room back: an object that went out, or a timer. Without this they would
+    /// wait for their time to run out, room or not.
+    async fn revive_bound(&self, bound: &Mutex<BoundForwarder>) -> Result<(), TransportError> {
+        let objects = self.with_bound(bound, |forwarder| {
+            forwarder.revive(Instant::now(), |header| self.validator.validate(header))
+        });
+        match objects {
+            Some(objects) if !objects.is_empty() => self.forward_bound(bound, objects).await,
+            _ => Ok(()),
+        }
     }
 
     /// Estimate original serialized length based on shard size.
@@ -1212,7 +1231,9 @@ impl<V: PowValidator> RelayNode<V> {
         }
         let relayed = objects.iter().map(|o| o.object.shards.len() as u64).sum();
         self.metrics.inc_chunks_relayed_from_key(&key_id, relayed);
-        self.forward_bound(bound, objects).await
+        self.forward_bound(bound, objects).await?;
+        // What went out gave its room back.
+        self.revive_bound(bound).await
     }
 
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
