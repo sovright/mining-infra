@@ -499,10 +499,13 @@ dependencies = [
 name = "chunk-proof"
 version = "0.0.0"
 dependencies = [
+ "blake2b_simd",
  "delivery-lease",
  "hmac 0.12.1",
  "reed-solomon-erasure",
+ "serde_json",
  "sha2 0.10.9",
+ "tokio",
 ]
 
 [[package]]
@@ -833,7 +836,12 @@ dependencies = [
 name = "delivery-lease"
 version = "0.0.0"
 dependencies = [
+ "blake2b_simd",
+ "delivery-lease",
+ "serde_json",
  "sha2 0.10.9",
+ "tokio",
+ "tokio-test",
 ]
 
 [[package]]

@@ -33,28 +33,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  research-crates:
-    name: Research crates
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: |
-            research/chunk-proof
-            research/delivery-lease
-      - name: Test chunk-proof
-        run: cargo test --locked --manifest-path research/chunk-proof/Cargo.toml
-      - name: Test delivery-lease
-        run: cargo test --locked --manifest-path research/delivery-lease/Cargo.toml
-      - name: Clippy chunk-proof
-        run: cargo clippy --locked --manifest-path research/chunk-proof/Cargo.toml --all-targets -- -D warnings
-      - name: Clippy delivery-lease
-        run: cargo clippy --locked --manifest-path research/delivery-lease/Cargo.toml --all-targets -- -D warnings
-
   tier2-chain:
     # Full-chain mining integration test (pool + JDC + proxy + real CPU
     # Equihash solver). It is #[ignore]d so the main `cargo test --workspace`
