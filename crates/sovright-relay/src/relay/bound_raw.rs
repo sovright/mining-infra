@@ -910,7 +910,10 @@ pub(crate) fn contain(
     };
     match catch_unwind(AssertUnwindSafe(|| step(receiver))) {
         Ok(true) => {}
-        Ok(false) => *bound = None,
+        Ok(false) => {
+            warn!("The bound path's consumer went, so this client takes no more bound blocks");
+            *bound = None;
+        }
         Err(_) => {
             error!("Bound path panicked, starting it over");
             *bound = bound.take().and_then(BoundReceiver::start_over);
