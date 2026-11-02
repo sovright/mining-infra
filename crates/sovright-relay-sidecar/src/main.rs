@@ -7,7 +7,7 @@ use sovright_relay::{
     TxCacheSnapshot, TxFeedRecord, WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
     zcash_block_hash,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,9 +18,11 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+mod bound_tasks;
 mod poller;
 mod relay;
 
+use bound_tasks::{Body, BoundTaskLimits, BoundTasks, HeldCopies, body_of};
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::RelayWrapper;
 use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
@@ -32,7 +34,7 @@ use sovright_relay_sidecar::metrics_textfile::write_metrics_textfile;
 use sovright_relay_sidecar::rpc::ZebraRpc;
 use sovright_relay_sidecar::submit::{
     RelayBlockError, SubmissionOutcome, SubmitBlock, SubmitBlockMode, SubmitBlockStatus,
-    SubmitRejectionClass, UnverifiedLimits, handle_relay_compact_block,
+    SubmitRejectionClass, UnverifiedLimits, build_submission_candidate, handle_relay_compact_block,
     handle_relay_compact_block_with_mempool, handle_relay_raw_block, submit_unverified_raw_block,
     unreadable_body, validate_then_gate_compact_block, validate_then_gate_raw_block,
     zebra_has_the_block,
@@ -470,6 +472,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             gate,
             chain_view,
             unreadable_submit,
+            BoundTaskLimits::default(),
         ))
     } else {
         relay.start().await?;
@@ -705,6 +708,17 @@ async fn submit_compact_fast_path<S, M>(
     log_submission_outcome(outcome, metrics, None);
 }
 
+/// What was held and can go now, then what comes in.
+async fn next_payload(
+    receiver: &mut BlockReceiver,
+    again: &mut VecDeque<RelayPayload>,
+) -> Option<RelayPayload> {
+    match again.pop_front() {
+        Some(payload) => Some(payload),
+        None => receiver.recv_payload().await,
+    }
+}
+
 async fn next_bound_block(
     blocks: &mut Option<tokio::sync::mpsc::Receiver<BoundBlock>>,
 ) -> Option<BoundBlock> {
@@ -739,25 +753,45 @@ async fn check_and_submit_raw_block(
     }
 }
 
-/// One whole bound block, through the same checks as a reassembled raw block, and then
-/// settled by what came of it. It has no record but its owners, and only an outcome that
-/// says this block is dealt with ends them for good. Any other end lets a copy in.
-#[allow(clippy::too_many_arguments)]
-async fn handle_bound_block(
-    block: BoundBlock,
-    rpc: &Arc<ZebraRpc>,
-    submitter: &Arc<DualSubmit<Arc<ZebraRpc>>>,
+/// What the work on a whole block needs, on whichever task does it.
+#[derive(Clone)]
+struct BlockWork {
+    rpc: Arc<ZebraRpc>,
+    submitter: Arc<DualSubmit<Arc<ZebraRpc>>>,
     mode: SubmitBlockMode,
-    gate: Option<&Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
-    chain_view: Option<&Arc<ZebraChainView>>,
-    unreadable_submit: Option<&UnreadableSubmit>,
-    metrics: &Arc<SidecarMetrics>,
+    gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
+    chain_view: Option<Arc<ZebraChainView>>,
+    unreadable_submit: Option<UnreadableSubmit>,
+    metrics: Arc<SidecarMetrics>,
+}
+
+/// What a block by the legacy ways leaves to wait while a task works on its block.
+enum HeldCopy {
+    Payload(RelayPayload),
+    Segments {
+        segments: Vec<RawBlockSegment>,
+        block_hash: [u8; 32],
+        first_seen: Instant,
+    },
+}
+
+/// The bytes a compact block comes to, if it carries them all.
+fn compact_body(compact: &CompactBlock) -> Option<Body> {
+    let candidate = build_submission_candidate(compact).ok()?;
+    Some(body_of(&hex::decode(candidate.block_hex).ok()?))
+}
+
+/// A bound block as the receive task takes it. Past this it is a task's, and nothing here waits
+/// for that.
+fn start_bound_block(
+    block: BoundBlock,
+    work: &BlockWork,
+    tasks: &mut BoundTasks,
     fast_path_dedup: &mut HashDedupRing,
 ) {
-    let first_seen = Instant::now();
-    metrics.inc_raw_segment_sets_completed();
+    work.metrics.inc_raw_segment_sets_completed();
     let Some(header) = block.raw().get(..ZCASH_FULL_HEADER_SIZE) else {
-        metrics.inc_raw_segment_reassembly_failures();
+        work.metrics.inc_raw_segment_reassembly_failures();
         block.give_back();
         return;
     };
@@ -768,46 +802,61 @@ async fn handle_bound_block(
         block.finish();
         return;
     }
+    let body = body_of(block.raw());
+    tasks.spawn(
+        hash_hex,
+        body,
+        handle_bound_block(block, block_hash, work.clone()),
+    );
+}
+
+/// One whole bound block, through the same checks as a reassembled raw block, and then
+/// settled by what came of it. It has no record but its owners, and only an outcome that
+/// says this block is dealt with ends them for good. Any other end lets a copy in, and that
+/// goes for a task cancelled here too, as the block and the gate's slot go with it. True if
+/// Zebra has the block from this, which the receive task records for the other ways in.
+async fn handle_bound_block(block: BoundBlock, block_hash: [u8; 32], work: BlockWork) -> bool {
+    let first_seen = Instant::now();
+    let metrics = &work.metrics;
+    let gate = work.gate.as_ref();
+    let chain_view = work.chain_view.as_ref();
     let outcome = check_and_submit_raw_block(
-        rpc,
-        submitter,
+        &work.rpc,
+        &work.submitter,
         block.raw(),
         block_hash,
-        mode,
+        work.mode,
         gate,
         chain_view,
     )
     .await;
     if let (Some(error), Some(unreadable), Some(gate), Some(chain_view)) = (
         unreadable_body(&outcome),
-        unreadable_submit,
+        work.unreadable_submit.as_ref(),
         gate,
         chain_view,
     ) {
         unreadable.spawn(UnverifiedSubmission {
-            submitter: Arc::clone(submitter),
-            rpc: Arc::clone(rpc),
+            submitter: Arc::clone(&work.submitter),
+            rpc: Arc::clone(&work.rpc),
             gate: Arc::clone(gate),
             chain_view: Arc::clone(chain_view),
             metrics: Arc::clone(metrics),
-            mode,
+            mode: work.mode,
             raw_block: block.raw().to_vec(),
             error,
             first_seen,
         });
         block.give_back();
-        return;
+        return false;
     }
     let delivered = matches!(
         outcome,
         Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_))
     );
     let known_to_zebra = zebra_has_the_block(&outcome, gate.map(Arc::as_ref)).await;
-    if delivered {
-        if gate.is_some() {
-            metrics.inc_submit_gate_accepted();
-        }
-        fast_path_dedup.record(hash_hex, Instant::now());
+    if delivered && gate.is_some() {
+        metrics.inc_submit_gate_accepted();
     }
     let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
     if matches!(outcome, Ok(SubmissionOutcome::Submitted { .. })) {
@@ -818,6 +867,112 @@ async fn handle_bound_block(
         block.finish();
     } else {
         block.give_back();
+    }
+    delivered
+}
+
+/// A legacy block whose segments are all here, the rest of the way to Zebra. This runs on the
+/// receive task, as the legacy ways always have.
+async fn finish_raw_segments(
+    segments: Vec<RawBlockSegment>,
+    block_hash: [u8; 32],
+    first_seen: Instant,
+    work: &BlockWork,
+    fast_path_dedup: &mut HashDedupRing,
+) {
+    let completed_segments = segments.len();
+    match reassemble_raw_block(&segments) {
+        Ok(raw_block) => {
+            let Some(header) = raw_block.get(..ZCASH_FULL_HEADER_SIZE) else {
+                work.metrics.inc_raw_segment_reassembly_failures();
+                warn!(
+                    raw_block_bytes = raw_block.len(),
+                    "Relay raw block is shorter than its header"
+                );
+                return;
+            };
+            info!(
+                block_hash = %hex::encode(block_hash),
+                segment_count = completed_segments,
+                raw_block_bytes = raw_block.len(),
+                "Relay raw block segments complete"
+            );
+            // Dedup against compact/skeleton paths: the
+            // consensus block hash is the shared key.
+            let raw_block_hash = hex::encode(zcash_block_hash(header));
+            if fast_path_dedup.contains(&raw_block_hash, Instant::now()) {
+                debug!(
+                    block_hash = %raw_block_hash,
+                    "raw segment already submitted by compact path; skipping duplicate"
+                );
+                return;
+            }
+            let raw_outcome = check_and_submit_raw_block(
+                &work.rpc,
+                &work.submitter,
+                &raw_block,
+                block_hash,
+                work.mode,
+                work.gate.as_ref(),
+                work.chain_view.as_ref(),
+            )
+            .await;
+            if let (Some(error), Some(unreadable), Some(gate), Some(chain_view)) = (
+                unreadable_body(&raw_outcome),
+                &work.unreadable_submit,
+                &work.gate,
+                &work.chain_view,
+            ) {
+                // Off the receive task, which must keep
+                // reading while Zebra judges this.
+                unreadable.spawn(UnverifiedSubmission {
+                    submitter: Arc::clone(&work.submitter),
+                    rpc: Arc::clone(&work.rpc),
+                    gate: Arc::clone(gate),
+                    chain_view: Arc::clone(chain_view),
+                    metrics: Arc::clone(&work.metrics),
+                    mode: work.mode,
+                    raw_block,
+                    error,
+                    first_seen,
+                });
+                return;
+            }
+            if work.gate.is_some()
+                && matches!(
+                    raw_outcome,
+                    Ok(SubmissionOutcome::DryRun(_)) | Ok(SubmissionOutcome::Submitted { .. })
+                )
+            {
+                work.metrics.inc_submit_gate_accepted();
+            }
+            // Relay-internal latency from the first raw
+            // segment chunk of this block arriving to the
+            // submit decision (mesh-receive → reassemble →
+            // gate → submit).
+            let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
+            if matches!(
+                raw_outcome,
+                Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_))
+            ) {
+                // Record in shared dedup ring so compact-block
+                // paths won't also submit this consensus block.
+                fast_path_dedup.record(raw_block_hash, Instant::now());
+            }
+            if matches!(raw_outcome, Ok(SubmissionOutcome::Submitted { .. })) {
+                work.metrics
+                    .observe_first_seen_to_submit_ms(first_seen_to_submit_ms);
+            }
+            log_submission_outcome(
+                raw_outcome,
+                work.metrics.as_ref(),
+                Some(first_seen_to_submit_ms),
+            );
+        }
+        Err(error) => {
+            work.metrics.inc_raw_segment_reassembly_failures();
+            warn!(%error, "Relay raw block segments did not reassemble");
+        }
     }
 }
 
@@ -836,12 +991,25 @@ fn spawn_relay_block_handler<M>(
     gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
     chain_view: Option<Arc<ZebraChainView>>,
     unreadable_submit: Option<UnreadableSubmit>,
+    bound_limits: BoundTaskLimits,
 ) -> tokio::task::JoinHandle<()>
 where
     M: MempoolProvider + Send + Sync + 'static,
 {
     tokio::spawn(async move {
+        let work = BlockWork {
+            rpc: Arc::clone(&rpc),
+            submitter: Arc::clone(&submitter),
+            mode,
+            gate: gate.clone(),
+            chain_view: chain_view.clone(),
+            unreadable_submit,
+            metrics: Arc::clone(&metrics),
+        };
         let mut bound_blocks = receiver.take_bound_blocks();
+        let mut bound_tasks = BoundTasks::new(bound_limits);
+        let mut held = HeldCopies::new(bound_limits.held);
+        let mut again = VecDeque::new();
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
         // Fast-path submit dedup shared by the skeleton and the non-gated
         // compact block paths (see `submit_compact_fast_path`).
@@ -852,30 +1020,51 @@ where
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
-                block = next_bound_block(&mut bound_blocks) => {
+                // With no room blocks stay in their channel, and this task goes on.
+                block = next_bound_block(&mut bound_blocks), if bound_tasks.has_room() => {
                     match block {
                         Some(block) => {
-                            handle_bound_block(
-                                block,
-                                &rpc,
-                                &submitter,
-                                mode,
-                                gate.as_ref(),
-                                chain_view.as_ref(),
-                                unreadable_submit.as_ref(),
-                                &metrics,
-                                &mut fast_path_dedup,
-                            )
-                            .await;
+                            start_bound_block(block, &work, &mut bound_tasks, &mut fast_path_dedup);
                         }
                         None => bound_blocks = None,
                     }
                 }
-                payload = receiver.recv_payload() => {
+                end = bound_tasks.next_end(), if !bound_tasks.is_idle() => {
+                    if end.delivered {
+                        fast_path_dedup.record(end.block.clone(), Instant::now());
+                    }
+                    for copy in held.task_ended(&bound_tasks, &end) {
+                        match copy {
+                            HeldCopy::Payload(payload) => again.push_back(payload),
+                            HeldCopy::Segments { segments, block_hash, first_seen } => {
+                                finish_raw_segments(
+                                    segments,
+                                    block_hash,
+                                    first_seen,
+                                    &work,
+                                    &mut fast_path_dedup,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                }
+                payload = next_payload(&mut receiver, &mut again) => {
                     let Some(payload) = payload else {
                         warn!("Relay block receiver closed");
                         break;
                     };
+                    if !bound_tasks.is_idle()
+                        && let RelayPayload::CompactBlock(compact)
+                        | RelayPayload::CompactSkeleton(compact) = &payload
+                    {
+                        let hash_hex = hex::encode(zcash_block_hash(&compact.header));
+                        let body = compact_body(compact);
+                        if let Some(place) = held.place_for(&bound_tasks, &hash_hex, body) {
+                            held.hold(place, HeldCopy::Payload(payload));
+                            continue;
+                        }
+                    }
                     match payload {
                         RelayPayload::CompactBlock(compact) => {
                             metrics.inc_compact_blocks_received();
@@ -990,111 +1179,29 @@ where
                                 } => {
                                     metrics.inc_raw_segment_sets_completed();
                                     raw_segments.update_metrics(metrics.as_ref());
-                                    let completed_segments = segments.len();
-                                     match reassemble_raw_block(&segments) {
-                                         Ok(raw_block) => {
-                                             let Some(header) = raw_block.get(..ZCASH_FULL_HEADER_SIZE) else {
-                                                 metrics.inc_raw_segment_reassembly_failures();
-                                                 warn!(raw_block_bytes = raw_block.len(), "Relay raw block is shorter than its header");
-                                                 continue;
-                                             };
-                                             info!(
-                                                 block_hash = %hex::encode(block_hash),
-                                                 segment_count = completed_segments,
-                                                 raw_block_bytes = raw_block.len(),
-                                                 "Relay raw block segments complete"
-                                             );
-                                             // Dedup against compact/skeleton paths: the
-                                             // consensus block hash is the shared key.
-                                             let raw_block_hash =
-                                                 hex::encode(zcash_block_hash(header));
-                                             if fast_path_dedup.contains(&raw_block_hash, Instant::now())
-                                             {
-                                                 debug!(
-                                                     block_hash = %raw_block_hash,
-                                                     "raw segment already submitted by compact path; skipping duplicate"
-                                                 );
-                                                 continue;
-                                             }
-                                             let raw_outcome = check_and_submit_raw_block(
-                                                &rpc,
-                                                &submitter,
-                                                &raw_block,
-                                                block_hash,
-                                                mode,
-                                                gate.as_ref(),
-                                                chain_view.as_ref(),
-                                            )
-                                            .await;
-                                            if let (
-                                                Some(error),
-                                                Some(unreadable),
-                                                Some(gate),
-                                                Some(chain_view),
-                                            ) = (
-                                                unreadable_body(&raw_outcome),
-                                                &unreadable_submit,
-                                                &gate,
-                                                &chain_view,
-                                            ) {
-                                                // Off the receive task, which must keep
-                                                // reading while Zebra judges this.
-                                                unreadable.spawn(UnverifiedSubmission {
-                                                    submitter: Arc::clone(&submitter),
-                                                    rpc: Arc::clone(&rpc),
-                                                    gate: Arc::clone(gate),
-                                                    chain_view: Arc::clone(chain_view),
-                                                    metrics: Arc::clone(&metrics),
-                                                    mode,
-                                                    raw_block,
-                                                    error,
-                                                    first_seen,
-                                                });
-                                                continue;
-                                            }
-                                            if gate.is_some()
-                                                && matches!(
-                                                    raw_outcome,
-                                                    Ok(SubmissionOutcome::DryRun(_))
-                                                        | Ok(SubmissionOutcome::Submitted { .. })
-                                                )
-                                            {
-                                                metrics.inc_submit_gate_accepted();
-                                            }
-                                             // Relay-internal latency from the first raw
-                                             // segment chunk of this block arriving to the
-                                             // submit decision (mesh-receive → reassemble →
-                                             // gate → submit).
-                                            let first_seen_to_submit_ms =
-                                                first_seen.elapsed().as_millis() as u64;
-                                            if matches!(
-                                                raw_outcome,
-                                                Ok(SubmissionOutcome::Submitted { .. })
-                                                    | Ok(SubmissionOutcome::DryRun(_))
-                                            ) {
-                                                // Record in shared dedup ring so compact-block
-                                                // paths won't also submit this consensus block.
-                                                fast_path_dedup.record(raw_block_hash, Instant::now());
-                                            }
-                                            if matches!(
-                                                raw_outcome,
-                                                Ok(SubmissionOutcome::Submitted { .. })
-                                            ) {
-                                                metrics.observe_first_seen_to_submit_ms(
-                                                    first_seen_to_submit_ms,
-                                                );
-                                            }
-                                            log_submission_outcome(
-                                                raw_outcome,
-                                                metrics.as_ref(),
-                                                Some(first_seen_to_submit_ms),
-                                            );
-                                        }
-                                        Err(error) => {
-                                            metrics.inc_raw_segment_reassembly_failures();
-                                            warn!(%error, "Relay raw block segments did not reassemble");
-                                        }
+                                    let hash_hex = hex::encode(block_hash);
+                                    let body = if bound_tasks.is_idle() {
+                                        None
+                                    } else {
+                                        reassemble_raw_block(&segments).ok().map(|raw| body_of(&raw))
+                                    };
+                                    if let Some(place) = held.place_for(&bound_tasks, &hash_hex, body) {
+                                        let copy = HeldCopy::Segments {
+                                            segments,
+                                            block_hash,
+                                            first_seen,
+                                        };
+                                        held.hold(place, copy);
+                                        continue;
                                     }
+                                    finish_raw_segments(
+                                        segments,
+                                        block_hash,
+                                        first_seen,
+                                        &work,
+                                        &mut fast_path_dedup,
+                                    )
+                                    .await;
                                 }
                                 RawSegmentInsert::Dropped { reason } => {
                                     metrics.inc_raw_segment_drops();
@@ -1119,6 +1226,11 @@ where
                     );
                 }
             }
+        }
+        // A found block at Zebra gets its time, each task up to its budget where it waits. What
+        // was held for one goes with this task: there is nothing left to run it.
+        while !bound_tasks.is_idle() {
+            bound_tasks.next_end().await;
         }
     })
 }
@@ -2827,6 +2939,7 @@ mod tests {
             None,
             None,
             None,
+            BoundTaskLimits::default(),
         );
 
         let valid = zcash_pool_common::fixtures::mainnet_raw_block();
@@ -2939,6 +3052,7 @@ mod tests {
                 Some(gate),
                 Some(chain_view),
                 unreadable_submit,
+                BoundTaskLimits::default(),
             );
             Self {
                 peer,

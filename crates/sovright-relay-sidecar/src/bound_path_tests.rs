@@ -25,7 +25,10 @@ use sovright_relay::{
     sealed_frame, split_raw_block,
 };
 use sovright_relay_sidecar::chain_view::ZebraChainViewConfig;
-use sovright_relay_sidecar::submit_gate::{DEFAULT_STRICT_BODIES_PER_BLOCK, GateConfig};
+use sovright_relay_sidecar::submit::build_raw_block_submission_candidate;
+use sovright_relay_sidecar::submit_gate::{
+    CandidateMeta, DEFAULT_STRICT_BODIES_PER_BLOCK, GateConfig, ParentObservation, RejectReason,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -49,6 +52,11 @@ struct Zebra {
     /// Permits for `submitblock`, if a test is holding it back.
     hold: Mutex<Option<Arc<Semaphore>>>,
     held: AtomicU64,
+    /// Every `submitblock` as it came in, held or not.
+    arrivals: Mutex<Vec<String>>,
+    /// The same for `getblockheader`.
+    hold_lookups: Mutex<Option<Arc<Semaphore>>>,
+    lookups_held: AtomicU64,
 }
 
 impl Zebra {
@@ -83,9 +91,31 @@ impl Zebra {
         permits
     }
 
+    /// Calls from here on go straight through. Those held stay held.
+    fn stop_holding(&self) {
+        *self.hold.lock().unwrap() = None;
+    }
+
+    fn hold_lookups(&self) -> Arc<Semaphore> {
+        let permits = Arc::new(Semaphore::new(0));
+        *self.hold_lookups.lock().unwrap() = Some(Arc::clone(&permits));
+        permits
+    }
+
+    fn stop_holding_lookups(&self) {
+        *self.hold_lookups.lock().unwrap() = None;
+    }
+
     /// Calls that have come in and are being held back.
     fn waiting(&self) -> u64 {
         self.held.load(Ordering::Relaxed)
+    }
+
+    /// Calls that have reached this stand-in for this block, answered or not.
+    fn arrivals_for(&self, raw: &[u8]) -> usize {
+        let wanted = hex::encode(raw);
+        let arrivals = self.arrivals.lock().unwrap();
+        arrivals.iter().filter(|call| **call == wanted).count()
     }
 
     fn calls_for(&self, raw: &[u8]) -> usize {
@@ -143,6 +173,7 @@ async fn start_zebra() -> (Arc<Zebra>, String, ServerHandle) {
     module
         .register_async_method("submitblock", |params, zebra, _| async move {
             let (block_hex,): (String,) = params.parse()?;
+            zebra.arrivals.lock().unwrap().push(block_hex.clone());
             let hold = zebra.hold.lock().unwrap().clone();
             if let Some(hold) = hold {
                 zebra.held.fetch_add(1, Ordering::Relaxed);
@@ -152,8 +183,13 @@ async fn start_zebra() -> (Arc<Zebra>, String, ServerHandle) {
         })
         .unwrap();
     module
-        .register_method("getblockheader", |params, zebra, _| {
+        .register_async_method("getblockheader", |params, zebra, _| async move {
             let (hash, _): (String, bool) = params.parse()?;
+            let hold = zebra.hold_lookups.lock().unwrap().clone();
+            if let Some(hold) = hold {
+                zebra.lookups_held.fetch_add(1, Ordering::Relaxed);
+                hold.acquire().await.expect("never closed").forget();
+            }
             zebra.header(&hash)
         })
         .unwrap();
@@ -303,6 +339,7 @@ struct Sidecar {
     handler_task: JoinHandle<()>,
     metrics: Arc<SidecarMetrics>,
     probe: Option<BoundProbe>,
+    gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
     _zebra_server: ServerHandle,
 }
 
@@ -315,6 +352,51 @@ async fn start_sidecar_with(
     bound: Option<BoundRawConfig>,
     unreadable: Option<UnreadableSubmit>,
 ) -> Sidecar {
+    let options = SidecarOptions {
+        bound,
+        unreadable,
+        ..Default::default()
+    };
+    start_sidecar_from(node, options).await
+}
+
+/// How a sidecar here differs from a sidecar with its defaults and its gate on.
+struct SidecarOptions {
+    bound: Option<BoundRawConfig>,
+    unreadable: Option<UnreadableSubmit>,
+    limits: BoundTaskLimits,
+    gate: bool,
+    raw_ttl: Duration,
+}
+
+impl Default for SidecarOptions {
+    fn default() -> Self {
+        Self {
+            bound: Some(Default::default()),
+            unreadable: None,
+            limits: Default::default(),
+            gate: true,
+            raw_ttl: Duration::from_secs(120),
+        }
+    }
+}
+
+/// One block at a time, for tests of what waits behind it.
+fn one_task_at_a_time() -> BoundTaskLimits {
+    BoundTaskLimits {
+        running: 1,
+        ..Default::default()
+    }
+}
+
+async fn start_sidecar_from(node: SocketAddr, options: SidecarOptions) -> Sidecar {
+    let SidecarOptions {
+        bound,
+        unreadable,
+        limits,
+        gate,
+        raw_ttl,
+    } = options;
     let (zebra, url, zebra_server) = start_zebra().await;
     let mut config = client_config(node);
     config.bound_raw = bound;
@@ -330,25 +412,29 @@ async fn start_sidecar_with(
     let metrics = Arc::new(SidecarMetrics::default());
     let chain_view = ZebraChainView::new(ZebraChainViewConfig::default());
     chain_view.set_tip_height(100);
-    let gate = Arc::new(TokioMutex::new(SubmitGate::new(
-        GateConfig {
-            enabled: true,
-            ..GateConfig::default()
-        },
-        Arc::clone(&chain_view),
-    )));
+    let gate = gate.then(|| {
+        Arc::new(TokioMutex::new(SubmitGate::new(
+            GateConfig {
+                enabled: true,
+                ..GateConfig::default()
+            },
+            Arc::clone(&chain_view),
+        )))
+    });
+    let chain_view = gate.is_some().then_some(chain_view);
     let handler_task = spawn_relay_block_handler(
         receiver,
         rpc,
         submitter,
         SubmitBlockMode::Live,
         false,
-        RawSegmentBufferConfig::new(128, 64 * 1024 * 1024, Duration::from_secs(120)).unwrap(),
+        RawSegmentBufferConfig::new(128, 64 * 1024 * 1024, raw_ttl).unwrap(),
         Arc::clone(&metrics),
         Arc::new(EmptyMempool),
-        Some(gate),
-        Some(chain_view),
+        gate.clone(),
+        chain_view,
         unreadable,
+        limits,
     );
     Sidecar {
         zebra,
@@ -358,6 +444,7 @@ async fn start_sidecar_with(
         handler_task,
         metrics,
         probe,
+        gate,
         _zebra_server: zebra_server,
     }
 }
@@ -365,6 +452,66 @@ async fn start_sidecar_with(
 impl Sidecar {
     fn probe(&self) -> &BoundProbe {
         self.probe.as_ref().expect("the bound path is on")
+    }
+
+    fn gate(&self) -> &TokioMutex<SubmitGate<Arc<ZebraChainView>>> {
+        self.gate.as_ref().expect("the gate is on")
+    }
+
+    /// Whether the gate has these bytes at Zebra, by what it says to a candidate as the real
+    /// path puts one to it. For a block Zebra does not have: a repeat reads the same. A no costs
+    /// that block one attempt, and a yes costs nothing.
+    async fn gate_has_at_zebra(&self, raw: &[u8]) -> bool {
+        let candidate = build_raw_block_submission_candidate(raw, None).unwrap();
+        let header = &raw[..ZCASH_FULL_HEADER_SIZE];
+        let parent = ParentObservation {
+            parent_hash: CandidateMeta::parent_hash_from_header(header).unwrap(),
+            height: 100,
+            confirmations: Some(1),
+        };
+        let meta =
+            CandidateMeta::from_header_bytes(header, candidate.block_hash.clone(), Some(&parent))
+                .unwrap();
+        let answer = self
+            .gate()
+            .lock()
+            .await
+            .reserve_strict_now(&candidate, &meta, false);
+        match answer {
+            Ok(_slot) => false,
+            Err(RejectReason::DuplicateSubmit) => true,
+            Err(reason) => panic!("the gate said {reason:?}"),
+        }
+    }
+
+    async fn gate_lets_go_of(&self, raw: &[u8]) {
+        let waited = timeout(WAIT, async {
+            while self.gate_has_at_zebra(raw).await {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "gave up waiting for the gate to let go");
+    }
+
+    async fn gate_knows(&self, raw: &[u8]) -> bool {
+        let hash = hex::encode(zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]));
+        self.gate().lock().await.knows(&hash)
+    }
+
+    async fn gate_learns_of(&self, raw: &[u8]) {
+        let waited = timeout(WAIT, async {
+            while !self.gate_knows(raw).await {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(waited.is_ok(), "gave up waiting for the gate to learn");
+    }
+
+    fn turned_away_as_repeats(&self) -> u64 {
+        let turned_away = &self.metrics.submit_gate_rejected_duplicate;
+        turned_away.load(Ordering::Relaxed)
     }
 
     /// With a channel of one place: a block at Zebra, a block in the channel, and this
@@ -964,7 +1111,12 @@ async fn a_full_channel_loses_nothing_and_every_block_goes_through_once() {
         channel_blocks: 1,
         ..Default::default()
     };
-    let sidecar = start_sidecar(node.addr, Some(config)).await;
+    let options = SidecarOptions {
+        bound: Some(config),
+        limits: one_task_at_a_time(),
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
     let blocks: Vec<Vec<u8>> = (1..=4).map(synthetic_block).collect();
     for block in &blocks {
         sidecar.zebra.knows_of(block);
@@ -1004,7 +1156,12 @@ async fn a_closed_channel_gives_every_reservation_back() {
         channel_blocks: 1,
         ..Default::default()
     };
-    let sidecar = start_sidecar(node.addr, Some(config)).await;
+    let options = SidecarOptions {
+        bound: Some(config),
+        limits: one_task_at_a_time(),
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
     let blocks: Vec<Vec<u8>> = (1..=3).map(synthetic_block).collect();
     for block in &blocks {
         sidecar.zebra.knows_of(block);
@@ -1036,7 +1193,12 @@ async fn a_cancelled_client_leaves_nothing_counted() {
         channel_blocks: 1,
         ..Default::default()
     };
-    let sidecar = start_sidecar(node.addr, Some(config)).await;
+    let options = SidecarOptions {
+        bound: Some(config),
+        limits: one_task_at_a_time(),
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
     let blocks: Vec<Vec<u8>> = (1..=3).map(synthetic_block).collect();
     for block in &blocks {
         sidecar.zebra.knows_of(block);
@@ -1567,6 +1729,846 @@ async fn leftovers_never_stop_the_next_honest_block() {
 // What each side of a mixed network gets, in one build with the bound path off on the old
 // side. This is a quick check and no evidence about an old release: for that, see
 // `research/real-binaries/matrix.py`, which runs builds of the real tags as processes.
+
+// Zebra's time is not the receive task's. A block at Zebra, in its parent lookup or in its
+// submit, leaves everything else this task does alone. Each of these holds Zebra's answer, so
+// what they look at happens while it is held, and no wait stands in for that.
+
+/// Until this many `submitblock` calls have come in, with Zebra holding them.
+async fn held_at_zebra(sidecar: &Sidecar, count: u64) {
+    let zebra = Arc::clone(&sidecar.zebra);
+    until("the calls to be at Zebra", move || zebra.waiting() == count).await;
+}
+
+async fn zebra_took(sidecar: &Sidecar, raw: &[u8]) {
+    let (zebra, wanted) = (Arc::clone(&sidecar.zebra), raw.to_vec());
+    until("the block to reach Zebra", move || zebra.took(&wanted)).await;
+}
+
+/// Until this many whole blocks have reached the receive task, by any way.
+async fn blocks_complete(sidecar: &Sidecar, count: u64) {
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the blocks to complete", move || {
+        metrics.raw_segment_sets_completed.load(Ordering::Relaxed) == count
+    })
+    .await;
+}
+
+/// A part of a legacy block, which asks nothing of Zebra. Payloads are handled in the order they
+/// came, so once this is in so is everything sent ahead of it, with Zebra holding what it likes.
+async fn behind_a_part(sender: &BlockSender, sidecar: &Sidecar) {
+    let part = large_block(240);
+    let hash = zcash_block_hash(&part[..ZCASH_FULL_HEADER_SIZE]);
+    let first = split_raw_block(hash, &part, 10 * 1124 - 4)
+        .unwrap()
+        .remove(0);
+    sender.send_raw_block_segment(first).await.unwrap();
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the part to be buffered", move || {
+        metrics
+            .raw_segment_incomplete_blocks
+            .load(Ordering::Relaxed)
+            == 1
+    })
+    .await;
+}
+
+/// The header of [`synthetic_block`] over other transactions: its hash, and none of its bytes.
+fn other_bytes_of_synthetic_block(fill: u8) -> Vec<u8> {
+    let txs = vec![
+        parseable_transaction(u32::from(fill) * 2),
+        parseable_transaction(u32::from(fill) * 2 + 1),
+    ];
+    let others = vec![parseable_transaction(u32::from(fill) * 2 + 100)];
+    raw_block(&committed_header(fill, &txs), &others)
+}
+
+/// [`synthetic_block`], in its compact form with every transaction in it.
+fn compact_of_synthetic_block(fill: u8) -> CompactBlock {
+    let txs = vec![
+        parseable_transaction(u32::from(fill) * 2),
+        parseable_transaction(u32::from(fill) * 2 + 1),
+    ];
+    let prefilled = txs.iter().map(|tx| sovright_relay::PrefilledTx {
+        index: 0,
+        tx_data: tx.clone(),
+    });
+    CompactBlock::new(
+        committed_header(fill, &txs),
+        0,
+        Vec::new(),
+        prefilled.collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_held_zebra_call_lets_a_different_block_through() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let (held, next) = (synthetic_block(1), synthetic_block(2));
+    sidecar.zebra.knows_of(&held);
+    sidecar.zebra.knows_of(&next);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+
+    send_bound(&sender, &held).await;
+    held_at_zebra(&sidecar, 1).await;
+    send_bound(&sender, &next).await;
+
+    held_at_zebra(&sidecar, 2).await;
+    permits.add_permits(2);
+    zebra_took(&sidecar, &held).await;
+    zebra_took(&sidecar, &next).await;
+    sidecar.settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+#[tokio::test]
+async fn a_held_zebra_call_lets_legacy_traffic_through() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let (held, legacy) = (synthetic_block(1), synthetic_block(2));
+    sidecar.zebra.knows_of(&held);
+    sidecar.zebra.knows_of(&legacy);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+
+    send_bound(&sender, &held).await;
+    held_at_zebra(&sidecar, 1).await;
+    send_legacy(&sender, &legacy).await;
+
+    held_at_zebra(&sidecar, 2).await;
+    permits.add_permits(2);
+    zebra_took(&sidecar, &held).await;
+    zebra_took(&sidecar, &legacy).await;
+    sidecar.settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// Part of a legacy block comes in and its time runs out, all with a call at Zebra.
+#[tokio::test]
+async fn a_held_zebra_call_lets_cleanup_run() {
+    let node = stub_pow_node(true).await;
+    let options = SidecarOptions {
+        raw_ttl: Duration::from_millis(200),
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let (held, part) = (synthetic_block(1), large_block(2));
+    sidecar.zebra.knows_of(&held);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &held).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    let hash = zcash_block_hash(&part[..ZCASH_FULL_HEADER_SIZE]);
+    let mut segments = split_raw_block(hash, &part, 10 * 1124 - 4).unwrap();
+    assert!(segments.len() > 1, "this needs part of a block");
+    let first = segments.remove(0);
+    sender.send_raw_block_segment(first).await.unwrap();
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the part to be buffered", move || {
+        metrics
+            .raw_segment_incomplete_blocks
+            .load(Ordering::Relaxed)
+            == 1
+    })
+    .await;
+
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the part to expire", move || {
+        metrics
+            .raw_segment_incomplete_blocks
+            .load(Ordering::Relaxed)
+            == 0
+    })
+    .await;
+    assert_eq!(sidecar.zebra.waiting(), 1, "the call is still held");
+    permits.add_permits(1);
+    zebra_took(&sidecar, &held).await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+#[tokio::test]
+async fn a_held_parent_lookup_lets_a_different_block_through() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let (held, next) = (synthetic_block(1), synthetic_block(2));
+    sidecar.zebra.knows_of(&held);
+    sidecar.zebra.knows_of(&next);
+    let permits = sidecar.zebra.hold_lookups();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+
+    send_bound(&sender, &held).await;
+    let zebra = Arc::clone(&sidecar.zebra);
+    until("the first lookup", move || {
+        zebra.lookups_held.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    send_bound(&sender, &next).await;
+
+    let zebra = Arc::clone(&sidecar.zebra);
+    until("the second lookup", move || {
+        zebra.lookups_held.load(Ordering::Relaxed) == 2
+    })
+    .await;
+    permits.add_permits(8);
+    zebra_took(&sidecar, &held).await;
+    zebra_took(&sidecar, &next).await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// Every task is at Zebra. More blocks wait where they waited before, in the channel, with
+/// none of them started. This task goes on with parts of legacy blocks, which ask nothing of
+/// Zebra, so it goes round many times with those blocks there to take. Then a whole legacy block
+/// gets through, nothing waits for a place, and nothing is lost.
+#[tokio::test]
+async fn full_tasks_stop_nothing_else_and_lose_nothing() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let running = BoundTaskLimits::default().running;
+    let blocks: Vec<Vec<u8>> = (1..=running as u8 + 2).map(synthetic_block).collect();
+    let legacy = synthetic_block(100);
+    for block in blocks.iter().chain([&legacy]) {
+        sidecar.zebra.knows_of(block);
+    }
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+
+    for block in &blocks[..running] {
+        send_bound(&sender, block).await;
+    }
+    held_at_zebra(&sidecar, running as u64).await;
+    let owned = sidecar.probe().ledger().held + sidecar.probe().ledger().in_flight;
+    for block in &blocks[running..] {
+        send_bound(&sender, block).await;
+    }
+    let probe = sidecar.probe().clone();
+    until("the rest to be whole", move || {
+        probe.ledger().held + probe.ledger().in_flight > owned + 1
+    })
+    .await;
+
+    const PARTS: usize = 16;
+    for fill in 0..PARTS {
+        let part = large_block(40 + fill as u8);
+        let hash = zcash_block_hash(&part[..ZCASH_FULL_HEADER_SIZE]);
+        let first = split_raw_block(hash, &part, 10 * 1124 - 4)
+            .unwrap()
+            .remove(0);
+        sender.send_raw_block_segment(first).await.unwrap();
+    }
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the parts to be taken in", move || {
+        metrics
+            .raw_segment_incomplete_blocks
+            .load(Ordering::Relaxed)
+            == PARTS
+    })
+    .await;
+    assert_eq!(
+        sidecar.zebra.waiting(),
+        running as u64,
+        "none past the limit"
+    );
+
+    send_legacy(&sender, &legacy).await;
+    held_at_zebra(&sidecar, running as u64 + 1).await;
+
+    permits.add_permits(blocks.len() + 1);
+    for block in blocks.iter().chain([&legacy]) {
+        zebra_took(&sidecar, block).await;
+        assert_eq!(sidecar.zebra.calls_for(block), 1);
+    }
+    sidecar.ledger_settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// What cancels the receive task cancels what it started, and the block it was at Zebra with
+/// is free to come again: the gate's slot is gone, its reservation is back, and nothing says
+/// the block is dealt with. No receive task is left here to take it, so what shows it going
+/// through is `a_task_past_its_budget_gives_way_to_a_copy`.
+#[tokio::test]
+async fn a_cancelled_handler_leaves_the_body_free_to_come_again() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    let _held = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &block).await;
+    held_at_zebra(&sidecar, 1).await;
+    assert!(sidecar.gate_has_at_zebra(&block).await, "the slot is taken");
+
+    sidecar.handler_task.abort();
+
+    sidecar.settled().await;
+    sidecar.gate_lets_go_of(&block).await;
+    assert_eq!(sidecar.probe().ledger().completed, 0);
+    assert!(!sidecar.gate_knows(&block).await);
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// What cancels the receive task cancels what it started, and each block goes back.
+#[tokio::test]
+async fn a_cancelled_handler_gives_back_what_its_tasks_held() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let blocks: Vec<Vec<u8>> = (1..=2).map(synthetic_block).collect();
+    for block in &blocks {
+        sidecar.zebra.knows_of(block);
+    }
+    let _held = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    for block in &blocks {
+        send_bound(&sender, block).await;
+    }
+    held_at_zebra(&sidecar, 2).await;
+
+    sidecar.handler_task.abort();
+
+    sidecar.settled().await;
+    assert!(!sidecar.client_task.is_finished(), "the client carries on");
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// A task out of time lets go of everything: the block, so a copy can come, and the gate, so
+/// that copy is no repeat of a call in progress.
+#[tokio::test]
+async fn a_task_past_its_budget_gives_way_to_a_copy() {
+    let node = stub_pow_node_with(resends_at_once()).await;
+    let options = SidecarOptions {
+        limits: BoundTaskLimits {
+            budget: Duration::from_millis(200),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    let _held = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &block).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    sidecar.ledger_settled().await;
+    sidecar.gate_lets_go_of(&block).await;
+    assert_eq!(sidecar.probe().ledger().completed, 0);
+    sidecar.zebra.stop_holding();
+    send_bound(&sender, &block).await;
+
+    zebra_took(&sidecar, &block).await;
+    sidecar.gate_learns_of(&block).await;
+    assert_eq!(sidecar.zebra.arrivals_for(&block), 2);
+    sidecar.settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// The client goes, and the receive task ends with it, with a call Zebra never answers. A found
+/// block gets its time at Zebra first, up to its budget.
+#[tokio::test]
+async fn a_client_that_goes_ends_the_handler_within_the_budget() {
+    let node = stub_pow_node(true).await;
+    let options = SidecarOptions {
+        limits: BoundTaskLimits {
+            budget: Duration::from_millis(200),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    let _held = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &block).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    sidecar.client_task.abort();
+
+    let finished = timeout(WAIT, sidecar.handler_task).await;
+    assert!(finished.is_ok(), "the handler is still waiting");
+    stop(node, [sender_task]);
+}
+
+/// Out of time at its parent lookup, before the gate has heard of it. There is no slot to let
+/// go of yet, and everything else goes as it does at Zebra.
+#[tokio::test]
+async fn a_task_out_of_time_at_its_parent_lookup_gives_way_too() {
+    let node = stub_pow_node_with(resends_at_once()).await;
+    let options = SidecarOptions {
+        limits: BoundTaskLimits {
+            budget: Duration::from_millis(200),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    let _held = sidecar.zebra.hold_lookups();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &block).await;
+    let zebra = Arc::clone(&sidecar.zebra);
+    until("the lookup", move || {
+        zebra.lookups_held.load(Ordering::Relaxed) == 1
+    })
+    .await;
+
+    sidecar.ledger_settled().await;
+    assert_eq!(sidecar.probe().ledger().completed, 0);
+    sidecar.zebra.stop_holding_lookups();
+    send_bound(&sender, &block).await;
+
+    zebra_took(&sidecar, &block).await;
+    assert_eq!(sidecar.zebra.calls_for(&block), 1);
+    sidecar.settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// Dual: the same body by both ways, the bound copy at Zebra when the legacy one is whole. It
+/// waits, and with Zebra's answer it has nothing to do. Zebra hears of the block once.
+#[tokio::test]
+async fn a_legacy_copy_during_a_bound_task_waits_and_is_then_a_repeat() {
+    for gate in [true, false] {
+        let node = stub_pow_node(true).await;
+        let options = SidecarOptions {
+            gate,
+            ..Default::default()
+        };
+        let sidecar = start_sidecar_from(node.addr, options).await;
+        let block = synthetic_block(1);
+        sidecar.zebra.knows_of(&block);
+        let permits = sidecar.zebra.hold();
+        node.has_a_receiver().await;
+        let (sender, sender_task) = start_sender(node.addr).await;
+        send_bound(&sender, &block).await;
+        held_at_zebra(&sidecar, 1).await;
+
+        send_legacy(&sender, &block).await;
+        blocks_complete(&sidecar, 2).await;
+        permits.add_permits(2);
+
+        zebra_took(&sidecar, &block).await;
+        behind_a_marker(&sender, &sidecar).await;
+        assert_eq!(sidecar.zebra.calls_for(&block), 1, "gate {gate}");
+        sidecar.settled().await;
+        stop(node, [sidecar.client_task, sender_task]);
+    }
+}
+
+/// The same, and Zebra could not answer the bound copy. The legacy copy was held for this: it
+/// is the retry, and nothing else was going to be.
+#[tokio::test]
+async fn a_legacy_copy_during_a_bound_task_goes_when_that_task_fails() {
+    for gate in [true, false] {
+        let node = stub_pow_node(true).await;
+        let options = SidecarOptions {
+            gate,
+            ..Default::default()
+        };
+        let sidecar = start_sidecar_from(node.addr, options).await;
+        let block = synthetic_block(1);
+        sidecar.zebra.knows_of(&block);
+        sidecar.zebra.go_down();
+        let permits = sidecar.zebra.hold();
+        node.has_a_receiver().await;
+        let (sender, sender_task) = start_sender(node.addr).await;
+        send_bound(&sender, &block).await;
+        held_at_zebra(&sidecar, 1).await;
+        send_legacy(&sender, &block).await;
+        blocks_complete(&sidecar, 2).await;
+
+        permits.add_permits(1);
+        let (zebra, wanted) = (Arc::clone(&sidecar.zebra), block.clone());
+        until("the error", move || zebra.calls_for(&wanted) == 1).await;
+        sidecar.zebra.come_back();
+        held_at_zebra(&sidecar, 2).await;
+        permits.add_permits(1);
+
+        zebra_took(&sidecar, &block).await;
+        assert_eq!(sidecar.zebra.calls_for(&block), 2, "gate {gate}");
+        sidecar.ledger_settled().await;
+        stop(node, [sidecar.client_task, sender_task]);
+    }
+}
+
+/// Another bound copy of the body at Zebra. The block's owner keeps it out, and nothing here
+/// has to.
+#[tokio::test]
+async fn a_second_bound_copy_during_a_task_does_not_reach_zebra() {
+    let node = stub_pow_node_with(resends_at_once()).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &block).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    send_bound(&sender, &block).await;
+    permits.add_permits(2);
+
+    zebra_took(&sidecar, &block).await;
+    behind_a_marker(&sender, &sidecar).await;
+    assert_eq!(sidecar.zebra.arrivals_for(&block), 1);
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// Copies of the bytes at Zebra with no shared room at all, by each way there is. The gate would
+/// turn them away, and with it off they would be second calls, so they wait all the same. One is
+/// all a retry needs, so the other takes no place: Zebra hears of these bytes once more and no
+/// more than that.
+#[tokio::test]
+async fn bytes_at_zebra_wait_with_no_shared_room() {
+    for gate in [true, false] {
+        let node = stub_pow_node(true).await;
+        let options = SidecarOptions {
+            gate,
+            limits: BoundTaskLimits {
+                held: 0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let sidecar = start_sidecar_from(node.addr, options).await;
+        let block = synthetic_block(1);
+        sidecar.zebra.knows_of(&block);
+        sidecar.zebra.go_down();
+        let permits = sidecar.zebra.hold();
+        node.has_a_receiver().await;
+        let (sender, sender_task) = start_sender(node.addr).await;
+        send_bound(&sender, &block).await;
+        held_at_zebra(&sidecar, 1).await;
+
+        send_legacy(&sender, &block).await;
+        sender.send(compact_of_synthetic_block(1)).await.unwrap();
+        behind_a_part(&sender, &sidecar).await;
+        assert_eq!(sidecar.zebra.arrivals_for(&block), 1, "gate {gate}");
+        assert_eq!(sidecar.turned_away_as_repeats(), 0, "gate {gate}");
+
+        permits.add_permits(1);
+        let (zebra, wanted) = (Arc::clone(&sidecar.zebra), block.clone());
+        until("the error", move || zebra.calls_for(&wanted) == 1).await;
+        sidecar.zebra.come_back();
+        held_at_zebra(&sidecar, 2).await;
+        sidecar.zebra.stop_holding();
+        permits.add_permits(1);
+
+        zebra_took(&sidecar, &block).await;
+        behind_a_marker(&sender, &sidecar).await;
+        assert_eq!(sidecar.zebra.calls_for(&block), 2, "gate {gate}");
+        assert_eq!(sidecar.turned_away_as_repeats(), 0, "gate {gate}");
+        sidecar.ledger_settled().await;
+        stop(node, [sidecar.client_task, sender_task]);
+    }
+}
+
+/// What fills the shared room is what a block can lose nothing by. A copy of other bytes with
+/// no room goes on as it came: the gate lets a different body run beside the one at Zebra, so
+/// it is tried now, on this task and inside the gate's limits, and not turned away.
+#[tokio::test]
+async fn a_different_body_with_no_room_goes_on_beside_the_task() {
+    let node = stub_pow_node(true).await;
+    let options = SidecarOptions {
+        limits: BoundTaskLimits {
+            held: 0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let (first, second) = (the_real_block(), body_marked(1));
+    sidecar.zebra.knows_of(&first);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &first).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    send_legacy(&sender, &second).await;
+
+    held_at_zebra(&sidecar, 2).await;
+    assert_eq!(sidecar.zebra.arrivals_for(&second), 1);
+    assert_eq!(sidecar.turned_away_as_repeats(), 0);
+    permits.add_permits(2);
+    zebra_took(&sidecar, &first).await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CopyBy {
+    Legacy,
+    Compact,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TaskEnds {
+    Refused,
+    OutOfTime,
+}
+
+/// The whole of it on the real receive task, gate on. A, B and C at Zebra, the shared room full
+/// of other bytes under B's and C's hashes, and only then a copy of A. A fails. The copy is all
+/// that is left of A here, so it has to be still here, and has to get to Zebra, and then the block
+/// is closed everywhere: the gate has Zebra's word, a later copy by the other way is a repeat,
+/// and nothing stays owned.
+async fn a_copy_behind_a_full_room(by: CopyBy, ends: TaskEnds) {
+    let node = stub_pow_node(true).await;
+    let budget = match ends {
+        TaskEnds::Refused => BoundTaskLimits::default().budget,
+        TaskEnds::OutOfTime => Duration::from_secs(1),
+    };
+    let options = SidecarOptions {
+        limits: BoundTaskLimits {
+            held: 2,
+            budget,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let blocks: Vec<Vec<u8>> = (1..=3).map(synthetic_block).collect();
+    let block = &blocks[0];
+    for each in &blocks {
+        sidecar.zebra.knows_of(each);
+    }
+    sidecar.zebra.refuse(block);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    for (at, each) in (1..).zip(&blocks) {
+        send_bound(&sender, each).await;
+        held_at_zebra(&sidecar, at).await;
+    }
+
+    send_legacy(&sender, &other_bytes_of_synthetic_block(2)).await;
+    send_legacy(&sender, &other_bytes_of_synthetic_block(3)).await;
+    blocks_complete(&sidecar, 5).await;
+    match by {
+        CopyBy::Legacy => send_legacy(&sender, block).await,
+        CopyBy::Compact => sender.send(compact_of_synthetic_block(1)).await.unwrap(),
+    }
+    behind_a_part(&sender, &sidecar).await;
+    assert_eq!(sidecar.zebra.arrivals_for(block), 1, "it waits");
+
+    if let TaskEnds::Refused = ends {
+        permits.add_permits(blocks.len());
+        let (zebra, wanted) = (Arc::clone(&sidecar.zebra), block.clone());
+        until("the refusal", move || zebra.calls_for(&wanted) == 1).await;
+    }
+    held_at_zebra(&sidecar, blocks.len() as u64 + 1).await;
+    sidecar.zebra.stop_refusing();
+    sidecar.zebra.stop_holding();
+    permits.add_permits(blocks.len() + 1);
+
+    zebra_took(&sidecar, block).await;
+    sidecar.gate_learns_of(block).await;
+    assert_eq!(sidecar.zebra.arrivals_for(block), 2);
+    assert_eq!(sidecar.turned_away_as_repeats(), 0);
+    match by {
+        CopyBy::Legacy => sender.send(compact_of_synthetic_block(1)).await.unwrap(),
+        CopyBy::Compact => send_legacy(&sender, block).await,
+    }
+    behind_a_marker(&sender, &sidecar).await;
+    assert_eq!(
+        sidecar.zebra.arrivals_for(block),
+        2,
+        "a later copy is a repeat"
+    );
+    sidecar.ledger_settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+#[tokio::test]
+async fn a_legacy_copy_behind_a_full_room_is_the_retry_after_a_refusal() {
+    a_copy_behind_a_full_room(CopyBy::Legacy, TaskEnds::Refused).await;
+}
+
+#[tokio::test]
+async fn a_legacy_copy_behind_a_full_room_is_the_retry_after_the_budget() {
+    a_copy_behind_a_full_room(CopyBy::Legacy, TaskEnds::OutOfTime).await;
+}
+
+#[tokio::test]
+async fn a_compact_copy_behind_a_full_room_is_the_retry_after_a_refusal() {
+    a_copy_behind_a_full_room(CopyBy::Compact, TaskEnds::Refused).await;
+}
+
+#[tokio::test]
+async fn a_compact_copy_behind_a_full_room_is_the_retry_after_the_budget() {
+    a_copy_behind_a_full_room(CopyBy::Compact, TaskEnds::OutOfTime).await;
+}
+
+/// A copy waits for every task on its block, not the first to end. Two bodies of one block at
+/// Zebra, one ends with an error, and the copy of it stays where it is while the other runs.
+#[tokio::test]
+async fn a_held_copy_waits_for_every_task_on_its_block() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let (first, second, marker) = (the_real_block(), body_marked(1), synthetic_block(200));
+    for block in [&first, &second, &marker] {
+        sidecar.zebra.knows_of(block);
+    }
+    sidecar.zebra.go_down();
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &first).await;
+    held_at_zebra(&sidecar, 1).await;
+    send_bound(&sender, &second).await;
+    held_at_zebra(&sidecar, 2).await;
+    send_legacy(&sender, &first).await;
+    blocks_complete(&sidecar, 3).await;
+
+    permits.add_permits(1);
+    let (zebra, wanted) = (Arc::clone(&sidecar.zebra), first.clone());
+    until("the error", move || zebra.calls_for(&wanted) == 1).await;
+    send_legacy(&sender, &marker).await;
+    held_at_zebra(&sidecar, 3).await;
+
+    assert_eq!(sidecar.zebra.arrivals_for(&first), 1, "it is still held");
+    assert_eq!(sidecar.zebra.arrivals_for(&marker), 1);
+    sidecar.zebra.come_back();
+    permits.add_permits(3);
+    zebra_took(&sidecar, &marker).await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// The other way round. The legacy copy got there first, and the bound one stops at the record
+/// with no task and no call, with the gate off as well.
+#[tokio::test]
+async fn a_copy_after_a_block_reached_zebra_is_a_repeat_and_takes_no_task() {
+    let node = stub_pow_node(true).await;
+    let options = SidecarOptions {
+        gate: false,
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_legacy(&sender, &block).await;
+    zebra_took(&sidecar, &block).await;
+
+    send_bound(&sender, &block).await;
+    blocks_complete(&sidecar, 2).await;
+    behind_a_marker(&sender, &sidecar).await;
+
+    assert_eq!(sidecar.zebra.arrivals_for(&block), 1);
+    sidecar.ledger_settled().await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// The compact way, where nothing but this record stops a second submit with the gate off.
+#[tokio::test]
+async fn a_compact_copy_during_a_bound_task_waits_and_is_then_a_repeat() {
+    let node = stub_pow_node(true).await;
+    let options = SidecarOptions {
+        gate: false,
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let block = synthetic_block(1);
+    sidecar.zebra.knows_of(&block);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_bound(&sender, &block).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    sender.send(compact_of_synthetic_block(1)).await.unwrap();
+    let marker = synthetic_block(200);
+    sidecar.zebra.knows_of(&marker);
+    send_legacy(&sender, &marker).await;
+    held_at_zebra(&sidecar, 2).await;
+    assert_eq!(sidecar.zebra.calls(), 0);
+    permits.add_permits(2);
+
+    zebra_took(&sidecar, &block).await;
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the compact copy to be a repeat", move || {
+        metrics.full_block_deduplicated.load(Ordering::Relaxed) == 1
+    })
+    .await;
+    assert_eq!(sidecar.zebra.calls(), 2, "the block and the marker");
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// Different bodies of one block may run side by side, as any of them may be the block, and the
+/// gate's limits hold all the same. The last one finds them spent and never reaches Zebra.
+#[tokio::test]
+async fn bodies_of_one_block_run_side_by_side_inside_the_gate_limits() {
+    let node = stub_pow_node(true).await;
+    let options = SidecarOptions {
+        limits: BoundTaskLimits {
+            running: 8,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let sidecar = start_sidecar_from(node.addr, options).await;
+    let limit = DEFAULT_STRICT_BODIES_PER_BLOCK as u64;
+    let bodies: Vec<Vec<u8>> = (1..=limit as u8 + 1).map(body_marked).collect();
+    for body in &bodies {
+        sidecar.zebra.knows_of(body);
+        sidecar.zebra.refuse(body);
+    }
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+
+    for body in &bodies {
+        send_bound(&sender, body).await;
+    }
+    held_at_zebra(&sidecar, limit).await;
+    permits.add_permits(bodies.len());
+    sidecar.ledger_settled().await;
+
+    assert_eq!(sidecar.zebra.calls(), limit as usize);
+    stop(node, [sidecar.client_task, sender_task]);
+}
+
+/// Known gap, and left as it is: the legacy paths still run on this task, so a held legacy call
+/// holds the bound path up, though what it started goes on.
+#[tokio::test]
+async fn known_gap_a_held_legacy_zebra_call_still_stops_this_task() {
+    let node = stub_pow_node(true).await;
+    let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+    let (legacy, next) = (synthetic_block(1), synthetic_block(2));
+    sidecar.zebra.knows_of(&legacy);
+    sidecar.zebra.knows_of(&next);
+    let permits = sidecar.zebra.hold();
+    node.has_a_receiver().await;
+    let (sender, sender_task) = start_sender(node.addr).await;
+    send_legacy(&sender, &legacy).await;
+    held_at_zebra(&sidecar, 1).await;
+
+    send_bound(&sender, &next).await;
+    let probe = sidecar.probe().clone();
+    until("the block to be whole", move || {
+        probe.ledger().reserved_bytes > 0
+    })
+    .await;
+    assert_eq!(sidecar.zebra.waiting(), 1, "it waits for this task");
+
+    permits.add_permits(2);
+    zebra_took(&sidecar, &next).await;
+    stop(node, [sidecar.client_task, sender_task]);
+}
 
 async fn send_dual(sender: &BlockSender, raw: &[u8]) {
     tokio::join!(send_legacy(sender, raw), send_bound(sender, raw));
