@@ -39,12 +39,13 @@ pub use reconstructor::{CompactBlockReconstructor, ReconstructionResult};
 pub use relay::{
     ANCHOR_HEADER_WINDOW, ArrivalSink, BOUND_ACK_TTL, BOUND_HELLO, BOUND_HELLO_ACK,
     BOUND_HELLO_WAIT, BOUND_RELEASE, BOUND_SEND_BURST_DELAY, BOUND_SEND_BURST_PACKETS,
-    BlockReceiver, BlockSender, BoundArrivals, BoundBlock, BoundForwardConfig, BoundHandoffs,
-    BoundIngress, BoundNodeUsage, BoundProbe, BoundProgress, BoundRawConfig, BoundSend, BoundUsed,
-    HELLO_RECEIVES, MAX_BODIES_PER_KEY_PER_BLOCK, MetricsSnapshot, NODE_ASSEMBLY_TTL,
-    RELEASE_LEFTOVER, RelayClient, RelayMetrics, RelayNode, RelayPayload, SHARED_EGRESS_BURST,
-    SendReport, body_frames, bound_hello, bound_raw_refused, bound_raw_switch, bound_release,
-    is_bound, render_bound_prometheus_text, render_prometheus_text, sealed_body, sealed_frame,
+    BOUND_SEND_TIMEOUT, BlockReceiver, BlockSender, BoundArrivals, BoundBlock, BoundForwardConfig,
+    BoundHandoffs, BoundIngress, BoundNodeUsage, BoundProbe, BoundProgress, BoundRawConfig,
+    BoundSend, BoundUsed, HELLO_RECEIVES, MAX_BODIES_PER_KEY_PER_BLOCK, MetricsSnapshot,
+    NODE_ASSEMBLY_TTL, RELEASE_LEFTOVER, RelayClient, RelayMetrics, RelayNode, RelayPayload,
+    SHARED_EGRESS_BURST, SendReport, body_frames, bound_hello, bound_raw_refused, bound_raw_switch,
+    bound_release, is_bound, render_bound_prometheus_text, render_prometheus_text, sealed_body,
+    sealed_frame,
 };
 pub use segmented_block::{
     RawBlockSegment, SegmentedBlockError, compact_v3_object_hash, reassemble_raw_block,

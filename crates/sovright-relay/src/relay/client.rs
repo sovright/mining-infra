@@ -132,9 +132,18 @@ impl BlockSender {
     /// `Ok` says the block was encoded and that one relay's socket took every datagram of
     /// it. That is as far as this client can see: it says nothing of whether anything arrived.
     /// An error says it did not fit, no relay took it all, the queue was full or the client
-    /// went. Dropping this does not stop a send the client has taken: a block on its way is
-    /// worth more than a repeat saved.
+    /// went, or, after [`BOUND_SEND_TIMEOUT`], that no answer came in time. Dropping this, or
+    /// that timeout, does not stop a send the client has taken: a block on its way is worth
+    /// more than a repeat saved.
     pub async fn send_bound_raw_block(&self, raw: Arc<Vec<u8>>) -> Result<(), TransportError> {
+        self.send_bound_within(raw, BOUND_SEND_TIMEOUT).await
+    }
+
+    async fn send_bound_within(
+        &self,
+        raw: Arc<Vec<u8>>,
+        limit: Duration,
+    ) -> Result<(), TransportError> {
         let (done, mut finished) = oneshot::channel();
         self.bound_tx
             .try_send(BoundSend { raw, done })
@@ -155,6 +164,7 @@ impl BlockSender {
             biased;
             answer = &mut finished => answer.map_err(|_| went())?,
             () = self.bound_tx.closed() => Err(went()),
+            () = sleep(limit) => Err(TransportError::Timeout),
         }
     }
 
@@ -1148,6 +1158,12 @@ impl Drop for BoundEgress {
         self.0.bound_sends.fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+/// How long [`BlockSender::send_bound_raw_block`] waits for its answer, from when the send
+/// is queued: the sends ahead of it, a hello's wait ([`BOUND_HELLO_WAIT`]), the encoding and
+/// the paced datagrams of a body as large as a block can be, with room to spare. Past it the
+/// caller hears `Timeout` and the send goes on.
+pub const BOUND_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a relay's answer to a bound hello stands. Once a client has bound work, a hello
 /// goes with every keepalive, so an answer is renewed well inside this. A relay that stops

@@ -487,6 +487,25 @@ async fn a_queue_that_goes_answers_for_what_it_held() {
 }
 
 /// A block on its way is worth more than a repeat saved: the send does not depend on who asked.
+/// A send nobody answers comes back as a timeout, and stays where it was.
+#[tokio::test]
+async fn a_bound_send_with_no_answer_times_out_and_stays_queued() {
+    let (tx, _payloads) = mpsc::channel(1);
+    let (bound_tx, mut queue) = mpsc::channel(BOUND_SENDS_WAITING);
+    let sender = BlockSender {
+        bound_tx,
+        ..BlockSender::for_tests(tx)
+    };
+
+    let answer = sender.send_bound_within(Arc::new(vec![1]), Duration::from_millis(50));
+    let answer = timeout(WAIT, answer)
+        .await
+        .expect("it waited past its limit");
+
+    assert!(matches!(answer, Err(TransportError::Timeout)));
+    assert_eq!(*queue.try_recv().unwrap().raw, vec![1]);
+}
+
 #[tokio::test]
 async fn a_caller_that_stops_waiting_leaves_the_send_going() {
     let mut relay = Relay::bind().await;

@@ -22,8 +22,8 @@ pub use bound_raw::{
     bound_release, frame_rules, is_bound, sealed_body, sealed_frame,
 };
 pub use client::{
-    BOUND_ACK_TTL, BOUND_HELLO_WAIT, BlockReceiver, BlockSender, BoundSend, RelayClient,
-    RelayPayload, SHARED_EGRESS_BURST, SendReport,
+    BOUND_ACK_TTL, BOUND_HELLO_WAIT, BOUND_SEND_TIMEOUT, BlockReceiver, BlockSender, BoundSend,
+    RelayClient, RelayPayload, SHARED_EGRESS_BURST, SendReport,
 };
 pub use metrics::{
     MetricsSnapshot, RelayMetrics, render_bound_prometheus_text, render_prometheus_text,
