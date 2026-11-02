@@ -125,6 +125,8 @@ struct UnverifiedForwards {
     /// Bodies a slot holds. Nothing is ever sent on these channels: the entry goes when
     /// the slot ends, and that wakes every copy waiting on it.
     sending: HashMap<UnverifiedBody, watch::Sender<()>>,
+    /// See [`Self::waiting_for_copies`].
+    wait_for_sending: bool,
 }
 
 /// What a body found when it asked to be forwarded unverified.
@@ -157,7 +159,15 @@ impl UnverifiedForwards {
             per_header,
             entries: VecDeque::new(),
             sending: HashMap::new(),
+            wait_for_sending: false,
         }
+    }
+
+    /// A copy of a body still being sent waits for that send to end, and goes if it failed.
+    /// Off, as `RawWire::Legacy` always had it, such a copy is a repeat and is dropped.
+    fn waiting_for_copies(mut self, wait: bool) -> Self {
+        self.wait_for_sending = wait;
+        self
     }
 
     fn reserve(&mut self, body: UnverifiedBody, now: std::time::Instant) -> UnverifiedReservation {
@@ -169,6 +179,9 @@ impl UnverifiedForwards {
         if let Some((_, at, progress)) = same_body {
             return match *progress {
                 UnverifiedProgress::Sent => UnverifiedReservation::Repeat,
+                UnverifiedProgress::Sending if !self.wait_for_sending => {
+                    UnverifiedReservation::Repeat
+                }
                 UnverifiedProgress::Sending => {
                     let sending = self.sending.entry(body);
                     let sending = sending.or_insert_with(|| watch::channel(()).0);
@@ -566,11 +579,14 @@ impl RelayBridge {
                 source: POOL_GATEWAY_SOURCE.to_owned(),
             }),
             forward_unreadable_blocks: config.relay_forward_unreadable_blocks,
-            unverified_forwards: Arc::new(std::sync::Mutex::new(UnverifiedForwards::new(
-                config.relay_forward_dedup_capacity,
-                config.relay_forward_dedup_window,
-                config.relay_unreadable_bodies_per_header,
-            ))),
+            unverified_forwards: Arc::new(std::sync::Mutex::new(
+                UnverifiedForwards::new(
+                    config.relay_forward_dedup_capacity,
+                    config.relay_forward_dedup_window,
+                    config.relay_unreadable_bodies_per_header,
+                )
+                .waiting_for_copies(config.relay_raw_wire.keys_by_body()),
+            )),
         }))
     }
 

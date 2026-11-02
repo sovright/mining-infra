@@ -1555,14 +1555,32 @@ fn the_budget_refreshes_when_the_window_ends_and_not_before() {
     ));
 }
 
+/// Review item 2 on #134: on `RawWire::Legacy` a copy of a body still being sent is a repeat,
+/// as it was before the #130 work, rather than waiting on the send.
+#[test]
+fn on_the_legacy_wire_a_copy_during_a_send_is_a_repeat() {
+    let now = std::time::Instant::now();
+    let mut forwards = UnverifiedForwards::new(4, Duration::from_secs(1), 1);
+    let body = UnverifiedBody {
+        header_hash: [1; 32],
+        digest: [2; 32],
+    };
+    assert!(matches!(
+        forwards.reserve(body, now),
+        UnverifiedReservation::Reserved
+    ));
+    assert!(matches!(
+        forwards.reserve(body, now),
+        UnverifiedReservation::Repeat
+    ));
+}
+
 #[test]
 fn in_flight_reservations_survive_expiry_and_capacity_pressure_until_cancelled() {
     let now = std::time::Instant::now();
-    let state = Arc::new(std::sync::Mutex::new(UnverifiedForwards::new(
-        1,
-        Duration::from_secs(1),
-        1,
-    )));
+    let state = Arc::new(std::sync::Mutex::new(
+        UnverifiedForwards::new(1, Duration::from_secs(1), 1).waiting_for_copies(true),
+    ));
     let first = UnverifiedBody {
         header_hash: [1; 32],
         digest: [2; 32],
@@ -2018,6 +2036,13 @@ async fn a_copy_waiting_on_a_bound_send_that_failed_sends_instead() {
 fn bypass_on(wire: RawWire) -> Harness {
     let mut harness = bypass_harness();
     harness.bridge.raw_wire = wire;
+    // As `RelayBridge::new` sets it from the config.
+    harness
+        .bridge
+        .unverified_forwards
+        .lock()
+        .unwrap()
+        .wait_for_sending = wire.keys_by_body();
     harness
 }
 
