@@ -2204,6 +2204,74 @@ async fn a_legacy_copy_during_a_bound_task_goes_when_that_task_fails() {
     }
 }
 
+/// Until the receive task has buffered a part of a legacy block, which asks nothing of Zebra.
+async fn takes_a_part(sender: &BlockSender, sidecar: &Sidecar, fill: u8, incomplete: usize) {
+    let part = large_block(fill);
+    let hash = zcash_block_hash(&part[..ZCASH_FULL_HEADER_SIZE]);
+    let first = split_raw_block(hash, &part, 10 * 1124 - 4)
+        .unwrap()
+        .remove(0);
+    sender.send_raw_block_segment(first).await.unwrap();
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the part to be buffered", move || {
+        metrics
+            .raw_segment_incomplete_blocks
+            .load(Ordering::Relaxed)
+            == incomplete
+    })
+    .await;
+}
+
+/// The held-copy stall. Zebra fails the bound copy and then sits on every call. The copy held
+/// for it is the retry, and it waits at Zebra on a task of its own: the receive task goes on
+/// with other payloads, and another bound block gets to Zebra beside it. Before, the retry ran
+/// here, and this task waited on Zebra with it.
+#[tokio::test]
+async fn the_held_copy_stall_stops_nothing_else() {
+    for by in [CopyBy::Legacy, CopyBy::Compact] {
+        let node = stub_pow_node(true).await;
+        let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
+        let (block, next) = (synthetic_block(1), synthetic_block(2));
+        sidecar.zebra.knows_of(&block);
+        sidecar.zebra.knows_of(&next);
+        sidecar.zebra.go_down();
+        let permits = sidecar.zebra.hold();
+        node.has_a_receiver().await;
+        let (sender, sender_task) = start_sender(node.addr).await;
+        send_bound(&sender, &block).await;
+        held_at_zebra(&sidecar, 1).await;
+        match by {
+            CopyBy::Legacy => send_legacy(&sender, &block).await,
+            CopyBy::Compact => sender.send(compact_of_synthetic_block(1)).await.unwrap(),
+        }
+        takes_a_part(&sender, &sidecar, 240, 1).await;
+        assert_eq!(
+            sidecar.zebra.arrivals_for(&block),
+            1,
+            "{by:?}: the copy waits"
+        );
+
+        permits.add_permits(1);
+        let (zebra, wanted) = (Arc::clone(&sidecar.zebra), block.clone());
+        until("the error", move || zebra.calls_for(&wanted) == 1).await;
+        sidecar.zebra.come_back();
+        held_at_zebra(&sidecar, 2).await;
+        assert_eq!(sidecar.zebra.arrivals_for(&block), 2, "{by:?}: the retry");
+
+        takes_a_part(&sender, &sidecar, 241, 2).await;
+        send_bound(&sender, &next).await;
+        held_at_zebra(&sidecar, 3).await;
+        assert_eq!(sidecar.zebra.arrivals_for(&next), 1, "{by:?}");
+
+        permits.add_permits(2);
+        zebra_took(&sidecar, &block).await;
+        zebra_took(&sidecar, &next).await;
+        assert_eq!(sidecar.zebra.calls_for(&block), 2, "{by:?}");
+        sidecar.ledger_settled().await;
+        stop(node, [sidecar.client_task, sender_task]);
+    }
+}
+
 /// Another bound copy of the body at Zebra. The block's owner keeps it out, and nothing here
 /// has to.
 #[tokio::test]
@@ -2278,7 +2346,7 @@ async fn bytes_at_zebra_wait_with_no_shared_room() {
 
 /// What fills the shared room is what a block can lose nothing by. A copy of other bytes with
 /// no room goes on as it came: the gate lets a different body run beside the one at Zebra, so
-/// it is tried now, on this task and inside the gate's limits, and not turned away.
+/// it is tried now, on a task of its own and inside the gate's limits, and not turned away.
 #[tokio::test]
 async fn a_different_body_with_no_room_goes_on_beside_the_task() {
     let node = stub_pow_node(true).await;
