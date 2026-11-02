@@ -17,9 +17,9 @@ pub use bound_raw::{
     ANCHOR_HEADER_WINDOW, BOUND_HELLO, BOUND_HELLO_ACK, BOUND_RELEASE, BOUND_SEND_BURST_DELAY,
     BOUND_SEND_BURST_PACKETS, BoundArrivals, BoundBlock, BoundForwardConfig, BoundHandoffs,
     BoundIngress, BoundNodeUsage, BoundProbe, BoundProgress, BoundRawConfig, BoundUsed,
-    HELLO_RECEIVES, MAX_BODIES_PER_KEY_PER_BLOCK, MAX_BODY_BYTES, RELEASE_LEFTOVER, SEGMENT_BYTES,
-    body_frames, bound_hello, bound_raw_refused, bound_raw_switch, bound_release, frame_rules,
-    is_bound, sealed_body, sealed_frame,
+    HELLO_RECEIVES, MAX_BODIES_PER_KEY_PER_BLOCK, MAX_BODY_BYTES, NODE_ASSEMBLY_TTL,
+    RELEASE_LEFTOVER, SEGMENT_BYTES, body_frames, bound_hello, bound_raw_refused, bound_raw_switch,
+    bound_release, frame_rules, is_bound, sealed_body, sealed_frame,
 };
 pub use client::{
     BOUND_ACK_TTL, BOUND_HELLO_WAIT, BlockReceiver, BlockSender, BoundSend, RelayClient,

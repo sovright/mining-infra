@@ -133,6 +133,25 @@ fn assembler_limits() -> AssemblerLimits {
     }
 }
 
+/// How long a node keeps an object open. An
+/// object's first datagram takes the room the whole object needs, about eight times its own
+/// size, so that what was let in can always finish. A sender sends an object's datagrams in
+/// one burst, and a second copy comes after `resend_after`, so a node needs no longer than
+/// this to finish one; holding the pool with first datagrams costs a datagram an object this
+/// often. The receiver keeps its own, longer time.
+pub const NODE_ASSEMBLY_TTL: Duration = Duration::from_secs(5);
+
+/// How long a node keeps a decoded object waiting for its segment 0. It gives way when the
+/// pool is short of bytes, so it holds nothing anyone else needs meanwhile.
+const WAITING_TTL: Duration = Duration::from_secs(30);
+
+fn node_assembler_limits() -> AssemblerLimits {
+    AssemblerLimits {
+        assembly_ttl: NODE_ASSEMBLY_TTL,
+        ..assembler_limits()
+    }
+}
+
 /// A receiver's research values. See the module note.
 #[derive(Clone, Copy, Debug)]
 pub struct BoundRawConfig {
@@ -221,8 +240,9 @@ pub struct BoundForwardConfig {
     /// How long a key's payment for an anchor lasts from that key's last use. As long as a
     /// resend can come.
     pub anchor_ttl: Duration,
-    /// Decoded objects of one session that wait for their segment 0, each for as long as an
-    /// open object lasts.
+    /// Decoded objects of one session that wait for their segment 0, each for up to 30 s. When
+    /// the pool or their key is short of bytes they give way, the oldest first, to a session
+    /// that holds less, after any open object of theirs that can move.
     pub max_unanchored: usize,
     /// Datagrams a node holds between its socket and its work, so that slow work does not
     /// leave the socket's buffer as all a burst has. Past this they stay in the socket. Zero
@@ -1387,6 +1407,9 @@ pub struct BoundNodeUsage {
     pub objects_sent_on: u64,
     pub objects_waiting_for_segment_0: usize,
     pub waiting_pushed_out: u64,
+    /// Objects that waited for their segment 0 and gave way to a session holding less, when
+    /// the pool had no room.
+    pub waiting_gave_way: u64,
     /// Objects that waited for their segment 0 until their time was up.
     pub waiting_expired: u64,
     pub anchors: usize,
@@ -1526,6 +1549,7 @@ pub(crate) struct BoundForwarder {
     objects_released: u64,
     objects_sent_on: u64,
     waiting_pushed_out: u64,
+    waiting_gave_way: u64,
     waiting_expired: u64,
     anchors_refused_for_bodies: u64,
     anchors_refused_for_key_bodies: u64,
@@ -1567,6 +1591,7 @@ impl BoundForwarder {
             objects_released: 0,
             objects_sent_on: 0,
             waiting_pushed_out: 0,
+            waiting_gave_way: 0,
             waiting_expired: 0,
             anchors_refused_for_bodies: 0,
             anchors_refused_for_key_bodies: 0,
@@ -1635,6 +1660,7 @@ impl BoundForwarder {
             objects_sent_on: self.objects_sent_on,
             objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
             waiting_pushed_out: self.waiting_pushed_out,
+            waiting_gave_way: self.waiting_gave_way,
             waiting_expired: self.waiting_expired,
             anchors: self.anchors.len(),
             anchors_refused_for_bodies: self.anchors_refused_for_bodies,
@@ -1672,7 +1698,8 @@ impl BoundForwarder {
             let key_budget = self.key_budget(key_id)?;
             let budget = Budget::within(self.config.session_budget, &key_budget).ok()?;
             let verifier = Verifier::new(key, Profile::BoundSegment);
-            let Ok(session) = Assembler::new(verifier, budget.clone(), assembler_limits()) else {
+            let limits = node_assembler_limits();
+            let Ok(session) = Assembler::new(verifier, budget.clone(), limits) else {
                 self.datagrams_without_a_place += 1;
                 return None;
             };
@@ -1735,19 +1762,38 @@ impl BoundForwarder {
                 refusal == Refusal::Outer && peer.key_share() > own_key
             }
         };
+        // What waits holds bytes and no open place, so it makes room only for a budget that
+        // is short of bytes.
+        let (used, limits) = match refusal {
+            Refusal::Outer => (self.pool.used(), self.config.pool),
+            _ => (asking.key_budget.used(), self.config.key_budget),
+        };
+        let waiting_makes_room = used.objects < limits.max_objects;
+        let can_give = |peer: &BoundPeer| {
+            peer.session.has_open() || (waiting_makes_room && !peer.unanchored.is_empty())
+        };
         let others = self
             .peers
             .iter()
-            .filter(|(addr, peer)| **addr != src && peer.session.has_open() && heavier(peer));
+            .filter(|(addr, peer)| **addr != src && can_give(peer) && heavier(peer));
         let weight =
             |peer: &BoundPeer| (peer.key_id != asking.key_id, peer.key_share(), peer.share());
         let Some((heaviest, _)) = others.max_by_key(|(_, peer)| weight(peer)) else {
             return false;
         };
         let heaviest = *heaviest;
+        // An open object moves to the shelf and can still finish there. Failing that, what
+        // waits for its segment 0 goes, oldest first: it is the only copy here, and its
+        // session can send it again.
         let give_way = |this: &mut Self| {
-            let peer = this.peers.get_mut(&heaviest);
-            let moved = peer.is_some_and(|peer| peer.session.give_way());
+            let Some(peer) = this.peers.get_mut(&heaviest) else {
+                return false;
+            };
+            let mut moved = peer.session.give_way();
+            if !moved && waiting_makes_room && peer.unanchored.pop_front().is_some() {
+                this.waiting_gave_way += 1;
+                moved = true;
+            }
             #[cfg(test)]
             this.trip(Trip::GaveWay(heaviest));
             moved
@@ -1996,7 +2042,7 @@ impl BoundForwarder {
     pub(crate) fn tidy(&mut self, now: Instant, is_live: impl Fn(&SocketAddr) -> bool) {
         self.peers.retain(|addr, _| is_live(addr));
         let window = self.config.resend_window;
-        let can_wait = assembler_limits().assembly_ttl;
+        let can_wait = WAITING_TTL;
         for peer in self.peers.values_mut() {
             peer.session.expire(now);
             peer.forwarded.forget_lapsed(now, window);
@@ -3410,9 +3456,11 @@ mod tests {
         assert_eq!(send(&mut bound, addr(2), &honest[9..10], now), 1);
     }
 
-    /// Decoded and waiting for its segment 0 is the only copy here, so it is not given up.
+    /// Decoded and waiting for its segment 0 gives way to a session that holds less, as an
+    /// open object does: held without end, it would keep the pool from anyone else for as
+    /// long as it waits. Its session can send it again.
     #[test]
-    fn what_waits_for_its_segment_0_is_not_given_up() {
+    fn what_waits_for_its_segment_0_gives_way_to_a_lighter_session() {
         let frames = body_frames(&vec![1u8; 2 * SEGMENT_BYTES as usize]).unwrap();
         let mut limits = config();
         limits.pool.max_held_bytes = frames[1].len() + 1000;
@@ -3422,11 +3470,30 @@ mod tests {
 
         open_as(&mut bound, OTHER, addr(1), 3, now);
 
-        assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
-        assert_eq!(open_in(&bound, addr(1)), 0);
+        assert_eq!(bound.peers[&addr(2)].unanchored.len(), 0);
+        assert_eq!(open_in(&bound, addr(1)), 1);
+        assert_eq!(bound.usage().waiting_gave_way, 1);
     }
 
-    /// Nor does it go in place of an open object that cannot move.
+    /// An open object that can move goes first, since it can still finish on the shelf.
+    #[test]
+    fn an_open_object_moves_before_what_waits_goes() {
+        let config = pool_config(1, 256);
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        hold_decoded_as(&mut bound, OTHER, addr(1), 1, now);
+        hold_decoded(&mut bound, addr(2), 2, now);
+        open_one(&mut bound, addr(2), 3, now);
+
+        open_as(&mut bound, OTHER, addr(1), 9, now);
+
+        assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
+        assert_eq!(open_in(&bound, addr(2)), 0);
+        assert_eq!(open_in(&bound, addr(1)), 1);
+        assert_eq!(bound.usage().waiting_gave_way, 0);
+    }
+
+    /// What waits holds no open place, so with the pool out of places it would make no room,
+    /// and it stays, as does an open object that cannot move.
     #[test]
     fn what_waits_stays_when_the_open_object_cannot_move() {
         let mut config = pool_config(1, 256);
@@ -3441,6 +3508,7 @@ mod tests {
         assert_eq!(bound.peers[&addr(2)].unanchored.len(), 1);
         assert_eq!(open_in(&bound, addr(2)), 1);
         assert_eq!(open_in(&bound, addr(1)), 0);
+        assert_eq!(bound.usage().waiting_gave_way, 0);
     }
 
     /// The same frame under a shape of its own would be another object, sent on again.
@@ -3906,7 +3974,7 @@ mod tests {
     #[test]
     fn a_frame_waiting_for_segment_0_gives_its_room_back() {
         let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
-        let time = assembler_limits().assembly_ttl;
+        let time = WAITING_TTL;
         hold_decoded(&mut bound, addr(1), 1, now);
         let held = bound.usage().pool.held_bytes;
         assert!(held > 0);
@@ -3927,7 +3995,7 @@ mod tests {
     #[test]
     fn a_frame_that_stopped_waiting_can_come_again() {
         let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
-        let time = assembler_limits().assembly_ttl;
+        let time = WAITING_TTL;
         let (first, later) = two_frames(1);
         assert_eq!(send(&mut bound, addr(1), &later, now), 0);
         bound.tidy(now + time, |_| true);
@@ -3937,6 +4005,23 @@ mod tests {
         assert_eq!(send(&mut bound, addr(1), &later, again), 0);
         assert_eq!(bound.usage().objects_waiting_for_segment_0, 1);
         assert_eq!(send(&mut bound, addr(1), &first, again), 2);
+    }
+
+    /// A first datagram holds the room of its whole object, so on a node that lasts only as
+    /// long as finishing it can take.
+    #[test]
+    fn a_node_keeps_an_open_object_only_for_its_own_time() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        open_one(&mut bound, addr(1), 1, now);
+        let held = bound.usage().pool.held_bytes;
+        assert!(held > 0);
+
+        bound.tidy(now + NODE_ASSEMBLY_TTL - Duration::from_millis(1), |_| true);
+        assert_eq!(open_in(&bound, addr(1)), 1);
+
+        bound.tidy(now + NODE_ASSEMBLY_TTL, |_| true);
+        assert_eq!(open_in(&bound, addr(1)), 0);
+        assert_eq!(bound.usage().pool.held_bytes, 0);
     }
 
     /// A session waits for no more than its limit, whatever its budget has room for.
