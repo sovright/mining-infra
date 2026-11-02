@@ -300,6 +300,11 @@ pub fn is_bound(datagram: &[u8]) -> bool {
 // answers nothing, and the plain keepalive sent beside it keeps the session. So the rollout
 // order does not lose a body in silence: relays first, then receivers, then senders, and a
 // sender in front of a relay without the path hears so on every send.
+//
+// A receiver that refused a body downstream, Zebra turning it away, says so with a keepalive
+// whose block hash is [`BOUND_RELEASE`] and whose payload is the body's block hash and body
+// id. A node with the path on takes the body's anchor away (see `BoundForwarder::release`).
+// An old node refuses it as it refuses a hello.
 
 const fn marker(text: &[u8]) -> [u8; 32] {
     let mut out = [0u8; 32];
@@ -315,28 +320,53 @@ const fn marker(text: &[u8]) -> [u8; 32] {
 pub const BOUND_HELLO: [u8; 32] = marker(b"sovright/bound-raw/hello/v1");
 /// The block hash of a node's answer to [`BOUND_HELLO`].
 pub const BOUND_HELLO_ACK: [u8; 32] = marker(b"sovright/bound-raw/ack/v1");
+/// The block hash of a keepalive that says a receiver refused a body.
+pub const BOUND_RELEASE: [u8; 32] = marker(b"sovright/bound-raw/release/v1");
 /// A hello's `chunk_id` flag: this peer takes bound objects, not only sends them.
 pub const HELLO_RECEIVES: u16 = 1;
 
-fn control(key: &[u8; 32], marker: &[u8; 32], flags: u16) -> Vec<u8> {
+fn control(key: &[u8; 32], marker: &[u8; 32], flags: u16, payload: Vec<u8>) -> Vec<u8> {
     let session = RelaySession::new("0.0.0.0:0".parse().expect("an address"), "", *key);
-    let hmac = session.compute_hmac(marker, flags, 0, 0, &[]);
+    let length = u16::try_from(payload.len()).expect("a short payload");
+    let hmac = session.compute_hmac(marker, flags, 0, length, &payload);
     let mut header = ChunkHeader::new_keepalive_authenticated(hmac);
     header.block_hash = *marker;
     header.chunk_id = flags;
-    Chunk::new(header, Vec::new()).to_bytes()
+    header.payload_len = length;
+    Chunk::new(header, payload).to_bytes()
+}
+
+/// A receiver's word that it refused the body `block_hash` and `body_id` name, under `key`.
+pub fn bound_release(key: &[u8; 32], block_hash: &[u8; 32], body_id: &[u8; 32]) -> Vec<u8> {
+    control(key, &BOUND_RELEASE, 0, [*block_hash, *body_id].concat())
+}
+
+/// The body a release names, if `chunk` is framed as one. Its MAC is checked with the
+/// session.
+pub(crate) fn released_body(chunk: &Chunk) -> Option<SetKey> {
+    let header = &chunk.header;
+    let framed = header.block_hash == BOUND_RELEASE
+        && header.chunk_id == 0
+        && header.total_chunks == 0
+        && usize::from(header.payload_len) == chunk.payload.len()
+        && chunk.payload.len() == 64;
+    let (block_hash, body_id) = chunk.payload.split_at_checked(32)?;
+    framed.then(|| SetKey {
+        block_hash: block_hash.try_into().expect("32 bytes"),
+        body_id: body_id.try_into().expect("32 bytes"),
+    })
 }
 
 /// A bound hello under `key`. `receives` says this peer takes bound objects; a peer that
 /// only sends them says so too, so that it hears whether a relay has the path.
 pub fn bound_hello(key: &[u8; 32], receives: bool) -> Vec<u8> {
     let flags = if receives { HELLO_RECEIVES } else { 0 };
-    control(key, &BOUND_HELLO, flags)
+    control(key, &BOUND_HELLO, flags, Vec::new())
 }
 
 /// A node's answer to a hello, under the session's key.
 pub(crate) fn bound_hello_ack(key: &[u8; 32]) -> Vec<u8> {
-    control(key, &BOUND_HELLO_ACK, 0)
+    control(key, &BOUND_HELLO_ACK, 0, Vec::new())
 }
 
 /// Whether `chunk` is a node's answer to a hello under `key`.
@@ -405,19 +435,69 @@ pub fn sealed_body(raw: &[u8], key: &[u8; 32]) -> Option<Vec<Vec<u8>>> {
 /// it is finished with, and anything else, [`Self::give_back`] or just dropping it, lets a
 /// copy in. Ending it says nothing about the block itself: it says what this consumer did.
 #[derive(Debug)]
-pub struct BoundBlock(AssembledBlock<Vec<u8>>);
+pub struct BoundBlock {
+    block: AssembledBlock<Vec<u8>>,
+    key: SetKey,
+    refusals: Option<Arc<Refusals>>,
+}
 
 impl BoundBlock {
     pub fn raw(&self) -> &[u8] {
-        self.0.block()
+        self.block.block()
+    }
+
+    /// The block hash the body's frames name.
+    pub fn block_hash(&self) -> [u8; 32] {
+        self.key.block_hash
+    }
+
+    /// The body's id, from its frames. Two bodies of one block differ here.
+    pub fn body_id(&self) -> [u8; 32] {
+        self.key.body_id
     }
 
     pub fn finish(self) {
-        self.0.finish(Instant::now());
+        self.block.finish(Instant::now());
     }
 
     pub fn give_back(self) {
-        self.0.give_back();
+        self.block.give_back();
+    }
+
+    /// The body was refused downstream, by Zebra: give it back, as [`Self::give_back`]
+    /// does, and tell every relay of this client, so that the place the body holds there is
+    /// freed for a rival body of the same block. See [`bound_release`]. Only for a refusal
+    /// that says the body is wrong: a relay keeps it out for a while after. How many relays
+    /// the socket took the word for, which says nothing of whether it arrived.
+    pub fn refuse(self) -> usize {
+        let told = self
+            .refusals
+            .as_ref()
+            .map_or(0, |refusals| refusals.tell(&self.key));
+        self.block.give_back();
+        told
+    }
+}
+
+/// Where a client's receiver says it refused a body: every relay of that client.
+#[derive(Debug)]
+pub(crate) struct Refusals {
+    pub(crate) socket: Arc<tokio::net::UdpSocket>,
+    pub(crate) relays: Vec<SocketAddr>,
+    pub(crate) key: [u8; 32],
+}
+
+impl Refusals {
+    fn tell(&self, body: &SetKey) -> usize {
+        let release = bound_release(&self.key, &body.block_hash, &body.body_id);
+        let sent = |relay: &&SocketAddr| match self.socket.try_send_to(&release, **relay) {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(%relay, %error, "Could not tell a relay of a refused bound body");
+                false
+            }
+        };
+        self.relays.iter().filter(sent).count()
     }
 }
 
@@ -619,6 +699,8 @@ pub(crate) struct BoundReceiver {
     consumer: mpsc::Sender<BoundBlock>,
     look_again: bool,
     progress: Arc<LiveProgress>,
+    /// Where the blocks handed over say they were refused, once the client has a socket.
+    refusals: Option<Arc<Refusals>>,
     #[cfg(test)]
     pub(crate) trip_next: bool,
 }
@@ -639,9 +721,14 @@ impl BoundReceiver {
             consumer,
             look_again: false,
             progress: Arc::default(),
+            refusals: None,
             #[cfg(test)]
             trip_next: false,
         })
+    }
+
+    pub(crate) fn tell_refusals_to(&mut self, refusals: Refusals) {
+        self.refusals = Some(Arc::new(refusals));
     }
 
     /// After a panic. The session and bridge go and give back all they held, blocks waiting
@@ -656,6 +743,7 @@ impl BoundReceiver {
             stack,
             consumer,
             progress,
+            refusals,
             ..
         } = self;
         drop(session);
@@ -669,6 +757,7 @@ impl BoundReceiver {
             consumer,
             look_again: false,
             progress,
+            refusals,
             #[cfg(test)]
             trip_next: false,
         })
@@ -760,16 +849,21 @@ impl BoundReceiver {
     pub(crate) fn pump(&mut self, now: Instant) -> bool {
         while self.has_waiting() {
             match self.consumer.try_reserve() {
-                Ok(permit) => match self.bridge.next_block(now) {
-                    Some(Ok(block)) => {
-                        permit.send(BoundBlock(block));
+                Ok(permit) => match (self.bridge.next_key(), self.bridge.next_block(now)) {
+                    (Some(key), Some(Ok(block))) => {
+                        let refusals = self.refusals.clone();
+                        permit.send(BoundBlock {
+                            block,
+                            key,
+                            refusals,
+                        });
                         add(&self.progress.handoffs.blocks_to_consumer, 1);
                     }
-                    Some(Err(error)) => {
+                    (_, Some(Err(error))) => {
                         warn!(?error, "Bound block did not assemble");
                         add(&self.progress.handoffs.assembly_failures, 1);
                     }
-                    None => break,
+                    (_, _) => break,
                 },
                 Err(TrySendError::Full(())) => break,
                 Err(TrySendError::Closed(())) => {
@@ -862,6 +956,8 @@ impl IngressQueue {
 #[derive(Debug)]
 struct Anchor {
     body_id: [u8; 32],
+    /// Its header's time, which a newer header can make too old. See [`ANCHOR_HEADER_WINDOW`].
+    time: u32,
     /// The keys that pay for its place in the table, each up to a time of its own.
     paid_until: HashMap<String, Instant>,
 }
@@ -883,8 +979,57 @@ impl Anchor {
 enum AnchorRefusal {
     /// Its block has all the bodies it can have.
     Bodies,
+    /// Its key pays for all of this block's bodies it may. See
+    /// [`MAX_BODIES_PER_KEY_PER_BLOCK`].
+    KeyBodies,
     /// Its key or the table has no room.
     Room,
+    /// Its header is older than the newest header here by more than
+    /// [`ANCHOR_HEADER_WINDOW`].
+    Old,
+    /// A receiver refused this body, and it stays refused for a while. See
+    /// [`BoundForwarder::release`].
+    Released,
+}
+
+/// How far behind the newest header a node has anchored a header's time may be, and still
+/// open an anchor. A header that far behind is refused before its PoW check, and an anchor
+/// that falls that far behind a newer one goes. The newest is never taken as later than this
+/// node's clock, so a header dated in the future cannot make every other look old.
+///
+/// A node has no chain view, so this stands in for one: a header with good PoW from long ago
+/// can no longer hold the table, but a node that has seen nothing newer yet takes it. A
+/// research value: consensus lets a block's time lag the chain by the median of the last 11
+/// blocks, about a quarter of an hour, so this leaves room for that and for clocks.
+pub const ANCHOR_HEADER_WINDOW: Duration = Duration::from_secs(30 * 60);
+
+/// Of one block's bodies, how many one key can pay for. A key that saw the header first can
+/// then not take every place [`BoundForwardConfig::max_bodies_per_block`] gives the block.
+/// An honest key needs one. With one key for the whole fleet this is the fleet's share, and
+/// [`BoundForwarder::release`] is what frees a place a refused body holds.
+pub const MAX_BODIES_PER_KEY_PER_BLOCK: usize = 2;
+
+/// Where a header's time sits in it.
+const HEADER_TIME: std::ops::Range<usize> = 100..104;
+
+/// A header's time, from the header at the front of a segment 0.
+fn header_time(header: &[u8]) -> u32 {
+    let bytes = header.get(HEADER_TIME).and_then(|b| b.try_into().ok());
+    bytes.map_or(0, u32::from_le_bytes)
+}
+
+/// This node's clock as a header's time.
+fn wall_clock() -> u32 {
+    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
+    since.map_or(0, |since| {
+        u32::try_from(since.as_secs()).unwrap_or(u32::MAX)
+    })
+}
+
+/// Whether a header dated `time` is too old next to `newest`.
+fn too_old(time: u32, newest: u32) -> bool {
+    let window = u32::try_from(ANCHOR_HEADER_WINDOW.as_secs()).unwrap_or(u32::MAX);
+    time.saturating_add(window) < newest
 }
 
 /// Anchors by block, so a block's bodies can be counted. What one opens is the one body whose
@@ -918,6 +1063,10 @@ struct Anchors {
     blocks: HashMap<[u8; 32], Vec<Anchor>>,
     /// Uses by a key with no room to pay. They renewed nothing.
     uses_without_room: u64,
+    /// The time of the newest header that passed its PoW check here.
+    newest: Option<u32>,
+    /// Bodies a receiver refused, each until a time.
+    released: HashMap<SetKey, Instant>,
 }
 
 impl Anchors {
@@ -958,10 +1107,37 @@ impl Anchors {
         true
     }
 
+    /// The newest header's time, never later than `wall`.
+    fn newest(&self, wall: u32) -> Option<u32> {
+        self.newest.map(|newest| newest.min(wall))
+    }
+
+    /// Whether a header dated `time` would, once it passed, make an anchor here too old.
+    fn would_age_any(&self, time: u32, wall: u32) -> bool {
+        let newest = time.min(wall);
+        let anchors = self.blocks.values().flatten();
+        anchors
+            .into_iter()
+            .any(|anchor| too_old(anchor.time, newest))
+    }
+
+    /// A header dated `time` passed its PoW check. What it makes too old goes.
+    fn passed(&mut self, time: u32, wall: u32) {
+        self.newest = Some(self.newest.map_or(time, |newest| newest.max(time)));
+        let Some(newest) = self.newest(wall) else {
+            return;
+        };
+        for bodies in self.blocks.values_mut() {
+            bodies.retain(|anchor| !too_old(anchor.time, newest));
+        }
+        self.blocks.retain(|_, bodies| !bodies.is_empty());
+    }
+
     fn refusal(
         &mut self,
         key: &SetKey,
         key_id: &str,
+        time: u32,
         now: Instant,
         config: &BoundForwardConfig,
     ) -> Option<AnchorRefusal> {
@@ -969,7 +1145,22 @@ impl Anchors {
         if self.find(key, now).is_some() {
             return None;
         }
-        let bodies = self.blocks.get(&key.block_hash).map_or(0, Vec::len);
+        if self.released.contains_key(key) {
+            return Some(AnchorRefusal::Released);
+        }
+        if self
+            .newest(wall_clock())
+            .is_some_and(|newest| too_old(time, newest))
+        {
+            return Some(AnchorRefusal::Old);
+        }
+        let of_block = self.blocks.get(&key.block_hash);
+        let paid = |anchor: &&Anchor| anchor.paid_by(key_id, now);
+        let mine = of_block.map_or(0, |bodies| bodies.iter().filter(paid).count());
+        if mine >= MAX_BODIES_PER_KEY_PER_BLOCK {
+            return Some(AnchorRefusal::KeyBodies);
+        }
+        let bodies = of_block.map_or(0, Vec::len);
         if bodies >= config.max_bodies_per_block {
             return Some(AnchorRefusal::Bodies);
         }
@@ -979,18 +1170,51 @@ impl Anchors {
     }
 
     /// Whoever opens an anchor pays for it. A key that brings a body with one has used it.
-    fn add(&mut self, key: SetKey, key_id: &str, now: Instant, config: &BoundForwardConfig) {
+    fn add(
+        &mut self,
+        key: SetKey,
+        key_id: &str,
+        time: u32,
+        now: Instant,
+        config: &BoundForwardConfig,
+    ) {
         if self.used(&key, key_id, now, config) {
             return;
         }
         let until = now + config.anchor_ttl;
         self.blocks.entry(key.block_hash).or_default().push(Anchor {
             body_id: key.body_id,
+            time,
             paid_until: HashMap::from([(key_id.to_string(), until)]),
         });
     }
 
+    /// A receiver refused this body: its anchor goes, whoever paid, and a copy of its
+    /// segment 0 opens none until `until`. At most `limit` such bodies are kept, the ones
+    /// closest to their end going first. Whether it had an anchor.
+    fn release(&mut self, key: SetKey, until: Instant, limit: usize) -> bool {
+        let mut had = false;
+        if let Some(bodies) = self.blocks.get_mut(&key.block_hash) {
+            let before = bodies.len();
+            bodies.retain(|anchor| anchor.body_id != key.body_id);
+            had = bodies.len() < before;
+            if bodies.is_empty() {
+                self.blocks.remove(&key.block_hash);
+            }
+        }
+        self.released.insert(key, until);
+        while self.released.len() > limit {
+            let first = self.released.iter().min_by_key(|(_, until)| **until);
+            let Some(first) = first.map(|(key, _)| *key) else {
+                break;
+            };
+            self.released.remove(&first);
+        }
+        had
+    }
+
     fn forget_lapsed(&mut self, now: Instant) {
+        self.released.retain(|_, until| now < *until);
         for bodies in self.blocks.values_mut() {
             for anchor in bodies.iter_mut() {
                 anchor.paid_until.retain(|_, until| now < *until);
@@ -1168,8 +1392,18 @@ pub struct BoundNodeUsage {
     pub anchors: usize,
     /// Segments 0 refused because their block had all the bodies it can have.
     pub anchors_refused_for_bodies: u64,
+    /// Segments 0 refused because their key paid for all of their block's bodies it may.
+    /// See [`MAX_BODIES_PER_KEY_PER_BLOCK`].
+    pub anchors_refused_for_key_bodies: u64,
     /// Segments 0 refused because their key or the table had no room for an anchor.
     pub anchors_refused_for_room: u64,
+    /// Segments 0 refused, before their PoW check, for a header too far behind the newest.
+    /// See [`ANCHOR_HEADER_WINDOW`].
+    pub anchors_refused_for_age: u64,
+    /// Segments 0 of a body a receiver refused, while that refusal stands.
+    pub anchors_refused_as_released: u64,
+    /// Anchors a receiver's refusal took away.
+    pub anchors_released: u64,
     /// Uses of an anchor by a key with no room to pay for it. They got through and renewed
     /// nothing, so what they used can go while they are using it.
     pub anchor_uses_without_room: u64,
@@ -1294,7 +1528,11 @@ pub(crate) struct BoundForwarder {
     waiting_pushed_out: u64,
     waiting_expired: u64,
     anchors_refused_for_bodies: u64,
+    anchors_refused_for_key_bodies: u64,
     anchors_refused_for_room: u64,
+    anchors_refused_for_age: u64,
+    anchors_refused_as_released: u64,
+    anchors_released: u64,
     sessions_lost_to_a_panic: u64,
     panic_resets: u64,
     #[cfg(test)]
@@ -1331,7 +1569,11 @@ impl BoundForwarder {
             waiting_pushed_out: 0,
             waiting_expired: 0,
             anchors_refused_for_bodies: 0,
+            anchors_refused_for_key_bodies: 0,
             anchors_refused_for_room: 0,
+            anchors_refused_for_age: 0,
+            anchors_refused_as_released: 0,
+            anchors_released: 0,
             sessions_lost_to_a_panic: 0,
             panic_resets: 0,
             #[cfg(test)]
@@ -1396,7 +1638,11 @@ impl BoundForwarder {
             waiting_expired: self.waiting_expired,
             anchors: self.anchors.len(),
             anchors_refused_for_bodies: self.anchors_refused_for_bodies,
+            anchors_refused_for_key_bodies: self.anchors_refused_for_key_bodies,
             anchors_refused_for_room: self.anchors_refused_for_room,
+            anchors_refused_for_age: self.anchors_refused_for_age,
+            anchors_refused_as_released: self.anchors_refused_as_released,
+            anchors_released: self.anchors_released,
             anchor_uses_without_room: self.anchors.uses_without_room,
             sessions_lost_to_a_panic: self.sessions_lost_to_a_panic,
             panic_resets: self.panic_resets,
@@ -1592,30 +1838,32 @@ impl BoundForwarder {
         }
         // Ahead of the PoW check, which is the costly part. A body turned away leaves no
         // record: nothing is wrong with it, and it can come again when there is room.
-        match self.anchors.refusal(&key, &key_id, now, &self.config) {
-            Some(AnchorRefusal::Bodies) => {
-                self.anchors_refused_for_bodies += 1;
+        let header = &segment.payload()[..ZCASH_FULL_HEADER_SIZE];
+        let (time, wall) = (header_time(header), wall_clock());
+        let mut checked = false;
+        if let Some(refusal) = self.anchors.refusal(&key, &key_id, time, now, &self.config) {
+            // Without room, a newer header may still make room by aging out what holds it.
+            // Only a header that passed can, so this one is checked first.
+            let may_make_room = matches!(refusal, AnchorRefusal::Room | AnchorRefusal::Bodies);
+            if !may_make_room || !self.anchors.would_age_any(time, wall) {
+                self.count_refusal(refusal);
                 return Vec::new();
             }
-            Some(AnchorRefusal::Room) => {
-                self.anchors_refused_for_room += 1;
+            if !self.pow_passes(src, &decoded, header, now, &validate) {
                 return Vec::new();
             }
-            None => {}
-        }
-        match validate(&segment.payload()[..ZCASH_FULL_HEADER_SIZE]) {
-            PowResult::Valid => {}
-            PowResult::Invalid => {
-                self.pow_refused += 1;
-                self.reject(src, decoded.object_id(), now);
-                return Vec::new();
-            }
-            PowResult::Indeterminate => {
-                self.pow_indeterminate += 1;
+            checked = true;
+            self.anchors.passed(time, wall);
+            if let Some(refusal) = self.anchors.refusal(&key, &key_id, time, now, &self.config) {
+                self.count_refusal(refusal);
                 return Vec::new();
             }
         }
-        self.anchors.add(key, &key_id, now, &self.config);
+        if !checked && !self.pow_passes(src, &decoded, header, now, &validate) {
+            return Vec::new();
+        }
+        self.anchors.passed(time, wall);
+        self.anchors.add(key, &key_id, time, now, &self.config);
         let mut ready = vec![(src, decoded)];
         for (addr, peer) in &mut self.peers {
             let (anchored, rest): (VecDeque<_>, VecDeque<_>) = std::mem::take(&mut peer.unanchored)
@@ -1627,6 +1875,57 @@ impl BoundForwarder {
         #[cfg(test)]
         self.trip(Trip::Drained);
         ready
+    }
+
+    fn pow_passes(
+        &mut self,
+        src: SocketAddr,
+        decoded: &DecodedObject,
+        header: &[u8],
+        now: Instant,
+        validate: &impl Fn(&[u8]) -> PowResult,
+    ) -> bool {
+        match validate(header) {
+            PowResult::Valid => true,
+            PowResult::Invalid => {
+                self.pow_refused += 1;
+                self.reject(src, decoded.object_id(), now);
+                false
+            }
+            PowResult::Indeterminate => {
+                self.pow_indeterminate += 1;
+                false
+            }
+        }
+    }
+
+    fn count_refusal(&mut self, refusal: AnchorRefusal) {
+        let count = match refusal {
+            AnchorRefusal::Bodies => &mut self.anchors_refused_for_bodies,
+            AnchorRefusal::KeyBodies => &mut self.anchors_refused_for_key_bodies,
+            AnchorRefusal::Room => &mut self.anchors_refused_for_room,
+            AnchorRefusal::Old => &mut self.anchors_refused_for_age,
+            AnchorRefusal::Released => &mut self.anchors_refused_as_released,
+        };
+        *count += 1;
+    }
+
+    /// A receiver refused the body `key` names, downstream of here: its anchor goes, which
+    /// frees its place in its block and in the table, and what comes next of it goes no
+    /// further. A copy of its segment 0 opens no anchor again for
+    /// [`BoundForwardConfig::anchor_ttl`], so a sender cannot put it straight back. Whether
+    /// it had an anchor.
+    ///
+    /// This takes the receiver's word. Only a key with the full role is asked, and that key
+    /// can already send whatever it likes; see the node.
+    pub(crate) fn release(&mut self, key: SetKey, now: Instant) -> bool {
+        let until = now + self.config.anchor_ttl;
+        let had = self.anchors.release(key, until, self.config.max_anchors);
+        self.anchors_released += u64::from(had);
+        for peer in self.peers.values_mut() {
+            peer.unanchored.retain(|waiting| waiting.key != key);
+        }
+        had
     }
 
     fn send_on_each(
@@ -2187,9 +2486,17 @@ mod tests {
         assert_eq!(bound.usage().pool, sum);
     }
 
+    /// A body of `fill` but for its header's time, which is that of a body of ones, so that
+    /// bodies of different fills are all as new. See [`ANCHOR_HEADER_WINDOW`].
+    fn dated(fill: u8, segments: usize) -> Vec<u8> {
+        let mut raw = vec![fill; segments * SEGMENT_BYTES as usize];
+        raw[HEADER_TIME].fill(1);
+        raw
+    }
+
     /// Two frames of one body, each sealed.
     fn two_frames(fill: u8) -> (Vec<Vec<u8>>, Vec<Vec<u8>>) {
-        let frames = body_frames(&vec![fill; 2 * SEGMENT_BYTES as usize]).unwrap();
+        let frames = body_frames(&dated(fill, 2)).unwrap();
         (
             sealed_frame(&frames[0], &KEY).unwrap(),
             sealed_frame(&frames[1], &KEY).unwrap(),
@@ -3155,9 +3462,12 @@ mod tests {
     // and the node has no chain source, so anyone with a key can open anchors with old headers.
 
     /// A body of its own under a header nobody else has, in one segment.
+    /// A body of a block of its own, in one segment. Its header's time is that of the bodies
+    /// of ones here, so neither looks old next to the other. See [`ANCHOR_HEADER_WINDOW`].
     fn one_segment(mark: u32) -> Vec<Vec<u8>> {
         let mut raw = vec![0u8; 5000];
         raw[..4].copy_from_slice(&mark.to_le_bytes());
+        raw[HEADER_TIME].fill(1);
         sealed_body(&raw, &KEY).unwrap()
     }
 
@@ -3170,7 +3480,7 @@ mod tests {
     }
 
     fn three_frames(fill: u8) -> SealedFrames {
-        let frames = body_frames(&vec![fill; 3 * SEGMENT_BYTES as usize]).unwrap();
+        let frames = body_frames(&dated(fill, 3)).unwrap();
         let sealed = frames
             .iter()
             .map(|frame| sealed_frame(frame, &KEY).unwrap());
@@ -3479,24 +3789,118 @@ mod tests {
         );
     }
 
-    /// What the limit on bodies and the limits on keys have to do with each other: nothing
-    /// yet. A key inside all of its limits can take every body a block has, and a real
-    /// body under that block is refused until those anchors go.
+    /// A key that saw the header first can pay for only its share of the block's bodies, so
+    /// a real body under that block from another key still gets a place. This was a known
+    /// gap: one key could take every body a block has.
     #[test]
-    fn known_gap_one_key_inside_its_limits_can_use_up_a_blocks_bodies() {
+    fn one_key_cannot_use_up_a_blocks_bodies() {
         let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
         let limit = bound.config.max_bodies_per_block as u8;
+        assert!(MAX_BODIES_PER_KEY_PER_BLOCK < limit as usize);
         for mark in 0..limit {
-            assert_eq!(
-                send_as(&mut bound, OTHER, addr(1), &body_of_a_block(mark), now),
-                1
+            let opened = send_as(&mut bound, OTHER, addr(1), &body_of_a_block(mark), now);
+            let mine = usize::from(mark) < MAX_BODIES_PER_KEY_PER_BLOCK;
+            assert_eq!(opened, usize::from(mine), "body {mark}");
+        }
+        let refused = limit as u64 - MAX_BODIES_PER_KEY_PER_BLOCK as u64;
+        assert_eq!(bound.usage().anchors_refused_for_key_bodies, refused);
+
+        assert_eq!(send(&mut bound, addr(2), &body_of_a_block(limit), now), 1);
+    }
+
+    /// A receiver's refusal frees the place a body held in its block, and its segment 0 opens
+    /// nothing again while the refusal stands. A rival body of the same block then gets in.
+    #[test]
+    fn a_released_body_frees_its_place_and_stays_out() {
+        let mut config = config();
+        config.max_bodies_per_block = 1;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let (forged, honest) = (body_of_a_block(1), body_of_a_block(2));
+        assert_eq!(send_as(&mut bound, OTHER, addr(1), &forged, now), 1);
+        assert_eq!(send(&mut bound, addr(2), &honest, now), 0);
+        assert_eq!(bound.usage().anchors_refused_for_bodies, 1);
+        let key = only_anchor(&bound);
+
+        assert!(bound.release(key, now));
+
+        let again = now + Duration::from_secs(5);
+        assert_eq!(send_as(&mut bound, OTHER, addr(3), &forged, again), 0);
+        assert_eq!(bound.usage().anchors_refused_as_released, 1);
+        assert_eq!(send(&mut bound, addr(4), &honest, again), 1);
+        assert_eq!(bound.usage().anchors_released, 1);
+        assert!(!bound.release(key, again), "no anchor is left to release");
+        let lapsed = again + bound.config.anchor_ttl;
+        bound.tidy(lapsed, |_| true);
+        assert!(bound.anchors.released.is_empty());
+    }
+
+    fn only_anchor(bound: &BoundForwarder) -> SetKey {
+        let (block_hash, bodies) = bound.anchors.blocks.iter().next().unwrap();
+        assert_eq!(bodies.len(), 1);
+        SetKey {
+            block_hash: *block_hash,
+            body_id: bodies[0].body_id,
+        }
+    }
+
+    fn at_time(mark: u32, time: u32) -> Vec<Vec<u8>> {
+        let mut raw = vec![0u8; 5000];
+        raw[..4].copy_from_slice(&mark.to_le_bytes());
+        raw[HEADER_TIME].copy_from_slice(&time.to_le_bytes());
+        sealed_body(&raw, &KEY).unwrap()
+    }
+
+    /// A header far behind the newest one here is refused before its PoW check, and it costs
+    /// nothing: it was a known gap that any old header with good PoW opened an anchor.
+    #[test]
+    fn an_old_header_opens_no_anchor_next_to_a_newer_one() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let window = ANCHOR_HEADER_WINDOW.as_secs() as u32;
+        let newest = 1_700_000_000;
+        assert_eq!(send(&mut bound, addr(1), &at_time(1, newest), now), 1);
+        let checks = std::cell::Cell::new(0);
+        let count = |_: &[u8]| {
+            checks.set(checks.get() + 1);
+            PowResult::Valid
+        };
+
+        for datagram in &at_time(2, newest - window - 1) {
+            let step = bound.take(addr(2), KEY, FLEET, datagram, now, count);
+            assert!(matches!(step, BoundStep::Forward(objects) if objects.is_empty()));
+        }
+
+        assert_eq!(checks.get(), 0, "an old header was checked");
+        assert_eq!(bound.usage().anchors_refused_for_age, 1);
+        assert_eq!(
+            send(&mut bound, addr(3), &at_time(3, newest - window), now),
+            1
+        );
+    }
+
+    /// A table that old headers filled, before anything newer came, is cleared by the first
+    /// newer header that passes. A cold start is no way to hold the path shut for good.
+    #[test]
+    fn a_newer_header_clears_a_table_old_headers_filled() {
+        let mut config = config();
+        config.max_anchors = 4;
+        let (mut bound, now) = (BoundForwarder::new(config).unwrap(), Instant::now());
+        let old = 1_600_000_000;
+        for mark in 0..4 {
+            let key_id = format!("key{mark}");
+            send_as(
+                &mut bound,
+                &key_id,
+                addr(10 + mark as u16),
+                &at_time(mark, old),
+                now,
             );
         }
-        let key = bound.key_used(OTHER);
-        assert!(key.objects < bound.config.key_budget.max_objects);
-        assert!(bound.usage().anchors < bound.config.max_anchors_per_key);
+        assert_eq!(bound.usage().anchors, 4);
 
-        assert_eq!(send(&mut bound, addr(2), &body_of_a_block(limit), now), 0);
+        assert_eq!(send(&mut bound, addr(1), &at_time(9, old + 3600), now), 1);
+
+        assert_eq!(bound.usage().anchors, 1);
+        assert_eq!(bound.usage().anchors_refused_for_room, 0);
     }
 
     #[test]
@@ -3792,7 +4196,7 @@ mod tests {
         let ttl = bound.config.anchor_ttl;
         let bodies: Vec<SealedFrames> = (1..=12u8)
             .map(|fill| {
-                let frames = body_frames(&vec![fill; 6 * SEGMENT_BYTES as usize]).unwrap();
+                let frames = body_frames(&dated(fill, 6)).unwrap();
                 let sealed = frames
                     .iter()
                     .map(|frame| sealed_frame(frame, &KEY).unwrap());

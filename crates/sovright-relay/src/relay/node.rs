@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use chunk_proof::datagram::Verifier;
 use chunk_proof::object::Profile;
+use delivery_lease::segment_frame::SetKey;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -35,6 +36,19 @@ use super::forwarding::ForwardOrder;
 use super::handled_log::HandledLog;
 use super::metrics::RelayMetrics;
 use super::{ArrivalSink, ReceiptObject};
+
+/// A keepalive that says more than that a session is alive. See the note in `bound_raw`.
+#[derive(Clone, Copy, Debug)]
+enum Control {
+    Hello(u16),
+    Release(SetKey),
+}
+
+/// What a [`Control`] comes to once its session is known.
+enum Answer {
+    Ack(Vec<u8>),
+    Release(SetKey),
+}
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
 const VALIDATED_RAW_BLOCK_TTL: Duration = Duration::from_secs(120);
@@ -275,6 +289,22 @@ impl<V: PowValidator> RelayNode<V> {
         let mut usage = self.with_bound(bound, |forwarder| forwarder.usage())?;
         usage.ingress = self.ingress.read();
         Some(usage)
+    }
+
+    /// A body named by its block hash and body id was refused downstream of this node, by
+    /// whoever runs it beside its own Zebra: its anchor goes, and its segment 0 opens none for
+    /// a while. Whether it had one. A receiver elsewhere says the same with
+    /// [`bound_release`](super::bound_raw::bound_release).
+    pub fn release_bound_body(&self, block_hash: [u8; 32], body_id: [u8; 32]) -> bool {
+        let Some(bound) = self.bound.as_ref() else {
+            return false;
+        };
+        let key = SetKey {
+            block_hash,
+            body_id,
+        };
+        let released = self.with_bound(bound, |forwarder| forwarder.release(key, Instant::now()));
+        released.unwrap_or(false)
     }
 
     /// Get the number of active sessions
@@ -1415,34 +1445,56 @@ impl<V: PowValidator> RelayNode<V> {
         src_addr: SocketAddr,
         chunk: &Chunk,
     ) -> Result<(), TransportError> {
-        let hello = self.bound.as_ref().and(bound_raw::hello_flags(chunk));
-        let ack = self.admit_keepalive(src_addr, chunk, hello).await?;
-        if let (Some(ack), Some(socket)) = (ack, self.socket.as_ref()) {
-            if let Err(error) = socket.send_to(&ack, src_addr).await {
-                self.metrics.inc_packet_send_errors();
-                warn!(peer = %src_addr, %error, "Failed to answer a bound hello");
+        let control = self.bound.as_ref().and_then(|_| {
+            let hello = bound_raw::hello_flags(chunk).map(Control::Hello);
+            hello.or_else(|| bound_raw::released_body(chunk).map(Control::Release))
+        });
+        match self.admit_keepalive(src_addr, chunk, control).await? {
+            Some(Answer::Ack(ack)) => {
+                let Some(socket) = self.socket.as_ref() else {
+                    return Ok(());
+                };
+                if let Err(error) = socket.send_to(&ack, src_addr).await {
+                    self.metrics.inc_packet_send_errors();
+                    warn!(peer = %src_addr, %error, "Failed to answer a bound hello");
+                }
             }
+            Some(Answer::Release(key)) => {
+                if let Some(bound) = self.bound.as_ref() {
+                    let released = self.with_bound(bound, |f| f.release(key, Instant::now()));
+                    debug!(peer = %src_addr, ?released, "A receiver refused a bound body");
+                }
+            }
+            None => {}
         }
         Ok(())
     }
 
-    /// What a hello says, on a session it authenticated, and the answer to send.
-    fn take_hello(session: &mut RelaySession, hello: Option<u16>) -> Option<Vec<u8>> {
-        let flags = hello?;
+    /// What a hello or a release says, on a session it authenticated. A release counts only
+    /// from a key with the full role: a receive-only key may not take another key's anchor.
+    fn take_control(session: &mut RelaySession, control: Option<Control>) -> Option<Answer> {
+        let control = control?;
         if !session.is_authenticated() {
             return None;
         }
-        session.set_receives_bound(flags & bound_raw::HELLO_RECEIVES != 0);
-        Some(bound_raw::bound_hello_ack(&session.auth_key()))
+        match control {
+            Control::Hello(flags) => {
+                session.set_receives_bound(flags & bound_raw::HELLO_RECEIVES != 0);
+                Some(Answer::Ack(bound_raw::bound_hello_ack(&session.auth_key())))
+            }
+            Control::Release(key) => {
+                (session.role() == KeyRole::Full).then_some(Answer::Release(key))
+            }
+        }
     }
 
     async fn admit_keepalive(
         &self,
         src_addr: SocketAddr,
         chunk: &Chunk,
-        hello: Option<u16>,
-    ) -> Result<Option<Vec<u8>>, TransportError> {
-        if hello.is_none()
+        control: Option<Control>,
+    ) -> Result<Option<Answer>, TransportError> {
+        if control.is_none()
             && (chunk.header.block_hash != [0u8; 32]
                 || chunk.header.chunk_id != 0
                 || chunk.header.total_chunks != 0
@@ -1479,7 +1531,7 @@ impl<V: PowValidator> RelayNode<V> {
                 return Err(TransportError::AuthenticationFailed);
             }
             session.touch();
-            return Ok(Self::take_hello(session, hello));
+            return Ok(Self::take_control(session, control));
         }
 
         if sessions.len() >= self.config.max_sessions {
@@ -1530,11 +1582,11 @@ impl<V: PowValidator> RelayNode<V> {
             info!(peer = %src_addr, key_id = %key.id, role = ?key.role, "Authenticated new keepalive session");
             let mut session =
                 RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role);
-            let ack = Self::take_hello(&mut session, hello);
+            let answer = Self::take_control(&mut session, control);
             sessions.insert(src_addr, session);
             self.metrics.inc_sessions_created();
             self.metrics.inc_sessions_created_for_key(&key.id);
-            Ok(ack)
+            Ok(answer)
         } else {
             warn!(peer = %src_addr, "Keepalive authentication failed - no matching key");
             self.metrics.inc_auth_failures();

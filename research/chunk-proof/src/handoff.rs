@@ -398,6 +398,11 @@ impl Bridge {
         self.waiting.len()
     }
 
+    /// Which body [`Self::next_block`] puts together next.
+    pub fn next_key(&self) -> Option<SetKey> {
+        self.waiting.front().map(|(set, _)| set.key)
+    }
+
     /// The oldest waiting set, put together, for a consumer that has room for one. Ask for
     /// the room first: past this point a block that cannot be handed over is lost.
     pub fn next_block(

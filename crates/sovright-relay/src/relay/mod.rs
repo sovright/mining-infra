@@ -14,10 +14,11 @@ mod ratelimit;
 
 pub use arrival::{ArrivalSink, ReceiptObject};
 pub use bound_raw::{
-    BOUND_HELLO, BOUND_HELLO_ACK, BOUND_SEND_BURST_DELAY, BOUND_SEND_BURST_PACKETS, BoundArrivals,
-    BoundBlock, BoundForwardConfig, BoundHandoffs, BoundIngress, BoundNodeUsage, BoundProbe,
-    BoundProgress, BoundRawConfig, BoundUsed, HELLO_RECEIVES, MAX_BODY_BYTES, RELEASE_LEFTOVER,
-    SEGMENT_BYTES, body_frames, bound_hello, bound_raw_refused, bound_raw_switch, frame_rules,
+    ANCHOR_HEADER_WINDOW, BOUND_HELLO, BOUND_HELLO_ACK, BOUND_RELEASE, BOUND_SEND_BURST_DELAY,
+    BOUND_SEND_BURST_PACKETS, BoundArrivals, BoundBlock, BoundForwardConfig, BoundHandoffs,
+    BoundIngress, BoundNodeUsage, BoundProbe, BoundProgress, BoundRawConfig, BoundUsed,
+    HELLO_RECEIVES, MAX_BODIES_PER_KEY_PER_BLOCK, MAX_BODY_BYTES, RELEASE_LEFTOVER, SEGMENT_BYTES,
+    body_frames, bound_hello, bound_raw_refused, bound_raw_switch, bound_release, frame_rules,
     is_bound, sealed_body, sealed_frame,
 };
 pub use client::{

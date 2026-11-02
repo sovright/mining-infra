@@ -409,6 +409,13 @@ impl RelayClient {
         let mut keepalive_interval = tokio::time::interval(self.keepalive_every);
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut bound = self.bound.take();
+        if let Some(bound) = bound.as_mut() {
+            bound.tell_refusals_to(bound_raw::Refusals {
+                socket: socket.clone(),
+                relays: self.config.relay_addrs.clone(),
+                key: self.config.auth_key,
+            });
+        }
         let mut bound_interval = tokio::time::interval(
             self.config
                 .bound_raw
