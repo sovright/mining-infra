@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chunk_proof::datagram::Verifier;
-use chunk_proof::object::{Encoded, Profile};
+use chunk_proof::object::Profile;
+use delivery_lease::segment_frame::SetKey;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -28,12 +29,26 @@ use crate::transport::{
 
 use super::bound_raw::{
     self, BoundForwarder, BoundNodeUsage, BoundStep, IngressQueue, LiveIngress, MAX_READ_BYTES,
+    Outgoing,
 };
 use super::forwarding::ForwardOrder;
 #[cfg(feature = "handled-log")]
 use super::handled_log::HandledLog;
 use super::metrics::RelayMetrics;
 use super::{ArrivalSink, ReceiptObject};
+
+/// A keepalive that says more than that a session is alive. See the note in `bound_raw`.
+#[derive(Clone, Copy, Debug)]
+enum Control {
+    Hello(u16),
+    Release(SetKey),
+}
+
+/// What a [`Control`] comes to once its session is known.
+enum Answer {
+    Ack(Vec<u8>),
+    Release(SetKey),
+}
 
 const MAX_VALIDATED_RAW_BLOCKS: usize = 4096;
 const VALIDATED_RAW_BLOCK_TTL: Duration = Duration::from_secs(120);
@@ -276,6 +291,22 @@ impl<V: PowValidator> RelayNode<V> {
         Some(usage)
     }
 
+    /// A body named by its block hash and body id was refused downstream of this node, by
+    /// whoever runs it beside its own Zebra: its anchor goes, and its segment 0 opens none for
+    /// a while. Whether it had one. A receiver elsewhere says the same with
+    /// [`bound_release`](super::bound_raw::bound_release).
+    pub fn release_bound_body(&self, block_hash: [u8; 32], body_id: [u8; 32]) -> bool {
+        let Some(bound) = self.bound.as_ref() else {
+            return false;
+        };
+        let key = SetKey {
+            block_hash,
+            body_id,
+        };
+        let released = self.with_bound(bound, |forwarder| forwarder.release(key, Instant::now()));
+        released.unwrap_or(false)
+    }
+
     /// Get the number of active sessions
     pub async fn session_count(&self) -> usize {
         self.sessions.read().await.len()
@@ -436,10 +467,29 @@ impl<V: PowValidator> RelayNode<V> {
         }
         self.tidy_bound(&sessions);
         let expired = (before - sessions.len()) as u64;
+        drop(sessions);
         if expired > 0 {
             self.metrics.add_sessions_expired(expired);
         }
         self.cleanup_validated_raw_blocks();
+        if let Some(bound) = &self.bound
+            && let Err(error) = self.revive_bound(bound).await
+        {
+            debug!(?error, "Error sending revived bound objects");
+        }
+    }
+
+    /// Spares a session had in full but no room to decode, tried again once something may
+    /// have given room back: an object that went out, or a timer. Without this they would
+    /// wait for their time to run out, room or not.
+    async fn revive_bound(&self, bound: &Mutex<BoundForwarder>) -> Result<(), TransportError> {
+        let objects = self.with_bound(bound, |forwarder| {
+            forwarder.revive(Instant::now(), |header| self.validator.validate(header))
+        });
+        match objects {
+            Some(objects) if !objects.is_empty() => self.forward_bound(bound, objects).await,
+            _ => Ok(()),
+        }
     }
 
     /// Estimate original serialized length based on shard size.
@@ -762,40 +812,56 @@ impl<V: PowValidator> RelayNode<V> {
         }
         drop(sessions);
 
-        self.send_outbound(outbound, chunks.len(), msg_type).await
+        self.send_outbound(outbound, chunks.len(), msg_type)
+            .await
+            .map(drop)
     }
 
-    /// Bound objects to every other session, each sealed with that session's own key.
+    /// Each bound object to every session that announced it takes them, but the one it came
+    /// from, sealed with each session's own key. A session that never sent a bound hello is
+    /// legacy and gets none: it would drop them. The datagram that released an object can be
+    /// another session's, such as a segment 0 that let waiting objects go, so each object
+    /// carries its origin.
+    ///
+    /// An object counts against its origin's sends only once every datagram of it went out
+    /// to at least one peer. With no peer, or a socket that refused, nothing is recorded and
+    /// the next copy can go.
     async fn forward_bound(
         &self,
-        src_addr: SocketAddr,
-        objects: &[Encoded],
+        bound: &Mutex<BoundForwarder>,
+        objects: Vec<Outgoing>,
     ) -> Result<(), TransportError> {
-        let sessions = self.sessions.read().await;
-        let outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = sessions
-            .iter()
-            .filter(|(peer_addr, _)| **peer_addr != src_addr)
-            .map(|(peer_addr, session)| {
-                let key = session.auth_key();
-                let payloads = objects
-                    .iter()
-                    .flat_map(|object| BoundForwarder::sealed(&key, object))
-                    .collect();
-                (*peer_addr, session.key_id().to_string(), payloads)
-            })
-            .collect();
-        drop(sessions);
-        let chunks = objects.iter().map(|object| object.shards.len()).sum();
-        self.send_outbound(outbound, chunks, MessageType::RawBlockSegment)
-            .await
+        for Outgoing { object, from } in objects {
+            let shards = object.shards.len() as u64;
+            let sessions = self.sessions.read().await;
+            let outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = sessions
+                .iter()
+                .filter(|(peer_addr, session)| **peer_addr != from && session.receives_bound())
+                .map(|(peer_addr, session)| {
+                    let payloads = BoundForwarder::sealed(&session.auth_key(), &object);
+                    (*peer_addr, session.key_id().to_string(), payloads)
+                })
+                .collect();
+            drop(sessions);
+            let sent = self
+                .send_outbound(outbound, shards as usize, MessageType::RawBlockSegment)
+                .await?;
+            if sent.contains(&shards) {
+                let id = object.object_id;
+                self.with_bound(bound, |forwarder| forwarder.sent(from, id, Instant::now()));
+            }
+        }
+        Ok(())
     }
 
+    /// Sends each peer its payloads, paced, and says how many datagrams each peer's socket
+    /// took, in the order of `outbound`.
     async fn send_outbound(
         &self,
         outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)>,
         chunks: usize,
         msg_type: MessageType,
-    ) -> Result<(), TransportError> {
+    ) -> Result<Vec<u64>, TransportError> {
         let socket = self.socket.as_ref().ok_or_else(|| {
             TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -841,7 +907,7 @@ impl<V: PowValidator> RelayNode<V> {
                 sleep(pacing.delay).await;
             }
         }
-        for ((_, key_id, _), chunks_sent) in outbound.iter().zip(sent) {
+        for ((_, key_id, _), &chunks_sent) in outbound.iter().zip(&sent) {
             if chunks_sent > 0 {
                 self.metrics.inc_packets_forwarded(chunks_sent);
                 self.metrics
@@ -858,7 +924,7 @@ impl<V: PowValidator> RelayNode<V> {
             }
         }
 
-        Ok(())
+        Ok(sent)
     }
 
     /// Stop the relay node
@@ -1163,9 +1229,11 @@ impl<V: PowValidator> RelayNode<V> {
         if objects.is_empty() {
             return Ok(());
         }
-        let relayed = objects.iter().map(|o| o.shards.len() as u64).sum();
+        let relayed = objects.iter().map(|o| o.object.shards.len() as u64).sum();
         self.metrics.inc_chunks_relayed_from_key(&key_id, relayed);
-        self.forward_bound(src_addr, &objects).await
+        self.forward_bound(bound, objects).await?;
+        // What went out gave its room back.
+        self.revive_bound(bound).await
     }
 
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
@@ -1390,16 +1458,69 @@ impl<V: PowValidator> RelayNode<V> {
         Ok(())
     }
 
+    /// A keepalive, or a bound hello, which is one with a marker and flags. A node without
+    /// the bound path takes a hello for a keepalive it cannot read, as an old node does. With
+    /// the path on, an authenticated hello sets what the session takes and is answered.
     async fn handle_keepalive(
         &self,
         src_addr: SocketAddr,
         chunk: &Chunk,
     ) -> Result<(), TransportError> {
-        if chunk.header.block_hash != [0u8; 32]
-            || chunk.header.chunk_id != 0
-            || chunk.header.total_chunks != 0
-            || chunk.header.payload_len != 0
-            || !chunk.payload.is_empty()
+        let control = self.bound.as_ref().and_then(|_| {
+            let hello = bound_raw::hello_flags(chunk).map(Control::Hello);
+            hello.or_else(|| bound_raw::released_body(chunk).map(Control::Release))
+        });
+        match self.admit_keepalive(src_addr, chunk, control).await? {
+            Some(Answer::Ack(ack)) => {
+                let Some(socket) = self.socket.as_ref() else {
+                    return Ok(());
+                };
+                if let Err(error) = socket.send_to(&ack, src_addr).await {
+                    self.metrics.inc_packet_send_errors();
+                    warn!(peer = %src_addr, %error, "Failed to answer a bound hello");
+                }
+            }
+            Some(Answer::Release(key)) => {
+                if let Some(bound) = self.bound.as_ref() {
+                    let released = self.with_bound(bound, |f| f.release(key, Instant::now()));
+                    debug!(peer = %src_addr, ?released, "A receiver refused a bound body");
+                }
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    /// What a hello or a release says, on a session it authenticated. A release counts only
+    /// from a key with the full role: a receive-only key may not take another key's anchor.
+    fn take_control(session: &mut RelaySession, control: Option<Control>) -> Option<Answer> {
+        let control = control?;
+        if !session.is_authenticated() {
+            return None;
+        }
+        match control {
+            Control::Hello(flags) => {
+                session.set_receives_bound(flags & bound_raw::HELLO_RECEIVES != 0);
+                Some(Answer::Ack(bound_raw::bound_hello_ack(&session.auth_key())))
+            }
+            Control::Release(key) => {
+                (session.role() == KeyRole::Full).then_some(Answer::Release(key))
+            }
+        }
+    }
+
+    async fn admit_keepalive(
+        &self,
+        src_addr: SocketAddr,
+        chunk: &Chunk,
+        control: Option<Control>,
+    ) -> Result<Option<Answer>, TransportError> {
+        if control.is_none()
+            && (chunk.header.block_hash != [0u8; 32]
+                || chunk.header.chunk_id != 0
+                || chunk.header.total_chunks != 0
+                || chunk.header.payload_len != 0
+                || !chunk.payload.is_empty())
         {
             self.metrics.inc_invalid_chunks();
             return Err(TransportError::InvalidChunk(
@@ -1431,7 +1552,7 @@ impl<V: PowValidator> RelayNode<V> {
                 return Err(TransportError::AuthenticationFailed);
             }
             session.touch();
-            return Ok(());
+            return Ok(Self::take_control(session, control));
         }
 
         if sessions.len() >= self.config.max_sessions {
@@ -1451,7 +1572,7 @@ impl<V: PowValidator> RelayNode<V> {
             self.metrics.inc_sessions_created();
             self.metrics
                 .inc_sessions_created_for_key(UNAUTHENTICATED_KEY_ID);
-            return Ok(());
+            return Ok(None);
         }
 
         if chunk.header.version != 2 {
@@ -1480,13 +1601,13 @@ impl<V: PowValidator> RelayNode<V> {
 
         if let Some(key) = authenticated_key {
             info!(peer = %src_addr, key_id = %key.id, role = ?key.role, "Authenticated new keepalive session");
-            sessions.insert(
-                src_addr,
-                RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role),
-            );
+            let mut session =
+                RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role);
+            let answer = Self::take_control(&mut session, control);
+            sessions.insert(src_addr, session);
             self.metrics.inc_sessions_created();
             self.metrics.inc_sessions_created_for_key(&key.id);
-            Ok(())
+            Ok(answer)
         } else {
             warn!(peer = %src_addr, "Keepalive authentication failed - no matching key");
             self.metrics.inc_auth_failures();
@@ -2700,7 +2821,7 @@ mod tests {
         for datagram in &sealed[1..] {
             socket.send_to(datagram, addr).await.unwrap();
         }
-        until(|| node.bound_usage().unwrap().objects_sent_on == 1).await;
+        until(|| node.bound_usage().unwrap().objects_released == 1).await;
 
         assert!(!task.is_finished());
         assert!(node.is_running());

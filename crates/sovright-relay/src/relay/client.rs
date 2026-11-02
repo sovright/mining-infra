@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -88,6 +88,8 @@ pub struct SendReport {
 
 impl BlockSender {
     /// A sender on a channel of the caller's, with no client behind it and no bound send.
+    /// Only for tests, here and, with `test-support`, downstream.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(tx: mpsc::Sender<RelayPayload>) -> Self {
         Self {
             tx,
@@ -130,9 +132,18 @@ impl BlockSender {
     /// `Ok` says the block was encoded and that one relay's socket took every datagram of
     /// it. That is as far as this client can see: it says nothing of whether anything arrived.
     /// An error says it did not fit, no relay took it all, the queue was full or the client
-    /// went. Dropping this does not stop a send the client has taken: a block on its way is
-    /// worth more than a repeat saved.
+    /// went, or, after [`BOUND_SEND_TIMEOUT`], that no answer came in time. Dropping this, or
+    /// that timeout, does not stop a send the client has taken: a block on its way is worth
+    /// more than a repeat saved.
     pub async fn send_bound_raw_block(&self, raw: Arc<Vec<u8>>) -> Result<(), TransportError> {
+        self.send_bound_within(raw, BOUND_SEND_TIMEOUT).await
+    }
+
+    async fn send_bound_within(
+        &self,
+        raw: Arc<Vec<u8>>,
+        limit: Duration,
+    ) -> Result<(), TransportError> {
         let (done, mut finished) = oneshot::channel();
         self.bound_tx
             .try_send(BoundSend { raw, done })
@@ -153,6 +164,7 @@ impl BlockSender {
             biased;
             answer = &mut finished => answer.map_err(|_| went())?,
             () = self.bound_tx.closed() => Err(went()),
+            () = sleep(limit) => Err(TransportError::Timeout),
         }
     }
 
@@ -237,6 +249,10 @@ pub struct RelayClient {
     bound_sends: Option<mpsc::Receiver<BoundSend>>,
     keepalive_every: Duration,
     sends: Arc<SendCounts>,
+    /// What the legacy and the bound sends of this client share while both are under way.
+    egress: Option<Arc<EgressCap>>,
+    /// Which relays answered a bound hello. See [`BoundSupport`].
+    bound_support: Arc<BoundSupport>,
     /// The bound path, from `take_receiver` until the run loop owns it.
     bound: Option<BoundReceiver>,
     /// Channel for delivering received blocks to user
@@ -264,6 +280,13 @@ impl RelayClient {
         let chunker = BlockChunker::new(config.data_shards, config.parity_shards)?;
         let (outgoing_tx, outgoing_rx) = mpsc::channel(16);
         let (bound_tx, bound_sends) = mpsc::channel(BOUND_SENDS_WAITING);
+        let egress = EgressCap::new(
+            config.relay_addrs.len(),
+            SendPacing::new(
+                config.bound_send_burst_packets,
+                config.bound_send_burst_delay,
+            ),
+        );
 
         Ok(Self {
             config,
@@ -275,6 +298,8 @@ impl RelayClient {
             bound_sends: Some(bound_sends),
             keepalive_every: KEEPALIVE_INTERVAL,
             sends: Arc::default(),
+            egress,
+            bound_support: Arc::default(),
             bound: None,
             incoming_tx: None,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -406,6 +431,13 @@ impl RelayClient {
         let mut keepalive_interval = tokio::time::interval(self.keepalive_every);
         keepalive_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut bound = self.bound.take();
+        if let Some(bound) = bound.as_mut() {
+            bound.tell_refusals_to(bound_raw::Refusals {
+                socket: socket.clone(),
+                relays: self.config.relay_addrs.clone(),
+                key: self.config.auth_key,
+            });
+        }
         let mut bound_interval = tokio::time::interval(
             self.config
                 .bound_raw
@@ -425,6 +457,9 @@ impl RelayClient {
                     self.config.bound_send_burst_delay,
                 ),
                 sends: self.sends.clone(),
+                egress: self.egress.clone(),
+                support: Arc::clone(&self.bound_support),
+                receives: self.config.bound_raw.is_some(),
             };
             bound_send.spawn(sender.run(queue));
         }
@@ -465,13 +500,17 @@ impl RelayClient {
                 // Handle incoming packets
                 result = socket.recv_from(&mut recv_buf) => {
                     match result {
-                        Ok((len, _src)) => {
+                        Ok((len, src)) => {
                             let datagram = &recv_buf[..len];
                             if bound.is_some() && bound_raw::is_bound(datagram) {
                                 bound_raw::contain(&mut bound, |bound| {
                                     bound.take(datagram, Instant::now())
                                 });
                             } else if let Ok(chunk) = Chunk::from_bytes(datagram) {
+                                if bound_raw::is_hello_ack(&chunk, &self.config.auth_key) {
+                                    self.bound_support.answered(src, Instant::now());
+                                    continue;
+                                }
                                 self.handle_incoming_chunk(
                                     chunk,
                                     &mut pending_blocks,
@@ -513,6 +552,17 @@ impl RelayClient {
 
         for relay_addr in &self.config.relay_addrs {
             socket.send_to(&data, relay_addr).await?;
+        }
+
+        // Behind the plain keepalive, which keeps the session on a relay that cannot read it.
+        // A receiver says so from the start, and a sender once it has been asked for a bound
+        // send, so a client with nothing bound to do sends none.
+        let receives = self.config.bound_raw.is_some();
+        if receives || self.bound_support.asked() {
+            let hello = bound_raw::bound_hello(&self.config.auth_key, receives);
+            for relay_addr in &self.config.relay_addrs {
+                socket.send_to(&hello, relay_addr).await?;
+            }
         }
 
         debug!("Sent relay keepalive");
@@ -716,6 +766,7 @@ impl RelayClient {
                 payloads.clone(),
                 pacing,
                 self.sends.clone(),
+                Egress::Legacy(self.egress.clone()),
             ));
         }
         while let Some(result) = tasks.join_next().await {
@@ -1006,6 +1057,174 @@ impl SendPacing {
     }
 }
 
+/// How many datagrams the legacy and the bound sends of one client may put on the socket at
+/// once, together, before the shared pace holds them back. Past it they go, together, no
+/// faster than the bound path's own pace to every relay (`bound_send_burst_packets` per
+/// `bound_send_burst_delay`, times the relays). The bound path alone stays under that pace,
+/// and legacy traffic alone is held only by its own pacing, so this changes nothing until
+/// both send at once.
+pub const SHARED_EGRESS_BURST: usize = 64;
+
+/// Waits shorter than this add up rather than sleep, as a timer is no finer.
+const SHARED_EGRESS_LEAST_WAIT: Duration = Duration::from_millis(1);
+
+/// One pace for every send of a client while a bound send is under way, so that its legacy
+/// and its bound copies together keep to what one of them would. See [`SHARED_EGRESS_BURST`].
+#[derive(Debug)]
+struct EgressCap {
+    per_second: f64,
+    /// Bound sends under way. Legacy sends wait on the pace only while there is one.
+    bound_sends: AtomicUsize,
+    bucket: tokio::sync::Mutex<EgressBucket>,
+}
+
+#[derive(Debug)]
+struct EgressBucket {
+    /// Datagrams that may go now; below zero, what is owed.
+    datagrams: f64,
+    at: tokio::time::Instant,
+}
+
+/// Which path a send is on, and the pace it may share.
+enum Egress {
+    Legacy(Option<Arc<EgressCap>>),
+    Bound(Option<Arc<EgressCap>>),
+}
+
+impl Egress {
+    async fn wait(&self) {
+        match self {
+            Self::Bound(Some(cap)) => cap.take().await,
+            Self::Legacy(Some(cap)) if cap.shared() => cap.take().await,
+            _ => {}
+        }
+    }
+}
+
+impl EgressCap {
+    /// None when the bound path is not paced, which leaves nothing to keep to.
+    fn new(relays: usize, bound: SendPacing) -> Option<Arc<Self>> {
+        if relays == 0 || bound.burst_packets == 0 || bound.delay.is_zero() {
+            return None;
+        }
+        let per_second = (relays * bound.burst_packets) as f64 / bound.delay.as_secs_f64();
+        Some(Arc::new(Self {
+            per_second,
+            bound_sends: AtomicUsize::new(0),
+            bucket: tokio::sync::Mutex::new(EgressBucket {
+                datagrams: SHARED_EGRESS_BURST as f64,
+                at: tokio::time::Instant::now(),
+            }),
+        }))
+    }
+
+    fn shared(&self) -> bool {
+        self.bound_sends.load(Ordering::Relaxed) > 0
+    }
+
+    /// Counts a bound send under way until the guard goes.
+    fn bound_send(self: &Arc<Self>) -> BoundEgress {
+        self.bound_sends.fetch_add(1, Ordering::Relaxed);
+        BoundEgress(Arc::clone(self))
+    }
+
+    /// Takes one datagram's place, waiting for it once enough is owed to be worth a sleep.
+    /// The lock is held over the wait, so the paths take their turns in order.
+    async fn take(&self) {
+        let mut bucket = self.bucket.lock().await;
+        self.refill(&mut bucket);
+        bucket.datagrams -= 1.0;
+        if bucket.datagrams < 0.0 {
+            let wait = Duration::from_secs_f64(-bucket.datagrams / self.per_second);
+            if wait >= SHARED_EGRESS_LEAST_WAIT {
+                sleep(wait).await;
+                self.refill(&mut bucket);
+            }
+        }
+    }
+
+    fn refill(&self, bucket: &mut EgressBucket) {
+        let now = tokio::time::Instant::now();
+        let earned = now.duration_since(bucket.at).as_secs_f64() * self.per_second;
+        bucket.datagrams = (bucket.datagrams + earned).min(SHARED_EGRESS_BURST as f64);
+        bucket.at = now;
+    }
+}
+
+struct BoundEgress(Arc<EgressCap>);
+
+impl Drop for BoundEgress {
+    fn drop(&mut self) {
+        self.0.bound_sends.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// How long [`BlockSender::send_bound_raw_block`] waits for its answer, from when the send
+/// is queued: the sends ahead of it, a hello's wait ([`BOUND_HELLO_WAIT`]), the encoding and
+/// the paced datagrams of a body as large as a block can be, with room to spare. Past it the
+/// caller hears `Timeout` and the send goes on.
+pub const BOUND_SEND_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a relay's answer to a bound hello stands. Once a client has bound work, a hello
+/// goes with every keepalive, so an answer is renewed well inside this. A relay that stops
+/// answering, rolled back or with the path turned off, counts as legacy once it lapses.
+pub const BOUND_ACK_TTL: Duration = Duration::from_secs(180);
+/// How long a bound send waits for a relay to answer its hello before it fails.
+pub const BOUND_HELLO_WAIT: Duration = Duration::from_secs(2);
+
+/// Which relays said they have the bound path, by answering a hello. A relay that never did
+/// is legacy, and a bound block is not sent to it.
+#[derive(Debug, Default)]
+struct BoundSupport {
+    answered: StdMutex<HashMap<SocketAddr, Instant>>,
+    changed: Notify,
+    /// A bound send has been asked for, so keepalives carry the hello from now on.
+    asked: AtomicBool,
+}
+
+impl BoundSupport {
+    fn asked(&self) -> bool {
+        self.asked.load(Ordering::Relaxed)
+    }
+
+    fn answered(&self, relay: SocketAddr, now: Instant) {
+        let mut answered = self.answered.lock().unwrap_or_else(PoisonError::into_inner);
+        answered.insert(relay, now);
+        drop(answered);
+        self.changed.notify_waiters();
+    }
+
+    /// Those of `relays` whose answer still stands at `now`.
+    fn with_the_path(&self, relays: &[SocketAddr], now: Instant) -> Vec<SocketAddr> {
+        let answered = self.answered.lock().unwrap_or_else(PoisonError::into_inner);
+        let stands = |relay: &SocketAddr| {
+            let at = answered.get(relay);
+            at.is_some_and(|at| now.saturating_duration_since(*at) < BOUND_ACK_TTL)
+        };
+        relays.iter().copied().filter(stands).collect()
+    }
+
+    /// Those of `relays` with the path, waiting until `deadline` for one if none has it yet.
+    async fn wait_for(
+        &self,
+        relays: &[SocketAddr],
+        deadline: tokio::time::Instant,
+    ) -> Vec<SocketAddr> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let ready = self.with_the_path(relays, Instant::now());
+            if !ready.is_empty() {
+                return ready;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Vec::new();
+            }
+        }
+    }
+}
+
 /// The bound send of one client: one block at a time, in the order they came, and off the
 /// client's loop, which goes on with legacy traffic, receiving and keepalives meanwhile.
 struct BoundSender {
@@ -1014,6 +1233,11 @@ struct BoundSender {
     key: [u8; 32],
     pacing: SendPacing,
     sends: Arc<SendCounts>,
+    /// The pace its sends share with the client's legacy ones.
+    egress: Option<Arc<EgressCap>>,
+    support: Arc<BoundSupport>,
+    /// Whether this client takes bound objects too, which its hello says.
+    receives: bool,
 }
 
 impl BoundSender {
@@ -1027,9 +1251,32 @@ impl BoundSender {
         }
     }
 
-    /// Encoded on the blocking pool, as it takes as long as a large body does. One relay that
+    /// With no relay known to have the path, ask every relay now, rather than at the next
+    /// keepalive.
+    async fn ask_relays(&self) {
+        self.support.asked.store(true, Ordering::Relaxed);
+        if !self
+            .support
+            .with_the_path(&self.relays, Instant::now())
+            .is_empty()
+        {
+            return;
+        }
+        let hello = bound_raw::bound_hello(&self.key, self.receives);
+        for relay in &self.relays {
+            if let Err(error) = self.socket.send_to(&hello, relay).await {
+                debug!(%relay, %error, "Could not send a bound hello");
+            }
+        }
+    }
+
+    /// Encoded on the blocking pool, as it takes as long as a large body does. Only relays
+    /// that answered a hello get it: a relay without the path would drop every datagram, and
+    /// this would say `Ok` for a body that went nowhere. With none, this fails. One relay that
     /// took all of it is enough, and one that refused costs the others nothing.
     async fn send(&self, raw: Arc<Vec<u8>>) -> Result<(), TransportError> {
+        let deadline = tokio::time::Instant::now() + BOUND_HELLO_WAIT;
+        self.ask_relays().await;
         let key = self.key;
         let encoded = tokio::task::spawn_blocking(move || bound_raw::sealed_body(&raw, &key));
         let datagrams = encoded
@@ -1038,15 +1285,23 @@ impl BoundSender {
             .ok_or_else(|| {
                 TransportError::InvalidChunk("raw block does not fit the bound format".into())
             })?;
+        let with_the_path = self.support.wait_for(&self.relays, deadline).await;
+        if with_the_path.is_empty() {
+            return Err(TransportError::ConnectionRefused(
+                "no relay has answered a bound hello, so the bound block was not sent".into(),
+            ));
+        }
         let datagrams = Arc::new(datagrams);
+        let _shared = self.egress.as_ref().map(EgressCap::bound_send);
         let mut relays = JoinSet::new();
-        for relay_addr in self.relays.iter().copied() {
+        for relay_addr in with_the_path {
             relays.spawn(send_payloads_to_relay(
                 self.socket.clone(),
                 relay_addr,
                 datagrams.clone(),
                 self.pacing,
                 self.sends.clone(),
+                Egress::Bound(self.egress.clone()),
             ));
         }
         let (mut took_it, mut failure) = (false, None);
@@ -1073,10 +1328,12 @@ async fn send_payloads_to_relay(
     payloads: Arc<Vec<Vec<u8>>>,
     pacing: SendPacing,
     sends: Arc<SendCounts>,
+    egress: Egress,
 ) -> Result<(), TransportError> {
     let packet_count = payloads.len();
     let mut sent_since_delay = 0usize;
     for (idx, data) in payloads.iter().enumerate() {
+        egress.wait().await;
         if let Err(error) = socket.send_to(data, relay_addr).await {
             sends.errors.fetch_add(1, Ordering::Relaxed);
             return Err(error.into());
@@ -1595,5 +1852,52 @@ mod tests {
             assert!(!pacing.should_delay(1, 3, &mut sent_since_delay));
             assert!(!pacing.should_delay(2, 3, &mut sent_since_delay));
         }
+    }
+
+    /// One relay at one datagram each 10 ms: 100 a second, past the first burst.
+    fn shared_cap() -> Arc<EgressCap> {
+        EgressCap::new(1, SendPacing::new(1, Duration::from_millis(10))).unwrap()
+    }
+
+    #[tokio::test]
+    async fn legacy_alone_is_not_held_by_the_shared_pace() {
+        let cap = shared_cap();
+        let legacy = Egress::Legacy(Some(Arc::clone(&cap)));
+
+        let started = Instant::now();
+        for _ in 0..SHARED_EGRESS_BURST * 4 {
+            legacy.wait().await;
+        }
+
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn legacy_and_bound_together_keep_to_one_pace() {
+        let cap = shared_cap();
+        let (legacy, bound) = (
+            Egress::Legacy(Some(Arc::clone(&cap))),
+            Egress::Bound(Some(Arc::clone(&cap))),
+        );
+        let under_way = cap.bound_send();
+
+        let started = Instant::now();
+        for _ in 0..SHARED_EGRESS_BURST / 2 + 15 {
+            legacy.wait().await;
+            bound.wait().await;
+        }
+
+        // 30 past the burst, at 100 a second.
+        let elapsed = started.elapsed();
+        assert!(elapsed >= Duration::from_millis(250), "{elapsed:?}");
+        drop(under_way);
+        assert!(!cap.shared());
+    }
+
+    #[test]
+    fn an_unpaced_bound_path_leaves_nothing_to_share() {
+        assert!(EgressCap::new(1, SendPacing::new(0, Duration::from_millis(1))).is_none());
+        assert!(EgressCap::new(1, SendPacing::new(3, Duration::ZERO)).is_none());
+        assert!(EgressCap::new(0, SendPacing::new(3, Duration::from_millis(1))).is_none());
     }
 }

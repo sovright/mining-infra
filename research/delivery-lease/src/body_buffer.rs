@@ -26,11 +26,21 @@
 //! about whether anyone wants the body, and what follows a refusal is the caller's
 //! policy, which is not decided. The research default is [`AssembledBlock::give_back`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use super::segment_frame::{SetKey, VerifiedSegment};
 use super::{Admission, DeliveryLedger, Holding, Lease, Phase, Refusal, Ticket};
+
+/// How long a set counts as still arriving after its last segment came. Room is never made
+/// by giving up such a set: a newcomer, however many there are, waits instead (see
+/// [`BodyBuffer::room_for`]). A set quiet for longer can go, the least advanced and then the
+/// newest first, since the oldest is likeliest to be the body that came first.
+///
+/// A research value. An honest body's segments come in one paced burst, and a resend comes
+/// a relay node's `resend_after` behind it, so this is longer than both; a set held open by a trickle still
+/// ends at the buffer's TTL, counted from its first segment.
+pub const ACTIVE_SET: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
 pub struct BufferLimits {
@@ -79,6 +89,9 @@ impl<W> Arrival<W> {
 pub enum Reject {
     /// The set could never fit, whatever else was evicted.
     TooManySegments,
+    /// Room could only have been made by giving up a set that is still arriving. This is no
+    /// fact about the segment: it can come again. See [`ACTIVE_SET`].
+    Busy,
 }
 
 #[derive(Debug)]
@@ -107,6 +120,8 @@ struct Held<W> {
 struct BodySet<W> {
     raw_len: u64,
     first_seen: Instant,
+    /// When its last segment came. See [`ACTIVE_SET`].
+    last_arrival: Instant,
     order: u64,
     filled: usize,
     bytes: usize,
@@ -192,16 +207,23 @@ impl<W> BodyBuffer<W> {
             };
         }
 
+        let Some(victims) = self.room_for(&key, now) else {
+            drop(held);
+            return Insertion {
+                outcome: Outcome::Rejected(Reject::Busy),
+                evicted: Vec::new(),
+            };
+        };
         let mut evicted = Vec::new();
-        if !self.sets.contains_key(&key) {
-            self.make_room_for_set(&key, &mut evicted);
+        for victim in &victims {
+            self.drop_set(victim, &mut evicted);
         }
-        self.make_room_for_segment(&key, &mut evicted);
 
         let order = self.next_order;
         let set = self.sets.entry(key).or_insert_with(|| BodySet {
             raw_len,
             first_seen: now,
+            last_arrival: now,
             order,
             filled: 0,
             bytes: 0,
@@ -211,6 +233,7 @@ impl<W> BodyBuffer<W> {
         });
         // One ticket per object means one arrival per slot, and the proof fixes the bytes.
         debug_assert!(set.slots[index].is_none());
+        set.last_arrival = now;
         set.bytes += held.payload.len();
         set.slots[index] = Some(held);
         set.filled += 1;
@@ -231,46 +254,48 @@ impl<W> BodyBuffer<W> {
         Insertion { outcome, evicted }
     }
 
-    fn make_room_for_set(&mut self, key: &SetKey, evicted: &mut Vec<SetKey>) {
-        let in_block = self
+    /// The sets that would go for a segment of `key` to fit at `now`, or `None` if only a set
+    /// still arriving could make room ([`ACTIVE_SET`]). A new set of a block at
+    /// [`BufferLimits::max_sets_per_block`] takes one of that block's quiet sets, and then
+    /// the counts of sets and segments take quiet sets of any block: the least advanced
+    /// first and, of those, the newest. `key`'s own set never goes.
+    pub fn room_for(&self, key: &SetKey, now: Instant) -> Option<Vec<SetKey>> {
+        let mut quiet: Vec<_> = self
             .sets
-            .keys()
-            .filter(|other| other.block_hash == key.block_hash)
-            .count();
-        if in_block >= self.limits.max_sets_per_block {
-            let least_advanced = self
+            .iter()
+            .filter(|(other, set)| *other != key && !set.is_active(now))
+            .collect();
+        quiet.sort_by_key(|(_, set)| (set.filled, std::cmp::Reverse(set.order)));
+        let mut gone = Vec::new();
+        let mut taken = HashSet::new();
+        let (mut sets, mut segments) = (self.sets.len(), self.segments);
+        let mut take = |same_block: bool, sets: &mut usize, segments: &mut usize| {
+            let next = quiet.iter().find(|(other, _)| {
+                !taken.contains(*other) && (!same_block || other.block_hash == key.block_hash)
+            });
+            let (other, set) = next?;
+            taken.insert(**other);
+            gone.push(**other);
+            *sets -= 1;
+            *segments -= set.filled;
+            Some(())
+        };
+        if !self.sets.contains_key(key) {
+            let in_block = self
                 .sets
-                .iter()
-                .filter(|(other, _)| other.block_hash == key.block_hash)
-                .min_by_key(|(_, set)| (set.filled, set.order))
-                .map(|(other, _)| *other);
-            if let Some(victim) = least_advanced {
-                self.drop_set(&victim, evicted);
+                .keys()
+                .filter(|other| other.block_hash == key.block_hash);
+            if in_block.count() >= self.limits.max_sets_per_block {
+                take(true, &mut sets, &mut segments)?;
+            }
+            while sets >= self.limits.max_sets {
+                take(false, &mut sets, &mut segments)?;
             }
         }
-        while self.sets.len() >= self.limits.max_sets {
-            let Some(oldest) = self.oldest_set_other_than(key) else {
-                break;
-            };
-            self.drop_set(&oldest, evicted);
+        while segments >= self.limits.max_segments {
+            take(false, &mut sets, &mut segments)?;
         }
-    }
-
-    fn make_room_for_segment(&mut self, key: &SetKey, evicted: &mut Vec<SetKey>) {
-        while self.segments >= self.limits.max_segments {
-            let Some(oldest) = self.oldest_set_other_than(key) else {
-                break;
-            };
-            self.drop_set(&oldest, evicted);
-        }
-    }
-
-    fn oldest_set_other_than(&self, key: &SetKey) -> Option<SetKey> {
-        self.sets
-            .iter()
-            .filter(|(other, _)| *other != key)
-            .min_by_key(|(_, set)| set.order)
-            .map(|(other, _)| *other)
+        Some(gone)
     }
 
     fn drop_set(&mut self, key: &SetKey, evicted: &mut Vec<SetKey>) {
@@ -280,15 +305,17 @@ impl<W> BodyBuffer<W> {
         }
     }
 
-    /// The sets this buffer could give up for `incoming`, best victim first: the least
-    /// advanced of its own block, then the oldest of the rest. `incoming`'s own set is
-    /// never offered, and nothing outside this buffer ever is.
-    pub fn evictable(&self, incoming: Option<&SetKey>) -> Vec<Evictable> {
-        let mut sets: Vec<_> = self
-            .sets
-            .iter()
-            .filter(|(key, _)| Some(*key) != incoming)
-            .collect();
+    /// The sets this buffer could give up for `incoming` at `now`, best victim first: the
+    /// least advanced of its own block, then the oldest of the rest. `incoming`'s own set is
+    /// never offered, and nothing outside this buffer ever is. For a segment, a set still
+    /// arriving is not offered either ([`ACTIVE_SET`]). With nothing incoming, for the copy of
+    /// a whole body, it is: refusing that copy would lose a body that is all there.
+    pub fn evictable(&self, incoming: Option<&SetKey>, now: Instant) -> Vec<Evictable> {
+        let offered = |(key, set): &(&SetKey, &BodySet<W>)| match incoming {
+            Some(incoming) => *key != incoming && !set.is_active(now),
+            None => true,
+        };
+        let mut sets: Vec<_> = self.sets.iter().filter(offered).collect();
         sets.sort_by_key(|(key, set)| {
             let same_block = incoming.is_some_and(|other| other.block_hash == key.block_hash);
             (!same_block, same_block.then_some(set.filled), set.order)
@@ -324,6 +351,12 @@ impl<W> BodyBuffer<W> {
             self.drop_set(key, &mut gone);
         }
         gone
+    }
+}
+
+impl<W> BodySet<W> {
+    fn is_active(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.last_arrival) < ACTIVE_SET
     }
 }
 

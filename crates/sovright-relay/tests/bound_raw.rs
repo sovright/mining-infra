@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use sovright_relay::{
-    AuthKey, BlockSender, BoundBlock, BoundForwardConfig, BoundRawConfig, BoundUsed, Chunk,
-    ChunkHeader, ClientConfig, EquihashPowValidator, KeyRole, PowResult, PowValidator,
-    RejectAllValidator, RelayClient, RelayConfig, RelayNode, RelaySession, StubPowValidator,
-    body_frames, is_bound, sealed_body, sealed_frame,
+    AuthKey, BOUND_HELLO_ACK, BlockSender, BoundBlock, BoundForwardConfig, BoundRawConfig,
+    BoundUsed, Chunk, ChunkHeader, ClientConfig, EquihashPowValidator, KeyRole,
+    MAX_BODIES_PER_KEY_PER_BLOCK, PowResult, PowValidator, RELEASE_LEFTOVER, RejectAllValidator,
+    RelayClient, RelayConfig, RelayNode, RelaySession, StubPowValidator, ZCASH_FULL_HEADER_SIZE,
+    body_frames, bound_hello, is_bound, reassemble_raw_block, sealed_body, sealed_frame,
+    split_raw_block, zcash_block_hash,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -113,11 +115,32 @@ fn keepalive_bytes(key: [u8; 32]) -> Vec<u8> {
     Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new()).to_bytes()
 }
 
-/// A socket that only watches: a real session by its keepalive, and every datagram it gets.
+fn is_hello_ack(datagram: &[u8]) -> bool {
+    !is_bound(datagram)
+        && Chunk::from_bytes(datagram).is_ok_and(|chunk| chunk.header.block_hash == BOUND_HELLO_ACK)
+}
+
+/// A socket that only watches: a real session by its keepalive and its bound hello, and every
+/// datagram it gets.
 struct Watcher(UdpSocket);
 
 impl Watcher {
     async fn start(node: SocketAddr, key: [u8; 32]) -> Self {
+        let watcher = Self::legacy(node, key).await;
+        watcher
+            .0
+            .send_to(&bound_hello(&key, true), node)
+            .await
+            .unwrap();
+        assert!(
+            is_hello_ack(&watcher.next().await),
+            "the node did not answer the hello"
+        );
+        watcher
+    }
+
+    /// A session that never says it takes bound objects, as one from before the bound path.
+    async fn legacy(node: SocketAddr, key: [u8; 32]) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.send_to(&keepalive_bytes(key), node).await.unwrap();
         Self(socket)
@@ -195,6 +218,20 @@ fn the_block() -> Vec<u8> {
     fixtures::mainnet_raw_block()
 }
 
+/// Where a header's time is.
+const HEADER_TIME: std::ops::Range<usize> = 100..104;
+
+/// `raw` with the time of [`the_block`]'s header, so neither looks old next to the other.
+/// See `sovright_relay::ANCHOR_HEADER_WINDOW`.
+fn dated_as_the_block(mut raw: Vec<u8>) -> Vec<u8> {
+    raw[HEADER_TIME].copy_from_slice(&the_block()[HEADER_TIME]);
+    raw
+}
+
+fn header_time(header: &[u8]) -> u32 {
+    u32::from_le_bytes(header[HEADER_TIME].try_into().unwrap())
+}
+
 async fn next_block(blocks: &mut Receiver<BoundBlock>) -> BoundBlock {
     timeout(WAIT, blocks.recv())
         .await
@@ -232,6 +269,44 @@ async fn each_session_gets_the_block_under_its_own_key() {
 
     assert_eq!(next_block(&mut alice).await.raw(), raw);
     assert_eq!(next_block(&mut bob).await.raw(), raw);
+}
+
+/// A node with the path on, and receivers from before it, which never send a hello. A legacy
+/// client still gets the whole block the legacy way, and a bare legacy session gets not one
+/// bound datagram, while a receiver with the path gets the bound copy of the same block.
+#[tokio::test]
+async fn a_legacy_receiver_gets_the_block_and_nothing_bound() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let old = Watcher::legacy(addr, KEY).await;
+    let mut legacy_client = RelayClient::new(config(addr, KEY)).unwrap();
+    legacy_client.bind().await.unwrap();
+    let (mut legacy, outgoing) = legacy_client.take_receiver().unwrap();
+    tokio::spawn(async move { legacy_client.run_with_outgoing(outgoing).await });
+    let mut blocks = start_receiver(addr, KEY).await;
+    sessions_reach(&node, 3).await;
+    let sender = start_sender(addr, KEY).await;
+    let raw = the_block();
+    let hash = zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
+    let segments = split_raw_block(hash, &raw, 10 * 1124 - 4).unwrap();
+
+    for segment in segments.clone() {
+        sender.send_raw_block_segment(segment).await.unwrap();
+    }
+    let send = sender.send_bound_raw_block(Arc::new(raw.clone()));
+    timeout(WAIT, send).await.unwrap().unwrap();
+
+    assert_eq!(next_block(&mut blocks).await.raw(), raw);
+    let mut got = Vec::new();
+    while got.len() < segments.len() {
+        let segment = timeout(WAIT, legacy.recv_raw_block_segment()).await;
+        got.push(segment.expect("the legacy client got the block").unwrap());
+    }
+    assert_eq!(reassemble_raw_block(&got).unwrap(), raw);
+    let mut buf = vec![0; 2048];
+    while let Ok(read) = timeout(STILL_WAITING, old.0.recv_from(&mut buf)).await {
+        let datagram = &buf[..read.unwrap().0];
+        assert!(!is_bound(datagram), "a legacy session got a bound datagram");
+    }
 }
 
 /// The same rule as the legacy path: a receive-only key's content goes nowhere.
@@ -338,7 +413,7 @@ async fn a_full_table_and_shelf_cost_a_real_node_nothing() {
     let (node, addr) = start_node(StubPowValidator, fleet()).await;
     let mut blocks = start_receiver(addr, KEY).await;
     sessions_reach(&node, 1).await;
-    let raw = vec![200u8; 5000];
+    let raw = dated_as_the_block(vec![200u8; 5000]);
     let sealed = sealed_body(&raw, &KEY).unwrap();
     let crowd: Vec<Vec<u8>> = (0..39u8)
         .map(|fill| sealed_body(&[fill; 5000], &KEY).unwrap().swap_remove(0))
@@ -405,9 +480,10 @@ async fn a_session_sends_an_object_on_once_and_another_may_send_it_again() {
 
     raw_session(&node, addr, &datagrams).await;
 
-    // To the watcher, and to the first sender, which has a session now.
+    // To the watcher again. The first sender has a session now, but it never said it takes
+    // bound objects, so it gets none.
     let forwarded = node.metrics().snapshot().packets_forwarded as usize;
-    assert_eq!(forwarded, once + 2 * datagrams.len());
+    assert_eq!(forwarded, once + datagrams.len());
 }
 
 /// Sent exactly `k` of each object, the node sends all `n` on.
@@ -494,13 +570,21 @@ async fn a_node_without_the_path_drops_it_at_decode() {
     let node = Arc::new(node);
     let running = Arc::clone(&node);
     tokio::spawn(async move { running.run().await });
-    let _watcher = Watcher::start(addr, KEY).await;
+    let watcher = Watcher::legacy(addr, KEY).await;
     sessions_reach(&node, 1).await;
+    watcher
+        .0
+        .send_to(&bound_hello(&KEY, true), addr)
+        .await
+        .unwrap();
 
     raw_session(&node, addr, &sealed_body(&the_block(), &KEY).unwrap()).await;
 
     assert_eq!(node.session_count().await, 1, "no session came of it");
     assert_eq!(node.metrics().snapshot().packets_forwarded, 0);
+    let mut buf = [0; 2048];
+    let answer = timeout(STILL_WAITING, watcher.0.recv_from(&mut buf)).await;
+    assert!(answer.is_err(), "a node without the path answered a hello");
 }
 
 /// Stops a node inside its PoW check until it is told to go on, so a test knows which packet
@@ -1068,7 +1152,7 @@ async fn another_key_gets_through_a_real_node_when_one_key_is_at_its_limit() {
     let body = sealed_body(&[0xee; 5000], &OTHER_KEY).unwrap();
     let _alice = raw_session(&node, addr, &body).await;
 
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 1);
 }
 
 /// A ReceiveOnly key never reaches the pool, and its sessions still take places in the
@@ -1193,7 +1277,7 @@ async fn a_session_that_times_out_gives_its_key_room_back() {
     let _silent = fill_from(&node, addr, 1).await;
     let body = sealed_body(&[0xee; 5000], &KEY).unwrap();
     let late = raw_session(&node, addr, &body).await;
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 0);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 0);
 
     timeout(Duration::from_secs(30), async {
         while node.bound_usage().unwrap().pool != BoundUsed::default() {
@@ -1204,7 +1288,7 @@ async fn a_session_that_times_out_gives_its_key_room_back() {
     .expect("the place never came back");
 
     send_again(&node, addr, &late, &body).await;
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 1);
 }
 
 /// Real headers from genesis on, each with its real proof of work. The node has no way to
@@ -1240,27 +1324,39 @@ async fn old_headers_cannot_take_an_active_bodys_anchor() {
     let first = sealed_frame(&frames[0], &KEY).unwrap();
     let later = sealed_frame(&frames[1], &KEY).unwrap();
     let honest = raw_session(&node, addr, &first).await;
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 1);
 
+    // Those older than the honest header: one newer would rightly make it old.
+    let honest_time = header_time(&raw);
+    let older: Vec<_> = old_headers()
+        .into_iter()
+        .filter(|header| header_time(header) < honest_time)
+        .collect();
     let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    for header in old_headers() {
-        let sealed = sealed_body(&on_a_header(&header, 5000), &OTHER_KEY).unwrap();
+    for header in &older {
+        let sealed = sealed_body(&on_a_header(header, 5000), &OTHER_KEY).unwrap();
         send_again(&node, addr, &flood, &sealed).await;
     }
-    let sent = node.bound_usage().unwrap().objects_sent_on;
+    let sent = node.bound_usage().unwrap().objects_released;
 
     send_again(&node, addr, &honest, &later).await;
 
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, sent + 1, "{usage:?}");
+    assert_eq!(usage.objects_released, sent + 1, "{usage:?}");
     assert_eq!(usage.objects_waiting_for_segment_0, 0);
+    assert_eq!(usage.anchors_refused_for_age, older.len() as u64);
+    assert_eq!(usage.pow_refused + usage.pow_indeterminate, 0);
 }
 
-/// What stays open until there is a chain source: the check says nothing of a header's age.
+/// Real headers with real PoW, the newest first: every older one is refused for its age
+/// before its PoW check. This was a known gap: the check said nothing of a header's age.
+/// A node that has seen nothing newer still takes an old header; see
+/// `sovright_relay::ANCHOR_HEADER_WINDOW`.
 #[tokio::test]
-async fn known_gap_an_old_header_still_opens_an_anchor() {
+async fn an_old_header_opens_no_anchor_once_a_newer_one_has() {
     let (node, addr) = start_node(EquihashPowValidator, fleet()).await;
-    let headers = old_headers();
+    let mut headers = old_headers();
+    headers.sort_by_key(|header| std::cmp::Reverse(header_time(header)));
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
     for header in &headers {
@@ -1268,24 +1364,120 @@ async fn known_gap_an_old_header_still_opens_an_anchor() {
         send_again(&node, addr, &socket, &sealed).await;
     }
 
-    assert_eq!(node.bound_usage().unwrap().anchors, headers.len());
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.anchors, 1);
+    assert_eq!(usage.anchors_refused_for_age, headers.len() as u64 - 1);
 }
 
+/// Headers that came in the order they were made: each newer one ages out the one before,
+/// so old headers sent first cannot hold the table once a newer one passes.
 #[tokio::test]
-async fn a_block_takes_only_so_many_bodies_at_a_real_node() {
-    let (node, addr) = start_node(StubPowValidator, fleet()).await;
-    let limit = BoundForwardConfig::default().max_bodies_per_block;
+async fn a_newer_header_clears_what_older_ones_hold_at_a_real_node() {
+    let (node, addr) = start_node(EquihashPowValidator, fleet()).await;
+    let mut headers = old_headers();
+    headers.sort_by_key(|header| header_time(header));
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-    for mark in 0..=limit {
-        let mut raw = vec![1u8; 5000];
-        raw[4000] = mark as u8;
-        send_again(&node, addr, &socket, &sealed_body(&raw, &KEY).unwrap()).await;
+    for header in &headers {
+        let sealed = sealed_body(&on_a_header(header, 5000), &KEY).unwrap();
+        send_again(&node, addr, &socket, &sealed).await;
     }
 
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, limit as u64);
+    assert_eq!(usage.objects_released, headers.len() as u64);
+    assert_eq!(usage.anchors, 1);
+}
+
+/// A block's bodies: no key can take more than its share of them, and over all keys no
+/// more than the block has.
+#[tokio::test]
+async fn a_block_takes_only_so_many_bodies_at_a_real_node() {
+    let keys = vec![
+        AuthKey::new("fleet", KEY),
+        AuthKey::new("alice", OTHER_KEY),
+        AuthKey::new("bob", [0x44; 32]),
+    ];
+    let (node, addr) = start_node(StubPowValidator, keys).await;
+    let limit = BoundForwardConfig::default().max_bodies_per_block;
+    assert_eq!(limit, 2 * MAX_BODIES_PER_KEY_PER_BLOCK);
+    let body = |mark: usize, key: &[u8; 32]| {
+        let mut raw = vec![1u8; 5000];
+        raw[4000] = mark as u8;
+        sealed_body(&raw, key).unwrap()
+    };
+    let (fleet, alice) = (
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+        UdpSocket::bind("127.0.0.1:0").await.unwrap(),
+    );
+
+    for mark in 0..=MAX_BODIES_PER_KEY_PER_BLOCK {
+        send_again(&node, addr, &fleet, &body(mark, &KEY)).await;
+    }
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_released, MAX_BODIES_PER_KEY_PER_BLOCK as u64);
+    assert_eq!(usage.anchors_refused_for_key_bodies, 1);
+    for mark in 10..10 + MAX_BODIES_PER_KEY_PER_BLOCK {
+        send_again(&node, addr, &alice, &body(mark, &OTHER_KEY)).await;
+    }
+    raw_session(&node, addr, &body(20, &[0x44; 32])).await;
+
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_released, limit as u64);
     assert_eq!(usage.anchors_refused_for_bodies, 1);
+}
+
+/// A receiver that refused a body says so to its relay, and the place the body held in its
+/// block is free for the right one. The refused body stays out for a while.
+#[tokio::test]
+async fn a_receivers_refusal_frees_the_place_a_forged_body_held() {
+    let limits = BoundForwardConfig {
+        max_bodies_per_block: 1,
+        ..Default::default()
+    };
+    let (node, addr) = start_config(relay_for(fleet(), limits), StubPowValidator).await;
+    let mut blocks = start_receiver(addr, KEY).await;
+    sessions_reach(&node, 1).await;
+    let honest = the_block();
+    let mut forged = honest.clone();
+    *forged.last_mut().unwrap() ^= 1;
+    let sender = raw_session(&node, addr, &sealed_body(&forged, &KEY).unwrap()).await;
+    let got = next_block(&mut blocks).await;
+    assert_eq!(got.raw(), forged);
+    send_again(&node, addr, &sender, &sealed_body(&honest, &KEY).unwrap()).await;
+    assert_eq!(node.bound_usage().unwrap().anchors_refused_for_bodies, 1);
+
+    assert_eq!(got.refuse(), 1, "one relay took the word");
+    timeout(WAIT, async {
+        while node.bound_usage().unwrap().anchors_released == 0 {
+            sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the relay never freed the place");
+
+    raw_session(&node, addr, &sealed_body(&forged, &KEY).unwrap()).await;
+    assert_eq!(node.bound_usage().unwrap().anchors_refused_as_released, 1);
+    raw_session(&node, addr, &sealed_body(&honest, &KEY).unwrap()).await;
+    assert_eq!(next_block(&mut blocks).await.raw(), honest);
+}
+
+/// A body is named by its block hash and its id, so whoever refuses it can say which.
+#[tokio::test]
+async fn a_bound_block_names_its_body() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let mut blocks = start_receiver(addr, KEY).await;
+    sessions_reach(&node, 1).await;
+    let raw = the_block();
+    let mut other = raw.clone();
+    *other.last_mut().unwrap() ^= 1;
+
+    raw_session(&node, addr, &sealed_body(&raw, &KEY).unwrap()).await;
+    let first = next_block(&mut blocks).await;
+    raw_session(&node, addr, &sealed_body(&other, &KEY).unwrap()).await;
+    let second = next_block(&mut blocks).await;
+
+    assert_eq!(first.block_hash(), second.block_hash());
+    assert_ne!(first.body_id(), second.body_id());
 }
 
 /// Revoking a key does not take back what its anchors prove, or free what they hold. A key
@@ -1298,11 +1490,11 @@ async fn a_revoked_key_answers_for_its_anchors_until_they_lapse() {
         ..Default::default()
     };
     let (node, addr) = start_config(relay_for(fleet(), limits), StubPowValidator).await;
-    let body = |fill: u8| sealed_body(&[fill; 5000], &KEY).unwrap();
+    let body = |fill: u8| sealed_body(&dated_as_the_block(vec![fill; 5000]), &KEY).unwrap();
     let socket = raw_session(&node, addr, &body(1)).await;
     send_again(&node, addr, &socket, &body(2)).await;
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, 1);
+    assert_eq!(usage.objects_released, 1);
     assert_eq!(usage.anchors_refused_for_room, 1);
 
     node.apply_active_keys(Vec::new()).await;
@@ -1311,15 +1503,74 @@ async fn a_revoked_key_answers_for_its_anchors_until_they_lapse() {
 
     let again = raw_session(&node, addr, &body(3)).await;
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, 1, "the key still pays: {usage:?}");
+    assert_eq!(usage.objects_released, 1, "the key still pays: {usage:?}");
     assert_eq!(usage.anchors_refused_for_room, 2);
 
     timeout(WAIT, async {
-        while node.bound_usage().unwrap().objects_sent_on < 2 {
+        while node.bound_usage().unwrap().objects_released < 2 {
             send_again(&node, addr, &again, &body(3)).await;
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .expect("the key never had its share again");
+}
+
+/// Everything `socket` gets until nothing more comes for a while.
+async fn drain(socket: &UdpSocket) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    let mut buf = vec![0; 2048];
+    while let Ok(received) = timeout(STILL_WAITING, socket.recv_from(&mut buf)).await {
+        let (len, _) = received.unwrap();
+        got.push(buf[..len].to_vec());
+    }
+    got
+}
+
+/// With nobody to send to nothing went, so nothing is recorded, and the next copy crosses
+/// as soon as somebody is there, however soon it comes.
+#[tokio::test]
+async fn a_send_with_no_peer_records_nothing() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let body = sealed_body(&[7u8; 5000], &KEY).unwrap();
+    let socket = raw_session(&node, addr, &body).await;
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_released, 1);
+    assert_eq!(usage.objects_sent_on, 0);
+
+    let watcher = Watcher::start(addr, KEY).await;
+    sessions_reach(&node, 2).await;
+    // Past what counts as left over from the decode, and well inside `resend_after`, which
+    // would hold back a copy of an object that had been sent.
+    sleep(RELEASE_LEFTOVER).await;
+    send_again(&node, addr, &socket, &body).await;
+
+    assert!(body.contains(&watcher.next().await));
+    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+}
+
+/// Objects that waited for their segment 0 go to everyone but the session they came from,
+/// even though the datagram that let them go came from another one.
+#[tokio::test]
+async fn an_object_never_goes_back_to_the_session_it_came_from() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let raw = the_block();
+    let frames = body_frames(&raw).unwrap();
+    let first = sealed_frame(&frames[0], &KEY).unwrap();
+    let later: Vec<Vec<u8>> = frames[1..]
+        .iter()
+        .flat_map(|frame| sealed_frame(frame, &KEY).unwrap())
+        .collect();
+    let a = Watcher::start(addr, KEY).await;
+    let b = Watcher::start(addr, KEY).await;
+    sessions_reach(&node, 2).await;
+
+    send_again(&node, addr, &a.0, &later).await;
+    send_again(&node, addr, &b.0, &first).await;
+
+    let (to_a, to_b) = (drain(&a.0).await, drain(&b.0).await);
+    assert!(to_a.iter().all(|datagram| !later.contains(datagram)));
+    assert!(first.iter().all(|datagram| to_a.contains(datagram)));
+    assert!(to_b.iter().all(|datagram| !first.contains(datagram)));
+    assert!(later.iter().all(|datagram| to_b.contains(datagram)));
 }

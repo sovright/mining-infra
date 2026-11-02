@@ -120,7 +120,13 @@ impl Handoff {
     fn is_a_lack_of_room(&self) -> bool {
         matches!(
             self,
-            Self::Refused(Refusal::Bytes | Refusal::Owners | Refusal::Records | Refusal::Transit)
+            Self::Refused(
+                Refusal::Bytes
+                    | Refusal::Owners
+                    | Refusal::Records
+                    | Refusal::Transit
+                    | Refusal::Sets
+            )
         )
     }
 }
@@ -321,6 +327,10 @@ impl Bridge {
                 ..
             }) => Handoff::Whole(set),
             Offer::Taken(Insertion {
+                outcome: Outcome::Rejected(Reject::Busy),
+                ..
+            }) => Handoff::Refused(Refusal::Sets),
+            Offer::Taken(Insertion {
                 outcome: Outcome::Rejected(reject),
                 ..
             }) => Handoff::TooLong(reject),
@@ -396,6 +406,11 @@ impl Bridge {
 
     pub fn waiting(&self) -> usize {
         self.waiting.len()
+    }
+
+    /// Which body [`Self::next_block`] puts together next.
+    pub fn next_key(&self) -> Option<SetKey> {
+        self.waiting.front().map(|(set, _)| set.key)
     }
 
     /// The oldest waiting set, put together, for a consumer that has room for one. Ask for

@@ -134,6 +134,9 @@ pub enum Refusal {
     /// Enough could be given up, but holding both until it has gone would pass
     /// [`Limits::transit`]. Nothing was given up, and a later try can pass.
     Transit,
+    /// The body buffer could make room only by giving up a set still arriving. The ledger
+    /// was not asked. See [`body_buffer::ACTIVE_SET`].
+    Sets,
 }
 
 #[derive(Debug)]

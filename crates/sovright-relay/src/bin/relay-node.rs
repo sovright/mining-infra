@@ -7,7 +7,7 @@ use std::{env, fs};
 
 use sovright_relay::{
     ArrivalSink, AuthKey, BoundForwardConfig, KeyRole, RelayConfig, RelayNode, bound_raw_switch,
-    render_prometheus_text,
+    render_bound_prometheus_text, render_prometheus_text,
 };
 use tracing::{error, info, warn};
 
@@ -95,7 +95,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "Sovright relay metrics"
             );
             if let Some(path) = &metrics_textfile {
-                let text = render_prometheus_text(&snapshot, sessions);
+                let mut text = render_prometheus_text(&snapshot, sessions);
+                if let Some(usage) = metrics_node.bound_usage() {
+                    text.push_str(&render_bound_prometheus_text(&usage));
+                }
                 if let Err(error) = write_metrics_textfile(path, &text) {
                     warn!(%error, path = %path.display(), "Failed to write Sovright relay metrics textfile");
                 }
