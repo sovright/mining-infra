@@ -88,6 +88,8 @@ pub struct SendReport {
 
 impl BlockSender {
     /// A sender on a channel of the caller's, with no client behind it and no bound send.
+    /// Only for tests, here and, with `test-support`, downstream.
+    #[cfg(any(test, feature = "test-support"))]
     pub fn for_tests(tx: mpsc::Sender<RelayPayload>) -> Self {
         Self {
             tx,
