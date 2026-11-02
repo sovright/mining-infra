@@ -768,9 +768,11 @@ impl<V: PowValidator> RelayNode<V> {
             .map(drop)
     }
 
-    /// Each bound object to every session but the one it came from, sealed with each
-    /// session's own key. The datagram that released an object can be another session's,
-    /// such as a segment 0 that let waiting objects go, so each object carries its origin.
+    /// Each bound object to every session that announced it takes them, but the one it came
+    /// from, sealed with each session's own key. A session that never sent a bound hello is
+    /// legacy and gets none: it would drop them. The datagram that released an object can be
+    /// another session's, such as a segment 0 that let waiting objects go, so each object
+    /// carries its origin.
     ///
     /// An object counts against its origin's sends only once every datagram of it went out
     /// to at least one peer. With no peer, or a socket that refused, nothing is recorded and
@@ -785,7 +787,7 @@ impl<V: PowValidator> RelayNode<V> {
             let sessions = self.sessions.read().await;
             let outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = sessions
                 .iter()
-                .filter(|(peer_addr, _)| **peer_addr != from)
+                .filter(|(peer_addr, session)| **peer_addr != from && session.receives_bound())
                 .map(|(peer_addr, session)| {
                     let payloads = BoundForwarder::sealed(&session.auth_key(), &object);
                     (*peer_addr, session.key_id().to_string(), payloads)
@@ -1405,16 +1407,47 @@ impl<V: PowValidator> RelayNode<V> {
         Ok(())
     }
 
+    /// A keepalive, or a bound hello, which is one with a marker and flags. A node without
+    /// the bound path takes a hello for a keepalive it cannot read, as an old node does. With
+    /// the path on, an authenticated hello sets what the session takes and is answered.
     async fn handle_keepalive(
         &self,
         src_addr: SocketAddr,
         chunk: &Chunk,
     ) -> Result<(), TransportError> {
-        if chunk.header.block_hash != [0u8; 32]
-            || chunk.header.chunk_id != 0
-            || chunk.header.total_chunks != 0
-            || chunk.header.payload_len != 0
-            || !chunk.payload.is_empty()
+        let hello = self.bound.as_ref().and(bound_raw::hello_flags(chunk));
+        let ack = self.admit_keepalive(src_addr, chunk, hello).await?;
+        if let (Some(ack), Some(socket)) = (ack, self.socket.as_ref()) {
+            if let Err(error) = socket.send_to(&ack, src_addr).await {
+                self.metrics.inc_packet_send_errors();
+                warn!(peer = %src_addr, %error, "Failed to answer a bound hello");
+            }
+        }
+        Ok(())
+    }
+
+    /// What a hello says, on a session it authenticated, and the answer to send.
+    fn take_hello(session: &mut RelaySession, hello: Option<u16>) -> Option<Vec<u8>> {
+        let flags = hello?;
+        if !session.is_authenticated() {
+            return None;
+        }
+        session.set_receives_bound(flags & bound_raw::HELLO_RECEIVES != 0);
+        Some(bound_raw::bound_hello_ack(&session.auth_key()))
+    }
+
+    async fn admit_keepalive(
+        &self,
+        src_addr: SocketAddr,
+        chunk: &Chunk,
+        hello: Option<u16>,
+    ) -> Result<Option<Vec<u8>>, TransportError> {
+        if hello.is_none()
+            && (chunk.header.block_hash != [0u8; 32]
+                || chunk.header.chunk_id != 0
+                || chunk.header.total_chunks != 0
+                || chunk.header.payload_len != 0
+                || !chunk.payload.is_empty())
         {
             self.metrics.inc_invalid_chunks();
             return Err(TransportError::InvalidChunk(
@@ -1446,7 +1479,7 @@ impl<V: PowValidator> RelayNode<V> {
                 return Err(TransportError::AuthenticationFailed);
             }
             session.touch();
-            return Ok(());
+            return Ok(Self::take_hello(session, hello));
         }
 
         if sessions.len() >= self.config.max_sessions {
@@ -1466,7 +1499,7 @@ impl<V: PowValidator> RelayNode<V> {
             self.metrics.inc_sessions_created();
             self.metrics
                 .inc_sessions_created_for_key(UNAUTHENTICATED_KEY_ID);
-            return Ok(());
+            return Ok(None);
         }
 
         if chunk.header.version != 2 {
@@ -1495,13 +1528,13 @@ impl<V: PowValidator> RelayNode<V> {
 
         if let Some(key) = authenticated_key {
             info!(peer = %src_addr, key_id = %key.id, role = ?key.role, "Authenticated new keepalive session");
-            sessions.insert(
-                src_addr,
-                RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role),
-            );
+            let mut session =
+                RelaySession::new_with_role(src_addr, key.id.clone(), key.key, key.role);
+            let ack = Self::take_hello(&mut session, hello);
+            sessions.insert(src_addr, session);
             self.metrics.inc_sessions_created();
             self.metrics.inc_sessions_created_for_key(&key.id);
-            Ok(())
+            Ok(ack)
         } else {
             warn!(peer = %src_addr, "Keepalive authentication failed - no matching key");
             self.metrics.inc_auth_failures();

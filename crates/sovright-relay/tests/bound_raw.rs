@@ -9,10 +9,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use sovright_relay::{
-    AuthKey, BlockSender, BoundBlock, BoundForwardConfig, BoundRawConfig, BoundUsed, Chunk,
-    ChunkHeader, ClientConfig, EquihashPowValidator, KeyRole, PowResult, PowValidator,
-    RELEASE_LEFTOVER, RejectAllValidator, RelayClient, RelayConfig, RelayNode, RelaySession,
-    StubPowValidator, body_frames, is_bound, sealed_body, sealed_frame,
+    AuthKey, BOUND_HELLO_ACK, BlockSender, BoundBlock, BoundForwardConfig, BoundRawConfig,
+    BoundUsed, Chunk, ChunkHeader, ClientConfig, EquihashPowValidator, KeyRole, PowResult,
+    PowValidator, RELEASE_LEFTOVER, RejectAllValidator, RelayClient, RelayConfig, RelayNode,
+    RelaySession, StubPowValidator, ZCASH_FULL_HEADER_SIZE, body_frames, bound_hello, is_bound,
+    reassemble_raw_block, sealed_body, sealed_frame, split_raw_block, zcash_block_hash,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -113,11 +114,32 @@ fn keepalive_bytes(key: [u8; 32]) -> Vec<u8> {
     Chunk::new(ChunkHeader::new_keepalive_authenticated(hmac), Vec::new()).to_bytes()
 }
 
-/// A socket that only watches: a real session by its keepalive, and every datagram it gets.
+fn is_hello_ack(datagram: &[u8]) -> bool {
+    !is_bound(datagram)
+        && Chunk::from_bytes(datagram).is_ok_and(|chunk| chunk.header.block_hash == BOUND_HELLO_ACK)
+}
+
+/// A socket that only watches: a real session by its keepalive and its bound hello, and every
+/// datagram it gets.
 struct Watcher(UdpSocket);
 
 impl Watcher {
     async fn start(node: SocketAddr, key: [u8; 32]) -> Self {
+        let watcher = Self::legacy(node, key).await;
+        watcher
+            .0
+            .send_to(&bound_hello(&key, true), node)
+            .await
+            .unwrap();
+        assert!(
+            is_hello_ack(&watcher.next().await),
+            "the node did not answer the hello"
+        );
+        watcher
+    }
+
+    /// A session that never says it takes bound objects, as one from before the bound path.
+    async fn legacy(node: SocketAddr, key: [u8; 32]) -> Self {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         socket.send_to(&keepalive_bytes(key), node).await.unwrap();
         Self(socket)
@@ -232,6 +254,44 @@ async fn each_session_gets_the_block_under_its_own_key() {
 
     assert_eq!(next_block(&mut alice).await.raw(), raw);
     assert_eq!(next_block(&mut bob).await.raw(), raw);
+}
+
+/// A node with the path on, and receivers from before it, which never send a hello. A legacy
+/// client still gets the whole block the legacy way, and a bare legacy session gets not one
+/// bound datagram, while a receiver with the path gets the bound copy of the same block.
+#[tokio::test]
+async fn a_legacy_receiver_gets_the_block_and_nothing_bound() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let old = Watcher::legacy(addr, KEY).await;
+    let mut legacy_client = RelayClient::new(config(addr, KEY)).unwrap();
+    legacy_client.bind().await.unwrap();
+    let (mut legacy, outgoing) = legacy_client.take_receiver().unwrap();
+    tokio::spawn(async move { legacy_client.run_with_outgoing(outgoing).await });
+    let mut blocks = start_receiver(addr, KEY).await;
+    sessions_reach(&node, 3).await;
+    let sender = start_sender(addr, KEY).await;
+    let raw = the_block();
+    let hash = zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
+    let segments = split_raw_block(hash, &raw, 10 * 1124 - 4).unwrap();
+
+    for segment in segments.clone() {
+        sender.send_raw_block_segment(segment).await.unwrap();
+    }
+    let send = sender.send_bound_raw_block(Arc::new(raw.clone()));
+    timeout(WAIT, send).await.unwrap().unwrap();
+
+    assert_eq!(next_block(&mut blocks).await.raw(), raw);
+    let mut got = Vec::new();
+    while got.len() < segments.len() {
+        let segment = timeout(WAIT, legacy.recv_raw_block_segment()).await;
+        got.push(segment.expect("the legacy client got the block").unwrap());
+    }
+    assert_eq!(reassemble_raw_block(&got).unwrap(), raw);
+    let mut buf = vec![0; 2048];
+    while let Ok(read) = timeout(STILL_WAITING, old.0.recv_from(&mut buf)).await {
+        let datagram = &buf[..read.unwrap().0];
+        assert!(!is_bound(datagram), "a legacy session got a bound datagram");
+    }
 }
 
 /// The same rule as the legacy path: a receive-only key's content goes nowhere.
@@ -405,9 +465,10 @@ async fn a_session_sends_an_object_on_once_and_another_may_send_it_again() {
 
     raw_session(&node, addr, &datagrams).await;
 
-    // To the watcher, and to the first sender, which has a session now.
+    // To the watcher again. The first sender has a session now, but it never said it takes
+    // bound objects, so it gets none.
     let forwarded = node.metrics().snapshot().packets_forwarded as usize;
-    assert_eq!(forwarded, once + 2 * datagrams.len());
+    assert_eq!(forwarded, once + datagrams.len());
 }
 
 /// Sent exactly `k` of each object, the node sends all `n` on.
@@ -494,13 +555,21 @@ async fn a_node_without_the_path_drops_it_at_decode() {
     let node = Arc::new(node);
     let running = Arc::clone(&node);
     tokio::spawn(async move { running.run().await });
-    let _watcher = Watcher::start(addr, KEY).await;
+    let watcher = Watcher::legacy(addr, KEY).await;
     sessions_reach(&node, 1).await;
+    watcher
+        .0
+        .send_to(&bound_hello(&KEY, true), addr)
+        .await
+        .unwrap();
 
     raw_session(&node, addr, &sealed_body(&the_block(), &KEY).unwrap()).await;
 
     assert_eq!(node.session_count().await, 1, "no session came of it");
     assert_eq!(node.metrics().snapshot().packets_forwarded, 0);
+    let mut buf = [0; 2048];
+    let answer = timeout(STILL_WAITING, watcher.0.recv_from(&mut buf)).await;
+    assert!(answer.is_err(), "a node without the path answered a hello");
 }
 
 /// Stops a node inside its PoW check until it is told to go on, so a test knows which packet

@@ -2,14 +2,14 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
@@ -237,6 +237,8 @@ pub struct RelayClient {
     bound_sends: Option<mpsc::Receiver<BoundSend>>,
     keepalive_every: Duration,
     sends: Arc<SendCounts>,
+    /// Which relays answered a bound hello. See [`BoundSupport`].
+    bound_support: Arc<BoundSupport>,
     /// The bound path, from `take_receiver` until the run loop owns it.
     bound: Option<BoundReceiver>,
     /// Channel for delivering received blocks to user
@@ -275,6 +277,7 @@ impl RelayClient {
             bound_sends: Some(bound_sends),
             keepalive_every: KEEPALIVE_INTERVAL,
             sends: Arc::default(),
+            bound_support: Arc::default(),
             bound: None,
             incoming_tx: None,
             running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -425,6 +428,8 @@ impl RelayClient {
                     self.config.bound_send_burst_delay,
                 ),
                 sends: self.sends.clone(),
+                support: Arc::clone(&self.bound_support),
+                receives: self.config.bound_raw.is_some(),
             };
             bound_send.spawn(sender.run(queue));
         }
@@ -465,13 +470,17 @@ impl RelayClient {
                 // Handle incoming packets
                 result = socket.recv_from(&mut recv_buf) => {
                     match result {
-                        Ok((len, _src)) => {
+                        Ok((len, src)) => {
                             let datagram = &recv_buf[..len];
                             if bound.is_some() && bound_raw::is_bound(datagram) {
                                 bound_raw::contain(&mut bound, |bound| {
                                     bound.take(datagram, Instant::now())
                                 });
                             } else if let Ok(chunk) = Chunk::from_bytes(datagram) {
+                                if bound_raw::is_hello_ack(&chunk, &self.config.auth_key) {
+                                    self.bound_support.answered(src, Instant::now());
+                                    continue;
+                                }
                                 self.handle_incoming_chunk(
                                     chunk,
                                     &mut pending_blocks,
@@ -513,6 +522,17 @@ impl RelayClient {
 
         for relay_addr in &self.config.relay_addrs {
             socket.send_to(&data, relay_addr).await?;
+        }
+
+        // Behind the plain keepalive, which keeps the session on a relay that cannot read it.
+        // A receiver says so from the start, and a sender once it has been asked for a bound
+        // send, so a client with nothing bound to do sends none.
+        let receives = self.config.bound_raw.is_some();
+        if receives || self.bound_support.asked() {
+            let hello = bound_raw::bound_hello(&self.config.auth_key, receives);
+            for relay_addr in &self.config.relay_addrs {
+                socket.send_to(&hello, relay_addr).await?;
+            }
         }
 
         debug!("Sent relay keepalive");
@@ -1006,6 +1026,66 @@ impl SendPacing {
     }
 }
 
+/// How long a relay's answer to a bound hello stands. Once a client has bound work, a hello
+/// goes with every keepalive, so an answer is renewed well inside this. A relay that stops
+/// answering, rolled back or with the path turned off, counts as legacy once it lapses.
+pub const BOUND_ACK_TTL: Duration = Duration::from_secs(180);
+/// How long a bound send waits for a relay to answer its hello before it fails.
+pub const BOUND_HELLO_WAIT: Duration = Duration::from_secs(2);
+
+/// Which relays said they have the bound path, by answering a hello. A relay that never did
+/// is legacy, and a bound block is not sent to it.
+#[derive(Debug, Default)]
+struct BoundSupport {
+    answered: StdMutex<HashMap<SocketAddr, Instant>>,
+    changed: Notify,
+    /// A bound send has been asked for, so keepalives carry the hello from now on.
+    asked: AtomicBool,
+}
+
+impl BoundSupport {
+    fn asked(&self) -> bool {
+        self.asked.load(Ordering::Relaxed)
+    }
+
+    fn answered(&self, relay: SocketAddr, now: Instant) {
+        let mut answered = self.answered.lock().unwrap_or_else(PoisonError::into_inner);
+        answered.insert(relay, now);
+        drop(answered);
+        self.changed.notify_waiters();
+    }
+
+    /// Those of `relays` whose answer still stands at `now`.
+    fn with_the_path(&self, relays: &[SocketAddr], now: Instant) -> Vec<SocketAddr> {
+        let answered = self.answered.lock().unwrap_or_else(PoisonError::into_inner);
+        let stands = |relay: &SocketAddr| {
+            let at = answered.get(relay);
+            at.is_some_and(|at| now.saturating_duration_since(*at) < BOUND_ACK_TTL)
+        };
+        relays.iter().copied().filter(stands).collect()
+    }
+
+    /// Those of `relays` with the path, waiting until `deadline` for one if none has it yet.
+    async fn wait_for(
+        &self,
+        relays: &[SocketAddr],
+        deadline: tokio::time::Instant,
+    ) -> Vec<SocketAddr> {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let ready = self.with_the_path(relays, Instant::now());
+            if !ready.is_empty() {
+                return ready;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return Vec::new();
+            }
+        }
+    }
+}
+
 /// The bound send of one client: one block at a time, in the order they came, and off the
 /// client's loop, which goes on with legacy traffic, receiving and keepalives meanwhile.
 struct BoundSender {
@@ -1014,6 +1094,9 @@ struct BoundSender {
     key: [u8; 32],
     pacing: SendPacing,
     sends: Arc<SendCounts>,
+    support: Arc<BoundSupport>,
+    /// Whether this client takes bound objects too, which its hello says.
+    receives: bool,
 }
 
 impl BoundSender {
@@ -1027,9 +1110,32 @@ impl BoundSender {
         }
     }
 
-    /// Encoded on the blocking pool, as it takes as long as a large body does. One relay that
+    /// With no relay known to have the path, ask every relay now, rather than at the next
+    /// keepalive.
+    async fn ask_relays(&self) {
+        self.support.asked.store(true, Ordering::Relaxed);
+        if !self
+            .support
+            .with_the_path(&self.relays, Instant::now())
+            .is_empty()
+        {
+            return;
+        }
+        let hello = bound_raw::bound_hello(&self.key, self.receives);
+        for relay in &self.relays {
+            if let Err(error) = self.socket.send_to(&hello, relay).await {
+                debug!(%relay, %error, "Could not send a bound hello");
+            }
+        }
+    }
+
+    /// Encoded on the blocking pool, as it takes as long as a large body does. Only relays
+    /// that answered a hello get it: a relay without the path would drop every datagram, and
+    /// this would say `Ok` for a body that went nowhere. With none, this fails. One relay that
     /// took all of it is enough, and one that refused costs the others nothing.
     async fn send(&self, raw: Arc<Vec<u8>>) -> Result<(), TransportError> {
+        let deadline = tokio::time::Instant::now() + BOUND_HELLO_WAIT;
+        self.ask_relays().await;
         let key = self.key;
         let encoded = tokio::task::spawn_blocking(move || bound_raw::sealed_body(&raw, &key));
         let datagrams = encoded
@@ -1038,9 +1144,15 @@ impl BoundSender {
             .ok_or_else(|| {
                 TransportError::InvalidChunk("raw block does not fit the bound format".into())
             })?;
+        let with_the_path = self.support.wait_for(&self.relays, deadline).await;
+        if with_the_path.is_empty() {
+            return Err(TransportError::ConnectionRefused(
+                "no relay has answered a bound hello, so the bound block was not sent".into(),
+            ));
+        }
         let datagrams = Arc::new(datagrams);
         let mut relays = JoinSet::new();
-        for relay_addr in self.relays.iter().copied() {
+        for relay_addr in with_the_path {
             relays.spawn(send_payloads_to_relay(
                 self.socket.clone(),
                 relay_addr,

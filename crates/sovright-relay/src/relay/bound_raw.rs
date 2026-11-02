@@ -44,7 +44,9 @@ use delivery_lease::{
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tracing::{error, warn};
 
-use crate::transport::{PowResult, ZCASH_FULL_HEADER_SIZE};
+use crate::transport::{
+    Chunk, ChunkHeader, MessageType, PowResult, RelaySession, ZCASH_FULL_HEADER_SIZE,
+};
 
 pub use chunk_proof::budget::Used as BoundUsed;
 
@@ -283,6 +285,87 @@ impl Default for BoundForwardConfig {
 /// Whether this datagram claims the bound format. Nothing is checked yet.
 pub fn is_bound(datagram: &[u8]) -> bool {
     claims_this_format(datagram)
+}
+
+// Capability negotiation. A peer says it has the bound path with a keepalive whose block
+// hash is [`BOUND_HELLO`], authenticated like any keepalive, and a node with the path on
+// answers with one whose block hash is [`BOUND_HELLO_ACK`]. Absent either, the other side is
+// legacy, and that is what a peer is taken to be until it says otherwise:
+//
+// - A node sends bound objects only to sessions whose hello said they take them.
+// - A client sends a bound block only to relays that answered its hello, and fails the send
+//   when none did.
+//
+// An old node, or one with the path off, refuses a hello as a keepalive it cannot read and
+// answers nothing, and the plain keepalive sent beside it keeps the session. So the rollout
+// order does not lose a body in silence: relays first, then receivers, then senders, and a
+// sender in front of a relay without the path hears so on every send.
+
+const fn marker(text: &[u8]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut at = 0;
+    while at < text.len() {
+        out[at] = text[at];
+        at += 1;
+    }
+    out
+}
+
+/// The block hash of a keepalive that announces the bound path.
+pub const BOUND_HELLO: [u8; 32] = marker(b"sovright/bound-raw/hello/v1");
+/// The block hash of a node's answer to [`BOUND_HELLO`].
+pub const BOUND_HELLO_ACK: [u8; 32] = marker(b"sovright/bound-raw/ack/v1");
+/// A hello's `chunk_id` flag: this peer takes bound objects, not only sends them.
+pub const HELLO_RECEIVES: u16 = 1;
+
+fn control(key: &[u8; 32], marker: &[u8; 32], flags: u16) -> Vec<u8> {
+    let session = RelaySession::new("0.0.0.0:0".parse().expect("an address"), "", *key);
+    let hmac = session.compute_hmac(marker, flags, 0, 0, &[]);
+    let mut header = ChunkHeader::new_keepalive_authenticated(hmac);
+    header.block_hash = *marker;
+    header.chunk_id = flags;
+    Chunk::new(header, Vec::new()).to_bytes()
+}
+
+/// A bound hello under `key`. `receives` says this peer takes bound objects; a peer that
+/// only sends them says so too, so that it hears whether a relay has the path.
+pub fn bound_hello(key: &[u8; 32], receives: bool) -> Vec<u8> {
+    let flags = if receives { HELLO_RECEIVES } else { 0 };
+    control(key, &BOUND_HELLO, flags)
+}
+
+/// A node's answer to a hello, under the session's key.
+pub(crate) fn bound_hello_ack(key: &[u8; 32]) -> Vec<u8> {
+    control(key, &BOUND_HELLO_ACK, 0)
+}
+
+/// Whether `chunk` is a node's answer to a hello under `key`.
+pub(crate) fn is_hello_ack(chunk: &Chunk, key: &[u8; 32]) -> bool {
+    let header = &chunk.header;
+    header.msg_type == MessageType::Keepalive
+        && header.block_hash == BOUND_HELLO_ACK
+        && header.chunk_id == 0
+        && header.total_chunks == 0
+        && header.payload_len == 0
+        && chunk.payload.is_empty()
+        && RelaySession::new("0.0.0.0:0".parse().expect("an address"), "", *key).verify_hmac(
+            &header.block_hash,
+            0,
+            0,
+            0,
+            &[],
+            &header.hmac,
+        )
+}
+
+/// The flags of a hello, if `chunk` is framed as one. Its MAC is checked with the session.
+pub(crate) fn hello_flags(chunk: &Chunk) -> Option<u16> {
+    let header = &chunk.header;
+    let framed = header.block_hash == BOUND_HELLO
+        && header.total_chunks == 0
+        && header.payload_len == 0
+        && chunk.payload.is_empty();
+    framed.then_some(header.chunk_id)
 }
 
 fn seal_object(key: &[u8; 32], object: &Encoded) -> Vec<Vec<u8>> {

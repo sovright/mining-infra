@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use sovright_relay::{
     BlockReceiver, BlockSender, BoundBlock, BoundRawConfig, ClientConfig, RelayClient,
-    ZCASH_FULL_HEADER_SIZE, split_raw_block, zcash_block_hash,
+    TransportError, ZCASH_FULL_HEADER_SIZE, split_raw_block, zcash_block_hash,
 };
 use tokio::sync::mpsc::Receiver;
 use tokio::time::timeout;
@@ -158,9 +158,9 @@ impl Path {
         panic!("legacy never crossed");
     }
 
-    async fn send_bound(&self, raw: &[u8]) {
+    async fn send_bound(&self, raw: &[u8]) -> Result<(), TransportError> {
         let send = self.sender.send_bound_raw_block(Arc::new(raw.to_vec()));
-        timeout(WAIT, send).await.unwrap().unwrap();
+        timeout(WAIT, send).await.unwrap()
     }
 }
 
@@ -170,7 +170,7 @@ async fn one_opens_the_path_on_a_real_node() {
     for value in ["1", "true"] {
         let mut path = Path::start(Some(value)).await;
 
-        path.send_bound(&raw).await;
+        path.send_bound(&raw).await.unwrap();
 
         let block = timeout(WAIT, path.blocks.recv()).await;
         assert_eq!(block.expect(value).unwrap().raw(), raw);
@@ -183,7 +183,13 @@ async fn zero_leaves_the_path_shut_on_a_real_node() {
     for value in [None, Some("0"), Some("false"), Some("")] {
         let mut path = Path::start(value).await;
 
-        path.send_bound(&raw).await;
+        // A node with the path shut does not answer the hello, so the send says it went
+        // nowhere instead of `Ok`.
+        let sent = path.send_bound(&raw).await;
+        assert!(
+            matches!(sent, Err(TransportError::ConnectionRefused(_))),
+            "{value:?}: {sent:?}"
+        );
         path.legacy_crosses().await;
 
         assert!(path.blocks.try_recv().is_err(), "{value:?}");

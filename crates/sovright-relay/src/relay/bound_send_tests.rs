@@ -29,6 +29,10 @@ struct Relay {
     bound: Vec<Vec<u8>>,
     legacy: usize,
     keepalives: usize,
+    /// The flags of each bound hello that came, answered unless `answers_hellos` is off.
+    hellos: Vec<u16>,
+    /// Off, this is a relay without the bound path: it reads a hello and says nothing.
+    answers_hellos: bool,
 }
 
 impl Relay {
@@ -38,6 +42,8 @@ impl Relay {
             bound: Vec::new(),
             legacy: 0,
             keepalives: 0,
+            hellos: Vec::new(),
+            answers_hellos: true,
         }
     }
 
@@ -50,10 +56,18 @@ impl Relay {
         let deadline = tokio::time::Instant::now() + WAIT;
         while !done(self) {
             let read = timeout_at(deadline, self.socket.recv_from(&mut datagram));
-            let (length, _) = read.await.expect("it never came").unwrap();
+            let (length, from) = read.await.expect("it never came").unwrap();
             let datagram = &datagram[..length];
             if bound_raw::is_bound(datagram) {
                 self.bound.push(datagram.to_vec());
+            } else if let Some(flags) =
+                bound_raw::hello_flags(&Chunk::from_bytes(datagram).unwrap())
+            {
+                self.hellos.push(flags);
+                if self.answers_hellos {
+                    let ack = bound_raw::bound_hello_ack(&KEY);
+                    self.socket.send_to(&ack, from).await.unwrap();
+                }
             } else if Chunk::from_bytes(datagram).unwrap().header.msg_type == MessageType::Keepalive
             {
                 self.keepalives += 1;
@@ -76,6 +90,7 @@ struct Client {
     receiver: BlockReceiver,
     running: Arc<AtomicBool>,
     task: JoinHandle<Result<(), TransportError>>,
+    support: Arc<BoundSupport>,
 }
 
 impl Client {
@@ -136,6 +151,7 @@ async fn start(config: ClientConfig, keepalive_every: Duration) -> Client {
     client.bind().await.unwrap();
     let (sender, addr) = (client.sender(), client.local_addr().unwrap());
     let running = Arc::clone(&client.running);
+    let support = Arc::clone(&client.bound_support);
     let (receiver, outgoing) = client.take_receiver().unwrap();
     let task = tokio::spawn(async move { client.run_with_outgoing(outgoing).await });
     Client {
@@ -144,6 +160,7 @@ async fn start(config: ClientConfig, keepalive_every: Duration) -> Client {
         receiver,
         running,
         task,
+        support,
     }
 }
 
@@ -349,7 +366,10 @@ async fn a_body_that_does_not_fit_comes_back_as_an_error() {
 
 #[tokio::test]
 async fn a_socket_that_refuses_comes_back_as_an_error() {
-    let client = start(config(&[REFUSED.parse().unwrap()]), KEEPALIVE_INTERVAL).await;
+    let refused = REFUSED.parse().unwrap();
+    let client = start(config(&[refused]), KEEPALIVE_INTERVAL).await;
+    // As if it had answered a hello once, so the send goes as far as the socket.
+    client.support.answered(refused, Instant::now());
     let (raw, _) = body(1, 1);
 
     let error = answer(client.sending(&raw)).await.unwrap_err();
@@ -365,6 +385,9 @@ async fn one_relay_that_took_it_all_is_enough() {
     let mut relay = Relay::bind().await;
     let relays = [REFUSED.parse().unwrap(), relay.addr()];
     let client = start(config(&relays), KEEPALIVE_INTERVAL).await;
+    for relay in relays {
+        client.support.answered(relay, Instant::now());
+    }
     let (raw, datagrams) = body(1, 1);
     let send = client.sending(&raw);
 
@@ -373,6 +396,49 @@ async fn one_relay_that_took_it_all_is_enough() {
 
     answer(send).await.unwrap();
     assert_eq!(client.sender.sends().errors, 1);
+}
+
+/// A relay that never answers a hello has no bound path, so the block is not sent to it, and
+/// the caller hears so rather than an `Ok` for a body that went nowhere.
+#[tokio::test]
+async fn a_send_with_no_relay_that_has_the_path_fails() {
+    let mut relay = Relay::bind().await;
+    relay.answers_hellos = false;
+    let client = start(config(&[relay.addr()]), KEEPALIVE_INTERVAL).await;
+    let (raw, _) = body(1, 1);
+    let send = client.sending(&raw);
+
+    relay.read_until(|relay| !relay.hellos.is_empty()).await;
+    let error = answer(send).await.unwrap_err();
+
+    assert!(
+        matches!(error, TransportError::ConnectionRefused(_)),
+        "{error}"
+    );
+    assert!(relay.bound.is_empty());
+    assert_eq!(client.sender.sends().sent, 0);
+}
+
+/// Only the relay that answered gets the block; the legacy one beside it gets none of it.
+#[tokio::test]
+async fn only_relays_that_answered_get_the_bound_block() {
+    let (mut new, mut old) = (Relay::bind().await, Relay::bind().await);
+    old.answers_hellos = false;
+    let client = start(config(&[old.addr(), new.addr()]), KEEPALIVE_INTERVAL).await;
+    let (raw, datagrams) = body(1, 1);
+    let send = client.sending(&raw);
+
+    new.read_until(|relay| relay.bound.len() == datagrams.len())
+        .await;
+    answer(send).await.unwrap();
+    old.read_until(|relay| !relay.hellos.is_empty()).await;
+
+    assert!(
+        old.bound.is_empty(),
+        "a relay without the path got bound datagrams"
+    );
+    // A client that is not set up to receive bound objects says so in its hello.
+    assert_eq!(old.hellos[0] & bound_raw::HELLO_RECEIVES, 0);
 }
 
 /// A client that goes takes its queue with it, and each caller hears it did.

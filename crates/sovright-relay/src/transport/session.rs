@@ -156,6 +156,9 @@ pub struct RelaySession {
     /// Recently seen chunks for replay detection
     recent_chunks: HashMap<ChunkKey, Instant>,
     recent_order: VecDeque<(ChunkKey, Instant)>,
+    /// Whether the peer said it takes bound raw objects, by a bound hello. Absent, it is a
+    /// legacy peer, and a node sends it no bound object.
+    receives_bound: bool,
 }
 
 impl RelaySession {
@@ -190,6 +193,7 @@ impl RelaySession {
             pending_blocks: HashMap::new(),
             recent_chunks: HashMap::new(),
             recent_order: VecDeque::new(),
+            receives_bound: false,
         }
     }
 
@@ -205,6 +209,7 @@ impl RelaySession {
             pending_blocks: HashMap::new(),
             recent_chunks: HashMap::new(),
             recent_order: VecDeque::new(),
+            receives_bound: false,
         }
     }
 
@@ -220,6 +225,16 @@ impl RelaySession {
     /// The role this session was bound with at admission time.
     pub fn role(&self) -> KeyRole {
         self.role
+    }
+
+    /// Whether the peer announced, by a bound hello, that it takes bound raw objects.
+    pub fn receives_bound(&self) -> bool {
+        self.receives_bound
+    }
+
+    /// What the peer's latest bound hello said.
+    pub(crate) fn set_receives_bound(&mut self, receives: bool) {
+        self.receives_bound = receives;
     }
 
     /// Whether the session authenticated with a configured key.
