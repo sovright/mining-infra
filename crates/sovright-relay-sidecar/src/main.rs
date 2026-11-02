@@ -37,7 +37,7 @@ use sovright_relay_sidecar::submit::{
     SubmitRejectionClass, UnverifiedLimits, build_submission_candidate, handle_relay_compact_block,
     handle_relay_compact_block_with_mempool, handle_relay_raw_block, submit_unverified_raw_block,
     unreadable_body, validate_then_gate_compact_block, validate_then_gate_raw_block,
-    zebra_has_the_block,
+    zebra_has_the_block, zebra_refused_the_body,
 };
 use sovright_relay_sidecar::submit_gate::SubmitGate;
 use tokio::sync::Mutex as TokioMutex;
@@ -1094,6 +1094,7 @@ async fn handle_bound_block(block: BoundBlock, block_hash: [u8; 32], work: Block
     );
     let delivered = matches!(outcome, Ok(SubmissionOutcome::Submitted { .. }));
     let known_to_zebra = zebra_has_the_block(&outcome, gate.map(Arc::as_ref)).await;
+    let refused = zebra_refused_the_body(&outcome);
     if passed && gate.is_some() {
         metrics.inc_submit_gate_accepted();
     }
@@ -1104,6 +1105,10 @@ async fn handle_bound_block(block: BoundBlock, block_hash: [u8; 32], work: Block
     log_submission_outcome(outcome, metrics.as_ref(), Some(first_seen_to_submit_ms));
     if delivered || known_to_zebra {
         block.finish();
+    } else if refused {
+        // Free the place this body holds at the relays, so a rival body of the block can
+        // come in behind it: a node lets one key hold only a few bodies of a block.
+        block.refuse();
     } else {
         block.give_back();
     }

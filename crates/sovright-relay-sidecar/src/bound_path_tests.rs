@@ -613,6 +613,17 @@ fn large_block(fill: u8) -> Vec<u8> {
     raw_block(&committed_header(fill, &txs), &txs)
 }
 
+/// As [`large_block`], dated as block `1` is. A node refuses a header far older than the
+/// newest it has seen, and a synthetic header's time is its fill.
+fn large_block_dated_as_the_first(fill: u8) -> Vec<u8> {
+    let txs: Vec<Vec<u8>> = (0..16)
+        .map(|at| parseable_transaction_with_script(at + u32::from(fill), 4096))
+        .collect();
+    let mut header = committed_header(fill, &txs);
+    header[100..104].copy_from_slice(&[1; 4]);
+    raw_block(&header, &txs)
+}
+
 async fn send_legacy(sender: &BlockSender, raw: &[u8]) {
     let hash = zcash_block_hash(&raw[..ZCASH_FULL_HEADER_SIZE]);
     for segment in split_raw_block(hash, raw, 10 * 1124 - 4).unwrap() {
@@ -778,12 +789,12 @@ async fn known_gap_a_legacy_receiver_still_loses_the_right_body_after_a_bad_one(
     node.has_a_receiver().await;
     let (sender, sender_task) = start_sender(node.addr).await;
 
-    send_dual(&sender, &bad).await;
+    send_dual(&sender, &bad, true).await;
     let zebra = Arc::clone(&sidecar.zebra);
     let wanted = bad.clone();
     until("the refusal", move || zebra.calls_for(&wanted) == 1).await;
 
-    send_dual(&sender, &real).await;
+    send_dual(&sender, &real, true).await;
     behind_a_marker(&sender, &sidecar).await;
 
     assert_eq!(sidecar.zebra.calls_for(&real), 0, "the client dropped it");
@@ -820,9 +831,29 @@ async fn two_copies_of_a_block_reach_zebra_once() {
     stop(node, [sidecar.client_task, first_task, second_task]);
 }
 
+/// A copy of a body Zebra refused is turned away, at the relay or at the gate. The receiver
+/// tells its relays of the refusal, and a relay then keeps the body out for a while; a copy
+/// that crossed before that word arrived meets the gate's own memory of the refusal.
+async fn a_refused_copy_is_turned_away(node: &Node, sidecar: &Sidecar) {
+    let live = Arc::clone(&node.node);
+    let metrics = Arc::clone(&sidecar.metrics);
+    until("the refused body to be turned away", move || {
+        let at_the_relay = live
+            .view()
+            .usage
+            .is_some_and(|usage| usage.anchors_refused_as_released > 0);
+        let at_the_gate = metrics
+            .submit_gate_rejected_refused_body
+            .load(Ordering::Relaxed)
+            > 0;
+        at_the_relay || at_the_gate
+    })
+    .await;
+}
+
 /// Review item 1 on #134: a body Zebra refused is remembered for the dedup window, so a later
-/// copy of the same bytes, here from another connection, is turned away at the gate instead of
-/// spending a Zebra call. For the sender's own connection, see
+/// copy of the same bytes, here from another connection, is turned away instead of spending a
+/// Zebra call. The relays are told too, so most copies stop there. For the sender's own connection, see
 /// `the_same_connection_cannot_send_a_refused_body_again`.
 #[tokio::test]
 async fn another_connection_cannot_send_a_refused_body_again() {
@@ -844,13 +875,13 @@ async fn another_connection_cannot_send_a_refused_body_again() {
 
     send_bound(&again, &real).await;
 
-    sidecar.turned_away_as_refused(1).await;
+    a_refused_copy_is_turned_away(&node, &sidecar).await;
     assert_eq!(sidecar.zebra.calls_for(&real), 1);
     assert!(!sidecar.zebra.took(&real));
     stop(node, [sidecar.client_task, sender_task, again_task]);
 }
 
-/// The same bytes on the same connection, after a refusal, are turned away at the gate.
+/// The same bytes on the same connection, after a refusal, are turned away.
 #[tokio::test]
 async fn the_same_connection_cannot_send_a_refused_body_again() {
     let real = the_real_block();
@@ -870,7 +901,7 @@ async fn the_same_connection_cannot_send_a_refused_body_again() {
 
     send_bound(&sender, &real).await;
 
-    sidecar.turned_away_as_refused(1).await;
+    a_refused_copy_is_turned_away(&node, &sidecar).await;
     assert_eq!(sidecar.zebra.calls_for(&real), 1);
     assert!(!sidecar.zebra.took(&real));
     stop(node, [sidecar.client_task, sender_task]);
@@ -904,11 +935,12 @@ async fn the_same_connection_can_send_a_body_again_after_a_zebra_error() {
 }
 
 /// The same bytes on the same connection, after the layer below evicted an unfinished set.
-/// Through the node, unlike `an_evicted_body_lets_go_and_can_come_again`.
+/// Through the node, unlike `an_evicted_body_lets_go_and_can_come_again`. The unfinished set
+/// goes only once it is quiet (review item 4 on #134), so the next block waits that long.
 #[tokio::test]
 async fn the_same_connection_can_send_an_evicted_body_again() {
     let node = stub_pow_node_with(resends_at_once()).await;
-    let (evicted, next) = (large_block(1), large_block(2));
+    let (evicted, next) = (large_block(1), large_block_dated_as_the_first(2));
     let mut config = BoundRawConfig::default();
     config.stack.buffer.max_sets = 1;
     config.stack.buffer.max_sets_per_block = 1;
@@ -1327,7 +1359,7 @@ async fn an_unfinished_body_expires_and_a_copy_goes_through() {
 #[tokio::test]
 async fn an_evicted_body_lets_go_and_can_come_again() {
     let node = stub_pow_node(true).await;
-    let (evicted, next) = (large_block(1), large_block(2));
+    let (evicted, next) = (large_block(1), large_block_dated_as_the_first(2));
     let mut config = BoundRawConfig::default();
     config.stack.buffer.max_sets = 1;
     config.stack.buffer.max_sets_per_block = 1;
@@ -2598,11 +2630,30 @@ async fn a_compact_copy_during_a_bound_task_waits_and_is_then_a_repeat() {
     stop(node, [sidecar.client_task, sender_task]);
 }
 
+/// A key of its own for each sender, beside the fleet's.
+fn sender_key(at: u8) -> [u8; 32] {
+    [0x50 + at; 32]
+}
+
+/// A stubbed node that also takes `senders` keys of their own: a node lets one key hold only
+/// a few bodies of a block, so a test of many bodies at once needs many keys.
+async fn stub_pow_node_for(senders: u8) -> Node {
+    let mut keys = vec![AuthKey::new("fleet", KEY)];
+    keys.extend((0..senders).map(|at| AuthKey::new(format!("sender-{at}"), sender_key(at))));
+    let config = RelayConfig::new("127.0.0.1:0".parse().unwrap())
+        .with_authorized_keys(keys)
+        .with_fec(10, 3)
+        .with_bound_raw(Default::default());
+    Node::start(RelayNode::with_validator(config, StubPowValidator).unwrap()).await
+}
+
 /// Different bodies of one block may run side by side, as any of them may be the block, and the
-/// gate's limits hold all the same. The last one finds them spent and never reaches Zebra.
+/// gate's limits hold all the same. The last one finds them spent and never reaches Zebra. Each
+/// body comes from a key of its own, as the node lets one key hold only a few of a block.
 #[tokio::test]
 async fn bodies_of_one_block_run_side_by_side_inside_the_gate_limits() {
-    let node = stub_pow_node(true).await;
+    let limit = DEFAULT_STRICT_BODIES_PER_BLOCK as u64;
+    let node = stub_pow_node_for(limit as u8 + 1).await;
     let options = SidecarOptions {
         limits: BoundTaskLimits {
             running: 8,
@@ -2611,7 +2662,6 @@ async fn bodies_of_one_block_run_side_by_side_inside_the_gate_limits() {
         ..Default::default()
     };
     let sidecar = start_sidecar_from(node.addr, options).await;
-    let limit = DEFAULT_STRICT_BODIES_PER_BLOCK as u64;
     let bodies: Vec<Vec<u8>> = (1..=limit as u8 + 1).map(body_marked).collect();
     for body in &bodies {
         sidecar.zebra.knows_of(body);
@@ -2619,17 +2669,25 @@ async fn bodies_of_one_block_run_side_by_side_inside_the_gate_limits() {
     }
     let permits = sidecar.zebra.hold();
     node.has_a_receiver().await;
-    let (sender, sender_task) = start_sender(node.addr).await;
-
-    for body in &bodies {
+    let mut tasks = Vec::new();
+    for (at, body) in bodies.iter().enumerate() {
+        let key = sender_key(at as u8);
+        let config = ClientConfig::new(vec![node.addr], key)
+            .with_bind_addr("127.0.0.1:0".parse().unwrap())
+            .with_auth_required(true)
+            .with_fec(10, 3)
+            .with_send_pacing(32, Duration::from_micros(200));
+        let (sender, task) = start_sender_with(config).await;
         send_bound(&sender, body).await;
+        tasks.push(task);
     }
     held_at_zebra(&sidecar, limit).await;
     permits.add_permits(bodies.len());
     sidecar.ledger_settled().await;
 
     assert_eq!(sidecar.zebra.calls(), limit as usize);
-    stop(node, [sidecar.client_task, sender_task]);
+    tasks.push(sidecar.client_task);
+    stop(node, tasks);
 }
 
 /// Known gap, and left as it is: the legacy paths still run on this task, so a held legacy call
@@ -2660,8 +2718,14 @@ async fn known_gap_a_held_legacy_zebra_call_still_stops_this_task() {
     stop(node, [sidecar.client_task, sender_task]);
 }
 
-async fn send_dual(sender: &BlockSender, raw: &[u8]) {
-    tokio::join!(send_legacy(sender, raw), send_bound(sender, raw));
+/// Both copies. The bound one is refused at the sender when no relay has answered its hello,
+/// and the legacy one goes all the same.
+async fn send_dual(sender: &BlockSender, raw: &[u8], bound_answered: bool) {
+    let ((), bound) = tokio::join!(
+        send_legacy(sender, raw),
+        sender.send_bound_raw_block(Arc::new(raw.to_vec()))
+    );
+    assert_eq!(bound.is_ok(), bound_answered, "{bound:?}");
 }
 
 /// How many times the block reached Zebra. A stubbed node, so a marker can follow it.
@@ -2677,10 +2741,19 @@ async fn mixed(node_bound: bool, receiver_bound: bool, send: Wire) -> usize {
     node.has_a_receiver().await;
     let (sender, sender_task) = start_sender(node.addr).await;
 
+    // A legacy relay never answers the bound hello, so the sender keeps its bound copy back
+    // rather than send what that relay would drop.
     match send {
         Wire::Legacy => send_legacy(&sender, &real).await,
-        Wire::Dual => send_dual(&sender, &real).await,
-        Wire::Bound => send_bound(&sender, &real).await,
+        Wire::Dual => send_dual(&sender, &real, node_bound).await,
+        Wire::Bound if node_bound => send_bound(&sender, &real).await,
+        Wire::Bound => {
+            let refused = sender.send_bound_raw_block(Arc::new(real.clone())).await;
+            assert!(
+                matches!(refused, Err(TransportError::ConnectionRefused(_))),
+                "{refused:?}"
+            );
+        }
     }
     behind_a_marker(&sender, &sidecar).await;
 

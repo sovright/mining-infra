@@ -892,6 +892,22 @@ where
     }
 }
 
+/// True when Zebra said this body is wrong, now or within the gate's memory of it. Only
+/// then may the relays be told to free the place the body holds for a rival body of its
+/// block: a transport failure, an `inconclusive` or a lost race says nothing against it.
+pub fn zebra_refused_the_body(outcome: &Result<SubmissionOutcome, RelayBlockError>) -> bool {
+    matches!(
+        outcome,
+        Err(RelayBlockError::SubmitRejected(
+            _,
+            SubmitRejectionClass::Invalid | SubmitRejectionClass::Unknown
+        )) | Ok(SubmissionOutcome::GateRejected {
+            reason: crate::submit_gate::RejectReason::RefusedBody,
+            ..
+        })
+    )
+}
+
 /// The refusal the emergency bypass may override, if this is one. A transaction that
 /// did not parse is the only one: anything else is a finding about the body.
 pub fn unreadable_body(
