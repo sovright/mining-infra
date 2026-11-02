@@ -450,8 +450,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // lifetime is bound by the main loop. Dropping the chain_view
             // Arc on shutdown cancels the poller.
             let _poller = Arc::clone(&chain_view).start(Arc::clone(&rpc));
+            let mut gate_config = cfg.to_gate_config();
+            // The bound path brings competing bodies of one block, and a legacy gate would
+            // let the first of them close the block whatever Zebra says of it.
+            if bound_raw && !gate_config.competing_bodies {
+                info!("Bound raw switch on: the submit gate runs its competing-body rules");
+                gate_config.competing_bodies = true;
+            }
             let gate = Arc::new(TokioMutex::new(SubmitGate::new(
-                cfg.to_gate_config(),
+                gate_config,
                 Arc::clone(&chain_view),
             )));
             info!("Safety gate enabled");
@@ -850,12 +857,16 @@ async fn handle_bound_block(block: BoundBlock, block_hash: [u8; 32], work: Block
         block.give_back();
         return false;
     }
-    let delivered = matches!(
+    // A dry run passed the gate but told Zebra nothing, so it is not a delivery: counting
+    // it as one would close the block on a body nobody checked, and the real body would
+    // never be measured.
+    let passed = matches!(
         outcome,
         Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_))
     );
+    let delivered = matches!(outcome, Ok(SubmissionOutcome::Submitted { .. }));
     let known_to_zebra = zebra_has_the_block(&outcome, gate.map(Arc::as_ref)).await;
-    if delivered && gate.is_some() {
+    if passed && gate.is_some() {
         metrics.inc_submit_gate_accepted();
     }
     let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
@@ -2018,6 +2029,7 @@ struct SidecarMetrics {
     submit_rejections_race_lost: AtomicU64,
     submit_rejections_invalid: AtomicU64,
     submit_rejections_unknown: AtomicU64,
+    submit_rejections_inconclusive: AtomicU64,
     not_submit_candidates: AtomicU64,
     /// Per-cause counters for the submit safety gate. Incremented in
     /// `handle_relay_*_block_with_gate` so the staging service can attribute
@@ -2029,6 +2041,7 @@ struct SidecarMetrics {
     submit_gate_rejected_duplicate: AtomicU64,
     submit_gate_rejected_unverified_limit: AtomicU64,
     submit_gate_rejected_strict_limit: AtomicU64,
+    submit_gate_rejected_refused_body: AtomicU64,
     block_body_unverified: AtomicU64,
     unreadable_submit_enabled: AtomicBool,
     raw_segment_incomplete_blocks: AtomicUsize,
@@ -2203,6 +2216,7 @@ impl SidecarMetrics {
             SubmitRejectionClass::RaceLost => &self.submit_rejections_race_lost,
             SubmitRejectionClass::Invalid => &self.submit_rejections_invalid,
             SubmitRejectionClass::Unknown => &self.submit_rejections_unknown,
+            SubmitRejectionClass::Inconclusive => &self.submit_rejections_inconclusive,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -2240,6 +2254,9 @@ impl SidecarMetrics {
             }
             sovright_relay_sidecar::submit_gate::RejectReason::StrictLimit => {
                 &self.submit_gate_rejected_strict_limit
+            }
+            sovright_relay_sidecar::submit_gate::RejectReason::RefusedBody => {
+                &self.submit_gate_rejected_refused_body
             }
         };
         counter.fetch_add(1, Ordering::Relaxed);
@@ -2564,6 +2581,15 @@ impl SidecarMetrics {
             "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"strict_limit\"}} {}\n",
             self.submit_gate_rejected_strict_limit
                 .load(Ordering::Relaxed)
+        ));
+        text.push_str(&format!(
+            "sovright_relay_sidecar_submit_gate_rejected_total{{reason=\"refused_body\"}} {}\n",
+            self.submit_gate_rejected_refused_body
+                .load(Ordering::Relaxed)
+        ));
+        text.push_str(&format!(
+            "sovright_relay_sidecar_relay_submit_rejections_total{{reason=\"inconclusive\"}} {}\n",
+            self.submit_rejections_inconclusive.load(Ordering::Relaxed)
         ));
         text.push_str(&format!(
             "# TYPE sovright_relay_sidecar_relay_block_body_unverified_total counter\n\

@@ -414,8 +414,10 @@ async fn start_sidecar_from(node: SocketAddr, options: SidecarOptions) -> Sideca
     chain_view.set_tip_height(100);
     let gate = gate.then(|| {
         Arc::new(TokioMutex::new(SubmitGate::new(
+            // As the sidecar runs it with the bound raw switch on.
             GateConfig {
                 enabled: true,
+                competing_bodies: true,
                 ..GateConfig::default()
             },
             Arc::clone(&chain_view),
@@ -507,6 +509,18 @@ impl Sidecar {
         })
         .await;
         assert!(waited.is_ok(), "gave up waiting for the gate to learn");
+    }
+
+    /// Waits until the gate has turned this many copies away as bodies Zebra refused.
+    async fn turned_away_as_refused(&self, copies: u64) {
+        let metrics = Arc::clone(&self.metrics);
+        until("the gate to turn a refused body away", move || {
+            metrics
+                .submit_gate_rejected_refused_body
+                .load(Ordering::Relaxed)
+                >= copies
+        })
+        .await;
     }
 
     fn turned_away_as_repeats(&self) -> u64 {
@@ -806,12 +820,12 @@ async fn two_copies_of_a_block_reach_zebra_once() {
     stop(node, [sidecar.client_task, first_task, second_task]);
 }
 
-/// A body Zebra turned down is not marked as bad: that answer is not shown to be final,
-/// so a later copy of the same bytes gets its turn. This one comes on another connection,
-/// whose node record is its own, so it says nothing of the sender's own connection. For
-/// that, see `the_same_connection_can_send_a_refused_body_again`.
+/// Review item 1 on #134: a body Zebra refused is remembered for the dedup window, so a later
+/// copy of the same bytes, here from another connection, is turned away at the gate instead of
+/// spending a Zebra call. For the sender's own connection, see
+/// `the_same_connection_cannot_send_a_refused_body_again`.
 #[tokio::test]
-async fn another_connection_can_send_a_refused_body() {
+async fn another_connection_cannot_send_a_refused_body_again() {
     let real = the_real_block();
     let node = equihash_node(true).await;
     let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
@@ -830,15 +844,15 @@ async fn another_connection_can_send_a_refused_body() {
 
     send_bound(&again, &real).await;
 
-    let zebra = Arc::clone(&sidecar.zebra);
-    let wanted = real.clone();
-    until("the block", move || zebra.took(&wanted)).await;
+    sidecar.turned_away_as_refused(1).await;
+    assert_eq!(sidecar.zebra.calls_for(&real), 1);
+    assert!(!sidecar.zebra.took(&real));
     stop(node, [sidecar.client_task, sender_task, again_task]);
 }
 
-/// The same bytes on the same connection, after a refusal.
+/// The same bytes on the same connection, after a refusal, are turned away at the gate.
 #[tokio::test]
-async fn the_same_connection_can_send_a_refused_body_again() {
+async fn the_same_connection_cannot_send_a_refused_body_again() {
     let real = the_real_block();
     let node = resending_equihash_node().await;
     let sidecar = start_sidecar(node.addr, Some(Default::default())).await;
@@ -856,10 +870,9 @@ async fn the_same_connection_can_send_a_refused_body_again() {
 
     send_bound(&sender, &real).await;
 
-    let zebra = Arc::clone(&sidecar.zebra);
-    let wanted = real.clone();
-    until("the block", move || zebra.took(&wanted)).await;
-    assert_eq!(sidecar.zebra.calls_for(&real), 2);
+    sidecar.turned_away_as_refused(1).await;
+    assert_eq!(sidecar.zebra.calls_for(&real), 1);
+    assert!(!sidecar.zebra.took(&real));
     stop(node, [sidecar.client_task, sender_task]);
 }
 
@@ -2368,6 +2381,15 @@ async fn a_copy_behind_a_full_room(by: CopyBy, ends: TaskEnds) {
         permits.add_permits(blocks.len());
         let (zebra, wanted) = (Arc::clone(&sidecar.zebra), block.clone());
         until("the refusal", move || zebra.calls_for(&wanted) == 1).await;
+        // Review item 1 on #134: the copy is the bytes Zebra just refused, so the gate turns
+        // it away without another call, and nothing stays owned.
+        sidecar.turned_away_as_refused(1).await;
+        assert_eq!(sidecar.zebra.arrivals_for(block), 1);
+        sidecar.zebra.stop_holding();
+        permits.add_permits(blocks.len() + 1);
+        sidecar.ledger_settled().await;
+        stop(node, [sidecar.client_task, sender_task]);
+        return;
     }
     held_at_zebra(&sidecar, blocks.len() as u64 + 1).await;
     sidecar.zebra.stop_refusing();
@@ -2393,7 +2415,7 @@ async fn a_copy_behind_a_full_room(by: CopyBy, ends: TaskEnds) {
 }
 
 #[tokio::test]
-async fn a_legacy_copy_behind_a_full_room_is_the_retry_after_a_refusal() {
+async fn a_legacy_copy_behind_a_full_room_is_turned_away_after_a_refusal() {
     a_copy_behind_a_full_room(CopyBy::Legacy, TaskEnds::Refused).await;
 }
 
@@ -2403,7 +2425,7 @@ async fn a_legacy_copy_behind_a_full_room_is_the_retry_after_the_budget() {
 }
 
 #[tokio::test]
-async fn a_compact_copy_behind_a_full_room_is_the_retry_after_a_refusal() {
+async fn a_compact_copy_behind_a_full_room_is_turned_away_after_a_refusal() {
     a_copy_behind_a_full_room(CopyBy::Compact, TaskEnds::Refused).await;
 }
 

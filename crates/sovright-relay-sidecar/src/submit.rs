@@ -87,6 +87,9 @@ pub enum SubmitRejectionClass {
     Invalid,
     /// The follow-up lookup failed, so the rejection cannot be attributed.
     Unknown,
+    /// Zebra answered `inconclusive`: it could not decide the block yet, for example
+    /// because it does not extend the best chain. Not a finding against the body.
+    Inconclusive,
 }
 
 impl SubmitRejectionClass {
@@ -95,6 +98,7 @@ impl SubmitRejectionClass {
             SubmitRejectionClass::RaceLost => "race_lost",
             SubmitRejectionClass::Invalid => "invalid",
             SubmitRejectionClass::Unknown => "unknown",
+            SubmitRejectionClass::Inconclusive => "inconclusive",
         }
     }
 
@@ -639,8 +643,15 @@ where
 {
     let candidate = build_submission_candidate(compact)?;
     let parent = look_up_parent().await;
-    let meta = candidate_meta(&candidate, &compact.header, parent.as_ref())?;
-    submit_without_the_gate_lock(submitter, candidate, &meta, mode, gate).await
+    gate_and_submit(
+        submitter,
+        candidate,
+        &compact.header,
+        mode,
+        gate,
+        parent.as_ref(),
+    )
+    .await
 }
 
 /// [`validate_then_gate_compact_block`] for a reassembled raw block.
@@ -661,7 +672,30 @@ where
     let candidate = build_raw_block_submission_candidate(raw_block, expected_block_hash)?;
     let header = raw_block_header(raw_block)?;
     let parent = look_up_parent().await;
-    let meta = candidate_meta(&candidate, header, parent.as_ref())?;
+    gate_and_submit(submitter, candidate, header, mode, gate, parent.as_ref()).await
+}
+
+/// The legacy gate holds its lock across the Zebra call and marks the block when the
+/// candidate passes, as it always has. The competing-body gate holds it only to reserve
+/// and to record.
+async fn gate_and_submit<S, V>(
+    submitter: &S,
+    candidate: SubmissionCandidate,
+    header: &[u8],
+    mode: SubmitBlockMode,
+    gate: &tokio::sync::Mutex<crate::submit_gate::SubmitGate<V>>,
+    parent: Option<&crate::submit_gate::ParentObservation>,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+{
+    let mut held = gate.lock().await;
+    if !held.competing_bodies() {
+        return submit_through_gate(submitter, candidate, header, mode, &mut held, parent).await;
+    }
+    drop(held);
+    let meta = candidate_meta(&candidate, header, parent)?;
     submit_without_the_gate_lock(submitter, candidate, &meta, mode, gate).await
 }
 
@@ -691,34 +725,42 @@ fn candidate_meta(
     .map_err(candidate_meta_error)
 }
 
-/// A reserved candidate to Zebra, and what it said. `true` if Zebra has the block, whatever
-/// the result says, because that is all that may close the block at the gate.
+/// A reserved candidate to Zebra, and what it said: the gate's answer for it, `None` if
+/// the call failed in transit, and the result.
 async fn ask_zebra<S>(
     submitter: &S,
     candidate: &SubmissionCandidate,
-) -> (bool, Result<SubmitBlockStatus, RelayBlockError>)
+) -> (
+    Option<crate::submit_gate::StrictAnswer>,
+    Result<SubmitBlockStatus, RelayBlockError>,
+)
 where
     S: SubmitBlock + Sync,
 {
+    use crate::submit_gate::StrictAnswer;
     let result = match submitter.submit_block(&candidate.block_hex).await {
         Ok(result) => result,
-        Err(error) => return (false, Err(RelayBlockError::SubmitFailed(error.to_string()))),
+        Err(error) => return (None, Err(RelayBlockError::SubmitFailed(error.to_string()))),
     };
     let status =
         classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash).await;
-    let known = matches!(
-        status,
-        Ok(_)
-            | Err(RelayBlockError::SubmitRejected(
-                _,
-                SubmitRejectionClass::RaceLost
-            ))
-    );
-    (known, status)
+    let answer = match &status {
+        Ok(_) | Err(RelayBlockError::SubmitRejected(_, SubmitRejectionClass::RaceLost)) => {
+            StrictAnswer::Known
+        }
+        Err(RelayBlockError::SubmitRejected(_, SubmitRejectionClass::Inconclusive)) => {
+            StrictAnswer::Undecided
+        }
+        Err(RelayBlockError::SubmitRejected(..)) => StrictAnswer::Refused,
+        // Classification only ever ends in a status or a rejection.
+        Err(_) => return (None, status),
+    };
+    (Some(answer), status)
 }
 
-/// The gate, held only to reserve and to record, so a slow Zebra call stops no one. Ending
-/// any way but an answer that Zebra has the block leaves nothing recorded.
+/// The competing-body gate, held only to reserve and to record, so a slow Zebra call
+/// stops no one. Only Zebra's answer is recorded: a call that fails in transit, times out
+/// or is cancelled records nothing, and gives the body's place back.
 async fn submit_without_the_gate_lock<S, V>(
     submitter: &S,
     candidate: SubmissionCandidate,
@@ -742,9 +784,11 @@ where
     if dry_run {
         return Ok(SubmissionOutcome::DryRun(candidate));
     }
-    let (known, status) = ask_zebra(submitter, &candidate).await;
-    if known {
-        gate.lock().await.record_submitted_now(&candidate);
+    let (answer, status) = ask_zebra(submitter, &candidate).await;
+    if let Some(answer) = answer {
+        gate.lock()
+            .await
+            .record_strict_answer_now(&candidate, answer);
     }
     drop(slot);
     Ok(SubmissionOutcome::Submitted {
@@ -754,6 +798,38 @@ where
 }
 
 /// [`submit_without_the_gate_lock`] for a caller that has the gate to itself.
+async fn submit_holding_the_competing_gate<S, V>(
+    submitter: &S,
+    candidate: SubmissionCandidate,
+    meta: &crate::submit_gate::CandidateMeta,
+    mode: SubmitBlockMode,
+    gate: &mut crate::submit_gate::SubmitGate<V>,
+) -> Result<SubmissionOutcome, RelayBlockError>
+where
+    S: SubmitBlock + Sync,
+    V: crate::submit_gate::ChainView,
+{
+    let dry_run = mode == SubmitBlockMode::DryRun;
+    let slot = match gate.reserve_strict_now(&candidate, meta, dry_run) {
+        Ok(slot) => slot,
+        Err(reason) => return Ok(SubmissionOutcome::GateRejected { candidate, reason }),
+    };
+    if dry_run {
+        return Ok(SubmissionOutcome::DryRun(candidate));
+    }
+    let (answer, status) = ask_zebra(submitter, &candidate).await;
+    if let Some(answer) = answer {
+        gate.record_strict_answer_now(&candidate, answer);
+    }
+    drop(slot);
+    Ok(SubmissionOutcome::Submitted {
+        status: status?,
+        candidate,
+    })
+}
+
+/// Run a validated candidate through the legacy gate and, if it passes, the mode. The
+/// caller holds the gate across the Zebra call.
 async fn submit_through_gate<S, V>(
     submitter: &S,
     candidate: SubmissionCandidate,
@@ -767,23 +843,30 @@ where
     V: crate::submit_gate::ChainView,
 {
     let meta = candidate_meta(&candidate, header, parent)?;
-    let dry_run = mode == SubmitBlockMode::DryRun;
-    let slot = match gate.reserve_strict_now(&candidate, &meta, dry_run) {
-        Ok(slot) => slot,
-        Err(reason) => return Ok(SubmissionOutcome::GateRejected { candidate, reason }),
-    };
-    if dry_run {
-        return Ok(SubmissionOutcome::DryRun(candidate));
+    if gate.competing_bodies() {
+        return submit_holding_the_competing_gate(submitter, candidate, &meta, mode, gate).await;
     }
-    let (known, status) = ask_zebra(submitter, &candidate).await;
-    if known {
-        gate.record_submitted_now(&candidate);
+
+    match gate.apply_now(&candidate, &meta) {
+        crate::submit_gate::GateDecision::Accept => {}
+        crate::submit_gate::GateDecision::Reject(reason) => {
+            return Ok(SubmissionOutcome::GateRejected { candidate, reason });
+        }
     }
-    drop(slot);
-    Ok(SubmissionOutcome::Submitted {
-        status: status?,
-        candidate,
-    })
+
+    match mode {
+        SubmitBlockMode::DryRun => Ok(SubmissionOutcome::DryRun(candidate)),
+        SubmitBlockMode::Live => {
+            let result = submitter
+                .submit_block(&candidate.block_hex)
+                .await
+                .map_err(|error| RelayBlockError::SubmitFailed(error.to_string()))?;
+            let status =
+                classify_submitblock_outcome(result, submitter, &candidate.consensus_block_hash)
+                    .await?;
+            Ok(SubmissionOutcome::Submitted { candidate, status })
+        }
+    }
 }
 
 /// Whether this outcome means Zebra has the block, even though this body was not what
@@ -932,6 +1015,12 @@ async fn classify_submitblock_outcome<S: SubmitBlock + ?Sized>(
 ) -> Result<SubmitBlockStatus, RelayBlockError> {
     match classify_submitblock_result(result) {
         Ok(status) => Ok(status),
+        // BIP 22: Zebra could not decide. Nothing is wrong with the body, so it is not
+        // counted as invalid. "duplicate-inconclusive" means Zebra has the block, which the
+        // lookup below reports as a lost race.
+        Err(RelayBlockError::SubmitRejected(reason, _)) if reason == "inconclusive" => Err(
+            RelayBlockError::SubmitRejected(reason, SubmitRejectionClass::Inconclusive),
+        ),
         Err(RelayBlockError::SubmitRejected(reason, _)) => {
             // One extra RPC, only on the rejection path.
             let known = submitter.block_known(consensus_block_hash).await;

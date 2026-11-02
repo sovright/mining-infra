@@ -177,6 +177,16 @@ pub struct SubmitGateConfig {
     /// an attempt can run past this. Default 10.
     #[serde(default = "default_submit_gate_unreadable_budget_secs")]
     pub unreadable_submit_budget_secs: u64,
+    /// #130 competing-body rules, off by default, which keeps the legacy gate. When on,
+    /// only Zebra's answer closes a block, the gate is not held across the Zebra call,
+    /// and `strict_bodies_per_block` bounds the bodies of one block. The bound raw switch
+    /// turns this on by itself.
+    #[serde(default)]
+    pub competing_bodies: bool,
+    /// With `competing_bodies`: different bodies of one block that may get an answer from
+    /// Zebra per dedup window. Default 4.
+    #[serde(default = "default_submit_gate_strict_bodies")]
+    pub strict_bodies_per_block: usize,
 }
 
 impl Default for SubmitGateConfig {
@@ -189,6 +199,8 @@ impl Default for SubmitGateConfig {
             submit_unreadable_blocks: false,
             unreadable_attempts_per_block: default_submit_gate_unreadable_attempts(),
             unreadable_submit_budget_secs: default_submit_gate_unreadable_budget_secs(),
+            competing_bodies: false,
+            strict_bodies_per_block: default_submit_gate_strict_bodies(),
         }
     }
 }
@@ -202,9 +214,32 @@ impl SubmitGateConfig {
             dedup_window: std::time::Duration::from_secs(self.dedup_window_secs),
             dedup_capacity: self.dedup_capacity,
             unreadable_attempts_per_block: self.unreadable_attempts_per_block,
-            ..crate::submit_gate::GateConfig::default()
+            competing_bodies: self.competing_bodies,
+            strict_bodies_per_block: self.strict_bodies_per_block,
         }
     }
+
+    /// Settings no gate can run with. Checked when the config is loaded.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.dedup_capacity == 0 {
+            return Err(
+                "submit_gate.dedup_capacity must be at least 1: a gate with no room remembers \
+                 nothing, so every copy of a block would reach Zebra"
+                    .to_string(),
+            );
+        }
+        if self.competing_bodies && self.strict_bodies_per_block == 0 {
+            return Err(
+                "submit_gate.strict_bodies_per_block must be at least 1 with competing_bodies"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_submit_gate_strict_bodies() -> usize {
+    crate::submit_gate::DEFAULT_STRICT_BODIES_PER_BLOCK
 }
 
 fn default_submit_gate_unreadable_budget_secs() -> u64 {
@@ -284,6 +319,7 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
+        config.submit_gate.validate()?;
         Ok(config)
     }
 
@@ -459,6 +495,41 @@ mod tests {
 
         assert_eq!(config.send_burst_packets, 32);
         assert_eq!(config.send_burst_delay_micros, 1000);
+    }
+
+    /// Review item 9 on #134: a gate that cannot remember is refused at load.
+    #[test]
+    fn a_zero_dedup_capacity_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar.toml");
+        std::fs::write(
+            &path,
+            "relay_peers = []\n[submit_gate]\nenabled = true\ndedup_capacity = 0\n",
+        )
+        .unwrap();
+        let error = Config::from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("dedup_capacity"), "{error}");
+
+        std::fs::write(
+            &path,
+            "relay_peers = []\n[submit_gate]\nenabled = true\ndedup_capacity = 1\n",
+        )
+        .unwrap();
+        assert!(Config::from_file(&path).is_ok());
+    }
+
+    #[test]
+    fn the_competing_body_gate_is_off_by_default_and_can_be_turned_on() {
+        let gate = SubmitGateConfig::default().to_gate_config();
+        assert!(!gate.competing_bodies);
+        let config: SubmitGateConfig =
+            toml::from_str("competing_bodies = true\nstrict_bodies_per_block = 2").unwrap();
+        let gate = config.to_gate_config();
+        assert!(gate.competing_bodies);
+        assert_eq!(gate.strict_bodies_per_block, 2);
+        let config: SubmitGateConfig =
+            toml::from_str("competing_bodies = true\nstrict_bodies_per_block = 0").unwrap();
+        assert!(config.validate().is_err());
     }
 
     #[test]

@@ -43,7 +43,7 @@
 //! All four decisions are independent and emit distinct rejection variants
 //! so metrics can attribute the cause precisely.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -78,9 +78,15 @@ pub struct GateConfig {
     pub dedup_capacity: usize,
     /// Unverified attempts per block in a dedup window. Default 4.
     pub unreadable_attempts_per_block: usize,
-    /// Zebra calls for one block in a dedup window, by bodies the strict reader passed.
-    pub strict_attempts_per_block: usize,
-    /// Different bodies of one block the strict reader passed, in a dedup window.
+    /// #130 competing-body gate. Default false, which keeps the legacy gate exactly:
+    /// the dedup mark is written when a candidate passes, and the gate lock is held
+    /// across the Zebra call. When true, only Zebra's answer closes a block (so a body
+    /// Zebra refuses cannot hide the real one), the lock is released for the Zebra
+    /// call, and the limits below apply. The bound raw path turns this on.
+    pub competing_bodies: bool,
+    /// With `competing_bodies`: different bodies of one block that may get a definitive
+    /// answer from Zebra in a dedup window, counting those at Zebra now. Repeats of a
+    /// body and calls that failed in transit are not counted.
     pub strict_bodies_per_block: usize,
 }
 
@@ -92,7 +98,7 @@ impl Default for GateConfig {
             dedup_window: Duration::from_secs(300),
             dedup_capacity: 256,
             unreadable_attempts_per_block: DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK,
-            strict_attempts_per_block: DEFAULT_STRICT_ATTEMPTS_PER_BLOCK,
+            competing_bodies: false,
             strict_bodies_per_block: DEFAULT_STRICT_BODIES_PER_BLOCK,
         }
     }
@@ -104,11 +110,12 @@ impl Default for GateConfig {
 /// holding a real header can still use all of it.
 pub const DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK: usize = 4;
 
-/// Research values for #130 PR B, and nobody's decision. Bodies a real header can carry
-/// and the strict reader passes spend these, so anyone holding that header can use them
-/// up, and then the real body is refused until the window ends. No value makes that go
-/// away: a larger one costs Zebra more per block.
-pub const DEFAULT_STRICT_ATTEMPTS_PER_BLOCK: usize = 8;
+/// Different bodies of one block the competing-body gate sends Zebra in a dedup window.
+/// Only distinct bodies that got an answer count: a resent body Zebra refused is turned
+/// away without a call, an accepted one closes the block, and a call that failed in
+/// transit gives its place back. A body that passes the strict reader matches the
+/// header's Merkle root, so a second such body is rare; four leaves room for the real
+/// one behind a few that Zebra refuses. Research value for #130, not a decided setting.
 pub const DEFAULT_STRICT_BODIES_PER_BLOCK: usize = 4;
 
 /// Why the gate rejected a candidate.
@@ -125,8 +132,10 @@ pub enum RejectReason {
     DuplicateSubmit,
     /// This block has used up its unverified attempts for the dedup window.
     UnverifiedLimit,
-    /// This block has used up its attempts or bodies for the dedup window.
+    /// This block has used up its bodies for the dedup window.
     StrictLimit,
+    /// Zebra refused these exact bytes for this block within the dedup window.
+    RefusedBody,
 }
 
 impl RejectReason {
@@ -138,6 +147,7 @@ impl RejectReason {
             RejectReason::DuplicateSubmit => "duplicate_submit",
             RejectReason::UnverifiedLimit => "unverified_limit",
             RejectReason::StrictLimit => "strict_limit",
+            RejectReason::RefusedBody => "refused_body",
         }
     }
 }
@@ -195,25 +205,50 @@ impl DedupRing {
     }
 }
 
-/// Exact bodies waiting on Zebra without the gate lock.
-type UnverifiedBodies = Arc<Mutex<HashSet<[u8; 32]>>>;
+/// Exact bodies waiting on Zebra without the gate lock, with the block each is for and
+/// whether the strict reader passed it.
+type UnverifiedBodies = Arc<Mutex<HashMap<[u8; 32], InFlight>>>;
+
+#[derive(Debug, Clone)]
+struct InFlight {
+    block_hash: String,
+    strict: bool,
+}
 
 /// One body at Zebra. The gate lock is not held through that call, so this
 /// keeps a concurrent copy of the same bytes out instead. Ending it any way, by an
 /// answer, an error, a timeout or cancellation, lets the next copy try.
 pub struct UnverifiedSlot {
     in_flight: UnverifiedBodies,
-    body: [u8; 32],
+    /// `None` for a slot that holds nothing at Zebra, such as a dry run's.
+    body: Option<[u8; 32]>,
 }
 
 impl Drop for UnverifiedSlot {
     fn drop(&mut self) {
+        let Some(body) = self.body else {
+            return;
+        };
         // This can run while unwinding, so a poisoned lock must not panic here.
         self.in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.body);
+            .remove(&body);
     }
+}
+
+/// What Zebra said of a body the competing-body gate reserved, for
+/// [`SubmitGate::record_strict_answer_now`]. A call that failed in transit, timed out
+/// or was cancelled is not an answer, and records nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrictAnswer {
+    /// Zebra has the block: it took this body, already had the block, or refused this
+    /// copy and turned out to have it.
+    Known,
+    /// Zebra refused these bytes and does not have the block, or could not say.
+    Refused,
+    /// Zebra answered without taking or refusing the block, such as `inconclusive`.
+    Undecided,
 }
 
 /// The gate. Apply to a candidate before invoking `submit_block`.
@@ -221,40 +256,53 @@ pub struct SubmitGate<V: ChainView> {
     config: GateConfig,
     chain: V,
     dedup: DedupRing,
-    dry_seen: DedupRing,
     unverified_attempts: DedupRing,
     unverified_in_flight: UnverifiedBodies,
-    strict_calls: DedupRing,
+    /// Competing-body gate: dry runs' own marks, by block and body, which a live run
+    /// never reads.
+    dry_seen: DedupRing,
+    /// Competing-body gate: one entry per distinct body that got an answer, by block.
     strict_bodies: DedupRing,
-    strict_seen: DedupRing,
+    /// Competing-body gate: the same bodies, by block and body.
+    strict_answered: DedupRing,
+    /// Competing-body gate: bodies Zebra refused, by block and body.
+    strict_refused: DedupRing,
 }
 
 impl<V: ChainView> SubmitGate<V> {
+    /// `config.dedup_capacity` must be at least 1; config loading rejects 0, and a gate
+    /// built from 0 here keeps one entry rather than none.
     pub fn new(config: GateConfig, chain: V) -> Self {
-        let dedup = DedupRing::new(config.dedup_capacity, config.dedup_window);
-        let ring = || DedupRing::new(config.dedup_capacity, config.dedup_window);
-        let (dry_seen, unverified_attempts) = (ring(), ring());
-        let (strict_calls, strict_bodies, strict_seen) = (ring(), ring(), ring());
+        let capacity = config.dedup_capacity.max(1);
+        let ring = || DedupRing::new(capacity, config.dedup_window);
         Self {
+            dedup: ring(),
+            unverified_attempts: ring(),
+            unverified_in_flight: UnverifiedBodies::default(),
+            dry_seen: ring(),
+            strict_bodies: ring(),
+            strict_answered: ring(),
+            strict_refused: ring(),
             config,
             chain,
-            dedup,
-            dry_seen,
-            unverified_attempts,
-            unverified_in_flight: UnverifiedBodies::default(),
-            strict_calls,
-            strict_bodies,
-            strict_seen,
         }
+    }
+
+    /// Whether this gate runs the #130 competing-body rules. Callers pick the submit
+    /// path from this: the legacy one holds the gate across the Zebra call.
+    pub fn competing_bodies(&self) -> bool {
+        self.config.competing_bodies
     }
 
     /// Evaluate a candidate against the gate. The metadata is everything the
     /// gate needs that is not directly on `SubmissionCandidate` (parent hash,
     /// block height, header-bytes for PoW recheck).
     ///
-    /// This records nothing, so it says whether Zebra should hear of this block at all.
-    /// Only [`Self::record_submitted_now`] closes a block, because only Zebra can say a
-    /// body is the block: a mark made here would let a body Zebra refuses stop the real one.
+    /// On the legacy gate an accepted candidate is recorded here, so the first copy
+    /// wins. On the competing-body gate this records nothing: only Zebra can say a body
+    /// is the block, so only [`Self::record_strict_answer_now`] closes it.
+    ///
+    /// Use `apply_now` in production. `apply_at` is for deterministic tests.
     pub fn apply_now(
         &mut self,
         candidate: &SubmissionCandidate,
@@ -276,9 +324,12 @@ impl<V: ChainView> SubmitGate<V> {
             return GateDecision::Reject(reason);
         }
 
-        // (4) Hash dedup. Nothing is recorded here.
+        // (4) Hash dedup. The legacy gate records on accept.
         if self.dedup.contains(&candidate.block_hash, now) {
             return GateDecision::Reject(RejectReason::DuplicateSubmit);
+        }
+        if !self.config.competing_bodies {
+            self.dedup.record(candidate.block_hash.clone(), now);
         }
 
         // Only accepted candidates are logged, so each line is a block the
@@ -297,11 +348,14 @@ impl<V: ChainView> SubmitGate<V> {
         GateDecision::Accept
     }
 
-    /// [`Self::apply_at`] for a candidate the strict reader passed, reserving its attempt.
-    /// The caller lets go of the gate for the Zebra call, and calls
-    /// [`Self::record_submitted_now`] if Zebra has the block. A different body of the block
-    /// may run alongside this one, and the same bytes wait for this answer. A DryRun has no
-    /// answer to wait for, so it leaves a mark of its own, which a live run never reads.
+    /// The competing-body gate's [`Self::apply_at`] for a candidate the strict reader
+    /// passed, reserving its place at Zebra. The caller lets go of the gate for the
+    /// Zebra call and reports the answer with [`Self::record_strict_answer_now`]. A
+    /// different body of the block may run alongside this one, and the same bytes wait
+    /// for this answer.
+    ///
+    /// A dry run has no answer, so it reads and writes only its own marks, by block and
+    /// body: it never closes a block for a live run, and never spends a live budget.
     pub fn reserve_strict_now(
         &mut self,
         candidate: &SubmissionCandidate,
@@ -318,49 +372,97 @@ impl<V: ChainView> SubmitGate<V> {
         dry_run: bool,
         now: Instant,
     ) -> Result<UnverifiedSlot, RejectReason> {
+        debug_assert!(
+            self.config.competing_bodies,
+            "the legacy gate has no strict reservation"
+        );
         if let GateDecision::Reject(reason) = self.apply_at(candidate, meta, now) {
             return Err(reason);
         }
         let hash = &candidate.block_hash;
-        if dry_run && self.config.enabled && self.dry_seen.contains(hash, now) {
-            return Err(RejectReason::DuplicateSubmit);
+        let body = body_digest(candidate);
+        let key = body_key(hash, &body);
+        if dry_run {
+            if self.config.enabled {
+                if self.dry_seen.contains(&key, now) {
+                    return Err(RejectReason::DuplicateSubmit);
+                }
+                self.dry_seen.record(key, now);
+            }
+            return Ok(UnverifiedSlot {
+                in_flight: Arc::clone(&self.unverified_in_flight),
+                body: None,
+            });
         }
-        let body: [u8; 32] = Sha256::digest(candidate.block_hex.as_bytes()).into();
+        if self.config.enabled && self.strict_refused.contains(&key, now) {
+            return Err(RejectReason::RefusedBody);
+        }
         let mut in_flight = self
             .unverified_in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if in_flight.contains(&body) {
+        if in_flight.contains_key(&body) {
             return Err(RejectReason::DuplicateSubmit);
         }
-        if self.config.enabled {
-            let seen = format!("{hash}:{}", hex::encode(body));
-            let new_body = !self.strict_seen.contains(&seen, now);
-            if self.strict_calls.count(hash, now) >= self.config.strict_attempts_per_block
-                || (new_body
-                    && self.strict_bodies.count(hash, now) >= self.config.strict_bodies_per_block)
-            {
+        if self.config.enabled && !self.strict_answered.contains(&key, now) {
+            let at_zebra = in_flight
+                .values()
+                .filter(|entry| entry.strict && entry.block_hash == *hash)
+                .count();
+            let answered = self.strict_bodies.count(hash, now);
+            if answered + at_zebra >= self.config.strict_bodies_per_block {
                 return Err(RejectReason::StrictLimit);
             }
-            self.strict_calls.record(hash.clone(), now);
-            if new_body {
-                self.strict_seen.record(seen, now);
-                self.strict_bodies.record(hash.clone(), now);
-            }
-            if dry_run {
-                self.dry_seen.record(hash.clone(), now);
-            }
         }
-        in_flight.insert(body);
+        in_flight.insert(
+            body,
+            InFlight {
+                block_hash: hash.clone(),
+                strict: true,
+            },
+        );
         Ok(UnverifiedSlot {
             in_flight: Arc::clone(&self.unverified_in_flight),
-            body,
+            body: Some(body),
         })
     }
 
-    /// Whether Zebra has said it has this block, within the dedup window.
+    /// Record what Zebra said of a body reserved by [`Self::reserve_strict_now`]. Call
+    /// it before dropping the slot, so a copy of the same bytes cannot slip in between.
+    pub fn record_strict_answer_now(
+        &mut self,
+        candidate: &SubmissionCandidate,
+        answer: StrictAnswer,
+    ) {
+        self.record_strict_answer_at(candidate, answer, Instant::now());
+    }
+
+    pub fn record_strict_answer_at(
+        &mut self,
+        candidate: &SubmissionCandidate,
+        answer: StrictAnswer,
+        now: Instant,
+    ) {
+        let hash = &candidate.block_hash;
+        if answer == StrictAnswer::Known {
+            self.dedup.record(hash.clone(), now);
+            return;
+        }
+        let key = body_key(hash, &body_digest(candidate));
+        if !self.strict_answered.contains(&key, now) {
+            self.strict_answered.record(key.clone(), now);
+            self.strict_bodies.record(hash.clone(), now);
+        }
+        if answer == StrictAnswer::Refused && !self.strict_refused.contains(&key, now) {
+            self.strict_refused.record(key, now);
+        }
+    }
+
+    /// Whether Zebra has said it has this block, within the dedup window. Only the
+    /// competing-body gate can say: the legacy gate marks a block when a candidate
+    /// passes, not when Zebra has it, so it always answers `false`.
     pub fn knows(&mut self, block_hash: &str) -> bool {
-        self.dedup.contains(block_hash, Instant::now())
+        self.config.competing_bodies && self.dedup.contains(block_hash, Instant::now())
     }
 
     /// [`Self::apply_at`] for a candidate the strict reader could not read. Only
@@ -396,7 +498,7 @@ impl<V: ChainView> SubmitGate<V> {
             .unverified_in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if in_flight.contains(&body) {
+        if in_flight.contains_key(&body) {
             return Err(RejectReason::DuplicateSubmit);
         }
         if self.config.enabled {
@@ -407,10 +509,16 @@ impl<V: ChainView> SubmitGate<V> {
             self.unverified_attempts
                 .record(candidate.block_hash.clone(), now);
         }
-        in_flight.insert(body);
+        in_flight.insert(
+            body,
+            InFlight {
+                block_hash: candidate.block_hash.clone(),
+                strict: false,
+            },
+        );
         Ok(UnverifiedSlot {
             in_flight: Arc::clone(&self.unverified_in_flight),
-            body,
+            body: Some(body),
         })
     }
 
@@ -602,6 +710,15 @@ impl CandidateMeta {
     }
 }
 
+/// A candidate's exact bytes, for telling copies of a block apart.
+fn body_digest(candidate: &SubmissionCandidate) -> [u8; 32] {
+    Sha256::digest(candidate.block_hex.as_bytes()).into()
+}
+
+fn body_key(block_hash: &str, body: &[u8; 32]) -> String {
+    format!("{block_hash}:{}", hex::encode(body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -712,7 +829,7 @@ mod tests {
             dedup_window: Duration::from_secs(60),
             dedup_capacity: 8,
             unreadable_attempts_per_block: DEFAULT_UNREADABLE_ATTEMPTS_PER_BLOCK,
-            strict_attempts_per_block: DEFAULT_STRICT_ATTEMPTS_PER_BLOCK,
+            competing_bodies: false,
             strict_bodies_per_block: DEFAULT_STRICT_BODIES_PER_BLOCK,
         }
     }
@@ -886,15 +1003,47 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(g.apply_at(&c, &m, t0), GateDecision::Accept);
         assert_eq!(
+            g.apply_at(&c, &m, t0 + Duration::from_secs(10)),
+            GateDecision::Reject(RejectReason::DuplicateSubmit),
+        );
+    }
+
+    /// The competing-body gate records nothing on accept: only Zebra's answer that it
+    /// has the block closes it.
+    #[test]
+    fn competing_gate_dedups_only_what_zebra_has() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(competing_config(), chain(1000, vec![parent]));
+        let c = candidate("ff");
+        let m = meta(1001, parent, "ff");
+        let t0 = Instant::now();
+        assert_eq!(g.apply_at(&c, &m, t0), GateDecision::Accept);
+        assert_eq!(
             g.apply_at(&c, &m, t0 + Duration::from_secs(5)),
             GateDecision::Accept,
             "nothing is recorded until Zebra has answered"
         );
-        g.record_submitted_at(&c, t0);
+        assert!(!g.knows(&c.block_hash));
+        g.record_strict_answer_at(&c, StrictAnswer::Known, t0);
+        assert!(g.knows(&c.block_hash));
         assert_eq!(
             g.apply_at(&c, &m, t0 + Duration::from_secs(10)),
             GateDecision::Reject(RejectReason::DuplicateSubmit),
         );
+    }
+
+    /// The legacy gate's mark is made on accept, not by Zebra, so it never claims Zebra
+    /// has a block.
+    #[test]
+    fn the_legacy_gate_never_says_zebra_has_a_block() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(enabled_config(), chain(1000, vec![parent]));
+        let c = candidate("ff");
+        assert_eq!(
+            g.apply_at(&c, &meta(1001, parent, "ff"), Instant::now()),
+            GateDecision::Accept
+        );
+        assert!(!g.knows(&c.block_hash));
     }
 
     #[test]
@@ -907,7 +1056,6 @@ mod tests {
         let m = meta(1001, parent, "0a");
         let t0 = Instant::now();
         assert_eq!(g.apply_at(&c, &m, t0), GateDecision::Accept);
-        g.record_submitted_at(&c, t0);
         assert_eq!(
             g.apply_at(&c, &m, t0 + Duration::from_secs(31)),
             GateDecision::Accept,
@@ -1040,53 +1188,218 @@ mod tests {
         );
     }
 
-    /// Attempts Zebra failed are counted, so resends of one body run out, and they come back
-    /// with the window: a long outage closes a body for this long, and a later copy can try.
-    #[test]
-    fn a_spent_strict_limit_ends_with_its_window() {
-        let parent = [7u8; 32];
-        let config = enabled_config();
-        let mut g = SubmitGate::new(config.clone(), chain(1000, vec![parent]));
-        let (c, m) = (candidate("cc"), meta(1001, parent, "cc"));
-        let start = Instant::now();
-        for _ in 0..config.strict_attempts_per_block {
-            assert!(g.reserve_strict_at(&c, &m, false, start).is_ok());
+    fn competing_config() -> GateConfig {
+        GateConfig {
+            competing_bodies: true,
+            ..enabled_config()
         }
-
-        assert_eq!(
-            g.reserve_strict_at(&c, &m, false, start).err(),
-            Some(RejectReason::StrictLimit)
-        );
-
-        let later = start + config.dedup_window + Duration::from_millis(1);
-        assert!(g.reserve_strict_at(&c, &m, false, later).is_ok());
     }
 
-    /// The bodies a header can try come back the same way.
+    fn body_of(mark: usize) -> SubmissionCandidate {
+        SubmissionCandidate {
+            block_hex: format!("{mark:02x}"),
+            ..candidate("cc")
+        }
+    }
+
+    /// Review item 1 on #134: one body replayed past any count must not lock out the valid
+    /// body. Zebra's refusal is remembered, so the replay never reaches Zebra again, and it
+    /// spends one place, not one per copy.
+    #[test]
+    fn a_replayed_refused_body_spends_one_place_and_no_calls() {
+        let parent = [7u8; 32];
+        let config = competing_config();
+        let mut g = SubmitGate::new(config.clone(), chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let (forged, real) = (body_of(1), body_of(2));
+        let start = Instant::now();
+
+        let slot = g.reserve_strict_at(&forged, &m, false, start).unwrap();
+        g.record_strict_answer_at(&forged, StrictAnswer::Refused, start);
+        drop(slot);
+        for _ in 0..32 {
+            assert_eq!(
+                g.reserve_strict_at(&forged, &m, false, start).err(),
+                Some(RejectReason::RefusedBody),
+                "a refused body is turned away without a Zebra call"
+            );
+        }
+
+        assert!(g.reserve_strict_at(&real, &m, false, start).is_ok());
+    }
+
+    /// Calls that fail in transit, time out or are cancelled are not answers, so they give
+    /// their place back and the same bytes can try again, however many times.
+    #[test]
+    fn transient_failures_spend_nothing() {
+        let parent = [7u8; 32];
+        let config = competing_config();
+        let mut g = SubmitGate::new(config.clone(), chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let start = Instant::now();
+        for _ in 0..(4 * config.strict_bodies_per_block) {
+            for mark in 0..config.strict_bodies_per_block {
+                // Reserved, then dropped with no answer recorded.
+                drop(
+                    g.reserve_strict_at(&body_of(mark), &m, false, start)
+                        .unwrap(),
+                );
+            }
+        }
+        let real = body_of(config.strict_bodies_per_block + 1);
+        assert!(g.reserve_strict_at(&real, &m, false, start).is_ok());
+    }
+
+    /// A body already answered without a refusal costs nothing more when it comes again.
+    #[test]
+    fn a_repeat_of_an_answered_body_is_free() {
+        let parent = [7u8; 32];
+        let mut config = competing_config();
+        config.strict_bodies_per_block = 1;
+        let mut g = SubmitGate::new(config, chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let start = Instant::now();
+        let body = body_of(1);
+        for _ in 0..8 {
+            let slot = g.reserve_strict_at(&body, &m, false, start).unwrap();
+            g.record_strict_answer_at(&body, StrictAnswer::Undecided, start);
+            drop(slot);
+        }
+        assert_eq!(
+            g.reserve_strict_at(&body_of(2), &m, false, start).err(),
+            Some(RejectReason::StrictLimit),
+            "the one place is spent by the one body"
+        );
+    }
+
+    /// The same bytes wait for the call at Zebra; a different body may run alongside.
+    #[test]
+    fn an_identical_copy_in_flight_waits_and_a_different_one_runs() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(competing_config(), chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let start = Instant::now();
+        let slot = g.reserve_strict_at(&body_of(1), &m, false, start).unwrap();
+        assert_eq!(
+            g.reserve_strict_at(&body_of(1), &m, false, start).err(),
+            Some(RejectReason::DuplicateSubmit)
+        );
+        assert!(g.reserve_strict_at(&body_of(2), &m, false, start).is_ok());
+        drop(slot);
+        assert!(g.reserve_strict_at(&body_of(1), &m, false, start).is_ok());
+    }
+
+    /// Distinct bodies at Zebra or answered count against the block, and come back with
+    /// the window.
     #[test]
     fn a_spent_body_limit_ends_with_its_window() {
         let parent = [7u8; 32];
-        let config = enabled_config();
+        let config = competing_config();
         let mut g = SubmitGate::new(config.clone(), chain(1000, vec![parent]));
         let m = meta(1001, parent, "cc");
-        let body = |mark: usize| SubmissionCandidate {
-            block_hex: format!("{mark:02x}"),
-            ..candidate("cc")
-        };
         let start = Instant::now();
         for mark in 0..config.strict_bodies_per_block {
-            assert!(g.reserve_strict_at(&body(mark), &m, false, start).is_ok());
+            let slot = g
+                .reserve_strict_at(&body_of(mark), &m, false, start)
+                .unwrap();
+            g.record_strict_answer_at(&body_of(mark), StrictAnswer::Refused, start);
+            drop(slot);
         }
-        let next = body(config.strict_bodies_per_block);
-
+        let next = body_of(config.strict_bodies_per_block);
         assert_eq!(
             g.reserve_strict_at(&next, &m, false, start).err(),
             Some(RejectReason::StrictLimit)
         );
-        assert!(g.reserve_strict_at(&body(0), &m, false, start).is_ok());
 
         let later = start + config.dedup_window + Duration::from_millis(1);
         assert!(g.reserve_strict_at(&next, &m, false, later).is_ok());
+        assert!(
+            g.reserve_strict_at(&body_of(0), &m, false, later).is_ok(),
+            "a refusal is forgotten with its window"
+        );
+    }
+
+    /// Bodies still at Zebra hold their places too.
+    #[test]
+    fn bodies_at_zebra_count_against_the_block() {
+        let parent = [7u8; 32];
+        let config = competing_config();
+        let mut g = SubmitGate::new(config.clone(), chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let start = Instant::now();
+        let slots: Vec<_> = (0..config.strict_bodies_per_block)
+            .map(|mark| {
+                g.reserve_strict_at(&body_of(mark), &m, false, start)
+                    .unwrap()
+            })
+            .collect();
+        let next = body_of(config.strict_bodies_per_block);
+        assert_eq!(
+            g.reserve_strict_at(&next, &m, false, start).err(),
+            Some(RejectReason::StrictLimit)
+        );
+        drop(slots);
+        assert!(g.reserve_strict_at(&next, &m, false, start).is_ok());
+    }
+
+    /// Review item 10 on #134: a dry run's marks are its own. A forged dry-run body does not
+    /// make the real one a duplicate, and dry runs spend nothing a live run needs.
+    #[test]
+    fn dry_runs_are_isolated() {
+        let parent = [7u8; 32];
+        let mut config = competing_config();
+        config.strict_bodies_per_block = 1;
+        let mut g = SubmitGate::new(config, chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let start = Instant::now();
+        let (forged, real) = (body_of(1), body_of(2));
+
+        assert!(g.reserve_strict_at(&forged, &m, true, start).is_ok());
+        assert_eq!(
+            g.reserve_strict_at(&forged, &m, true, start).err(),
+            Some(RejectReason::DuplicateSubmit),
+            "the same dry-run body is seen once"
+        );
+        assert!(
+            g.reserve_strict_at(&real, &m, true, start).is_ok(),
+            "another body of the header is not a duplicate"
+        );
+        let slot = g.reserve_strict_at(&forged, &m, false, start);
+        assert!(slot.is_ok(), "dry runs spend no live place");
+        assert!(!g.knows(&forged.block_hash));
+    }
+
+    /// A dry run holds nothing at Zebra, so ending it cannot free a live copy's place.
+    #[test]
+    fn a_dry_run_slot_does_not_free_a_live_one() {
+        let parent = [7u8; 32];
+        let mut g = SubmitGate::new(competing_config(), chain(1000, vec![parent]));
+        let m = meta(1001, parent, "cc");
+        let start = Instant::now();
+        let live = g.reserve_strict_at(&body_of(1), &m, false, start).unwrap();
+        drop(g.reserve_strict_at(&body_of(1), &m, true, start).unwrap());
+        assert_eq!(
+            g.reserve_strict_at(&body_of(1), &m, false, start).err(),
+            Some(RejectReason::DuplicateSubmit)
+        );
+        drop(live);
+    }
+
+    /// Review item 9 on #134: a capacity of 0 must not make a gate that remembers nothing.
+    #[test]
+    fn a_zero_dedup_capacity_still_remembers() {
+        let parent = [7u8; 32];
+        let mut cfg = enabled_config();
+        cfg.dedup_capacity = 0;
+        let mut g = SubmitGate::new(cfg, chain(1000, vec![parent]));
+        let c = candidate("ff");
+        let m = meta(1001, parent, "ff");
+        let t0 = Instant::now();
+        assert_eq!(g.apply_at(&c, &m, t0), GateDecision::Accept);
+        assert_eq!(
+            g.apply_at(&c, &m, t0),
+            GateDecision::Reject(RejectReason::DuplicateSubmit)
+        );
     }
 
     #[test]
@@ -1100,7 +1413,6 @@ mod tests {
             let c = candidate(tag);
             let m = meta(1001, parent, tag);
             assert_eq!(g.apply_at(&c, &m, t0), GateDecision::Accept);
-            g.record_submitted_at(&c, t0);
         }
         // After three additions over a capacity-2 ring, the very first
         // entry must have been evicted and is accepted again.
