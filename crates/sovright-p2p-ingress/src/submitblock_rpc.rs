@@ -482,6 +482,49 @@ mod tests {
         );
     }
 
+    /// Real NU7 bytes through the pool's existing JSON-RPC request shape.
+    /// The backend is a recording mock: this proves byte preservation and
+    /// relay-failure independence, not full-node consensus acceptance.
+    #[tokio::test]
+    async fn real_nu7_pool_rpc_preserves_block_when_relay_is_unavailable() {
+        struct RecordingNode(std::sync::Mutex<Vec<String>>);
+        impl SubmitBlock for RecordingNode {
+            fn submit_block<'a>(&'a self, block: &'a str) -> SubmitFuture<'a> {
+                self.0.lock().unwrap().push(block.to_owned());
+                Box::pin(async { Ok(None) })
+            }
+        }
+        let raw = include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim();
+        let node = Arc::new(RecordingNode(std::sync::Mutex::new(Vec::new())));
+        let relay = Arc::new(MockRelay {
+            calls: AtomicUsize::new(0),
+            fail: true,
+        });
+        let mut rpc_state = state(true, None);
+        rpc_state.relay = relay.clone();
+        rpc_state.validator = Arc::new(MainnetSubmittedBlockValidator::new(4 * 1024 * 1024));
+        rpc_state.zebra = node.clone();
+        let config = SubmitBlockRpcConfig {
+            bind_addr: "127.0.0.1:0".parse().unwrap(),
+            zebra_url: "http://127.0.0.1:1".to_owned(),
+            max_block_bytes: 4 * 1024 * 1024,
+            max_requests_per_minute: 4,
+            relay_timeout: Duration::from_secs(1),
+        };
+        let (addr, handle) = start_rpc_server(&config, rpc_state).await.unwrap();
+        let client = HttpClientBuilder::default()
+            .build(format!("http://{addr}"))
+            .unwrap();
+        let result: Option<String> = client
+            .request("submitblock", rpc_params![raw])
+            .await
+            .unwrap();
+        handle.stop().unwrap();
+        assert_eq!(result, None);
+        assert_eq!(relay.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*node.0.lock().unwrap(), vec![raw.to_owned()]);
+    }
+
     #[test]
     fn params_accept_standard_and_compatibility_shapes() {
         assert_eq!(
