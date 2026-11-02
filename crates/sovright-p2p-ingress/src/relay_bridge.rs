@@ -48,6 +48,28 @@ const P2P_PARSE_PERMITS: usize = 1;
 /// never queues behind peer traffic.
 const POOL_PARSE_PERMITS: usize = 1;
 
+/// How raw blocks leave this ingress. Every mode but `Legacy` is #130 PR B research.
+///
+/// The record of what was forwarded follows: `Legacy` keeps one per header, so the first
+/// body this ingress passes stops every other body of that header. The others keep one
+/// per body, up to a limit per header, because this ingress cannot tell which body is the
+/// block: the strict reader can pass more than one, and only Zebra can choose.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RawWire {
+    #[default]
+    Legacy,
+    /// Both formats. An old receiver takes the legacy copy, with everything that means.
+    Dual,
+    /// The bound format only, so a receiver or relay without it gets no raw block.
+    Bound,
+}
+
+impl RawWire {
+    fn keys_by_body(self) -> bool {
+        self != Self::Legacy
+    }
+}
+
 /// Bounded, time-windowed LRU of recently-forwarded block hashes. Used by
 /// `RelayBridge::forward_block` to implement first-seen-wins dedup so the
 /// same block being delivered by multiple P2P peers (the steady-state case)
@@ -61,13 +83,32 @@ struct RecentForwardedHashes {
     /// [`ForwardClaim`] removes its entry when it ends, and that closes the
     /// channel and wakes every copy waiting on it, however late they subscribed.
     in_flight: HashMap<[u8; 32], watch::Sender<()>>,
+    /// Bodies a header has sent, or is sending, in the window. Only a record per body
+    /// can go past one. A body counts once any copy of it has left, even with another
+    /// copy still owed, and its own repeats cost it nothing.
+    bodies_per_header: usize,
+    /// Header, what the record is kept by, and when.
+    sent_bodies: VecDeque<([u8; 32], [u8; 32], std::time::Instant)>,
+    sending_bodies: HashMap<[u8; 32], [u8; 32]>,
 }
 
 /// One body forwarded without validation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct UnverifiedBody {
     header_hash: [u8; 32],
     digest: [u8; 32],
+}
+
+/// How far an unverified body has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnverifiedProgress {
+    /// A slot holds it, and only that slot can end this.
+    Sending,
+    /// A copy left and another is owed. It keeps its place, as what left has gone, and
+    /// its next delivery sends.
+    Owed,
+    /// Every copy went.
+    Sent,
 }
 
 /// Bodies forwarded without validation. They never claim their header, or a forged
@@ -80,12 +121,20 @@ struct UnverifiedForwards {
     capacity: usize,
     window: Duration,
     per_header: usize,
-    entries: VecDeque<(UnverifiedBody, std::time::Instant, bool)>,
+    entries: VecDeque<(UnverifiedBody, std::time::Instant, UnverifiedProgress)>,
+    /// Bodies a slot holds. Nothing is ever sent on these channels: the entry goes when
+    /// the slot ends, and that wakes every copy waiting on it.
+    sending: HashMap<UnverifiedBody, watch::Sender<()>>,
 }
 
 /// What a body found when it asked to be forwarded unverified.
 enum UnverifiedReservation {
     Reserved,
+    /// It left before with a copy owed, and this is its next try. The place is its own.
+    Owed,
+    /// A copy is going now. How that ends says what this one does, so it waits. It is
+    /// neither a refusal nor a repeat yet.
+    Sending(watch::Receiver<()>),
     Repeat,
     HeaderFull,
 }
@@ -107,15 +156,30 @@ impl UnverifiedForwards {
             window,
             per_header,
             entries: VecDeque::new(),
+            sending: HashMap::new(),
         }
     }
 
     fn reserve(&mut self, body: UnverifiedBody, now: std::time::Instant) -> UnverifiedReservation {
         // Never expire an in-flight reservation: its drop guard still owns it.
-        self.entries
-            .retain(|(_, at, sent)| !*sent || now.duration_since(*at) <= self.window);
-        if self.entries.iter().any(|(entry, _, _)| *entry == body) {
-            return UnverifiedReservation::Repeat;
+        self.entries.retain(|(_, at, progress)| {
+            *progress == UnverifiedProgress::Sending || now.duration_since(*at) <= self.window
+        });
+        let same_body = self.entries.iter_mut().find(|(entry, _, _)| *entry == body);
+        if let Some((_, at, progress)) = same_body {
+            return match *progress {
+                UnverifiedProgress::Sent => UnverifiedReservation::Repeat,
+                UnverifiedProgress::Sending => {
+                    let sending = self.sending.entry(body);
+                    let sending = sending.or_insert_with(|| watch::channel(()).0);
+                    UnverifiedReservation::Sending(sending.subscribe())
+                }
+                UnverifiedProgress::Owed => {
+                    (*at, *progress) = (now, UnverifiedProgress::Sending);
+                    self.sending.insert(body, watch::channel(()).0);
+                    UnverifiedReservation::Owed
+                }
+            };
         }
         let same_header = self
             .entries
@@ -128,37 +192,53 @@ impl UnverifiedForwards {
         if self.entries.len() >= self.capacity.max(self.per_header) {
             return UnverifiedReservation::HeaderFull;
         }
-        self.entries.push_back((body, now, false));
+        self.entries
+            .push_back((body, now, UnverifiedProgress::Sending));
+        self.sending.insert(body, watch::channel(()).0);
         UnverifiedReservation::Reserved
     }
 
     fn sent(&self, body: &UnverifiedBody) -> bool {
-        self.entries
-            .iter()
-            .any(|(entry, at, sent)| *entry == *body && *sent && at.elapsed() <= self.window)
+        self.entries.iter().any(|(entry, at, progress)| {
+            *entry == *body && *progress == UnverifiedProgress::Sent && at.elapsed() <= self.window
+        })
+    }
+
+    fn settle(&mut self, body: &UnverifiedBody, settled: UnverifiedProgress) {
+        let entry = self.entries.iter_mut().find(|(entry, _, _)| entry == body);
+        if let Some((_, at, progress)) = entry {
+            (*at, *progress) = (std::time::Instant::now(), settled);
+        }
+        self.sending.remove(body);
     }
 
     fn commit(&mut self, body: &UnverifiedBody) {
-        if let Some((_, at, sent)) = self.entries.iter_mut().find(|(entry, _, _)| entry == body) {
-            *at = std::time::Instant::now();
-            *sent = true;
-        }
+        self.settle(body, UnverifiedProgress::Sent);
     }
 
     fn release(&mut self, body: &UnverifiedBody) {
         self.entries.retain(|(entry, _, _)| entry != body);
+        self.sending.remove(body);
     }
 }
 
-/// A body's place while it is sent. Ending it any way but [`Self::commit`] gives
-/// the place back, so a failed send does not count against the header.
+/// A body's place while it is sent. Ending it any way but [`Self::commit`] gives the
+/// place back, so a failed send does not count against the header, unless a copy has
+/// left. Then the body stays owed: it holds its place and can come again.
 struct UnverifiedSlot {
     forwards: Arc<std::sync::Mutex<UnverifiedForwards>>,
     body: UnverifiedBody,
+    /// A copy of this body has left, on this try or an earlier one.
+    left: bool,
     sent: bool,
 }
 
 impl UnverifiedSlot {
+    /// Says a copy left. True the first time for this body, which is the one to report.
+    fn body_left(&mut self) -> bool {
+        !std::mem::replace(&mut self.left, true)
+    }
+
     fn commit(mut self) {
         self.forwards
             .lock()
@@ -170,11 +250,14 @@ impl UnverifiedSlot {
 
 impl Drop for UnverifiedSlot {
     fn drop(&mut self) {
-        if !self.sent {
-            self.forwards
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .release(&self.body);
+        if self.sent {
+            return;
+        }
+        let mut forwards = self.forwards.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.left {
+            forwards.settle(&self.body, UnverifiedProgress::Owed);
+        } else {
+            forwards.release(&self.body);
         }
     }
 }
@@ -196,7 +279,33 @@ impl RecentForwardedHashes {
             window,
             entries: std::collections::VecDeque::with_capacity(capacity.max(1)),
             in_flight: HashMap::new(),
+            bodies_per_header: usize::MAX,
+            sent_bodies: VecDeque::new(),
+            sending_bodies: HashMap::new(),
         }
+    }
+
+    fn with_bodies_per_header(mut self, limit: usize) -> Self {
+        self.bodies_per_header = limit;
+        self
+    }
+
+    /// The bodies of `header` other than `key`.
+    fn bodies_of(&mut self, header: &[u8; 32], key: &[u8; 32], now: std::time::Instant) -> usize {
+        let window = self.window;
+        self.sent_bodies
+            .retain(|(_, _, sent)| now.duration_since(*sent) <= window);
+        let sent = self.sent_bodies.iter();
+        let sent = sent.filter(|(h, body, _)| h == header && body != key);
+        let sending = self.sending_bodies.iter();
+        let sending = sending.filter(|(body, h)| *h == header && *body != key);
+        sent.count() + sending.count()
+    }
+
+    fn body_left(&mut self, header: [u8; 32], key: [u8; 32], now: std::time::Instant) {
+        self.sending_bodies.remove(&key);
+        self.sent_bodies.retain(|(_, body, _)| *body != key);
+        self.sent_bodies.push_back((header, key, now));
     }
 
     fn state(&mut self, hash: &[u8; 32], now: std::time::Instant) -> ForwardState {
@@ -241,15 +350,28 @@ impl RecentForwardedHashes {
 /// waiting on it sends instead of being deduplicated against a send that failed.
 struct ForwardClaim {
     recent_forwarded: Arc<std::sync::Mutex<RecentForwardedHashes>>,
+    /// What the record is kept by: the header, or the header and body. See [`RawWire`].
+    key: [u8; 32],
     header_hash: [u8; 32],
 }
 
 impl ForwardClaim {
-    /// The block went out, so later copies of it are duplicates.
+    /// A copy has gone, so the body has its place under its header, whatever becomes of the
+    /// rest of the send. It stays open for its next delivery until [`Self::commit`].
+    fn body_left(&self) {
+        if let Ok(mut recent) = self.recent_forwarded.lock() {
+            recent.body_left(self.header_hash, self.key, std::time::Instant::now());
+        }
+    }
+
+    /// The block went out, so later copies of it are duplicates. For a bound copy that means
+    /// encoded and taken by the socket, and a legacy copy need only be queued. Neither says
+    /// anything arrived.
     fn commit(self) {
         let now = std::time::Instant::now();
         if let Ok(mut recent) = self.recent_forwarded.lock() {
-            recent.record(self.header_hash, now);
+            recent.record(self.key, now);
+            recent.body_left(self.header_hash, self.key, now);
         }
     }
 }
@@ -258,11 +380,12 @@ impl Drop for ForwardClaim {
     fn drop(&mut self) {
         // Runs after `commit` too, so a woken copy finds the block recorded. This
         // can run while unwinding, so a poisoned lock must not panic here.
-        self.recent_forwarded
+        let mut recent = self
+            .recent_forwarded
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .in_flight
-            .remove(&self.header_hash);
+            .unwrap_or_else(PoisonError::into_inner);
+        recent.in_flight.remove(&self.key);
+        recent.sending_bodies.remove(&self.key);
     }
 }
 
@@ -289,6 +412,8 @@ struct PreparedForward {
 
 enum PreparedObjects {
     PreviouslySent,
+    /// An unverified copy of this very body is going now.
+    BeingSent(watch::Receiver<()>),
     /// The compact block does not fit the current FEC budget.
     RawSegments(Vec<RawBlockSegment>),
     Compact {
@@ -332,6 +457,7 @@ pub struct RelayBridge {
     raw_fallback_with_tx_cache: bool,
     raw_segment_send_rounds: usize,
     raw_segment_round_delay: Duration,
+    raw_wire: RawWire,
     /// Shared dedup ring for first-seen-wins forward suppression. Cloned
     /// bridges share the same state via `Arc`.
     recent_forwarded: Arc<std::sync::Mutex<RecentForwardedHashes>>,
@@ -424,10 +550,14 @@ impl RelayBridge {
             raw_segment_round_delay: Duration::from_millis(
                 config.relay_raw_segment_round_delay_millis,
             ),
-            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
-                config.relay_forward_dedup_capacity,
-                config.relay_forward_dedup_window,
-            ))),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(
+                RecentForwardedHashes::new(
+                    config.relay_forward_dedup_capacity,
+                    config.relay_forward_dedup_window,
+                )
+                .with_bodies_per_header(config.relay_bodies_per_header),
+            )),
+            raw_wire: config.relay_raw_wire,
             parse_permits: ParsePermits::new(),
             block_body_rejections,
             peer_pow_limit: Some(config.network.pow_limit()),
@@ -466,10 +596,14 @@ impl RelayBridge {
             raw_segment_round_delay: Duration::from_millis(
                 config.relay_raw_segment_round_delay_millis,
             ),
-            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
-                config.relay_forward_dedup_capacity,
-                config.relay_forward_dedup_window,
-            ))),
+            recent_forwarded: Arc::new(std::sync::Mutex::new(
+                RecentForwardedHashes::new(
+                    config.relay_forward_dedup_capacity,
+                    config.relay_forward_dedup_window,
+                )
+                .with_bodies_per_header(config.relay_bodies_per_header),
+            )),
+            raw_wire: config.relay_raw_wire,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -585,6 +719,9 @@ impl RelayBridge {
         // The decision is recorded on successful broadcast so a half-failed
         // forward can be retried by the next delivery.
         let header_hash = zcash_block_hash(header);
+        let forward_key = self
+            .forward_key(&header_hash, block_payload, permits)
+            .await?;
         let deduplicated = || ForwardedBlock {
             tx_count: declared_tx_count(block_payload),
             bytes: 0,
@@ -596,7 +733,7 @@ impl RelayBridge {
         // of one is skipped unsent; before any send, so a body that fails is
         // neither forwarded nor recorded and cannot hide a good copy.
         let (prepared, permit) = loop {
-            if self.wait_for_forward(&header_hash).await {
+            if self.wait_for_forward(&forward_key).await {
                 return Ok(deduplicated());
             }
             let permit = Arc::clone(permits)
@@ -604,10 +741,23 @@ impl RelayBridge {
                 .await
                 .expect("parse permits are never closed");
             // A copy ahead in the queue may have settled this block meanwhile.
-            if matches!(self.forward_state(&header_hash), ForwardState::Open) {
-                break self
+            if matches!(self.forward_state(&forward_key), ForwardState::Open) {
+                match self
                     .prepare_off_workers(block_payload, tx_cache, permit)
-                    .await?;
+                    .await?
+                {
+                    (
+                        PreparedForward {
+                            objects: PreparedObjects::BeingSent(mut sending),
+                            ..
+                        },
+                        permit,
+                    ) => {
+                        drop(permit);
+                        let _ = sending.changed().await;
+                    }
+                    ready => break ready,
+                }
             }
         };
 
@@ -622,14 +772,28 @@ impl RelayBridge {
                     PreparedObjects::Unverified {
                         segments,
                         error,
-                        slot,
+                        mut slot,
                     },
             } => {
                 drop(permit);
                 let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
-                let relay_objects = self.send_raw_block_segments(&segments).await?;
+                // What this record bounds and reports is what left without its checks, so a
+                // legacy copy counts then, whatever becomes of the bound one.
+                let report = |slot: &mut UnverifiedSlot| {
+                    if slot.body_left() {
+                        self.log_unverified_forward(header, &error, block_payload.len());
+                    }
+                };
+                let legacy = async {
+                    let relay_objects = self.send_raw_block_segments(&segments).await?;
+                    if relay_objects > 0 {
+                        report(&mut slot);
+                    }
+                    Ok(relay_objects)
+                };
+                let relay_objects = self.with_bound_copy(block_payload, legacy).await?;
+                report(&mut slot);
                 slot.commit();
-                self.log_unverified_forward(header, &error, block_payload.len());
                 return Ok(ForwardedBlock {
                     tx_count,
                     bytes: raw_wire_bytes,
@@ -644,12 +808,74 @@ impl RelayBridge {
         // keeps what it prepared until the winner's send has really gone out. The
         // permit is given up with the first attempt: the next copy in the queue
         // then finds this claim, rather than an open block to parse again.
-        let Some(claim) = self.claim_forward(header_hash, permit).await else {
+        let Some(claim) = self.claim_forward(forward_key, header_hash, permit).await? else {
             return Ok(deduplicated());
         };
-        let forwarded = self.send_prepared(prepared).await?;
+        let legacy = async {
+            let forwarded = self.send_prepared(prepared).await?;
+            if forwarded.relay_objects > 0 {
+                claim.body_left();
+            }
+            Ok(forwarded)
+        };
+        let forwarded = self.with_bound_copy(block_payload, legacy).await?;
         claim.commit();
         Ok(forwarded)
+    }
+
+    /// What a forward is deduplicated by. See [`RawWire`]. Hashing the body takes a parse
+    /// permit and the blocking pool, as anything else that reads a whole body here does.
+    async fn forward_key(
+        &self,
+        header_hash: &[u8; 32],
+        block_payload: &[u8],
+        permits: &Arc<Semaphore>,
+    ) -> Result<[u8; 32]> {
+        if !self.raw_wire.keys_by_body() {
+            return Ok(*header_hash);
+        }
+        let permit = Arc::clone(permits)
+            .acquire_owned()
+            .await
+            .expect("parse permits are never closed");
+        let (block, header_hash) = (block_payload.to_vec(), *header_hash);
+        let (key, _permit) = run_holding_permit(permit, move || {
+            let mut digest = Sha256::new();
+            digest.update(header_hash);
+            digest.update(&block);
+            <[u8; 32]>::from(digest.finalize())
+        })
+        .await
+        .map_err(|error| IngressError::Relay(format!("body hash failed: {error}")))?;
+        Ok(key)
+    }
+
+    /// Sends the legacy copy and the bound copy side by side. Neither waits for the other or
+    /// stops it, so a bound copy that fails or takes its time leaves the legacy one alone, and
+    /// a slow legacy copy cannot stop a bound one from being taken before a caller gives up.
+    /// The result says whether both went, so a body whose bound copy failed stays open, and
+    /// its next delivery sends both again, which repeats the legacy copy.
+    async fn with_bound_copy<T>(
+        &self,
+        block_payload: &[u8],
+        legacy: impl Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let (legacy, bound) = tokio::join!(legacy, self.send_bound_copy(block_payload));
+        let legacy = legacy?;
+        bound?;
+        Ok(legacy)
+    }
+
+    /// The bound copy of a body that is going out, if this ingress sends one, as far as this
+    /// client can tell: see [`BlockSender::send_bound_raw_block`].
+    async fn send_bound_copy(&self, block_payload: &[u8]) -> Result<()> {
+        if self.raw_wire == RawWire::Legacy {
+            return Ok(());
+        }
+        self.sender
+            .send_bound_raw_block(Arc::new(block_payload.to_vec()))
+            .await
+            .map_err(map_transport_error)
     }
 
     /// Reported once a body has parsed, so nothing about the send can lose it, and
@@ -720,12 +946,14 @@ impl RelayBridge {
     }
 
     /// Claim a validated block, waiting out any send in progress without holding
-    /// `permit`. `None` if it was forwarded.
+    /// `permit`. `None` if it was forwarded, and an error if its header has sent all the
+    /// bodies it may. That fails closed, so the real body can be the one turned away.
     async fn claim_forward(
         &self,
+        forward_key: [u8; 32],
         header_hash: [u8; 32],
         permit: OwnedSemaphorePermit,
-    ) -> Option<ForwardClaim> {
+    ) -> Result<Option<ForwardClaim>> {
         let mut permit = Some(permit);
         loop {
             let state = {
@@ -733,21 +961,30 @@ impl RelayBridge {
                     .recent_forwarded
                     .lock()
                     .expect("recent_forwarded mutex poisoned");
-                let state = recent.state(&header_hash, std::time::Instant::now());
+                let now = std::time::Instant::now();
+                let state = recent.state(&forward_key, now);
                 if matches!(state, ForwardState::Open) {
-                    recent.in_flight.insert(header_hash, watch::channel(()).0);
+                    let others = recent.bodies_of(&header_hash, &forward_key, now);
+                    if others >= recent.bodies_per_header {
+                        return Err(IngressError::Relay(
+                            "this header has sent all the bodies it may".to_string(),
+                        ));
+                    }
+                    recent.in_flight.insert(forward_key, watch::channel(()).0);
+                    recent.sending_bodies.insert(forward_key, header_hash);
                 }
                 state
             };
             drop(permit.take());
             match state {
                 ForwardState::Open => {
-                    return Some(ForwardClaim {
+                    return Ok(Some(ForwardClaim {
                         recent_forwarded: Arc::clone(&self.recent_forwarded),
+                        key: forward_key,
                         header_hash,
-                    });
+                    }));
                 }
-                ForwardState::Forwarded => return None,
+                ForwardState::Forwarded => return Ok(None),
                 ForwardState::InFlight(mut sending) => {
                     let _ = sending.changed().await;
                 }
@@ -908,15 +1145,25 @@ impl RelayBridge {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .reserve(body, std::time::Instant::now());
-        match reservation {
-            UnverifiedReservation::Reserved => {}
-            UnverifiedReservation::Repeat | UnverifiedReservation::HeaderFull => {
-                return Err(refused);
+        let elsewhere = |objects| {
+            Ok(PreparedForward {
+                tx_count: declared_tx_count(&block),
+                objects,
+            })
+        };
+        let left = match reservation {
+            UnverifiedReservation::Reserved => false,
+            UnverifiedReservation::Owed => true,
+            UnverifiedReservation::Sending(sending) => {
+                return elsewhere(PreparedObjects::BeingSent(sending));
             }
-        }
+            UnverifiedReservation::Repeat => return elsewhere(PreparedObjects::PreviouslySent),
+            UnverifiedReservation::HeaderFull => return Err(refused),
+        };
         let slot = UnverifiedSlot {
             forwards: Arc::clone(&self.unverified_forwards),
             body,
+            left,
             sent: false,
         };
         if EquihashPowValidator.validate(header) != PowResult::Valid {
@@ -936,7 +1183,9 @@ impl RelayBridge {
     async fn send_prepared(&self, prepared: PreparedForward) -> Result<ForwardedBlock> {
         let PreparedForward { tx_count, objects } = prepared;
         let (compact_wire_bytes, raw_fallback) = match objects {
-            PreparedObjects::PreviouslySent => unreachable!("dedup handled before sending"),
+            PreparedObjects::PreviouslySent | PreparedObjects::BeingSent(_) => {
+                unreachable!("dedup handled before sending")
+            }
             PreparedObjects::Unverified { segments, .. } => {
                 let raw_wire_bytes = self.raw_segments_wire_bytes(&segments);
                 let relay_objects = self.send_raw_block_segments(&segments).await?;
@@ -1070,6 +1319,9 @@ impl RelayBridge {
     }
 
     async fn send_raw_block_segments(&self, segments: &[RawBlockSegment]) -> Result<usize> {
+        if self.raw_wire == RawWire::Bound {
+            return Ok(0);
+        }
         let mut relay_objects = 0;
         for round in 0..self.raw_segment_send_rounds {
             for segment in segments {
@@ -1182,6 +1434,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1250,6 +1503,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1324,6 +1578,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1381,6 +1636,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1487,6 +1743,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1537,6 +1794,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1590,6 +1848,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1658,6 +1917,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1715,6 +1975,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1781,6 +2042,7 @@ mod tests {
                 64,
                 Duration::from_secs(30),
             ))),
+            raw_wire: RawWire::Legacy,
             parse_permits: ParsePermits::new(),
             block_body_rejections: Default::default(),
             peer_pow_limit: None,
@@ -1864,6 +2126,8 @@ mod tests {
             relay_forward_unreadable_blocks: false,
             relay_unreadable_bodies_per_header: DEFAULT_UNREADABLE_BODIES_PER_HEADER,
             relay_raw_segment_send_rounds: 1,
+            relay_raw_wire: Default::default(),
+            relay_bodies_per_header: 4,
             relay_raw_segment_round_delay_millis: 0,
             relay_forward_dedup_window: Duration::from_secs(30),
             relay_forward_dedup_capacity: 64,

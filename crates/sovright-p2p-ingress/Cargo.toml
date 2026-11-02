@@ -25,4 +25,5 @@ zcash_protocol = { workspace = true }
 
 [dev-dependencies]
 sovright-relay = { path = "../sovright-relay", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }

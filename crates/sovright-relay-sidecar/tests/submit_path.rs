@@ -306,6 +306,7 @@ fn enabled_gate_config() -> GateConfig {
         dedup_window: std::time::Duration::from_secs(60),
         dedup_capacity: 8,
         unreadable_attempts_per_block: 4,
+        ..GateConfig::default()
     }
 }
 
