@@ -918,12 +918,20 @@ impl Anchors {
     }
 }
 
-/// One object's sends through one session.
+/// How long chunks of an object a node has just let go count as left over from that decode,
+/// whether or not the object then went anywhere: the shards the decode did not need come in
+/// the same burst. This is no send and counts as none. A research value: a copy that comes
+/// later than this, after a send that never happened, goes through.
+pub const RELEASE_LEFTOVER: Duration = Duration::from_millis(500);
+
+/// One object's sends through one session. A record with no sends says it was let go and
+/// never went out.
 #[derive(Clone, Copy, Debug)]
 struct Sends {
     first: Instant,
     last: Instant,
     count: u32,
+    released: Instant,
 }
 
 /// What a session has had sent on. Bounded, oldest forgotten first, and each record ends.
@@ -943,6 +951,9 @@ impl Forwarded {
         let Some(sends) = self.sends.get(object) else {
             return true;
         };
+        if sends.count == 0 {
+            return now.saturating_duration_since(sends.released) >= RELEASE_LEFTOVER;
+        }
         if now.saturating_duration_since(sends.last) < config.resend_after {
             return false;
         }
@@ -950,27 +961,52 @@ impl Forwarded {
         lapsed || sends.count <= config.max_resends
     }
 
+    /// The object was let go, and nothing says yet that it went anywhere.
+    fn note_released(&mut self, object: Node, now: Instant, config: &BoundForwardConfig) {
+        if let Some(sends) = self.sends.get_mut(&object) {
+            sends.released = now;
+            return;
+        }
+        let record = Sends {
+            first: now,
+            last: now,
+            count: 0,
+            released: now,
+        };
+        self.insert(object, record, config);
+    }
+
+    /// The object went out. Only this counts against the session's sends.
     fn note(&mut self, object: Node, now: Instant, config: &BoundForwardConfig) {
         let fresh = Sends {
             first: now,
             last: now,
             count: 1,
+            released: now,
         };
         match self.sends.get_mut(&object) {
-            Some(sends) if now.saturating_duration_since(sends.first) >= config.resend_window => {
-                *sends = fresh;
+            Some(sends)
+                if sends.count == 0
+                    || now.saturating_duration_since(sends.first) >= config.resend_window =>
+            {
+                *sends = Sends {
+                    released: sends.released,
+                    ..fresh
+                };
             }
             Some(sends) => {
                 sends.last = now;
                 sends.count += 1;
             }
-            None => {
-                self.sends.insert(object, fresh);
-                self.order.push_back(object);
-                if self.order.len() > config.max_forwarded {
-                    self.forget_oldest();
-                }
-            }
+            None => self.insert(object, fresh, config),
+        }
+    }
+
+    fn insert(&mut self, object: Node, record: Sends, config: &BoundForwardConfig) {
+        self.sends.insert(object, record);
+        self.order.push_back(object);
+        if self.order.len() > config.max_forwarded {
+            self.forget_oldest();
         }
     }
 
@@ -1037,6 +1073,10 @@ pub struct BoundNodeUsage {
     pub frames_rejected: u64,
     pub pow_refused: u64,
     pub pow_indeterminate: u64,
+    /// Objects the node let go on, whether or not anyone was there to take them.
+    pub objects_released: u64,
+    /// Of those, the ones that went out to at least one peer, every datagram of them. Only
+    /// these count against their session's sends.
     pub objects_sent_on: u64,
     pub objects_waiting_for_segment_0: usize,
     pub waiting_pushed_out: u64,
@@ -1057,12 +1097,21 @@ pub struct BoundNodeUsage {
     pub ingress: BoundIngress,
 }
 
+/// An object a node may send on, and the session it came from. That session already has
+/// it, so it is left out of the fan-out, whatever datagram released the object.
+#[derive(Debug)]
+pub(crate) struct Outgoing {
+    pub(crate) object: Encoded,
+    pub(crate) from: SocketAddr,
+}
+
 /// What a datagram came to on a node.
 pub(crate) enum BoundStep {
     /// A1 to A4. Nothing changed.
     Invalid,
-    /// Objects to send on, all `n` shards of each.
-    Forward(Vec<Encoded>),
+    /// Objects to send on, all `n` shards of each. Nothing records them as sent: the node
+    /// does, with [`BoundForwarder::sent`], once a send of one has gone out.
+    Forward(Vec<Outgoing>),
     /// A panic took the session it came from.
     Lost,
 }
@@ -1157,6 +1206,7 @@ pub(crate) struct BoundForwarder {
     frames_rejected: u64,
     pow_refused: u64,
     pow_indeterminate: u64,
+    objects_released: u64,
     objects_sent_on: u64,
     waiting_pushed_out: u64,
     waiting_expired: u64,
@@ -1193,6 +1243,7 @@ impl BoundForwarder {
             frames_rejected: 0,
             pow_refused: 0,
             pow_indeterminate: 0,
+            objects_released: 0,
             objects_sent_on: 0,
             waiting_pushed_out: 0,
             waiting_expired: 0,
@@ -1255,6 +1306,7 @@ impl BoundForwarder {
             frames_rejected: self.frames_rejected,
             pow_refused: self.pow_refused,
             pow_indeterminate: self.pow_indeterminate,
+            objects_released: self.objects_released,
             objects_sent_on: self.objects_sent_on,
             objects_waiting_for_segment_0: self.peers.values().map(|p| p.unanchored.len()).sum(),
             waiting_pushed_out: self.waiting_pushed_out,
@@ -1498,7 +1550,7 @@ impl BoundForwarder {
         &mut self,
         ready: Vec<(SocketAddr, DecodedObject)>,
         now: Instant,
-    ) -> Vec<Encoded> {
+    ) -> Vec<Outgoing> {
         let mut objects = Vec::with_capacity(ready.len());
         for (from, object) in ready {
             let send = |this: &mut Self| this.send_on(from, object, now);
@@ -1507,25 +1559,46 @@ impl BoundForwarder {
         objects
     }
 
+    /// The object to send on, if its session's record lets it go. No send is recorded here:
+    /// one written before the send would hold back the next copy, and count against the
+    /// session, for a send that never happened, with no peer to send to or a socket that
+    /// refused. Only that it was let go is, for [`RELEASE_LEFTOVER`].
     fn send_on(
         &mut self,
         from: SocketAddr,
         decoded: DecodedObject,
         now: Instant,
-    ) -> Option<Encoded> {
+    ) -> Option<Outgoing> {
         let shape = decoded.shape();
         let object = encode(shape.msg_type, shape.n, shape.k, decoded.content())?;
+        let config = self.config;
         let forwarded = &mut self.peers.get_mut(&from)?.forwarded;
         let id = object.object_id;
-        if id != decoded.object_id() || !forwarded.allows(&id, now, &self.config) {
+        if id != decoded.object_id() || !forwarded.allows(&id, now, &config) {
             return None;
         }
-        forwarded.note(id, now, &self.config);
-        #[cfg(test)]
-        self.trip(Trip::Noted(from));
-        self.objects_sent_on += 1;
+        forwarded.note_released(id, now, &config);
         self.keep_records_within_limit();
-        Some(object)
+        self.objects_released += 1;
+        Some(Outgoing { object, from })
+    }
+
+    /// `object` from `from` went out to at least one peer, every datagram of it. Only now
+    /// does it count against that session's sends. A session that went meanwhile has no
+    /// record to write.
+    pub(crate) fn sent(&mut self, from: SocketAddr, object: Node, now: Instant) {
+        let note = |this: &mut Self| {
+            let config = this.config;
+            let Some(peer) = this.peers.get_mut(&from) else {
+                return;
+            };
+            peer.forwarded.note(object, now, &config);
+            this.objects_sent_on += 1;
+            #[cfg(test)]
+            this.trip(Trip::Noted(from));
+            this.keep_records_within_limit();
+        };
+        self.only_for(from, note);
     }
 
     fn keep_records_within_limit(&mut self) {
@@ -1654,16 +1727,21 @@ mod tests {
         now: Instant,
     ) -> usize {
         let accept = |_: &[u8]| PowResult::Valid;
-        let steps = datagrams
-            .iter()
-            .map(|datagram| bound.take(src, KEY, key_id, datagram, now, accept));
-        steps
-            .map(|step| match step {
-                BoundStep::Forward(objects) => objects.len(),
+        let mut forwarded = 0;
+        for datagram in datagrams {
+            match bound.take(src, KEY, key_id, datagram, now, accept) {
+                BoundStep::Forward(objects) => {
+                    forwarded += objects.len();
+                    // As the node does once a send went out.
+                    for outgoing in objects {
+                        bound.sent(outgoing.from, outgoing.object.object_id, now);
+                    }
+                }
                 BoundStep::Invalid => panic!("a sealed datagram is valid"),
-                BoundStep::Lost => 0,
-            })
-            .sum()
+                BoundStep::Lost => {}
+            }
+        }
+        forwarded
     }
 
     fn config() -> BoundForwardConfig {
@@ -1685,6 +1763,69 @@ mod tests {
         assert!(node.max_resends >= ledger.repeat_budget);
         let resending = node.resend_after * node.max_resends;
         assert!(node.resend_window >= ledger.released_ttl + resending);
+    }
+
+    /// What `take` lets go is not yet sent. Until the node says it went, nothing holds the
+    /// next copy back, and a session's sends are what went out.
+    #[test]
+    fn an_object_let_go_and_never_sent_leaves_no_record() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let datagrams = body(7);
+        let accept = |_: &[u8]| PowResult::Valid;
+        let take = |bound: &mut BoundForwarder, now: Instant| {
+            let steps = datagrams
+                .iter()
+                .map(|datagram| bound.take(addr(1), KEY, FLEET, datagram, now, accept))
+                .collect::<Vec<_>>();
+            let objects = steps.into_iter().map(|step| match step {
+                BoundStep::Forward(objects) => objects,
+                _ => Vec::new(),
+            });
+            objects.flatten().collect::<Vec<_>>()
+        };
+
+        let first = take(&mut bound, now);
+        assert_eq!(first.len(), 1);
+        assert_eq!(bound.usage().objects_sent_on, 0);
+        assert_eq!(bound.usage().objects_released, 1);
+        assert!(
+            take(&mut bound, now).is_empty(),
+            "left over from that decode"
+        );
+
+        let later = now + RELEASE_LEFTOVER;
+        let again = take(&mut bound, later);
+        assert_eq!(again.len(), 1, "never sent, so it goes inside resend_after");
+        bound.sent(again[0].from, again[0].object.object_id, later);
+        assert_eq!(bound.usage().objects_sent_on, 1);
+        let soon = later + RELEASE_LEFTOVER;
+        assert!(soon < later + bound.config.resend_after);
+        assert!(
+            take(&mut bound, soon).is_empty(),
+            "sent, so held to resend_after"
+        );
+    }
+
+    /// Objects let go by another session's segment 0 say which session they came from, so
+    /// the node can leave that session out.
+    #[test]
+    fn objects_let_go_by_a_segment_0_keep_their_own_origin() {
+        let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
+        let (first, later) = two_frames(1);
+        assert_eq!(send(&mut bound, addr(1), &later, now), 0);
+        let accept = |_: &[u8]| PowResult::Valid;
+
+        let mut origins = Vec::new();
+        for datagram in &first {
+            if let BoundStep::Forward(objects) =
+                bound.take(addr(2), KEY, FLEET, datagram, now, accept)
+            {
+                origins.extend(objects.iter().map(|outgoing| outgoing.from));
+            }
+        }
+
+        origins.sort();
+        assert_eq!(origins, vec![addr(1), addr(2)]);
     }
 
     #[test]
@@ -2096,8 +2237,9 @@ mod tests {
         assert_eq!(send(&mut bound, addr(1), &later, now), 1);
     }
 
-    /// One send fails with its record written. The sends around it go on, and the record
-    /// goes with its session, so nothing says that object went when it did not.
+    /// Recording one send fails with its record written. The records around it go on, and
+    /// the record goes with its session, so nothing says that session sent it when it did
+    /// not. Recording comes after the send, so the object itself went.
     #[test]
     fn a_panic_on_one_send_leaves_the_others_and_no_false_record() {
         let (mut bound, now) = (BoundForwarder::new(config()).unwrap(), Instant::now());
@@ -2106,10 +2248,10 @@ mod tests {
         assert_eq!(send(&mut bound, addr(3), &later, now), 0);
         bound.trips = vec![Trip::Noted(addr(1))];
 
-        assert_eq!(send(&mut bound, addr(2), &first, now), 2);
+        assert_eq!(send(&mut bound, addr(2), &first, now), 3);
 
         assert!(!bound.peers.contains_key(&addr(1)));
-        assert_eq!(bound.usage().objects_sent_on, 2);
+        assert_eq!(bound.usage().objects_sent_on, 3);
         pool_is_what_the_sessions_hold(&bound);
 
         assert_eq!(send(&mut bound, addr(1), &later, now), 1);

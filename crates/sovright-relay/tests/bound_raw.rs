@@ -11,8 +11,8 @@ use std::time::Duration;
 use sovright_relay::{
     AuthKey, BlockSender, BoundBlock, BoundForwardConfig, BoundRawConfig, BoundUsed, Chunk,
     ChunkHeader, ClientConfig, EquihashPowValidator, KeyRole, PowResult, PowValidator,
-    RejectAllValidator, RelayClient, RelayConfig, RelayNode, RelaySession, StubPowValidator,
-    body_frames, is_bound, sealed_body, sealed_frame,
+    RELEASE_LEFTOVER, RejectAllValidator, RelayClient, RelayConfig, RelayNode, RelaySession,
+    StubPowValidator, body_frames, is_bound, sealed_body, sealed_frame,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -1068,7 +1068,7 @@ async fn another_key_gets_through_a_real_node_when_one_key_is_at_its_limit() {
     let body = sealed_body(&[0xee; 5000], &OTHER_KEY).unwrap();
     let _alice = raw_session(&node, addr, &body).await;
 
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 1);
 }
 
 /// A ReceiveOnly key never reaches the pool, and its sessions still take places in the
@@ -1193,7 +1193,7 @@ async fn a_session_that_times_out_gives_its_key_room_back() {
     let _silent = fill_from(&node, addr, 1).await;
     let body = sealed_body(&[0xee; 5000], &KEY).unwrap();
     let late = raw_session(&node, addr, &body).await;
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 0);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 0);
 
     timeout(Duration::from_secs(30), async {
         while node.bound_usage().unwrap().pool != BoundUsed::default() {
@@ -1204,7 +1204,7 @@ async fn a_session_that_times_out_gives_its_key_room_back() {
     .expect("the place never came back");
 
     send_again(&node, addr, &late, &body).await;
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 1);
 }
 
 /// Real headers from genesis on, each with its real proof of work. The node has no way to
@@ -1240,19 +1240,19 @@ async fn old_headers_cannot_take_an_active_bodys_anchor() {
     let first = sealed_frame(&frames[0], &KEY).unwrap();
     let later = sealed_frame(&frames[1], &KEY).unwrap();
     let honest = raw_session(&node, addr, &first).await;
-    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+    assert_eq!(node.bound_usage().unwrap().objects_released, 1);
 
     let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     for header in old_headers() {
         let sealed = sealed_body(&on_a_header(&header, 5000), &OTHER_KEY).unwrap();
         send_again(&node, addr, &flood, &sealed).await;
     }
-    let sent = node.bound_usage().unwrap().objects_sent_on;
+    let sent = node.bound_usage().unwrap().objects_released;
 
     send_again(&node, addr, &honest, &later).await;
 
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, sent + 1, "{usage:?}");
+    assert_eq!(usage.objects_released, sent + 1, "{usage:?}");
     assert_eq!(usage.objects_waiting_for_segment_0, 0);
 }
 
@@ -1284,7 +1284,7 @@ async fn a_block_takes_only_so_many_bodies_at_a_real_node() {
     }
 
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, limit as u64);
+    assert_eq!(usage.objects_released, limit as u64);
     assert_eq!(usage.anchors_refused_for_bodies, 1);
 }
 
@@ -1302,7 +1302,7 @@ async fn a_revoked_key_answers_for_its_anchors_until_they_lapse() {
     let socket = raw_session(&node, addr, &body(1)).await;
     send_again(&node, addr, &socket, &body(2)).await;
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, 1);
+    assert_eq!(usage.objects_released, 1);
     assert_eq!(usage.anchors_refused_for_room, 1);
 
     node.apply_active_keys(Vec::new()).await;
@@ -1311,15 +1311,74 @@ async fn a_revoked_key_answers_for_its_anchors_until_they_lapse() {
 
     let again = raw_session(&node, addr, &body(3)).await;
     let usage = node.bound_usage().unwrap();
-    assert_eq!(usage.objects_sent_on, 1, "the key still pays: {usage:?}");
+    assert_eq!(usage.objects_released, 1, "the key still pays: {usage:?}");
     assert_eq!(usage.anchors_refused_for_room, 2);
 
     timeout(WAIT, async {
-        while node.bound_usage().unwrap().objects_sent_on < 2 {
+        while node.bound_usage().unwrap().objects_released < 2 {
             send_again(&node, addr, &again, &body(3)).await;
             sleep(Duration::from_millis(100)).await;
         }
     })
     .await
     .expect("the key never had its share again");
+}
+
+/// Everything `socket` gets until nothing more comes for a while.
+async fn drain(socket: &UdpSocket) -> Vec<Vec<u8>> {
+    let mut got = Vec::new();
+    let mut buf = vec![0; 2048];
+    while let Ok(received) = timeout(STILL_WAITING, socket.recv_from(&mut buf)).await {
+        let (len, _) = received.unwrap();
+        got.push(buf[..len].to_vec());
+    }
+    got
+}
+
+/// With nobody to send to nothing went, so nothing is recorded, and the next copy crosses
+/// as soon as somebody is there, however soon it comes.
+#[tokio::test]
+async fn a_send_with_no_peer_records_nothing() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let body = sealed_body(&[7u8; 5000], &KEY).unwrap();
+    let socket = raw_session(&node, addr, &body).await;
+    let usage = node.bound_usage().unwrap();
+    assert_eq!(usage.objects_released, 1);
+    assert_eq!(usage.objects_sent_on, 0);
+
+    let watcher = Watcher::start(addr, KEY).await;
+    sessions_reach(&node, 2).await;
+    // Past what counts as left over from the decode, and well inside `resend_after`, which
+    // would hold back a copy of an object that had been sent.
+    sleep(RELEASE_LEFTOVER).await;
+    send_again(&node, addr, &socket, &body).await;
+
+    assert!(body.contains(&watcher.next().await));
+    assert_eq!(node.bound_usage().unwrap().objects_sent_on, 1);
+}
+
+/// Objects that waited for their segment 0 go to everyone but the session they came from,
+/// even though the datagram that let them go came from another one.
+#[tokio::test]
+async fn an_object_never_goes_back_to_the_session_it_came_from() {
+    let (node, addr) = start_node(StubPowValidator, fleet()).await;
+    let raw = the_block();
+    let frames = body_frames(&raw).unwrap();
+    let first = sealed_frame(&frames[0], &KEY).unwrap();
+    let later: Vec<Vec<u8>> = frames[1..]
+        .iter()
+        .flat_map(|frame| sealed_frame(frame, &KEY).unwrap())
+        .collect();
+    let a = Watcher::start(addr, KEY).await;
+    let b = Watcher::start(addr, KEY).await;
+    sessions_reach(&node, 2).await;
+
+    send_again(&node, addr, &a.0, &later).await;
+    send_again(&node, addr, &b.0, &first).await;
+
+    let (to_a, to_b) = (drain(&a.0).await, drain(&b.0).await);
+    assert!(to_a.iter().all(|datagram| !later.contains(datagram)));
+    assert!(first.iter().all(|datagram| to_a.contains(datagram)));
+    assert!(to_b.iter().all(|datagram| !first.contains(datagram)));
+    assert!(later.iter().all(|datagram| to_b.contains(datagram)));
 }

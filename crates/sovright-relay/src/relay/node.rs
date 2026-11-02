@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use chunk_proof::datagram::Verifier;
-use chunk_proof::object::{Encoded, Profile};
+use chunk_proof::object::Profile;
 use socket2::{Domain, Protocol, SockRef, Socket, Type};
 use tokio::net::UdpSocket;
 use tokio::sync::RwLock;
@@ -28,6 +28,7 @@ use crate::transport::{
 
 use super::bound_raw::{
     self, BoundForwarder, BoundNodeUsage, BoundStep, IngressQueue, LiveIngress, MAX_READ_BYTES,
+    Outgoing,
 };
 use super::forwarding::ForwardOrder;
 #[cfg(feature = "handled-log")]
@@ -762,40 +763,54 @@ impl<V: PowValidator> RelayNode<V> {
         }
         drop(sessions);
 
-        self.send_outbound(outbound, chunks.len(), msg_type).await
+        self.send_outbound(outbound, chunks.len(), msg_type)
+            .await
+            .map(drop)
     }
 
-    /// Bound objects to every other session, each sealed with that session's own key.
+    /// Each bound object to every session but the one it came from, sealed with each
+    /// session's own key. The datagram that released an object can be another session's,
+    /// such as a segment 0 that let waiting objects go, so each object carries its origin.
+    ///
+    /// An object counts against its origin's sends only once every datagram of it went out
+    /// to at least one peer. With no peer, or a socket that refused, nothing is recorded and
+    /// the next copy can go.
     async fn forward_bound(
         &self,
-        src_addr: SocketAddr,
-        objects: &[Encoded],
+        bound: &Mutex<BoundForwarder>,
+        objects: Vec<Outgoing>,
     ) -> Result<(), TransportError> {
-        let sessions = self.sessions.read().await;
-        let outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = sessions
-            .iter()
-            .filter(|(peer_addr, _)| **peer_addr != src_addr)
-            .map(|(peer_addr, session)| {
-                let key = session.auth_key();
-                let payloads = objects
-                    .iter()
-                    .flat_map(|object| BoundForwarder::sealed(&key, object))
-                    .collect();
-                (*peer_addr, session.key_id().to_string(), payloads)
-            })
-            .collect();
-        drop(sessions);
-        let chunks = objects.iter().map(|object| object.shards.len()).sum();
-        self.send_outbound(outbound, chunks, MessageType::RawBlockSegment)
-            .await
+        for Outgoing { object, from } in objects {
+            let shards = object.shards.len() as u64;
+            let sessions = self.sessions.read().await;
+            let outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)> = sessions
+                .iter()
+                .filter(|(peer_addr, _)| **peer_addr != from)
+                .map(|(peer_addr, session)| {
+                    let payloads = BoundForwarder::sealed(&session.auth_key(), &object);
+                    (*peer_addr, session.key_id().to_string(), payloads)
+                })
+                .collect();
+            drop(sessions);
+            let sent = self
+                .send_outbound(outbound, shards as usize, MessageType::RawBlockSegment)
+                .await?;
+            if sent.contains(&shards) {
+                let id = object.object_id;
+                self.with_bound(bound, |forwarder| forwarder.sent(from, id, Instant::now()));
+            }
+        }
+        Ok(())
     }
 
+    /// Sends each peer its payloads, paced, and says how many datagrams each peer's socket
+    /// took, in the order of `outbound`.
     async fn send_outbound(
         &self,
         outbound: Vec<(SocketAddr, String, Vec<Vec<u8>>)>,
         chunks: usize,
         msg_type: MessageType,
-    ) -> Result<(), TransportError> {
+    ) -> Result<Vec<u64>, TransportError> {
         let socket = self.socket.as_ref().ok_or_else(|| {
             TransportError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotConnected,
@@ -841,7 +856,7 @@ impl<V: PowValidator> RelayNode<V> {
                 sleep(pacing.delay).await;
             }
         }
-        for ((_, key_id, _), chunks_sent) in outbound.iter().zip(sent) {
+        for ((_, key_id, _), &chunks_sent) in outbound.iter().zip(&sent) {
             if chunks_sent > 0 {
                 self.metrics.inc_packets_forwarded(chunks_sent);
                 self.metrics
@@ -858,7 +873,7 @@ impl<V: PowValidator> RelayNode<V> {
             }
         }
 
-        Ok(())
+        Ok(sent)
     }
 
     /// Stop the relay node
@@ -1163,9 +1178,9 @@ impl<V: PowValidator> RelayNode<V> {
         if objects.is_empty() {
             return Ok(());
         }
-        let relayed = objects.iter().map(|o| o.shards.len() as u64).sum();
+        let relayed = objects.iter().map(|o| o.object.shards.len() as u64).sum();
         self.metrics.inc_chunks_relayed_from_key(&key_id, relayed);
-        self.forward_bound(src_addr, &objects).await
+        self.forward_bound(bound, objects).await
     }
 
     async fn handle_packet(&self, data: &[u8], src_addr: SocketAddr) -> Result<(), TransportError> {
@@ -2700,7 +2715,7 @@ mod tests {
         for datagram in &sealed[1..] {
             socket.send_to(datagram, addr).await.unwrap();
         }
-        until(|| node.bound_usage().unwrap().objects_sent_on == 1).await;
+        until(|| node.bound_usage().unwrap().objects_released == 1).await;
 
         assert!(!task.is_finished());
         assert!(node.is_running());
