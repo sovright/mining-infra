@@ -7,7 +7,7 @@ use sovright_relay::{
     TxCacheSnapshot, TxFeedRecord, WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block,
     zcash_block_hash,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ mod bound_tasks;
 mod poller;
 mod relay;
 
-use bound_tasks::{Body, BoundTaskLimits, BoundTasks, HeldCopies, body_of};
+use bound_tasks::{Body, BoundTaskLimits, BoundTasks, HeldCopies, Place, Retries, body_of};
 use poller::{TemplatePoller, TemplateUpdate};
 use relay::RelayWrapper;
 use sovright_relay_sidecar::chain_view::{ZebraChainView, ZebraChainViewConfig};
@@ -137,6 +137,18 @@ struct Args {
     /// Optional Prometheus textfile path for sidecar receive metrics
     #[arg(long)]
     metrics_textfile: Option<PathBuf>,
+
+    /// Bound raw path: blocks worked on at once, retried copies included (at least 1)
+    #[arg(long, default_value_t = config::DEFAULT_BOUND_TASKS_RUNNING)]
+    bound_tasks_running: usize,
+
+    /// Bound raw path: seconds one task may wait at the parent lookup, gate and Zebra
+    #[arg(long, default_value_t = config::DEFAULT_BOUND_TASKS_BUDGET_SECS)]
+    bound_tasks_budget_secs: u64,
+
+    /// Bound raw path: other copies of a block under way kept while its task runs
+    #[arg(long, default_value_t = config::DEFAULT_BOUND_TASKS_HELD)]
+    bound_tasks_held: usize,
 }
 
 #[tokio::main]
@@ -183,6 +195,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         submit_gate_cfg,
         zebra_mempool_sync_enabled,
         zebra_mempool_sync_interval_ms,
+        bound_limits,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -211,6 +224,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(cfg.submit_gate.clone()),
             cfg.zebra_mempool_sync_enabled,
             cfg.zebra_mempool_sync_interval_ms,
+            BoundTaskLimits::from_config(
+                cfg.bound_tasks_running,
+                cfg.bound_tasks_budget_secs,
+                cfg.bound_tasks_held,
+            )?,
         )
     } else {
         // Use CLI args
@@ -264,6 +282,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             None,
             false, // zebra mempool sync is config-only (off for bare CLI)
             2000,
+            BoundTaskLimits::from_config(
+                args.bound_tasks_running,
+                args.bound_tasks_budget_secs,
+                args.bound_tasks_held,
+            )?,
         )
     };
 
@@ -479,7 +502,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             gate,
             chain_view,
             unreadable_submit,
-            BoundTaskLimits::default(),
+            bound_limits,
         ))
     } else {
         relay.start().await?;
@@ -668,7 +691,36 @@ async fn submit_compact_fast_path<S, M>(
         );
         return;
     }
+    let delivered = compact_fast_path_outcome(
+        submitter,
+        compact,
+        mode,
+        compact_reconstruction_enabled,
+        mempool,
+        metrics,
+        is_skeleton,
+    )
+    .await;
+    if delivered {
+        dedup.record(block_hash, now);
+    }
+}
 
+/// The work of [`submit_compact_fast_path`] past its dedup check, wherever it runs. True if the
+/// block was submitted or a dry run built it, which is what that check records.
+async fn compact_fast_path_outcome<S, M>(
+    submitter: &S,
+    compact: &CompactBlock,
+    mode: SubmitBlockMode,
+    compact_reconstruction_enabled: bool,
+    mempool: &M,
+    metrics: &SidecarMetrics,
+    is_skeleton: bool,
+) -> bool
+where
+    S: SubmitBlock + Sync,
+    M: MempoolProvider,
+{
     let outcome = if is_skeleton {
         metrics.inc_skeleton_received();
         // A skeleton submits ONLY on complete mempool reconstruction; it never
@@ -686,9 +738,12 @@ async fn submit_compact_fast_path<S, M>(
         .await
     };
 
+    let delivered = matches!(
+        outcome,
+        Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_))
+    );
     match &outcome {
         Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_)) => {
-            dedup.record(block_hash, now);
             if is_skeleton {
                 metrics.inc_skeleton_submit_successes();
             }
@@ -713,17 +768,7 @@ async fn submit_compact_fast_path<S, M>(
         }
     }
     log_submission_outcome(outcome, metrics, None);
-}
-
-/// What was held and can go now, then what comes in.
-async fn next_payload(
-    receiver: &mut BlockReceiver,
-    again: &mut VecDeque<RelayPayload>,
-) -> Option<RelayPayload> {
-    match again.pop_front() {
-        Some(payload) => Some(payload),
-        None => receiver.recv_payload().await,
-    }
+    delivered
 }
 
 async fn next_bound_block(
@@ -766,20 +811,203 @@ struct BlockWork {
     rpc: Arc<ZebraRpc>,
     submitter: Arc<DualSubmit<Arc<ZebraRpc>>>,
     mode: SubmitBlockMode,
+    compact_reconstruction_enabled: bool,
     gate: Option<Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>>,
     chain_view: Option<Arc<ZebraChainView>>,
     unreadable_submit: Option<UnreadableSubmit>,
     metrics: Arc<SidecarMetrics>,
 }
 
+impl BlockWork {
+    /// Whether a full compact block goes through the gate. Not in mempool-reconstruction mode,
+    /// which the gated handler does not support yet.
+    fn gates_compact(&self, compact: &CompactBlock) -> bool {
+        self.gate.is_some()
+            && self.chain_view.is_some()
+            && (!self.compact_reconstruction_enabled || compact.short_ids.is_empty())
+    }
+}
+
 /// What a block by the legacy ways leaves to wait while a task works on its block.
 enum HeldCopy {
-    Payload(RelayPayload),
+    Compact {
+        compact: CompactBlock,
+        skeleton: bool,
+    },
     Segments {
         segments: Vec<RawBlockSegment>,
         block_hash: [u8; 32],
         first_seen: Instant,
     },
+}
+
+impl HeldCopy {
+    /// The block it is a copy of, by the hash it came under.
+    fn block(&self) -> String {
+        match self {
+            Self::Compact { compact, .. } => hex::encode(zcash_block_hash(&compact.header)),
+            Self::Segments { block_hash, .. } => hex::encode(block_hash),
+        }
+    }
+
+    /// The bytes it comes to, if it can say.
+    fn body(&self) -> Option<Body> {
+        match self {
+            Self::Compact { compact, .. } => compact_body(compact),
+            Self::Segments { segments, .. } => {
+                reassemble_raw_block(segments).ok().map(|raw| body_of(&raw))
+            }
+        }
+    }
+}
+
+/// Where a copy of a block a task is on waits.
+enum Waits {
+    Held(Place),
+    /// For a task of its own: no place to wait in, but never on the receive task.
+    ForATask(Option<Body>),
+}
+
+/// Where a copy of `block` waits, if a task is on it. With none it is no such copy, and goes on
+/// as it always has. `body` is asked for only while tasks run.
+fn waits(
+    tasks: &BoundTasks,
+    held: &HeldCopies<HeldCopy>,
+    block: &str,
+    body: impl FnOnce() -> Option<Body>,
+) -> Option<Waits> {
+    if tasks.is_idle() {
+        return None;
+    }
+    let body = body();
+    if let Some(place) = held.place_for(tasks, block, body) {
+        return Some(Waits::Held(place));
+    }
+    tasks.under_way(block).then_some(Waits::ForATask(body))
+}
+
+fn park(
+    waits: Waits,
+    block: &str,
+    copy: HeldCopy,
+    held: &mut HeldCopies<HeldCopy>,
+    retries: &mut Retries<HeldCopy>,
+) {
+    match waits {
+        Waits::Held(place) => held.hold(place, copy),
+        Waits::ForATask(body) => {
+            retries.push(block, body, copy);
+        }
+    }
+}
+
+/// A copy whose turn has come, on a bound task of its own: the receive task never waits for
+/// Zebra on its behalf. If another task took its block up while it waited, it waits for that
+/// one too.
+fn start_copy<M>(
+    copy: HeldCopy,
+    body: Option<Body>,
+    work: &BlockWork,
+    mempool: &Arc<M>,
+    tasks: &mut BoundTasks,
+    held: &mut HeldCopies<HeldCopy>,
+    fast_path_dedup: &mut HashDedupRing,
+) where
+    M: MempoolProvider + Send + Sync + 'static,
+{
+    let block = copy.block();
+    if let Some(place) = held.place_for(tasks, &block, body) {
+        held.hold(place, copy);
+        return;
+    }
+    match copy {
+        HeldCopy::Compact { compact, skeleton } => {
+            let metrics = &work.metrics;
+            if !skeleton {
+                metrics.inc_compact_blocks_received();
+            }
+            if fast_path_dedup.contains(&block, Instant::now()) {
+                if skeleton {
+                    metrics.inc_skeleton_deduplicated();
+                } else {
+                    metrics.inc_full_block_deduplicated();
+                }
+                debug!(
+                    block_hash = %block,
+                    skeleton,
+                    "compact copy's block already submitted; skipping duplicate"
+                );
+                return;
+            }
+            let (work, mempool) = (work.clone(), Arc::clone(mempool));
+            tasks.spawn(block, body, async move {
+                if !skeleton
+                    && work.gates_compact(&compact)
+                    && let (Some(gate), Some(chain_view)) = (&work.gate, &work.chain_view)
+                {
+                    return submit_gated_compact(&compact, &work, gate, chain_view).await;
+                }
+                compact_fast_path_outcome(
+                    work.submitter.as_ref(),
+                    &compact,
+                    work.mode,
+                    work.compact_reconstruction_enabled,
+                    mempool.as_ref(),
+                    work.metrics.as_ref(),
+                    skeleton,
+                )
+                .await
+            });
+        }
+        HeldCopy::Segments {
+            segments,
+            block_hash,
+            first_seen,
+        } => {
+            let Some((raw_block, raw_block_hash)) = raw_block_of(&segments, block_hash, work)
+            else {
+                return;
+            };
+            if fast_path_dedup.contains(&raw_block_hash, Instant::now()) {
+                debug!(
+                    block_hash = %raw_block_hash,
+                    "raw segment copy's block already submitted; skipping duplicate"
+                );
+                return;
+            }
+            let body = body_of(&raw_block);
+            let work = work.clone();
+            tasks.spawn(raw_block_hash, Some(body), async move {
+                submit_whole_raw_block(raw_block, block_hash, first_seen, &work).await
+            });
+        }
+    }
+}
+
+/// A full compact block through the gate. True if it was submitted or a dry run built it.
+async fn submit_gated_compact(
+    compact: &CompactBlock,
+    work: &BlockWork,
+    gate: &Arc<TokioMutex<SubmitGate<Arc<ZebraChainView>>>>,
+    chain_view: &Arc<ZebraChainView>,
+) -> bool {
+    let outcome =
+        validate_then_gate_compact_block(work.submitter.as_ref(), compact, work.mode, gate, || {
+            chain_view.observe_candidate_parent(work.rpc.as_ref(), &compact.header)
+        })
+        .await;
+    // Per-cause GateRejected metric is incremented in log_submission_outcome; here we tick the
+    // accepted-by-gate counter for outcomes that came through the gated handler and were not
+    // rejected.
+    let delivered = matches!(
+        outcome,
+        Ok(SubmissionOutcome::DryRun(_)) | Ok(SubmissionOutcome::Submitted { .. })
+    );
+    if delivered {
+        work.metrics.inc_submit_gate_accepted();
+    }
+    log_submission_outcome(outcome, work.metrics.as_ref(), None);
+    delivered
 }
 
 /// The bytes a compact block comes to, if it carries them all.
@@ -812,7 +1040,7 @@ fn start_bound_block(
     let body = body_of(block.raw());
     tasks.spawn(
         hash_hex,
-        body,
+        Some(body),
         handle_bound_block(block, block_hash, work.clone()),
     );
 }
@@ -883,7 +1111,8 @@ async fn handle_bound_block(block: BoundBlock, block_hash: [u8; 32], work: Block
 }
 
 /// A legacy block whose segments are all here, the rest of the way to Zebra. This runs on the
-/// receive task, as the legacy ways always have.
+/// receive task, as the legacy ways always have. A copy held for a bound task takes the same
+/// steps on a task of its own instead (see [`start_copy`]).
 async fn finish_raw_segments(
     segments: Vec<RawBlockSegment>,
     block_hash: [u8; 32],
@@ -891,8 +1120,34 @@ async fn finish_raw_segments(
     work: &BlockWork,
     fast_path_dedup: &mut HashDedupRing,
 ) {
+    let Some((raw_block, raw_block_hash)) = raw_block_of(&segments, block_hash, work) else {
+        return;
+    };
+    // Dedup against compact/skeleton paths: the
+    // consensus block hash is the shared key.
+    if fast_path_dedup.contains(&raw_block_hash, Instant::now()) {
+        debug!(
+            block_hash = %raw_block_hash,
+            "raw segment already submitted by compact path; skipping duplicate"
+        );
+        return;
+    }
+    if submit_whole_raw_block(raw_block, block_hash, first_seen, work).await {
+        // Record in shared dedup ring so compact-block
+        // paths won't also submit this consensus block.
+        fast_path_dedup.record(raw_block_hash, Instant::now());
+    }
+}
+
+/// A legacy block's segments put back together, with the consensus hash of its header. Nothing
+/// if they do not make a block, which is counted and logged.
+fn raw_block_of(
+    segments: &[RawBlockSegment],
+    block_hash: [u8; 32],
+    work: &BlockWork,
+) -> Option<(Vec<u8>, String)> {
     let completed_segments = segments.len();
-    match reassemble_raw_block(&segments) {
+    match reassemble_raw_block(segments) {
         Ok(raw_block) => {
             let Some(header) = raw_block.get(..ZCASH_FULL_HEADER_SIZE) else {
                 work.metrics.inc_raw_segment_reassembly_failures();
@@ -900,7 +1155,7 @@ async fn finish_raw_segments(
                     raw_block_bytes = raw_block.len(),
                     "Relay raw block is shorter than its header"
                 );
-                return;
+                return None;
             };
             info!(
                 block_hash = %hex::encode(block_hash),
@@ -908,83 +1163,78 @@ async fn finish_raw_segments(
                 raw_block_bytes = raw_block.len(),
                 "Relay raw block segments complete"
             );
-            // Dedup against compact/skeleton paths: the
-            // consensus block hash is the shared key.
             let raw_block_hash = hex::encode(zcash_block_hash(header));
-            if fast_path_dedup.contains(&raw_block_hash, Instant::now()) {
-                debug!(
-                    block_hash = %raw_block_hash,
-                    "raw segment already submitted by compact path; skipping duplicate"
-                );
-                return;
-            }
-            let raw_outcome = check_and_submit_raw_block(
-                &work.rpc,
-                &work.submitter,
-                &raw_block,
-                block_hash,
-                work.mode,
-                work.gate.as_ref(),
-                work.chain_view.as_ref(),
-            )
-            .await;
-            if let (Some(error), Some(unreadable), Some(gate), Some(chain_view)) = (
-                unreadable_body(&raw_outcome),
-                &work.unreadable_submit,
-                &work.gate,
-                &work.chain_view,
-            ) {
-                // Off the receive task, which must keep
-                // reading while Zebra judges this.
-                unreadable.spawn(UnverifiedSubmission {
-                    submitter: Arc::clone(&work.submitter),
-                    rpc: Arc::clone(&work.rpc),
-                    gate: Arc::clone(gate),
-                    chain_view: Arc::clone(chain_view),
-                    metrics: Arc::clone(&work.metrics),
-                    mode: work.mode,
-                    raw_block,
-                    error,
-                    first_seen,
-                });
-                return;
-            }
-            if work.gate.is_some()
-                && matches!(
-                    raw_outcome,
-                    Ok(SubmissionOutcome::DryRun(_)) | Ok(SubmissionOutcome::Submitted { .. })
-                )
-            {
-                work.metrics.inc_submit_gate_accepted();
-            }
-            // Relay-internal latency from the first raw
-            // segment chunk of this block arriving to the
-            // submit decision (mesh-receive → reassemble →
-            // gate → submit).
-            let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
-            if matches!(
-                raw_outcome,
-                Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_))
-            ) {
-                // Record in shared dedup ring so compact-block
-                // paths won't also submit this consensus block.
-                fast_path_dedup.record(raw_block_hash, Instant::now());
-            }
-            if matches!(raw_outcome, Ok(SubmissionOutcome::Submitted { .. })) {
-                work.metrics
-                    .observe_first_seen_to_submit_ms(first_seen_to_submit_ms);
-            }
-            log_submission_outcome(
-                raw_outcome,
-                work.metrics.as_ref(),
-                Some(first_seen_to_submit_ms),
-            );
+            Some((raw_block, raw_block_hash))
         }
         Err(error) => {
             work.metrics.inc_raw_segment_reassembly_failures();
             warn!(%error, "Relay raw block segments did not reassemble");
+            None
         }
     }
+}
+
+/// A whole legacy raw block to the gate and Zebra, past the dedup check. True if it was
+/// submitted or a dry run built it, which is what that check records.
+async fn submit_whole_raw_block(
+    raw_block: Vec<u8>,
+    block_hash: [u8; 32],
+    first_seen: Instant,
+    work: &BlockWork,
+) -> bool {
+    let raw_outcome = check_and_submit_raw_block(
+        &work.rpc,
+        &work.submitter,
+        &raw_block,
+        block_hash,
+        work.mode,
+        work.gate.as_ref(),
+        work.chain_view.as_ref(),
+    )
+    .await;
+    if let (Some(error), Some(unreadable), Some(gate), Some(chain_view)) = (
+        unreadable_body(&raw_outcome),
+        &work.unreadable_submit,
+        &work.gate,
+        &work.chain_view,
+    ) {
+        // Off the receive task, which must keep
+        // reading while Zebra judges this.
+        unreadable.spawn(UnverifiedSubmission {
+            submitter: Arc::clone(&work.submitter),
+            rpc: Arc::clone(&work.rpc),
+            gate: Arc::clone(gate),
+            chain_view: Arc::clone(chain_view),
+            metrics: Arc::clone(&work.metrics),
+            mode: work.mode,
+            raw_block,
+            error,
+            first_seen,
+        });
+        return false;
+    }
+    let delivered = matches!(
+        raw_outcome,
+        Ok(SubmissionOutcome::DryRun(_)) | Ok(SubmissionOutcome::Submitted { .. })
+    );
+    if work.gate.is_some() && delivered {
+        work.metrics.inc_submit_gate_accepted();
+    }
+    // Relay-internal latency from the first raw
+    // segment chunk of this block arriving to the
+    // submit decision (mesh-receive → reassemble →
+    // gate → submit).
+    let first_seen_to_submit_ms = first_seen.elapsed().as_millis() as u64;
+    if matches!(raw_outcome, Ok(SubmissionOutcome::Submitted { .. })) {
+        work.metrics
+            .observe_first_seen_to_submit_ms(first_seen_to_submit_ms);
+    }
+    log_submission_outcome(
+        raw_outcome,
+        work.metrics.as_ref(),
+        Some(first_seen_to_submit_ms),
+    );
+    delivered
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1012,6 +1262,7 @@ where
             rpc: Arc::clone(&rpc),
             submitter: Arc::clone(&submitter),
             mode,
+            compact_reconstruction_enabled,
             gate: gate.clone(),
             chain_view: chain_view.clone(),
             unreadable_submit,
@@ -1020,7 +1271,7 @@ where
         let mut bound_blocks = receiver.take_bound_blocks();
         let mut bound_tasks = BoundTasks::new(bound_limits);
         let mut held = HeldCopies::new(bound_limits.held);
-        let mut again = VecDeque::new();
+        let mut retries = Retries::new(bound_limits.retries());
         let mut raw_segments = RawSegmentBuffer::new(raw_segment_buffer_config);
         // Fast-path submit dedup shared by the skeleton and the non-gated
         // compact block paths (see `submit_compact_fast_path`).
@@ -1030,6 +1281,20 @@ where
             tokio::time::interval(raw_segment_cleanup_interval(raw_segment_buffer_config.ttl));
         cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            // Copies whose turn has come go to tasks as there is room, and never run here.
+            while bound_tasks.has_room()
+                && let Some((body, copy)) = retries.pop()
+            {
+                start_copy(
+                    copy,
+                    body,
+                    &work,
+                    &mempool,
+                    &mut bound_tasks,
+                    &mut held,
+                    &mut fast_path_dedup,
+                );
+            }
             tokio::select! {
                 // With no room blocks stay in their channel, and this task goes on.
                 block = next_bound_block(&mut bound_blocks), if bound_tasks.has_room() => {
@@ -1044,47 +1309,32 @@ where
                     if end.delivered {
                         fast_path_dedup.record(end.block.clone(), Instant::now());
                     }
+                    // Its copies go to tasks of their own, at the top of the loop.
                     for copy in held.task_ended(&bound_tasks, &end) {
-                        match copy {
-                            HeldCopy::Payload(payload) => again.push_back(payload),
-                            HeldCopy::Segments { segments, block_hash, first_seen } => {
-                                finish_raw_segments(
-                                    segments,
-                                    block_hash,
-                                    first_seen,
-                                    &work,
-                                    &mut fast_path_dedup,
-                                )
-                                .await;
-                            }
-                        }
+                        let (block, body) = (copy.block(), copy.body());
+                        retries.push(&block, body, copy);
                     }
                 }
-                payload = next_payload(&mut receiver, &mut again) => {
+                payload = receiver.recv_payload() => {
                     let Some(payload) = payload else {
                         warn!("Relay block receiver closed");
                         break;
                     };
-                    if !bound_tasks.is_idle()
-                        && let RelayPayload::CompactBlock(compact)
-                        | RelayPayload::CompactSkeleton(compact) = &payload
-                    {
-                        let hash_hex = hex::encode(zcash_block_hash(&compact.header));
-                        let body = compact_body(compact);
-                        if let Some(place) = held.place_for(&bound_tasks, &hash_hex, body) {
-                            held.hold(place, HeldCopy::Payload(payload));
-                            continue;
-                        }
-                    }
                     match payload {
                         RelayPayload::CompactBlock(compact) => {
+                            let block = hex::encode(zcash_block_hash(&compact.header));
+                            if let Some(waits) =
+                                waits(&bound_tasks, &held, &block, || compact_body(&compact))
+                            {
+                                let copy = HeldCopy::Compact { compact, skeleton: false };
+                                park(waits, &block, copy, &mut held, &mut retries);
+                                continue;
+                            }
                             metrics.inc_compact_blocks_received();
                             // Gate the candidate when configured and not in
                             // mempool-reconstruction mode (the gated handler
                             // doesn't support short_id reconstruction yet).
-                            let use_gate = gate.is_some()
-                                && (!compact_reconstruction_enabled
-                                    || compact.short_ids.is_empty());
+                            let use_gate = work.gates_compact(&compact);
                             if let (true, Some(gate), Some(chain_view)) =
                                 (use_gate, &gate, &chain_view)
                             {
@@ -1100,29 +1350,11 @@ where
                                     );
                                     continue;
                                 }
-                                let outcome = validate_then_gate_compact_block(
-                                    submitter.as_ref(),
-                                    &compact,
-                                    mode,
-                                    gate,
-                                    || chain_view.observe_candidate_parent(rpc.as_ref(), &compact.header),
-                                )
-                                .await;
-                                // Per-cause GateRejected metric is incremented in
-                                // log_submission_outcome; here we tick the
-                                // accepted-by-gate counter for outcomes that came
-                                // through the gated handler and were not rejected.
-                                if matches!(
-                                    outcome,
-                                    Ok(SubmissionOutcome::DryRun(_))
-                                        | Ok(SubmissionOutcome::Submitted { .. })
-                                ) {
-                                    metrics.inc_submit_gate_accepted();
+                                if submit_gated_compact(&compact, &work, gate, chain_view).await {
                                     // Record in the shared dedup ring so the raw-segment
                                     // path won't also submit the same block.
                                     fast_path_dedup.record(header_hash, Instant::now());
                                 }
-                                log_submission_outcome(outcome, metrics.as_ref(), None);
                             } else {
                                 // Non-gated fast path: reconstruct + submit with
                                 // block-hash dedup, so a skeleton and the full
@@ -1143,6 +1375,14 @@ where
                             }
                         }
                         RelayPayload::CompactSkeleton(compact) => {
+                            let block = hex::encode(zcash_block_hash(&compact.header));
+                            if let Some(waits) =
+                                waits(&bound_tasks, &held, &block, || compact_body(&compact))
+                            {
+                                let copy = HeldCopy::Compact { compact, skeleton: true };
+                                park(waits, &block, copy, &mut held, &mut retries);
+                                continue;
+                            }
                             // Skeleton fast path: attempt full mempool
                             // reconstruction. On a complete reconstruction submit
                             // and record the block hash (so the later full compact
@@ -1191,18 +1431,16 @@ where
                                     metrics.inc_raw_segment_sets_completed();
                                     raw_segments.update_metrics(metrics.as_ref());
                                     let hash_hex = hex::encode(block_hash);
-                                    let body = if bound_tasks.is_idle() {
-                                        None
-                                    } else {
+                                    let body = || {
                                         reassemble_raw_block(&segments).ok().map(|raw| body_of(&raw))
                                     };
-                                    if let Some(place) = held.place_for(&bound_tasks, &hash_hex, body) {
+                                    if let Some(waits) = waits(&bound_tasks, &held, &hash_hex, body) {
                                         let copy = HeldCopy::Segments {
                                             segments,
                                             block_hash,
                                             first_seen,
                                         };
-                                        held.hold(place, copy);
+                                        park(waits, &hash_hex, copy, &mut held, &mut retries);
                                         continue;
                                     }
                                     finish_raw_segments(
@@ -1239,7 +1477,8 @@ where
             }
         }
         // A found block at Zebra gets its time, each task up to its budget where it waits. What
-        // was held for one goes with this task: there is nothing left to run it.
+        // was held for one, or waits for a task, goes with this task: there is nothing left to
+        // run it.
         while !bound_tasks.is_idle() {
             bound_tasks.next_end().await;
         }

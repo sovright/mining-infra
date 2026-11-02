@@ -7,7 +7,7 @@ use delivery_lease::segment_frame::{
 };
 use serde_json::Value;
 
-const VECTORS: &str = include_str!("vectors/cerceve.json");
+const VECTORS: &str = include_str!("vectors/frames.json");
 
 fn hash_header(header: &[u8]) -> [u8; 32] {
     let hash = blake2b_simd::Params::new()
@@ -57,7 +57,7 @@ fn every_valid_frame_passes_with_the_expected_identity() {
     let rules = rules(&vectors);
     let mut frames = 0;
     for case in vectors["gecerli"].as_array().unwrap() {
-        for (index, frame) in case["cerceveler"].as_object().unwrap() {
+        for (index, frame) in case["frames"].as_object().unwrap() {
             let segment = verify(&unhex(frame.as_str().unwrap()), &rules)
                 .unwrap_or_else(|error| panic!("{}, {index}: {error:?}", case["ad"]));
             assert_eq!(
@@ -83,7 +83,7 @@ fn every_invalid_frame_stops_at_the_expected_rule() {
     let cases = vectors["olumsuz"].as_array().unwrap();
     assert!(cases.len() >= 20);
     for case in cases {
-        let frame = match case["cerceve"].as_str() {
+        let frame = match case["frame"].as_str() {
             Some(frame) => unhex(frame),
             None => vec![0; case["uzunluk"].as_u64().unwrap() as usize],
         };
@@ -175,7 +175,7 @@ fn identities_separate_what_they_should() {
 
     // A consistent body of the same header is valid, under an identity of its own.
     let own = &identities["kendi_koku_ile_tutarli"];
-    let frame = unhex(own["cerceve_0"].as_str().unwrap());
+    let frame = unhex(own["frame_0"].as_str().unwrap());
     let segment = verify(&frame, &rules).unwrap();
     assert_eq!(segment.key().body_id, hex32(&own["body_id"]));
     assert_eq!(segment.key().block_hash, block_hash);

@@ -8,9 +8,13 @@
 //! The gate turns away only the bytes it has at Zebra. So a copy with the bytes of a running task
 //! has a place of its own, one for each task, and nothing can crowd it out: it is that task's
 //! retry. Any other copy of a block under way waits in a shared room while there is room. With
-//! none it goes on as it came: the gate lets a different body run alongside, at the price of a
-//! Zebra call on the receive task. Whether a copy comes at all, and whether it is the block, is
-//! not for this to promise.
+//! none it goes on as it came, as the gate lets a different body run alongside, but on a task of
+//! its own like any other retry.
+//!
+//! A copy whose wait is over, and one with no room to wait, goes to [`Retries`]. The receive task
+//! starts each on a bound task once one has room, inside the same limits, and never runs it
+//! itself: it never waits for Zebra on behalf of a copy. Past what that queue holds a copy is
+//! dropped. Whether a copy comes at all, and whether it is the block, is not for this to promise.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -20,6 +24,8 @@ use sha2::{Digest, Sha256};
 use tokio::task::{Id, JoinSet};
 use tracing::{debug, error, warn};
 
+use sovright_relay_sidecar::config;
+
 /// A body's exact bytes, for telling copies apart as the gate does.
 pub(crate) type Body = [u8; 32];
 
@@ -27,10 +33,12 @@ pub(crate) fn body_of(raw: &[u8]) -> Body {
     Sha256::digest(raw).into()
 }
 
-/// How much bound work runs at once, and for how long. Research values, past what a parent
-/// lookup and two Zebra calls of 30 s can take, and no setting anyone decided.
+/// How much bound work runs at once, and for how long. The defaults are research values, past
+/// what a parent lookup and two Zebra calls of 30 s can take, and no setting anyone decided.
+/// The sidecar config sets them (`bound_tasks_*`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BoundTaskLimits {
+    /// Tasks at once, bound blocks and retried copies together. At least one.
     pub(crate) running: usize,
     /// A timer, which acts where a task waits. Work that does not wait runs to its end first,
     /// and what a task handed to another task goes on. So this bounds what Zebra can hold up,
@@ -43,18 +51,39 @@ pub(crate) struct BoundTaskLimits {
 impl Default for BoundTaskLimits {
     fn default() -> Self {
         Self {
-            running: 4,
-            budget: Duration::from_secs(120),
-            held: 4,
+            running: config::DEFAULT_BOUND_TASKS_RUNNING,
+            budget: Duration::from_secs(config::DEFAULT_BOUND_TASKS_BUDGET_SECS),
+            held: config::DEFAULT_BOUND_TASKS_HELD,
         }
     }
 }
 
-/// A running task's block and body.
+impl BoundTaskLimits {
+    /// The limits a config gives, checked as the config is.
+    pub(crate) fn from_config(
+        running: usize,
+        budget_secs: u64,
+        held: usize,
+    ) -> Result<Self, config::ConfigError> {
+        config::validate_bound_task_limits(running, budget_secs, held)?;
+        Ok(Self {
+            running,
+            budget: Duration::from_secs(budget_secs),
+            held,
+        })
+    }
+
+    /// Copies waiting for a task: as many as can be held, one for each task and the shared room.
+    pub(crate) fn retries(&self) -> usize {
+        self.running.saturating_add(self.held)
+    }
+}
+
+/// A running task's block and body. A compact block that needs the mempool has no body to say.
 #[derive(Default)]
 struct BoundWork {
     block: String,
-    body: Body,
+    body: Option<Body>,
 }
 
 /// The tasks at work, and what each is working on. Dropped, it cancels them.
@@ -67,7 +96,7 @@ pub(crate) struct BoundTasks {
 /// What a task came to.
 pub(crate) struct BoundTaskEnd {
     pub(crate) block: String,
-    body: Body,
+    body: Option<Body>,
     /// Zebra has the block from this task. Ending any other way says nothing of the block.
     pub(crate) delivered: bool,
 }
@@ -89,20 +118,20 @@ impl BoundTasks {
         self.running.is_empty()
     }
 
-    fn under_way(&self, block: &str) -> bool {
+    pub(crate) fn under_way(&self, block: &str) -> bool {
         self.work.values().any(|work| work.block == block)
     }
 
     /// The block of the task on these bytes, if one is.
     fn block_of_body(&self, body: &Body) -> Option<&str> {
-        let work = self.work.values().find(|work| work.body == *body);
+        let work = self.work.values().find(|work| work.body == Some(*body));
         work.map(|work| work.block.as_str())
     }
 
     pub(crate) fn spawn(
         &mut self,
         block: String,
-        body: Body,
+        body: Option<Body>,
         work: impl Future<Output = bool> + Send + 'static,
     ) {
         let budget = self.limits.budget;
@@ -203,13 +232,16 @@ impl<T> HeldCopies<T> {
         if !tasks.under_way(&end.block) {
             return self.take(|held| held.place.block == end.block);
         }
-        if tasks.block_of_body(&end.body).is_some() {
+        let Some(body) = end.body else {
+            return Vec::new();
+        };
+        if tasks.block_of_body(&body).is_some() {
             return Vec::new();
         }
         let room = self.has_room();
-        let released = self.take(|held| held.place.body == Some(end.body) && !room);
+        let released = self.take(|held| held.place.body == Some(body) && !room);
         for held in &mut self.copies {
-            if held.place.body == Some(end.body) {
+            if held.place.body == Some(body) {
                 held.place.body = None;
             }
         }
@@ -222,6 +254,45 @@ impl<T> HeldCopies<T> {
             .partition(wanted);
         self.copies = kept;
         released.into_iter().map(|held| held.copy).collect()
+    }
+}
+
+/// Copies for a task of their own, in the order they came. The receive task starts them as
+/// tasks have room, and never runs one itself. At most `limit` wait, and a copy of bytes that
+/// already wait is not kept: a retry needs them once.
+pub(crate) struct Retries<T> {
+    limit: usize,
+    copies: VecDeque<(Option<Body>, T)>,
+}
+
+impl<T> Retries<T> {
+    pub(crate) fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            copies: VecDeque::new(),
+        }
+    }
+
+    /// Queues a copy, and says whether it was kept.
+    pub(crate) fn push(&mut self, block: &str, body: Option<Body>, copy: T) -> bool {
+        if body.is_some() && self.copies.iter().any(|(waiting, _)| *waiting == body) {
+            debug!(block_hash = %block, "these bytes are waiting for a task already; dropping a copy");
+            return false;
+        }
+        if self.copies.len() >= self.limit {
+            warn!(
+                block_hash = %block,
+                waiting = self.copies.len(),
+                "Too many copies waiting for a bound task; dropping one"
+            );
+            return false;
+        }
+        self.copies.push_back((body, copy));
+        true
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<(Option<Body>, T)> {
+        self.copies.pop_front()
     }
 }
 
@@ -268,9 +339,11 @@ mod tests {
         let mut tasks = tasks(2);
         assert!(tasks.has_room() && tasks.is_idle());
         let (first, first_done) = oneshot::channel::<()>();
-        tasks.spawn("a".into(), body(1), async move { first_done.await.is_ok() });
+        tasks.spawn("a".into(), Some(body(1)), async move {
+            first_done.await.is_ok()
+        });
         assert!(tasks.has_room());
-        tasks.spawn("b".into(), body(2), std::future::pending());
+        tasks.spawn("b".into(), Some(body(2)), std::future::pending());
         assert!(!tasks.has_room(), "two are running");
 
         first.send(()).unwrap();
@@ -287,8 +360,10 @@ mod tests {
     async fn a_block_stays_under_way_until_its_last_task_ends() {
         let mut tasks = tasks(4);
         let (first, first_done) = oneshot::channel::<()>();
-        tasks.spawn("a".into(), body(1), async move { first_done.await.is_ok() });
-        tasks.spawn("a".into(), body(2), std::future::pending());
+        tasks.spawn("a".into(), Some(body(1)), async move {
+            first_done.await.is_ok()
+        });
+        tasks.spawn("a".into(), Some(body(2)), std::future::pending());
 
         first.send(()).unwrap();
         end_of(&mut tasks).await;
@@ -306,7 +381,7 @@ mod tests {
         });
         let dropped = Arc::new(AtomicBool::new(false));
         let held = Held(Arc::clone(&dropped));
-        tasks.spawn("a".into(), body(1), async move {
+        tasks.spawn("a".into(), Some(body(1)), async move {
             let _held = held;
             std::future::pending().await
         });
@@ -327,12 +402,14 @@ mod tests {
         let mut tasks = tasks(2);
         let dropped = Arc::new(AtomicBool::new(false));
         let held = Held(Arc::clone(&dropped));
-        tasks.spawn("a".into(), body(1), async move {
+        tasks.spawn("a".into(), Some(body(1)), async move {
             let _held = held;
             panic!("in a task");
         });
         let (other, other_done) = oneshot::channel::<()>();
-        tasks.spawn("b".into(), body(2), async move { other_done.await.is_ok() });
+        tasks.spawn("b".into(), Some(body(2)), async move {
+            other_done.await.is_ok()
+        });
 
         let end = end_of(&mut tasks).await;
 
@@ -350,7 +427,7 @@ mod tests {
         let dropped = Arc::new(AtomicBool::new(false));
         let held = Held(Arc::clone(&dropped));
         let (started, has_started) = oneshot::channel::<()>();
-        tasks.spawn("a".into(), body(1), async move {
+        tasks.spawn("a".into(), Some(body(1)), async move {
             let _held = held;
             let _ = started.send(());
             std::future::pending().await
@@ -385,7 +462,7 @@ mod tests {
             let (stop, stopped) = oneshot::channel::<()>();
             self.stops.insert(body(mark), stop);
             let work = async move { stopped.await.is_ok() };
-            self.tasks.spawn(block.into(), body(mark), work);
+            self.tasks.spawn(block.into(), Some(body(mark)), work);
         }
 
         async fn end(&mut self, mark: u8) -> BoundTaskEnd {
@@ -471,12 +548,12 @@ mod tests {
         let mut tasks = tasks(4);
         let (first, first_done) = oneshot::channel::<()>();
         let (second, second_done) = oneshot::channel::<()>();
-        tasks.spawn("a".into(), body(1), async move { first_done.await.is_ok() });
-        tasks.spawn(
-            "a".into(),
-            body(1),
-            async move { second_done.await.is_ok() },
-        );
+        tasks.spawn("a".into(), Some(body(1)), async move {
+            first_done.await.is_ok()
+        });
+        tasks.spawn("a".into(), Some(body(1)), async move {
+            second_done.await.is_ok()
+        });
         let mut held = HeldCopies::new(0);
         assert!(try_hold(&mut held, &tasks, ("a", 1, 1)));
 
@@ -510,5 +587,64 @@ mod tests {
             held.task_ended(&running.tasks, &end);
             assert!(held.copies.len() <= RUNNING + ROOM, "{}", held.copies.len());
         }
+    }
+
+    #[test]
+    fn retries_keep_their_order_up_to_the_limit_and_one_copy_of_each_body() {
+        let mut retries = Retries::new(3);
+        assert!(retries.push("a", Some(body(1)), 1));
+        assert!(
+            !retries.push("a", Some(body(1)), 2),
+            "these bytes wait already"
+        );
+        assert!(retries.push("a", None, 3));
+        assert!(retries.push("b", None, 4));
+        assert!(!retries.push("c", Some(body(5)), 5), "the queue is full");
+
+        let order: Vec<i32> = std::iter::from_fn(|| retries.pop())
+            .map(|(_, copy)| copy)
+            .collect();
+        assert_eq!(order, vec![1, 3, 4]);
+        assert!(retries.pop().is_none());
+        assert!(
+            retries.push("a", Some(body(1)), 6),
+            "gone from the queue, so kept again"
+        );
+    }
+
+    /// A task with no body to say, as a compact copy that needs the mempool: its end frees no
+    /// place of bytes, and the block's last end still lets every copy go.
+    #[tokio::test]
+    async fn a_task_with_no_body_ends_like_any_other() {
+        let mut tasks = tasks(4);
+        let (first, first_done) = oneshot::channel::<()>();
+        tasks.spawn("a".into(), None, async move { first_done.await.is_ok() });
+        let (second, second_done) = oneshot::channel::<()>();
+        tasks.spawn("a".into(), Some(body(1)), async move {
+            second_done.await.is_ok()
+        });
+        let mut held = HeldCopies::new(1);
+        assert!(try_hold(&mut held, &tasks, ("a", 1, 1)));
+        assert!(try_hold(&mut held, &tasks, ("a", 0, 2)));
+
+        first.send(()).unwrap();
+        let end = end_of(&mut tasks).await;
+        assert!(held.task_ended(&tasks, &end).is_empty());
+        second.send(()).unwrap();
+        let end = end_of(&mut tasks).await;
+
+        assert_eq!(held.task_ended(&tasks, &end), vec![1, 2]);
+    }
+
+    #[test]
+    fn limits_from_a_config_are_checked() {
+        assert!(BoundTaskLimits::from_config(0, 120, 4).is_err());
+        assert!(BoundTaskLimits::from_config(4, 0, 4).is_err());
+        let limits = BoundTaskLimits::from_config(1, 7, 0).unwrap();
+        assert_eq!(
+            (limits.running, limits.budget, limits.held),
+            (1, Duration::from_secs(7), 0)
+        );
+        assert_eq!(limits.retries(), 1);
     }
 }

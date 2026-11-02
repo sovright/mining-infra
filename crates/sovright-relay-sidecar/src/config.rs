@@ -5,7 +5,32 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Error type alias for config operations
-type ConfigError = Box<dyn std::error::Error + Send + Sync>;
+pub type ConfigError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Bound raw blocks (and retried copies of them) worked on at once. Research value.
+pub const DEFAULT_BOUND_TASKS_RUNNING: usize = 4;
+/// Seconds one bound task may wait in all. Research value, past what a parent lookup and two
+/// Zebra calls of 30 s can take.
+pub const DEFAULT_BOUND_TASKS_BUDGET_SECS: u64 = 120;
+/// Copies of a block under way kept in the shared room. Research value.
+pub const DEFAULT_BOUND_TASKS_HELD: usize = 4;
+
+/// The checks on the bound task limits, from the config file or the command line.
+pub fn validate_bound_task_limits(
+    running: usize,
+    budget_secs: u64,
+    held: usize,
+) -> Result<(), ConfigError> {
+    // `held` is unsigned, so any value is at least zero: zero means no shared room.
+    let _ = held;
+    if running == 0 {
+        return Err("bound_tasks_running must be at least 1".into());
+    }
+    if budget_secs == 0 {
+        return Err("bound_tasks_budget_secs must be greater than 0".into());
+    }
+    Ok(())
+}
 
 /// Configuration loaded from file
 #[derive(Debug, Deserialize)]
@@ -139,6 +164,21 @@ pub struct Config {
     /// every reassembled candidate without forwarding anything upstream.
     #[serde(default)]
     pub submit_gate: SubmitGateConfig,
+
+    /// Bound raw path (`SOVRIGHT_RELAY_BOUND_RAW`): blocks worked on at once, bound blocks and
+    /// retried copies together. At least 1.
+    #[serde(default = "default_bound_tasks_running")]
+    pub bound_tasks_running: usize,
+
+    /// Bound raw path: seconds one task may wait, at its parent lookup, the gate and Zebra
+    /// together, before it gives way to a copy. Greater than 0.
+    #[serde(default = "default_bound_tasks_budget_secs")]
+    pub bound_tasks_budget_secs: u64,
+
+    /// Bound raw path: copies of a block under way kept in the shared room while its task runs.
+    /// 0 keeps only the copies that are a running task's own bytes.
+    #[serde(default = "default_bound_tasks_held")]
+    pub bound_tasks_held: usize,
 }
 
 /// Configuration for the safety gate in front of `submit_block`.
@@ -262,6 +302,18 @@ fn default_submit_gate_dedup_capacity() -> usize {
     256
 }
 
+fn default_bound_tasks_running() -> usize {
+    DEFAULT_BOUND_TASKS_RUNNING
+}
+
+fn default_bound_tasks_budget_secs() -> u64 {
+    DEFAULT_BOUND_TASKS_BUDGET_SECS
+}
+
+fn default_bound_tasks_held() -> usize {
+    DEFAULT_BOUND_TASKS_HELD
+}
+
 fn default_zebra_mempool_sync_interval_ms() -> u64 {
     2000
 }
@@ -319,8 +371,18 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
-        config.submit_gate.validate()?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// The checks a loaded config has to pass before anything runs on it.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.submit_gate.validate()?;
+        validate_bound_task_limits(
+            self.bound_tasks_running,
+            self.bound_tasks_budget_secs,
+            self.bound_tasks_held,
+        )
     }
 
     /// Parse relay peers to SocketAddr
@@ -682,5 +744,53 @@ mod ab_config_tests {
             cfg.submit_log_path.as_deref(),
             Some("/var/log/bedrock/submit-calls.jsonl")
         );
+    }
+
+    #[test]
+    fn bound_task_limits_default_and_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "relay_peers = []\n").unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert_eq!(cfg.bound_tasks_running, DEFAULT_BOUND_TASKS_RUNNING);
+        assert_eq!(cfg.bound_tasks_budget_secs, DEFAULT_BOUND_TASKS_BUDGET_SECS);
+        assert_eq!(cfg.bound_tasks_held, DEFAULT_BOUND_TASKS_HELD);
+        assert_eq!(
+            (
+                DEFAULT_BOUND_TASKS_RUNNING,
+                DEFAULT_BOUND_TASKS_BUDGET_SECS,
+                DEFAULT_BOUND_TASKS_HELD
+            ),
+            (4, 120, 4),
+            "the defaults stay what they were"
+        );
+
+        std::fs::write(
+            &path,
+            "relay_peers = []\n\
+             bound_tasks_running = 2\n\
+             bound_tasks_budget_secs = 30\n\
+             bound_tasks_held = 0\n",
+        )
+        .unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert_eq!(cfg.bound_tasks_running, 2);
+        assert_eq!(cfg.bound_tasks_budget_secs, 30);
+        assert_eq!(cfg.bound_tasks_held, 0);
+    }
+
+    #[test]
+    fn bound_task_limits_are_checked_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        for (bad, says) in [
+            ("bound_tasks_running = 0", "bound_tasks_running"),
+            ("bound_tasks_budget_secs = 0", "bound_tasks_budget_secs"),
+            ("bound_tasks_held = -1", "bound_tasks_held"),
+        ] {
+            std::fs::write(&path, format!("relay_peers = []\n{bad}\n")).unwrap();
+            let error = Config::from_file(&path).expect_err(bad).to_string();
+            assert!(error.contains(says), "{bad}: {error}");
+        }
     }
 }
