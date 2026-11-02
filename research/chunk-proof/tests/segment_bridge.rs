@@ -16,7 +16,7 @@ use common::{
     KEY, assembler_limits, assembler_on, content, datagrams, decoded, object, pending, roomy,
     roomy_limits,
 };
-use delivery_lease::body_buffer::BufferLimits;
+use delivery_lease::body_buffer::{ACTIVE_SET, BufferLimits};
 use delivery_lease::segment_frame::{FrameError, check};
 use delivery_lease::{
     Admission, DeliveryLedger, Limits, ObjectId, Phase, Refusal, Snapshot, Ticket, Transit,
@@ -293,6 +293,8 @@ fn a_segment_evicted_for_capacity_can_come_back() {
     let (_, third, _) = carried_body(30);
     held(rig.deliver(&first[0], now));
     held(rig.deliver(&second[0], now));
+    // A set still arriving is never given up, so these have gone quiet.
+    let now = now + ACTIVE_SET;
 
     let evicted = held(rig.deliver(&third[0], now));
 
@@ -302,6 +304,7 @@ fn a_segment_evicted_for_capacity_can_come_back() {
         Some(Phase::Released)
     );
     assert_eq!(rig.bridge.interest(&first[0].object_id, now), Interest::Due);
+    let now = now + ACTIVE_SET;
 
     assert_eq!(held(rig.deliver(&first[0], now)).len(), 1);
     assert_eq!(rig.ledger.observe(&first_segments[0]), Some(Phase::Held));

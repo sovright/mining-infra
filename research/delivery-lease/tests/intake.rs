@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use common::{Body, SEGMENT, body, frame, levels, padded_body, proof, rules, sized};
 use delivery_lease::body_buffer::{
-    AssembledBlock, AssemblyError, BodyBuffer, BufferLimits, Reject,
+    ACTIVE_SET, AssembledBlock, AssemblyError, BodyBuffer, BufferLimits, Reject,
 };
 use delivery_lease::intake::{Intake, Offer, Step, into_complete};
 use delivery_lease::segment_frame::{FrameError, segment_leaf, verify};
@@ -212,7 +212,7 @@ fn an_invalid_frame_evicts_nothing_even_with_the_ledger_full() {
 /// cannot touch the honest slots, but it competes for capacity, and with one set per
 /// block it evicts the honest one. This is the known limit, kept visible.
 #[test]
-fn known_gap_a_consistent_body_of_the_header_can_evict_the_honest_one() {
+fn known_gap_a_consistent_body_of_the_header_can_evict_the_honest_one_once_it_is_quiet() {
     let limits = BufferLimits {
         max_sets_per_block: 1,
         ..buffer_limits()
@@ -222,7 +222,15 @@ fn known_gap_a_consistent_body_of_the_header_can_evict_the_honest_one() {
     let (honest, own_root) = (body(1, 10), body(1, 20));
     take(&mut intake, &honest, 0, now);
 
-    let evicted = take(&mut intake, &own_root, 0, now);
+    // While the honest set is still arriving it stays, and the rival costs nothing.
+    assert!(matches!(
+        intake.receive(&own_root.frames[0], now),
+        Offer::Refused(Refusal::Sets)
+    ));
+    assert_eq!(phase(&ledger, &honest, 0), Some(Phase::Held));
+    assert_eq!(phase(&ledger, &own_root, 0), None);
+
+    let evicted = take(&mut intake, &own_root, 0, now + ACTIVE_SET);
 
     assert_eq!(evicted, vec![honest.key.body_id]);
     assert_eq!(phase(&ledger, &honest, 0), Some(Phase::Released));
@@ -292,6 +300,7 @@ fn a_full_ledger_makes_room_from_the_buffer() {
     let (first, second, third) = (body(1, 10), body(2, 10), body(3, 10));
     take(&mut intake, &first, 0, now);
     take(&mut intake, &second, 0, now);
+    let now = now + ACTIVE_SET;
 
     let evicted = take(&mut intake, &third, 0, now);
 
@@ -316,6 +325,7 @@ fn under_pressure_the_same_block_gives_up_its_least_advanced_set_first() {
     take(&mut intake, &other_block, 0, now);
     take(&mut intake, &advanced, 0, now);
     take(&mut intake, &behind, 0, now);
+    let now = now + ACTIVE_SET;
 
     let evicted = take(&mut intake, &new, 0, now);
 
@@ -338,6 +348,7 @@ fn a_full_owner_limit_makes_room_the_same_way() {
     let now = Instant::now();
     let (first, second) = (body(1, 10), body(2, 10));
     take(&mut intake, &first, 0, now);
+    let now = now + ACTIVE_SET;
 
     assert_eq!(take(&mut intake, &second, 0, now), vec![first.key.body_id]);
     assert_eq!(ledger.snapshot().live_owners, 1);
@@ -435,6 +446,7 @@ fn only_capacity_makes_room() {
         Offer::Owned(Phase::Held)
     ));
     assert!(intake.buffer().holds(&x.key), "a duplicate evicts nothing");
+    let now = now + ACTIVE_SET;
 
     take(&mut intake, &y, 0, now);
     assert_eq!(phase(&ledger, &x, 0), Some(Phase::Released));
@@ -530,6 +542,7 @@ fn room_promised_by_an_eviction_cannot_be_taken() {
     let (first, second, third, thief) = (body(1, 10), body(2, 10), body(3, 10), body(7, 70));
     take(&mut intake, &first, 0, now);
     take(&mut intake, &second, 0, now);
+    let now = now + ACTIVE_SET;
 
     let mut steps = Vec::new();
     let offer = intake.receive_stepping(&third.frames[0], now, |step| {
@@ -637,6 +650,7 @@ fn a_full_record_map_makes_room_the_same_way_and_ends_at_its_limit() {
     let now = Instant::now();
     let (first, second) = (body(1, 10), body(2, 10));
     take(&mut intake, &first, 0, now);
+    let now = now + ACTIVE_SET;
 
     assert_eq!(take(&mut intake, &second, 0, now), vec![first.key.body_id]);
 
@@ -743,6 +757,7 @@ fn a_second_intake_cannot_stack_on_a_reservation_in_transit() {
             take(&mut other, &body(block, 10), 0, now);
         }
         let (first_new, second_new) = (body(5, 10), body(6, 10));
+        let now = now + ACTIVE_SET;
 
         let offer = waiting.receive_stepping(&first_new.frames[0], now, |step| {
             if step != Step::BeforeEvicting {
@@ -791,6 +806,7 @@ fn a_plain_admission_stays_under_the_limit() {
     let now = Instant::now();
     let (victim, new, thief) = (body(1, 10), body(2, 10), body(7, 70));
     take(&mut intake, &victim, 0, now);
+    let now = now + ACTIVE_SET;
     assert!(ledger.limits().transit.bytes >= SEGMENT);
 
     assert!(matches!(
@@ -813,6 +829,7 @@ fn with_no_share_a_full_ledger_refuses_and_gives_up_nothing() {
     let (first, second, third) = (body(1, 10), body(2, 10), body(3, 10));
     take(&mut intake, &first, 0, now);
     take(&mut intake, &second, 0, now);
+    let now = now + ACTIVE_SET;
     let before = ledger.snapshot();
 
     assert!(matches!(
@@ -838,6 +855,7 @@ fn a_share_smaller_than_the_object_gives_up_nothing() {
     let now = Instant::now();
     let (first, second) = (body(1, 10), body(2, 10));
     take(&mut intake, &first, 0, now);
+    let now = now + ACTIVE_SET;
     let before = ledger.snapshot();
 
     assert!(matches!(
@@ -893,6 +911,7 @@ fn a_panic_before_the_evictions_gives_the_reservation_back_and_keeps_the_sets() 
     let now = Instant::now();
     let (victim, new) = (body(1, 10), body(2, 10));
     take(&mut intake, &victim, 0, now);
+    let now = now + ACTIVE_SET;
     let before = ledger.snapshot();
 
     dies(|| {

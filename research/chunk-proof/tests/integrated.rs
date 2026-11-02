@@ -22,6 +22,7 @@ use chunk_proof::object::Profile;
 use common::bodies::{Body, HEADER, SEG, body, carried, forged_frame, rules};
 use common::world::{BUFFER_TTL, COMPLETED_TTL, World, held, limits};
 use common::{ASSEMBLY_TTL, KEY, datagrams};
+use delivery_lease::body_buffer::ACTIVE_SET;
 use delivery_lease::segment_frame::FrameError;
 use delivery_lease::{Admission, Limits as LedgerLimits, Phase, Refusal, Transit};
 use sha2::{Digest, Sha256};
@@ -318,6 +319,8 @@ fn an_evicted_set_is_rebuilt_from_a_resend() {
     let (first, second) = (honest(), body(2, 20, RAW_LEN));
     held(world.object(&first.objects[0]));
     held(world.object(&first.objects[1]));
+    // A set still arriving is never given up, so the first has gone quiet.
+    world.later(ACTIVE_SET);
 
     let evicted = held(world.object(&second.objects[0]));
 
@@ -482,6 +485,13 @@ fn known_gap_the_ledger_can_be_held_until_a_set_expires() {
         held(world.object(object));
     }
 
+    // Its own set is still arriving, so it is not even offered, and the ledger is full.
+    assert!(matches!(
+        world.object(&honest.objects[0]),
+        Handoff::Refused(Refusal::Bytes)
+    ));
+    // Quiet, it is offered, and the share is too small to give it up.
+    world.later(ACTIVE_SET);
     assert!(matches!(
         world.object(&honest.objects[0]),
         Handoff::Refused(Refusal::Transit)

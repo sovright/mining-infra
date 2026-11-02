@@ -123,6 +123,11 @@ impl Intake {
             return Offer::Rejected(Reject::TooManySegments);
         }
         let (id, key, bytes) = (frame.ledger_key(), frame.key(), frame.payload_len());
+        // Ahead of the ledger, so a segment that would have to push out a set still arriving
+        // costs nothing and can come again.
+        if self.buffer.room_for(&key, now).is_none() {
+            return Offer::Refused(Refusal::Sets);
+        }
         let (admission, mut evicted) = self.reserve(id, bytes, now, Some(&key), step);
         let ticket = match admission {
             Admission::Admitted(ticket) => ticket,
@@ -154,7 +159,7 @@ impl Intake {
             return (first, Vec::new());
         }
 
-        let offered = self.buffer.evictable(incoming);
+        let offered = self.buffer.evictable(incoming, now);
         let holdings: Vec<Holding> = offered.iter().map(|set| set.holding).collect();
         step(Step::BeforeAsking);
         let (admission, spent) = self.ledger.admit_giving_up(id, bytes, now, &holdings);

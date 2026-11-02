@@ -24,7 +24,7 @@ use chunk_proof::object::{Encoded, held_bytes};
 use common::bodies::{Body, SEG, body};
 use common::world::{BUFFER_TTL, COMPLETED_TTL, World, held, limits};
 use common::{ASSEMBLY_TTL, KEY, datagrams};
-use delivery_lease::body_buffer::CompleteSet;
+use delivery_lease::body_buffer::{ACTIVE_SET, CompleteSet};
 use delivery_lease::{Admission, Phase, Ticket};
 
 const RAW_LEN: usize = 2 * SEG;
@@ -102,7 +102,11 @@ fn back_after_eviction(way: Way, gone_after: usize) -> bool {
     for position in 0..gone_after {
         send(&mut world, way, &first.objects[0], position);
     }
+    // A set still arriving is never given up, so the first has gone quiet.
+    world.later(ACTIVE_SET);
     held(world.object(&other.objects[0]));
+    // And the other has gone quiet by the time the first comes back.
+    world.later(ACTIVE_SET);
     assert_eq!(
         world.stack.ledger().observe(&first.segments[0]),
         Some(Phase::Released)
@@ -283,7 +287,9 @@ fn a_copy_after_the_owner_has_gone_is_taken_however_it_went() {
     evicting.buffer.max_sets = 1;
     let mut world = World::new(evicting);
     held(world.object(&body.objects[0]));
+    world.later(ACTIVE_SET);
     held(world.object(&two_segments(20).objects[0]));
+    world.later(ACTIVE_SET);
     assert_eq!(world.bridge.interest(&object, world.now), Interest::Due);
     held(world.object(&body.objects[0]));
 

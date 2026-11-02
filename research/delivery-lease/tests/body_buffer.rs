@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use common::{Body, SEGMENT, body, rules, sized};
 use delivery_lease::body_buffer::{
-    Arrival, AssembledBlock, AssemblyError, BodyBuffer, BufferLimits, CompleteSet, InvalidLimits,
-    Outcome, Reject,
+    ACTIVE_SET, Arrival, AssembledBlock, AssemblyError, BodyBuffer, BufferLimits, CompleteSet,
+    InvalidLimits, Outcome, Reject,
 };
 use delivery_lease::segment_frame::verify;
 use delivery_lease::{Admission, DeliveryLedger, Limits, Phase, Refusal, Ticket, Transit};
@@ -137,8 +137,9 @@ fn a_limit_of_one_holds() {
     let mut buffer = BodyBuffer::new(limits).unwrap();
     let (first, second) = (body(1, 10), body(2, 10));
     pending(&mut buffer, seg(&ledger, &first, 0, now), now);
+    let quiet = now + ACTIVE_SET;
 
-    let insertion = buffer.insert(seg(&ledger, &second, 0, now), now);
+    let insertion = buffer.insert(seg(&ledger, &second, 0, quiet), quiet);
 
     assert_eq!(insertion.evicted, vec![first.key]);
     assert_eq!(buffer.sets(), 1);
@@ -209,8 +210,9 @@ fn a_full_block_gives_up_its_least_advanced_set_and_no_other_blocks() {
     pending(&mut buffer, seg(&ledger, &advanced, 0, now), now);
     pending(&mut buffer, seg(&ledger, &advanced, 1, now), now);
     pending(&mut buffer, seg(&ledger, &behind, 0, now), now);
+    let quiet = now + ACTIVE_SET;
 
-    let insertion = buffer.insert(seg(&ledger, &new, 0, now), now);
+    let insertion = buffer.insert(seg(&ledger, &new, 0, quiet), quiet);
 
     assert_eq!(insertion.evicted, vec![behind.key]);
     assert!(buffer.holds(&advanced.key));
@@ -219,8 +221,10 @@ fn a_full_block_gives_up_its_least_advanced_set_and_no_other_blocks() {
     assert_eq!(phase(&ledger, &advanced, 1), Some(Phase::Held));
 }
 
+/// Of two quiet sets as far along, the newer goes: the older is the likelier to be the body
+/// that came first. This used to be the other way round.
 #[test]
-fn the_older_of_two_equal_sets_goes_first() {
+fn the_newer_of_two_equal_quiet_sets_goes_first() {
     let limits = BufferLimits {
         max_sets_per_block: 2,
         ..buffer_limits()
@@ -230,10 +234,11 @@ fn the_older_of_two_equal_sets_goes_first() {
     let (older, newer, new) = (body(1, 10), body(1, 20), body(1, 30));
     pending(&mut buffer, seg(&ledger, &older, 0, now), now);
     pending(&mut buffer, seg(&ledger, &newer, 0, now), now);
+    let quiet = now + ACTIVE_SET;
 
-    let insertion = buffer.insert(seg(&ledger, &new, 0, now), now);
+    let insertion = buffer.insert(seg(&ledger, &new, 0, quiet), quiet);
 
-    assert_eq!(insertion.evicted, vec![older.key]);
+    assert_eq!(insertion.evicted, vec![newer.key]);
 }
 
 #[test]
@@ -247,10 +252,11 @@ fn the_set_limit_holds_across_blocks() {
     let (first, second, third) = (body(1, 10), body(2, 10), body(3, 10));
     pending(&mut buffer, seg(&ledger, &first, 0, now), now);
     pending(&mut buffer, seg(&ledger, &second, 0, now), now);
+    let quiet = now + ACTIVE_SET;
 
-    let insertion = buffer.insert(seg(&ledger, &third, 0, now), now);
+    let insertion = buffer.insert(seg(&ledger, &third, 0, quiet), quiet);
 
-    assert_eq!(insertion.evicted, vec![first.key]);
+    assert_eq!(insertion.evicted, vec![second.key]);
     assert_eq!(buffer.sets(), 2);
     assert_eq!(ledger.snapshot().live_owners, 2);
 }
@@ -266,12 +272,77 @@ fn the_segment_limit_gives_up_other_sets_and_not_the_one_filling() {
     let (first, second) = (body(1, 10), body(2, 10));
     pending(&mut buffer, seg(&ledger, &first, 0, now), now);
     pending(&mut buffer, seg(&ledger, &second, 0, now), now);
+    let quiet = now + ACTIVE_SET;
 
-    let insertion = buffer.insert(seg(&ledger, &second, 1, now), now);
+    let insertion = buffer.insert(seg(&ledger, &second, 1, quiet), quiet);
 
     assert_eq!(insertion.evicted, vec![first.key]);
     assert!(matches!(insertion.outcome, Outcome::Complete(_)));
     assert_eq!(buffer.segments(), 0);
+}
+
+/// A set still arriving is never given up for a newcomer, of its block or any other: the
+/// newcomer is refused, costs nothing, and gets in once a set has gone quiet.
+#[test]
+fn a_set_still_arriving_is_never_given_up_for_a_newcomer() {
+    for limits in [
+        BufferLimits {
+            max_sets: 1,
+            ..buffer_limits()
+        },
+        BufferLimits {
+            max_sets_per_block: 1,
+            ..buffer_limits()
+        },
+    ] {
+        let (ledger, now) = (DeliveryLedger::new(self::limits()), Instant::now());
+        let mut buffer = BodyBuffer::new(limits).unwrap();
+        let (honest, forged) = (body(1, 10), body(1, 20));
+        pending(&mut buffer, seg(&ledger, &honest, 0, now), now);
+        let still = now + ACTIVE_SET - Duration::from_millis(1);
+
+        let insertion = buffer.insert(seg(&ledger, &forged, 0, still), still);
+
+        assert!(matches!(insertion.outcome, Outcome::Rejected(Reject::Busy)));
+        assert!(insertion.evicted.is_empty());
+        assert!(buffer.holds(&honest.key), "{limits:?}");
+        assert_eq!(phase(&ledger, &forged, 0), Some(Phase::Released));
+        let quiet = now + ACTIVE_SET;
+        let insertion = buffer.insert(seg(&ledger, &forged, 0, quiet), quiet);
+        assert_eq!(insertion.evicted, vec![honest.key], "{limits:?}");
+    }
+}
+
+/// The review's case: a large honest set, still arriving, and as many forged sets as the
+/// buffer has room for, and more. The forged ones go quiet and the honest one does not, so
+/// they are what goes, and the honest set finishes.
+#[test]
+fn forged_newcomers_cannot_push_out_an_honest_set_under_way() {
+    let (ledger, now) = (DeliveryLedger::new(limits()), Instant::now());
+    let mut buffer = buffer();
+    let honest = sized(1, 10, 3 * SEGMENT);
+    pending(&mut buffer, seg(&ledger, &honest, 0, now), now);
+    let forged: Vec<Body> = (0..=buffer_limits().max_sets as u8)
+        .map(|mark| body(2 + mark, 10))
+        .collect();
+    let mut at = now;
+    for (sent, body) in forged.iter().enumerate() {
+        at += Duration::from_millis(500);
+        if sent == 6 {
+            pending(&mut buffer, seg(&ledger, &honest, 1, at), at);
+        }
+        let _ = buffer.insert(seg(&ledger, body, 0, at), at);
+    }
+    assert!(buffer.holds(&honest.key));
+    let late = now + ACTIVE_SET * 2;
+    for body in &forged {
+        if !buffer.holds(&body.key) && phase(&ledger, body, 0) != Some(Phase::Held) {
+            let _ = buffer.insert(seg(&ledger, body, 0, late), late);
+        }
+    }
+
+    assert!(buffer.holds(&honest.key));
+    complete(&mut buffer, seg(&ledger, &honest, 2, late), late);
 }
 
 #[test]

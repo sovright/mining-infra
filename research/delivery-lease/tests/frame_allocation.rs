@@ -11,7 +11,7 @@ use std::cell::Cell;
 use std::time::{Duration, Instant};
 
 use common::{SEGMENT, body, rules};
-use delivery_lease::body_buffer::{BodyBuffer, BufferLimits};
+use delivery_lease::body_buffer::{ACTIVE_SET, BodyBuffer, BufferLimits};
 use delivery_lease::intake::{Intake, Offer, Step, into_complete};
 use delivery_lease::segment_frame::{FrameError, verify};
 use delivery_lease::{DeliveryLedger, Limits, Refusal, Transit};
@@ -156,7 +156,7 @@ fn the_copy_comes_after_the_reservation_and_the_evictions() {
 
     let mut at_eviction = None;
     let (taken, total) = measured(|| {
-        let offer = intake.receive_stepping(&new.frames[0], now, |step| {
+        let offer = intake.receive_stepping(&new.frames[0], now + ACTIVE_SET, |step| {
             if step == Step::BeforeEvicting {
                 at_eviction = COUNTED.with(|counted| counted.get());
                 assert_eq!(ledger.snapshot().reserved_bytes, 2 * SEGMENT);
