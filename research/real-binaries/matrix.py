@@ -44,10 +44,24 @@ SETTLE_SECS = 1.5
 HEADER_BYTES = 1487
 
 
-def free_port(kind):
-    with socket.socket(socket.AF_INET, kind) as held:
-        held.bind(("127.0.0.1", 0))
-        return held.getsockname()[1]
+LISTENING = re.compile(r"local_addr=127\.0\.0\.1:(\d+)")
+ESCAPES = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def bound_port(process, message, secs):
+    """The port a child bound, from the line it logs once it has. A child asked for port 0
+    gets one from the kernel, so nothing can take it between a pick here and the child's bind,
+    as could happen when this picked a port and closed it for the child to bind later."""
+    end = time.monotonic() + secs
+    while time.monotonic() < end:
+        for line in ESCAPES.sub("", process.text()).splitlines():
+            found = LISTENING.search(line) if message in line else None
+            if found:
+                return int(found.group(1))
+        if not process.alive():
+            raise RuntimeError(f"{process.name} exited before it was listening: {process.path}")
+        time.sleep(0.02)
+    raise TimeoutError(message)
 
 
 def display_hash(raw):
@@ -185,7 +199,8 @@ class Build:
 class Fleet:
     def __init__(self, work):
         self.work = work
-        self.relay_port = free_port(socket.SOCK_DGRAM)
+        # Set by the first relay, which picks it. Clients and every later relay use it.
+        self.relay_port = None
         self.relay = None
         self.peer = SilentPeer()
 
@@ -199,15 +214,17 @@ class Fleet:
 
     def start_relay(self, build):
         env = {
-            "SOVRIGHT_RELAY_LISTEN_ADDR": f"127.0.0.1:{self.relay_port}",
+            "SOVRIGHT_RELAY_LISTEN_ADDR": f"127.0.0.1:{self.relay_port or 0}",
             "SOVRIGHT_RELAY_AUTH_KEY_HEX": KEY,
         }
         if build.bound:
             env["SOVRIGHT_RELAY_BOUND_RAW"] = "1"
         self.relay = Process("relay", [build.path("relay-node")], env, self.work)
-        self.wait_for(
-            "the relay", lambda: "Sovright relay listening" in self.relay.text(), 10
-        )
+        port = bound_port(self.relay, "Sovright relay listening", 10)
+        if self.relay_port is None:
+            self.relay_port = port
+        elif port != self.relay_port:
+            raise RuntimeError(f"relay came up on {port}, not {self.relay_port}")
 
     def stop_relay(self):
         if self.relay:
@@ -249,7 +266,6 @@ enabled = true
         return sidecar
 
     def start_ingress(self, build, wire, zebra, window_secs=30):
-        port = free_port(socket.SOCK_STREAM)
         env = {
             "SOVRIGHT_P2P_NETWORK": "mainnet",
             "SOVRIGHT_P2P_DNS_SEEDS": "",
@@ -262,7 +278,7 @@ enabled = true
             "SOVRIGHT_P2P_RELAY_BIND_ADDR": "127.0.0.1:0",
             "SOVRIGHT_P2P_RELAY_AUTH_KEY_HEX": KEY,
             "SOVRIGHT_P2P_RELAY_FORWARD_DEDUP_WINDOW_SECS": str(window_secs),
-            "SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR": f"127.0.0.1:{port}",
+            "SOVRIGHT_P2P_SUBMITBLOCK_RPC_BIND_ADDR": "127.0.0.1:0",
             "SOVRIGHT_P2P_SUBMITBLOCK_ZEBRA_URL": zebra.url,
             "SOVRIGHT_P2P_SUBMITBLOCK_MAX_REQUESTS_PER_MINUTE": "120",
             "SOVRIGHT_P2P_SUBMITBLOCK_RELAY_TIMEOUT_MILLIS": "10000",
@@ -270,6 +286,7 @@ enabled = true
         if wire != "legacy":
             env["SOVRIGHT_P2P_RELAY_RAW_WIRE"] = wire
         ingress = Process("ingress", [build.path("sovright-p2p-ingress")], env, self.work)
+        port = bound_port(ingress, "Pool submitblock relay gateway started", 15)
 
         def listening():
             with socket.socket() as probe:
