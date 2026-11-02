@@ -2113,11 +2113,14 @@ enum SendEnd {
 
 /// However a send ends, nothing stays held, the copy that waited on it gets its answer, and
 /// the body is a repeat only once every copy has gone. A wait that never ended would fail here
-/// on [`finishes`], so this is also what shows none of them can.
+/// on [`finishes`], so this is also what shows none of them can. With `failure_sends` (dual),
+/// a bound send that fails once the legacy copy has left leaves the body sent, and the copy
+/// that waited is a repeat.
 async fn a_copy_gets_past_every_end_of_a_send(
     harness_for: impl Fn() -> Harness,
     raw: &[u8],
     went: ForwardMode,
+    failure_sends: bool,
 ) {
     use SendEnd::*;
     for end in [Failed, NobodyAnswered, Cancelled, TimedOut, ClientWent] {
@@ -2147,13 +2150,18 @@ async fn a_copy_gets_past_every_end_of_a_send(
             }
         }
 
+        let sent = failure_sends && matches!(end, Failed | NobodyAnswered | ClientWent);
         match finishes(first).await {
-            Ok(Ok(outcome)) => assert!(outcome.is_err(), "{end:?}"),
+            Ok(Ok(outcome)) => assert_eq!(outcome.is_ok(), sent, "{end:?}"),
             Ok(Err(_)) => assert_eq!(end, TimedOut),
             Err(_) => assert_eq!(end, Cancelled),
         }
         harness.sent();
-        if end == ClientWent {
+        if sent {
+            let second = forwarded(second).await;
+            assert_eq!(second.mode, ForwardMode::Deduplicated, "{end:?}");
+            assert!(harness.sent().is_empty(), "{end:?}");
+        } else if end == ClientWent {
             assert!(finishes(second).await.unwrap().is_err(), "{end:?}");
         } else {
             harness.next_bound_send().await.finish(Ok(()));
@@ -2172,30 +2180,31 @@ async fn a_copy_gets_past_every_end_of_a_send(
 async fn a_copy_of_a_strict_body_gets_past_every_end_of_a_send_in_dual() {
     let (real, _) = two_valid_bodies();
     let harness = || holding_bound_sends(RawWire::Dual, 4);
-    a_copy_gets_past_every_end_of_a_send(harness, &real, ForwardMode::RawBlockSegments).await;
+    a_copy_gets_past_every_end_of_a_send(harness, &real, ForwardMode::RawBlockSegments, true).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_copy_of_a_strict_body_gets_past_every_end_of_a_send_on_the_bound_wire() {
     let (real, _) = two_valid_bodies();
     let harness = || holding_bound_sends(RawWire::Bound, 4);
-    a_copy_gets_past_every_end_of_a_send(harness, &real, ForwardMode::RawBlockSegments).await;
+    a_copy_gets_past_every_end_of_a_send(harness, &real, ForwardMode::RawBlockSegments, false)
+        .await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_copy_of_an_unverified_body_gets_past_every_end_of_a_send_in_dual() {
     let raw = unreadable_block(400, 1);
     let harness = || bypass_on(RawWire::Dual);
-    a_copy_gets_past_every_end_of_a_send(harness, &raw, ForwardMode::RawBlockSegmentsUnverified)
-        .await;
+    let went = ForwardMode::RawBlockSegmentsUnverified;
+    a_copy_gets_past_every_end_of_a_send(harness, &raw, went, true).await;
 }
 
 #[tokio::test(start_paused = true)]
 async fn a_copy_of_an_unverified_body_gets_past_every_end_of_a_send_on_the_bound_wire() {
     let raw = unreadable_block(400, 1);
     let harness = || bypass_on(RawWire::Bound);
-    a_copy_gets_past_every_end_of_a_send(harness, &raw, ForwardMode::RawBlockSegmentsUnverified)
-        .await;
+    let went = ForwardMode::RawBlockSegmentsUnverified;
+    a_copy_gets_past_every_end_of_a_send(harness, &raw, went, false).await;
 }
 
 /// On the bound wire nothing left, so there is nothing to count and the place goes back.
@@ -2233,10 +2242,10 @@ async fn an_unverified_body_counts_on_the_bound_wire_once_it_has_gone() {
 }
 
 /// In dual the legacy copy left without its checks, and that is what this record bounds and
-/// reports, so it counts then, and once. The bound copy is still owed, so the body stays open
-/// for its next delivery, which repeats the legacy copy as a validated body's does.
+/// reports, so it counts then, and once. A failed bound copy leaves the body sent, so its next
+/// delivery is a repeat and does not send the legacy copy again.
 #[tokio::test]
-async fn after_a_failed_bound_copy_an_unverified_body_stays_open_and_counts_once_in_dual() {
+async fn after_a_failed_bound_copy_an_unverified_body_is_sent_and_counts_once_in_dual() {
     let raw = unreadable_block(400, 1);
     let mut harness = bypass_on(RawWire::Dual);
     let task = spawn_forward(&harness.bridge, &raw);
@@ -2246,20 +2255,15 @@ async fn after_a_failed_bound_copy_an_unverified_body_stays_open_and_counts_once
         .await
         .finish(Err(TransportError::Timeout));
 
-    assert!(finishes(task).await.unwrap().is_err());
+    let first = forwarded(task).await;
+    assert_eq!(first.mode, ForwardMode::RawBlockSegmentsUnverified);
     assert_eq!(legacy_copy(harness.sent()), raw);
     assert_eq!(unverified_seen(&harness), (1, 1));
 
-    let again = spawn_forward(&harness.bridge, &raw);
-    harness.next_bound_send().await.finish(Ok(()));
-    let again = forwarded(again).await;
-    assert_eq!(again.mode, ForwardMode::RawBlockSegmentsUnverified);
-    assert_eq!(legacy_copy(harness.sent()), raw);
+    let again = harness.forward(&raw).await.unwrap();
+    assert_eq!(again.mode, ForwardMode::Deduplicated);
+    assert!(harness.sent().is_empty(), "no second legacy copy");
     assert_eq!(unverified_seen(&harness), (1, 1));
-
-    let third = harness.forward(&raw).await.unwrap();
-    assert_eq!(third.mode, ForwardMode::Deduplicated);
-    assert!(harness.sent().is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -2313,7 +2317,9 @@ fn an_owed_body_holds_its_place_until_its_window_ends() {
     ));
 }
 
-#[tokio::test]
+/// In dual a failed bound copy leaves the body sent, so what leaves one owed here is a caller
+/// that gave up with the bound copy still under way.
+#[tokio::test(start_paused = true)]
 async fn an_owed_body_can_come_again_with_its_header_at_its_limit() {
     let (raw, other) = (unreadable_block(400, 1), unreadable_block(400, 2));
     let mut harness = bypass_on(RawWire::Dual);
@@ -2322,12 +2328,9 @@ async fn an_owed_body_can_come_again_with_its_header_at_its_limit() {
         Duration::from_secs(30),
         1,
     )));
-    let task = spawn_forward(&harness.bridge, &raw);
-    harness
-        .next_bound_send()
+    caller_gives_up(&mut harness, &raw)
         .await
         .finish(Err(TransportError::Timeout));
-    assert!(finishes(task).await.unwrap().is_err());
     harness.sent();
 
     let turned_away = harness.forward(&other).await;
@@ -2364,8 +2367,10 @@ async fn a_copy_during_an_unverified_send_waits_and_is_then_a_repeat() {
     assert_eq!(unverified_seen(&harness), (1, 1));
 }
 
+/// On the bound wire the copy that waited sends when that send fails. In dual the legacy copy
+/// left, so the body is sent and the copy that waited is a repeat.
 #[tokio::test]
-async fn a_copy_during_an_unverified_send_sends_when_that_send_fails() {
+async fn a_copy_during_an_unverified_send_goes_by_how_that_send_fails() {
     for wire in [RawWire::Bound, RawWire::Dual] {
         let raw = unreadable_block(400, 1);
         let mut harness = bypass_on(wire);
@@ -2376,9 +2381,14 @@ async fn a_copy_during_an_unverified_send_sends_when_that_send_fails() {
 
         send.finish(Err(TransportError::Timeout));
 
-        assert!(finishes(first).await.unwrap().is_err());
-        harness.next_bound_send().await.finish(Ok(()));
-        assert_ne!(forwarded(second).await.mode, ForwardMode::Deduplicated);
+        if wire == RawWire::Dual {
+            forwarded(first).await;
+            assert_eq!(forwarded(second).await.mode, ForwardMode::Deduplicated);
+        } else {
+            assert!(finishes(first).await.unwrap().is_err());
+            harness.next_bound_send().await.finish(Ok(()));
+            assert_ne!(forwarded(second).await.mode, ForwardMode::Deduplicated);
+        }
         assert_eq!(rejected(&harness), 0, "{wire:?}");
         assert_eq!(unverified_seen(&harness), (1, 1), "{wire:?}");
     }
@@ -2407,22 +2417,24 @@ async fn another_body_past_the_limit_during_a_send_is_still_refused() {
     forwarded(first).await;
 }
 
+/// In dual a full bound queue holds no legacy copy back, and once that copy has left the body
+/// is sent: its next delivery is a repeat, not a second legacy copy.
 #[tokio::test]
-async fn a_full_bound_queue_comes_back_to_the_caller_of_an_unverified_body() {
+async fn a_full_bound_queue_in_dual_leaves_an_unverified_body_sent_by_its_legacy_copy() {
     let raw = unreadable_block(400, 1);
     let mut harness = bypass_on(RawWire::Dual);
     let filling = fill_bound_queue(&harness).await;
 
-    let refused = finishes(harness.bridge.forward_pool_block(&raw, None)).await;
+    let went = finishes(harness.bridge.forward_pool_block(&raw, None)).await;
 
-    assert!(matches!(refused, Err(IngressError::Relay(_))));
+    assert!(went.is_ok());
     assert_eq!(legacy_copy(harness.sent()), raw);
     assert_eq!(unverified_seen(&harness), (1, 1));
     empty_bound_queue(&mut harness, filling);
 
-    let again = spawn_forward(&harness.bridge, &raw);
-    harness.next_bound_send().await.finish(Ok(()));
-    assert_ne!(forwarded(again).await.mode, ForwardMode::Deduplicated);
+    let again = harness.forward(&raw).await.unwrap();
+    assert_eq!(again.mode, ForwardMode::Deduplicated);
+    assert!(harness.sent().is_empty());
     assert_eq!(unverified_seen(&harness), (1, 1));
 }
 
@@ -2432,6 +2444,7 @@ fn legacy_copy(sent: Vec<RelayPayload>) -> Vec<u8> {
     reassemble_raw_block(&raw_segments(sent)).unwrap()
 }
 
+/// And the body is sent by it, so a bound path that keeps failing costs no legacy copy again.
 #[tokio::test]
 async fn a_bound_failure_lets_the_legacy_copy_go_in_dual() {
     let (real, _) = two_valid_bodies();
@@ -2440,9 +2453,17 @@ async fn a_bound_failure_lets_the_legacy_copy_go_in_dual() {
 
     let outcome = harness.forward(&real).await;
 
-    assert!(matches!(outcome, Err(IngressError::Relay(_))));
+    assert_eq!(outcome.unwrap().mode, ForwardMode::RawBlockSegments);
     assert_eq!(legacy_copy(harness.sent()), real);
-    assert!(is_open(&harness, &real), "the bound copy is still owed");
+    assert!(
+        is_sent(&harness, &real),
+        "the failed bound copy is not tried again"
+    );
+    for _ in 0..3 {
+        let again = harness.forward(&real).await.unwrap();
+        assert_eq!(again.mode, ForwardMode::Deduplicated);
+        assert!(harness.sent().is_empty(), "no legacy copy again");
+    }
 }
 
 /// The answer from a bound send that takes its time is no reason for legacy to wait.
@@ -2462,9 +2483,10 @@ async fn a_bound_copy_under_way_lets_the_legacy_copy_go_in_dual() {
 }
 
 /// A body counts under its header from the moment a copy of it has left, so a bound path in
-/// trouble is no way past the limit. It can still come again for the copy it is owed.
+/// trouble is no way past the limit. Its legacy copy left, so it is sent, and it does not
+/// come again.
 #[tokio::test]
-async fn after_a_failed_bound_copy_a_strict_body_stays_open_and_keeps_its_place_in_dual() {
+async fn after_a_failed_bound_copy_a_strict_body_is_sent_and_keeps_its_place_in_dual() {
     let (real, other) = two_valid_bodies();
     let mut harness = holding_bound_sends(RawWire::Dual, 1);
     let task = spawn_forward(&harness.bridge, &real);
@@ -2472,25 +2494,17 @@ async fn after_a_failed_bound_copy_a_strict_body_stays_open_and_keeps_its_place_
         .next_bound_send()
         .await
         .finish(Err(TransportError::Timeout));
-    assert!(finishes(task).await.unwrap().is_err());
+    forwarded(task).await;
     assert_eq!(legacy_copy(harness.sent()), real);
-    assert!(is_open(&harness, &real));
+    assert!(is_sent(&harness, &real));
 
     let turned_away = harness.forward(&other).await;
     assert!(matches!(turned_away, Err(IngressError::Relay(_))));
     assert!(harness.sent().is_empty(), "nothing of the other body left");
 
-    let again = spawn_forward(&harness.bridge, &real);
-    harness.next_bound_send().await.finish(Ok(()));
-    assert_ne!(forwarded(again).await.mode, ForwardMode::Deduplicated);
-    assert_eq!(
-        legacy_copy(harness.sent()),
-        real,
-        "this repeats the legacy copy"
-    );
-    assert!(is_sent(&harness, &real));
-    let turned_away = harness.forward(&other).await;
-    assert!(matches!(turned_away, Err(IngressError::Relay(_))));
+    let again = harness.forward(&real).await.unwrap();
+    assert_eq!(again.mode, ForwardMode::Deduplicated);
+    assert!(harness.sent().is_empty(), "no legacy copy again");
 }
 
 /// The value did not change. Past it the caller goes, the send does not, and the body stays
@@ -2589,18 +2603,19 @@ async fn a_slow_legacy_copy_lets_the_bound_copy_go_in_dual() {
     assert!(is_open(&harness, &real));
 }
 
-/// The client's bound queue is full. That is no reason for legacy to wait, the caller hears
-/// of it, and the body stays open: nothing here decides that a refused copy is a sent one.
+/// The client's bound queue is full. That is no reason for legacy to wait. On the bound wire
+/// the caller hears of it and the body stays open; in dual the legacy copy left, so the body
+/// is sent and is not sent again.
 #[tokio::test]
 async fn a_full_bound_queue_comes_back_to_the_caller_of_a_strict_body() {
     let (real, _) = two_valid_bodies();
-    let mut harness = holding_bound_sends(RawWire::Dual, 4);
+    let mut harness = holding_bound_sends(RawWire::Bound, 4);
     let filling = fill_bound_queue(&harness).await;
 
     let refused = finishes(harness.bridge.forward_pool_block(&real, None)).await;
 
     assert!(matches!(refused, Err(IngressError::Relay(_))));
-    assert_eq!(legacy_copy(harness.sent()), real);
+    assert!(harness.sent().is_empty());
     assert!(is_open(&harness, &real));
     empty_bound_queue(&mut harness, filling);
 
@@ -2608,6 +2623,24 @@ async fn a_full_bound_queue_comes_back_to_the_caller_of_a_strict_body() {
     harness.next_bound_send().await.finish(Ok(()));
     assert_ne!(forwarded(again).await.mode, ForwardMode::Deduplicated);
     assert!(is_sent(&harness, &real));
+}
+
+#[tokio::test]
+async fn a_full_bound_queue_in_dual_leaves_a_strict_body_sent_by_its_legacy_copy() {
+    let (real, _) = two_valid_bodies();
+    let mut harness = holding_bound_sends(RawWire::Dual, 4);
+    let filling = fill_bound_queue(&harness).await;
+
+    let went = finishes(harness.bridge.forward_pool_block(&real, None)).await;
+
+    assert!(went.is_ok());
+    assert_eq!(legacy_copy(harness.sent()), real);
+    assert!(is_sent(&harness, &real));
+    empty_bound_queue(&mut harness, filling);
+
+    let again = harness.forward(&real).await.unwrap();
+    assert_eq!(again.mode, ForwardMode::Deduplicated);
+    assert!(harness.sent().is_empty());
 }
 
 /// The real bridge through a real client and node to a real receiver: both bodies of one

@@ -853,8 +853,13 @@ impl RelayBridge {
     /// Sends the legacy copy and the bound copy side by side. Neither waits for the other or
     /// stops it, so a bound copy that fails or takes its time leaves the legacy one alone, and
     /// a slow legacy copy cannot stop a bound one from being taken before a caller gives up.
-    /// The result says whether both went, so a body whose bound copy failed stays open, and
-    /// its next delivery sends both again, which repeats the legacy copy.
+    ///
+    /// On the bound wire the result says whether the bound copy went, so a body whose copy
+    /// failed stays open for its next delivery. In dual, once the legacy copy has left, a
+    /// failed bound copy is logged and the body counts as sent: were it left open, a bound
+    /// path that kept failing would have every later delivery send the whole legacy copy
+    /// again. That bound copy is not tried again. A caller that gives up while the bound copy
+    /// is still under way leaves the body open, as before.
     async fn with_bound_copy<T>(
         &self,
         block_payload: &[u8],
@@ -862,7 +867,12 @@ impl RelayBridge {
     ) -> Result<T> {
         let (legacy, bound) = tokio::join!(legacy, self.send_bound_copy(block_payload));
         let legacy = legacy?;
-        bound?;
+        match bound {
+            Err(error) if self.raw_wire == RawWire::Dual => {
+                warn!(%error, "The bound copy failed after the legacy copy left; not sending it again");
+            }
+            bound => bound?,
+        }
         Ok(legacy)
     }
 
