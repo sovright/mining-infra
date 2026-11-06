@@ -126,6 +126,17 @@ pub struct Config {
     #[serde(default = "default_zebra_mempool_sync_interval_ms")]
     pub zebra_mempool_sync_interval_ms: u64,
 
+    /// Remove canonical confirmed cache entries after both retention bounds.
+    /// Opt-in; independent from mempool synchronization and submission.
+    #[serde(default)]
+    pub tx_cache_confirmed_eviction_enabled: bool,
+    #[serde(default = "default_confirmed_grace_secs")]
+    pub tx_cache_confirmed_grace_secs: u64,
+    #[serde(default = "default_min_confirmations")]
+    pub tx_cache_min_confirmations: u64,
+    #[serde(default = "default_maintenance_interval_secs")]
+    pub tx_cache_maintenance_interval_secs: u64,
+
     /// Optional Prometheus textfile path for sidecar receive metrics.
     #[serde(default)]
     pub metrics_textfile: Option<PathBuf>,
@@ -278,11 +289,34 @@ fn default_tx_cache_max_tx_bytes() -> usize {
     2 * 1024 * 1024
 }
 
+fn default_confirmed_grace_secs() -> u64 {
+    600
+}
+fn default_min_confirmations() -> u64 {
+    12
+}
+fn default_maintenance_interval_secs() -> u64 {
+    5
+}
+
 impl Config {
     /// Load configuration from a TOML file
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
+        if config.tx_cache_confirmed_eviction_enabled {
+            if !config.tx_cache_enabled {
+                return Err("confirmed cache eviction requires tx_cache_enabled".into());
+            }
+            if config.tx_cache_confirmed_grace_secs == 0
+                || config.tx_cache_min_confirmations == 0
+                || config.tx_cache_maintenance_interval_secs == 0
+            {
+                return Err(
+                    "confirmed cache retention bounds and interval must be positive".into(),
+                );
+            }
+        }
         Ok(config)
     }
 
@@ -609,6 +643,46 @@ mod ab_config_tests {
         assert_eq!(
             cfg.submit_log_path.as_deref(),
             Some("/var/log/bedrock/submit-calls.jsonl")
+        );
+    }
+}
+
+#[cfg(test)]
+mod cache_retention_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn load(text: &str) -> Result<Config, ConfigError> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(text.as_bytes()).unwrap();
+        Config::from_file(file.path())
+    }
+
+    #[test]
+    fn confirmed_cache_policy_defaults_off() {
+        let c = load("relay_peers = []").unwrap();
+        assert!(!c.tx_cache_confirmed_eviction_enabled);
+        assert_eq!(c.tx_cache_confirmed_grace_secs, 600);
+        assert_eq!(c.tx_cache_min_confirmations, 12);
+        assert_eq!(c.tx_cache_maintenance_interval_secs, 5);
+    }
+
+    #[test]
+    fn confirmed_cache_policy_requires_cache_and_positive_bounds() {
+        assert!(load("relay_peers=[]\ntx_cache_confirmed_eviction_enabled=true").is_err());
+        for bound in [
+            "tx_cache_confirmed_grace_secs",
+            "tx_cache_min_confirmations",
+            "tx_cache_maintenance_interval_secs",
+        ] {
+            let text = format!(
+                "relay_peers=[]\ntx_cache_enabled=true\ntx_cache_confirmed_eviction_enabled=true\n{bound}=0"
+            );
+            assert!(load(&text).is_err(), "{bound}");
+        }
+        assert!(
+            load("relay_peers=[]\ntx_cache_enabled=true\ntx_cache_confirmed_eviction_enabled=true")
+                .is_ok()
         );
     }
 }

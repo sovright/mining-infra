@@ -55,6 +55,16 @@ pub struct SubmitBlockRpcConfig {
     pub relay_timeout: Duration,
 }
 
+/// Trusted full-node source for delayed canonical transaction eviction.
+/// This is independent of the solved-block submission RPC frontend.
+#[derive(Debug, Clone)]
+pub struct TxCacheMaintenanceConfig {
+    pub zebra_url: String,
+    pub interval: Duration,
+    pub grace: Duration,
+    pub min_confirmations: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub network: Network,
@@ -93,6 +103,7 @@ pub struct Config {
     pub peer_score_relay_forwarded: i64,
     pub peer_score_error: i64,
     pub tx_cache_enabled: bool,
+    pub tx_cache_maintenance: Option<TxCacheMaintenanceConfig>,
     pub tx_cache_max_entries: usize,
     pub tx_cache_max_bytes: usize,
     pub tx_cache_max_tx_bytes: usize,
@@ -196,6 +207,7 @@ impl Config {
         let peer_score_relay_forwarded = env_i64("SOVRIGHT_P2P_PEER_SCORE_FORGE_FORWARDED", 10)?;
         let peer_score_error = env_i64("SOVRIGHT_P2P_PEER_SCORE_ERROR", -50)?;
         let tx_cache_enabled = env_bool("SOVRIGHT_P2P_TX_CACHE_ENABLED", false)?;
+        let tx_cache_maintenance = tx_cache_maintenance_from_env(tx_cache_enabled)?;
         let tx_cache_max_entries = env_usize("SOVRIGHT_P2P_TX_CACHE_MAX_ENTRIES", 200_000)?;
         let tx_cache_max_bytes = env_usize("SOVRIGHT_P2P_TX_CACHE_MAX_BYTES", 536_870_912)?;
         let tx_cache_max_tx_bytes = env_usize("SOVRIGHT_P2P_TX_CACHE_MAX_TX_BYTES", 2_097_152)?;
@@ -320,6 +332,7 @@ impl Config {
             peer_score_relay_forwarded,
             peer_score_error,
             tx_cache_enabled,
+            tx_cache_maintenance,
             tx_cache_max_entries,
             tx_cache_max_bytes,
             tx_cache_max_tx_bytes,
@@ -349,6 +362,51 @@ impl Config {
             forwarding_min_peer_version,
         })
     }
+}
+
+fn tx_cache_maintenance_from_env(cache_enabled: bool) -> Result<Option<TxCacheMaintenanceConfig>> {
+    const URL: &str = "SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL";
+    let Some(zebra_url) = env::var(URL).ok().filter(|value| !value.trim().is_empty()) else {
+        return Ok(None);
+    };
+    if !cache_enabled {
+        return Err(IngressError::Config(format!(
+            "{URL} requires SOVRIGHT_P2P_TX_CACHE_ENABLED"
+        )));
+    }
+    // Never include the supplied URL in errors/logs: configuration may contain
+    // accidentally pasted credentials. Only explicit HTTP(S) endpoints work.
+    let authority = zebra_url
+        .split_once("://")
+        .map(|(_, rest)| rest.split('/').next().unwrap_or(""));
+    if !(zebra_url.starts_with("http://") || zebra_url.starts_with("https://"))
+        || zebra_url.chars().any(char::is_whitespace)
+        || zebra_url.contains(['@', '?', '#'])
+        || authority.is_none_or(str::is_empty)
+        || jsonrpsee::http_client::HttpClientBuilder::default()
+            .build(&zebra_url)
+            .is_err()
+    {
+        return Err(IngressError::Config(format!(
+            "{URL} must be an HTTP(S) node URL without credentials, query or fragment"
+        )));
+    }
+    let positive = |name, default| {
+        let value = env_u64(name, default)?;
+        if value == 0 {
+            return Err(IngressError::Config(format!("{name} must be at least 1")));
+        }
+        Ok(value)
+    };
+    Ok(Some(TxCacheMaintenanceConfig {
+        zebra_url,
+        interval: Duration::from_secs(positive(
+            "SOVRIGHT_P2P_TX_CACHE_MAINTENANCE_INTERVAL_SECS",
+            5,
+        )?),
+        grace: Duration::from_secs(positive("SOVRIGHT_P2P_TX_CACHE_CONFIRMED_GRACE_SECS", 600)?),
+        min_confirmations: positive("SOVRIGHT_P2P_TX_CACHE_MIN_CONFIRMATIONS", 12)?,
+    }))
 }
 
 fn submitblock_rpc_from_env() -> Result<Option<SubmitBlockRpcConfig>> {
@@ -678,6 +736,63 @@ mod tests {
             false,
             Network::Mainnet
         ));
+    }
+
+    #[test]
+    fn cache_maintenance_defaults_disabled_and_opt_in_uses_safe_retention() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[("SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL", "".into())]);
+        assert!(Config::from_env().unwrap().tx_cache_maintenance.is_none());
+        let _enabled = EnvGuard::set(&[
+            (
+                "SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL",
+                "http://10.40.0.6:8232".into(),
+            ),
+            ("SOVRIGHT_P2P_TX_CACHE_ENABLED", "true".into()),
+        ]);
+        let config = Config::from_env().unwrap().tx_cache_maintenance.unwrap();
+        assert_eq!(config.grace, Duration::from_secs(600));
+        assert_eq!(config.interval, Duration::from_secs(5));
+        assert_eq!(config.min_confirmations, 12);
+    }
+
+    #[test]
+    fn cache_maintenance_rejects_unsafe_or_incomplete_configuration() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _enabled = EnvGuard::set(&[
+            (
+                "SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL",
+                "http://10.40.0.6:8232".into(),
+            ),
+            ("SOVRIGHT_P2P_TX_CACHE_ENABLED", "true".into()),
+        ]);
+        for name in [
+            "SOVRIGHT_P2P_TX_CACHE_CONFIRMED_GRACE_SECS",
+            "SOVRIGHT_P2P_TX_CACHE_MIN_CONFIRMATIONS",
+            "SOVRIGHT_P2P_TX_CACHE_MAINTENANCE_INTERVAL_SECS",
+        ] {
+            let _bad = EnvGuard::set(&[(name, "0".into())]);
+            assert!(Config::from_env().unwrap_err().to_string().contains(name));
+        }
+        for url in [
+            "file:///tmp/cache",
+            "http://",
+            "http://secret@10.40.0.6:8232",
+            "http://10.40.0.6:8232?token=secret",
+            "http://bad host:8232",
+        ] {
+            let _bad = EnvGuard::set(&[("SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL", url.into())]);
+            let error = Config::from_env().unwrap_err().to_string();
+            assert!(error.contains("SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL"));
+            assert!(!error.contains("secret"));
+        }
+        let _disabled = EnvGuard::set(&[("SOVRIGHT_P2P_TX_CACHE_ENABLED", "false".into())]);
+        assert!(
+            Config::from_env()
+                .unwrap_err()
+                .to_string()
+                .contains("TX_CACHE_ENABLED")
+        );
     }
 
     #[test]

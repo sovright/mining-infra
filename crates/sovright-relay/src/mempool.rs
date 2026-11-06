@@ -3,12 +3,13 @@
 //! Defines the trait that mempool implementations must satisfy
 //! for compact block reconstruction to work.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 
-use crate::types::WtxId;
+use crate::types::{TxId, WtxId};
 
 /// Error type for mempool operations
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +112,10 @@ pub struct TxCacheSnapshot {
     pub evicted_entries_total: usize,
     pub evicted_bytes_total: usize,
     pub dropped_too_large_total: usize,
+    /// Retained entries observed in the trusted canonical chain.
+    pub confirmed_entries: usize,
+    /// Entries removed after both confirmed-retention thresholds elapsed.
+    pub confirmed_evicted_entries_total: usize,
 }
 
 /// Bounded transaction cache usable as a compact-block reconstruction mempool.
@@ -129,11 +134,43 @@ struct TxCacheInner {
     evicted_entries_total: usize,
     evicted_bytes_total: usize,
     dropped_too_large_total: usize,
+    confirmed_evicted_entries_total: usize,
+    retention_policy: Option<RetentionPolicy>,
 }
 
 struct CachedTx {
     bytes: Vec<u8>,
     payload_digest: [u8; 32],
+    confirmed: Option<Confirmation>,
+}
+
+#[derive(Clone, Copy)]
+struct Confirmation {
+    height: u64,
+    observed_at: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct RetentionPolicy {
+    tip_height: u64,
+    grace: Duration,
+    min_confirmations: u64,
+}
+
+impl RetentionPolicy {
+    fn eligible(&self, confirmed: Option<Confirmation>, now: Instant) -> bool {
+        confirmed.is_some_and(|confirmed| {
+            let Some(depth) = self
+                .tip_height
+                .checked_sub(confirmed.height)
+                .and_then(|depth| depth.checked_add(1))
+            else {
+                return false;
+            };
+            now.checked_duration_since(confirmed.observed_at)
+                .is_some_and(|age| depth >= self.min_confirmations && age >= self.grace)
+        })
+    }
 }
 
 impl TxCache {
@@ -147,6 +184,10 @@ impl TxCache {
 
     /// Insert raw transaction bytes by their Zcash wtxid.
     pub fn insert(&self, wtxid: WtxId, tx_bytes: Vec<u8>) -> TxCacheInsertOutcome {
+        self.insert_at(wtxid, tx_bytes, Instant::now())
+    }
+
+    fn insert_at(&self, wtxid: WtxId, tx_bytes: Vec<u8>, now: Instant) -> TxCacheInsertOutcome {
         let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
         if tx_bytes.len() > self.config.max_tx_bytes || self.config.max_entries == 0 {
             inner.dropped_too_large_total += 1;
@@ -159,7 +200,8 @@ impl TxCache {
             };
         }
 
-        remove_entry(&mut inner, &wtxid);
+        // Duplicate untrusted announcements must not reset the grace period.
+        let confirmed = remove_entry(&mut inner, &wtxid).and_then(|entry| entry.confirmed);
 
         let payload_digest = payload_digest(&tx_bytes);
         inner.bytes += tx_bytes.len();
@@ -168,6 +210,7 @@ impl TxCache {
             CachedTx {
                 bytes: tx_bytes,
                 payload_digest,
+                confirmed,
             },
         );
         inner.order.push_back(wtxid);
@@ -180,12 +223,29 @@ impl TxCache {
         let mut evicted_entries = 0;
         let mut evicted_bytes = 0;
         while inner.entries.len() > self.config.max_entries || inner.bytes > self.config.max_bytes {
-            let Some(oldest) = inner.order.pop_front() else {
+            // A confirmation can mature between maintenance ticks. Reuse only
+            // the last trusted tip; never infer additional depth from time.
+            let preferred = inner.retention_policy.and_then(|policy| {
+                inner
+                    .order
+                    .iter()
+                    .find(|wtxid| {
+                        inner
+                            .entries
+                            .get(wtxid)
+                            .is_some_and(|entry| policy.eligible(entry.confirmed, now))
+                    })
+                    .copied()
+            });
+            let Some(candidate) = preferred.or_else(|| inner.order.front().copied()) else {
                 break;
             };
-            if let Some(entry) = remove_entry(&mut inner, &oldest) {
+            if let Some(entry) = remove_entry(&mut inner, &candidate) {
                 evicted_entries += 1;
                 evicted_bytes += entry.bytes.len();
+                if preferred.is_some() {
+                    inner.confirmed_evicted_entries_total += 1;
+                }
             }
         }
         inner.evicted_entries_total += evicted_entries;
@@ -199,6 +259,83 @@ impl TxCache {
             evicted_bytes,
             dropped_too_large: 0,
         }
+    }
+
+    /// Mark cached variants of txids observed in a trusted canonical block.
+    ///
+    /// Merely hearing a block or a successful submit is not canonical evidence.
+    /// Repeated observations preserve the original confirmation age; callers
+    /// clear markers before applying a replacement chain after a reorg.
+    pub fn mark_confirmed(&self, txids: &[TxId], height: u64, now: Instant) {
+        let txids: HashSet<_> = txids.iter().copied().collect();
+        let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
+        for (wtxid, entry) in &mut inner.entries {
+            if txids.contains(wtxid.txid()) && entry.confirmed.is_none() {
+                entry.confirmed = Some(Confirmation {
+                    height,
+                    observed_at: now,
+                });
+            }
+        }
+    }
+
+    /// Restore retained transactions observed in the trusted node's mempool.
+    pub fn restore_pending(&self, txids: &[TxId]) {
+        let txids: HashSet<_> = txids.iter().copied().collect();
+        let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
+        for (wtxid, entry) in &mut inner.entries {
+            if txids.contains(wtxid.txid()) {
+                entry.confirmed = None;
+            }
+        }
+    }
+
+    /// Conservatively forget confirmation evidence after a chain reorganization.
+    /// This retains existing payloads; already evicted payloads need refetching.
+    pub fn clear_confirmations(&self) {
+        let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
+        for entry in inner.entries.values_mut() {
+            entry.confirmed = None;
+        }
+        inner.retention_policy = None;
+    }
+
+    /// Evict confirmed entries only after both wall-time and depth retention.
+    ///
+    /// Stores trusted depth and retention thresholds for capacity eviction:
+    /// insertions prefer eligible confirmed entries even between maintenance
+    /// ticks. When none qualify, the hard byte/entry cap falls back to FIFO.
+    pub fn evict_confirmed(
+        &self,
+        tip_height: u64,
+        now: Instant,
+        grace: Duration,
+        min_confirmations: u64,
+    ) -> usize {
+        let mut inner = self.inner.lock().expect("tx cache mutex poisoned");
+        let policy = RetentionPolicy {
+            tip_height,
+            grace,
+            min_confirmations,
+        };
+        inner.retention_policy = Some(policy);
+        let eligible: Vec<_> = inner
+            .entries
+            .iter()
+            .filter_map(|(wtxid, entry)| policy.eligible(entry.confirmed, now).then_some(*wtxid))
+            .collect();
+        for wtxid in &eligible {
+            if let Some(entry) = remove_entry_data(&mut inner, wtxid) {
+                inner.evicted_entries_total += 1;
+                inner.evicted_bytes_total += entry.bytes.len();
+                inner.confirmed_evicted_entries_total += 1;
+            }
+        }
+        // Remove queue references once for the batch, avoiding O(n²) queue
+        // scans when a full cache of confirmed transactions expires together.
+        let removed: HashSet<_> = eligible.iter().copied().collect();
+        inner.order.retain(|wtxid| !removed.contains(wtxid));
+        eligible.len()
     }
 
     /// Resolve a raw transaction payload to a unique cached wtxid.
@@ -236,6 +373,12 @@ impl TxCache {
             evicted_entries_total: inner.evicted_entries_total,
             evicted_bytes_total: inner.evicted_bytes_total,
             dropped_too_large_total: inner.dropped_too_large_total,
+            confirmed_entries: inner
+                .entries
+                .values()
+                .filter(|entry| entry.confirmed.is_some())
+                .count(),
+            confirmed_evicted_entries_total: inner.confirmed_evicted_entries_total,
         }
     }
 }
@@ -257,9 +400,14 @@ fn payload_digest(tx_payload: &[u8]) -> [u8; 32] {
 }
 
 fn remove_entry(inner: &mut TxCacheInner, wtxid: &WtxId) -> Option<CachedTx> {
+    let entry = remove_entry_data(inner, wtxid)?;
+    inner.order.retain(|candidate| candidate != wtxid);
+    Some(entry)
+}
+
+fn remove_entry_data(inner: &mut TxCacheInner, wtxid: &WtxId) -> Option<CachedTx> {
     let entry = inner.entries.remove(wtxid)?;
     inner.bytes = inner.bytes.saturating_sub(entry.bytes.len());
-    inner.order.retain(|candidate| candidate != wtxid);
     remove_payload_index_entry(&mut inner.payload_index, entry.payload_digest, wtxid);
     Some(entry)
 }
@@ -428,7 +576,193 @@ mod tests {
                 evicted_entries_total: 1,
                 evicted_bytes_total: 2,
                 dropped_too_large_total: 1,
+                confirmed_entries: 0,
+                confirmed_evicted_entries_total: 0,
             }
         );
+    }
+    fn retention_cache() -> (TxCache, WtxId, WtxId) {
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 4,
+            max_bytes: 100,
+            max_tx_bytes: 100,
+        });
+        let a = WtxId::new(TxId::from_bytes([1; 32]), AuthDigest::from_bytes([1; 32]));
+        let b = WtxId::new(TxId::from_bytes([2; 32]), AuthDigest::from_bytes([2; 32]));
+        cache.insert(a, vec![1, 2, 3]);
+        cache.insert(b, vec![4, 5]);
+        (cache, a, b)
+    }
+
+    #[test]
+    fn confirmed_retention_requires_both_time_and_depth_then_preserves_pending() {
+        let (cache, a, b) = retention_cache();
+        let now = Instant::now();
+        cache.mark_confirmed(&[*a.txid()], 100, now);
+        assert_eq!(
+            cache.evict_confirmed(
+                111,
+                now + Duration::from_secs(599),
+                Duration::from_secs(600),
+                12
+            ),
+            0
+        );
+        assert_eq!(cache.get_tx_data(&a), Some(vec![1, 2, 3]));
+        assert_eq!(
+            cache.evict_confirmed(
+                110,
+                now + Duration::from_secs(600),
+                Duration::from_secs(600),
+                12
+            ),
+            0
+        );
+        assert_eq!(
+            cache.evict_confirmed(
+                111,
+                now + Duration::from_secs(600),
+                Duration::from_secs(600),
+                12
+            ),
+            1
+        );
+        assert_eq!(cache.get_tx_data(&a), None);
+        assert!(cache.contains(&b));
+        assert_eq!(cache.wtxid_for_payload(&[1, 2, 3]), None);
+        let snap = cache.snapshot();
+        assert_eq!(snap.bytes, 2);
+        assert_eq!(snap.confirmed_entries, 0);
+        assert_eq!(snap.confirmed_evicted_entries_total, 1);
+        assert_eq!(snap.evicted_entries_total, 1);
+        assert_eq!(snap.evicted_bytes_total, 3);
+        let inner = cache.inner.lock().unwrap();
+        assert_eq!(inner.order.len(), 1);
+        assert_eq!(inner.payload_index.len(), 1);
+    }
+
+    #[test]
+    fn duplicate_insert_and_repeated_confirmation_do_not_extend_grace() {
+        let (cache, a, _) = retention_cache();
+        let now = Instant::now();
+        cache.mark_confirmed(&[*a.txid()], 100, now);
+        cache.insert(a, vec![1, 2, 3]);
+        cache.mark_confirmed(&[*a.txid()], 100, now + Duration::from_secs(599));
+        assert_eq!(
+            cache.evict_confirmed(
+                111,
+                now + Duration::from_secs(600),
+                Duration::from_secs(600),
+                12
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn mempool_reappearance_and_reorg_clear_retained_confirmation() {
+        let (cache, a, b) = retention_cache();
+        let now = Instant::now();
+        cache.mark_confirmed(&[*a.txid(), *b.txid()], 100, now);
+        cache.restore_pending(&[*a.txid()]);
+        assert_eq!(cache.snapshot().confirmed_entries, 1);
+        cache.clear_confirmations();
+        assert_eq!(
+            cache.evict_confirmed(
+                111,
+                now + Duration::from_secs(600),
+                Duration::from_secs(600),
+                12
+            ),
+            0
+        );
+        assert_eq!(cache.snapshot().confirmed_entries, 0);
+        assert!(cache.contains(&a) && cache.contains(&b));
+    }
+
+    #[test]
+    fn confirmations_match_all_auth_variants_and_reject_future_height_or_clock() {
+        let (cache, a, _) = retention_cache();
+        let variant = WtxId::new(*a.txid(), AuthDigest::from_bytes([3; 32]));
+        cache.insert(variant, vec![8]);
+        let now = Instant::now();
+        cache.mark_confirmed(&[*a.txid()], 100, now);
+        assert_eq!(cache.snapshot().confirmed_entries, 2);
+        assert_eq!(
+            cache.evict_confirmed(99, now + Duration::from_secs(600), Duration::ZERO, 1),
+            0
+        );
+        assert_eq!(
+            cache.evict_confirmed(111, now - Duration::from_secs(1), Duration::ZERO, 1),
+            0
+        );
+        assert_eq!(
+            cache.evict_confirmed(
+                111,
+                now + Duration::from_secs(600),
+                Duration::from_secs(600),
+                12
+            ),
+            2
+        );
+    }
+    #[test]
+    fn capacity_eviction_prefers_confirmation_maturing_between_maintenance_ticks() {
+        let cache = TxCache::new(TxCacheConfig {
+            max_entries: 2,
+            max_bytes: 100,
+            max_tx_bytes: 100,
+        });
+        let a = WtxId::new(TxId::from_bytes([1; 32]), AuthDigest::from_bytes([1; 32]));
+        let b = WtxId::new(TxId::from_bytes([2; 32]), AuthDigest::from_bytes([2; 32]));
+        let c = WtxId::new(TxId::from_bytes([3; 32]), AuthDigest::from_bytes([3; 32]));
+        let now = Instant::now();
+        cache.insert_at(a, vec![1], now);
+        cache.insert_at(b, vec![2], now);
+        cache.mark_confirmed(&[*b.txid()], 100, now);
+        assert_eq!(
+            cache.evict_confirmed(
+                111,
+                now + Duration::from_secs(599),
+                Duration::from_secs(600),
+                12
+            ),
+            0
+        );
+        let result = cache.insert_at(c, vec![3], now + Duration::from_secs(600));
+        assert_eq!(result.evicted_entries, 1);
+        assert!(cache.contains(&a));
+        assert!(!cache.contains(&b));
+        assert!(cache.contains(&c));
+        assert_eq!(cache.snapshot().confirmed_evicted_entries_total, 1);
+        assert_eq!(cache.wtxid_for_payload(&[2]), None);
+    }
+
+    #[test]
+    fn capacity_preference_context_is_invalidated_by_reorg_or_pending_reappearance() {
+        for reorg in [false, true] {
+            let cache = TxCache::new(TxCacheConfig {
+                max_entries: 2,
+                max_bytes: 100,
+                max_tx_bytes: 100,
+            });
+            let a = WtxId::new(TxId::from_bytes([1; 32]), AuthDigest::from_bytes([1; 32]));
+            let b = WtxId::new(TxId::from_bytes([2; 32]), AuthDigest::from_bytes([2; 32]));
+            let c = WtxId::new(TxId::from_bytes([3; 32]), AuthDigest::from_bytes([3; 32]));
+            let now = Instant::now();
+            cache.insert_at(a, vec![1], now);
+            cache.insert_at(b, vec![2], now);
+            cache.mark_confirmed(&[*b.txid()], 100, now);
+            cache.evict_confirmed(111, now, Duration::from_secs(600), 12);
+            if reorg {
+                cache.clear_confirmations();
+            } else {
+                cache.restore_pending(&[*b.txid()]);
+            }
+            cache.insert_at(c, vec![3], now + Duration::from_secs(600));
+            assert!(!cache.contains(&a));
+            assert!(cache.contains(&b));
+            assert_eq!(cache.snapshot().confirmed_evicted_entries_total, 0);
+        }
     }
 }

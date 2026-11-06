@@ -500,6 +500,7 @@ mod tests {
             peer_score_relay_forwarded: 10,
             peer_score_error: -50,
             tx_cache_enabled: false,
+            tx_cache_maintenance: None,
             tx_cache_max_entries: 200_000,
             tx_cache_max_bytes: 536_870_912,
             tx_cache_max_tx_bytes: 2_097_152,
