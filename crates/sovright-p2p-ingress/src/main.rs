@@ -48,6 +48,32 @@ async fn main() -> Result<()> {
             max_tx_bytes: config.tx_cache_max_tx_bytes,
         })
     });
+    // Confirmation comes only from the explicitly configured trusted node,
+    // never from blocks announced by untrusted ingress peers.
+    if let (Some(policy), Some(cache)) = (&config.tx_cache_maintenance, tx_cache.clone()) {
+        let rpc = sovright_relay_sidecar::rpc::ZebraRpc::new(&policy.zebra_url)
+            .await
+            .map_err(|_| {
+                error::IngressError::Config(
+                    "could not initialize SOVRIGHT_P2P_TX_CACHE_ZEBRA_URL client".to_string(),
+                )
+            })?;
+        info!(
+            interval_secs = policy.interval.as_secs(),
+            grace_secs = policy.grace.as_secs(),
+            min_confirmations = policy.min_confirmations,
+            "trusted-node transaction cache maintenance enabled"
+        );
+        tokio::spawn(
+            sovright_relay_sidecar::cache_maintenance::run_cache_maintenance(
+                std::sync::Arc::new(rpc),
+                cache,
+                policy.interval,
+                policy.grace,
+                policy.min_confirmations,
+            ),
+        );
+    }
     let _submitblock_rpc = match config.submitblock_rpc.clone() {
         Some(rpc_config) => {
             let relay = relay.clone().ok_or_else(|| {

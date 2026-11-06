@@ -173,6 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         submit_gate_cfg,
         zebra_mempool_sync_enabled,
         zebra_mempool_sync_interval_ms,
+        cache_retention,
     ) = if let Some(config_path) = &args.config {
         let cfg = config::Config::from_file(std::path::Path::new(config_path))?;
         (
@@ -201,6 +202,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Some(cfg.submit_gate.clone()),
             cfg.zebra_mempool_sync_enabled,
             cfg.zebra_mempool_sync_interval_ms,
+            cfg.tx_cache_confirmed_eviction_enabled.then_some((
+                cfg.tx_cache_maintenance_interval_secs,
+                cfg.tx_cache_confirmed_grace_secs,
+                cfg.tx_cache_min_confirmations,
+            )),
         )
     } else {
         // Use CLI args
@@ -254,6 +260,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             None,
             false, // zebra mempool sync is config-only (off for bare CLI)
             2000,
+            None, // confirmed eviction is opt-in via TOML
         )
     };
 
@@ -391,6 +398,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             None => warn!("zebra_mempool_sync_enabled but tx cache is disabled; ignoring"),
         }
+    }
+
+    if let Some((interval_secs, grace_secs, confirmations)) = cache_retention {
+        let cache = mempool
+            .tx_cache()
+            .ok_or("confirmed cache eviction requires tx cache")?;
+        info!(
+            interval_secs,
+            grace_secs, confirmations, "Confirmed cache maintenance enabled"
+        );
+        tokio::spawn(
+            sovright_relay_sidecar::cache_maintenance::run_cache_maintenance(
+                Arc::clone(&rpc),
+                cache,
+                Duration::from_secs(interval_secs),
+                Duration::from_secs(grace_secs),
+                confirmations,
+            ),
+        );
     }
 
     // Initialize relay
@@ -1784,6 +1810,8 @@ struct SidecarMetrics {
     raw_segment_incomplete_blocks: AtomicUsize,
     raw_segment_payload_bytes: AtomicUsize,
     tx_cache_entries: AtomicUsize,
+    tx_cache_confirmed_entries: AtomicUsize,
+    tx_cache_confirmed_evicted_entries_total: AtomicUsize,
     tx_cache_bytes: AtomicUsize,
     tx_cache_max_entries: AtomicUsize,
     tx_cache_max_bytes: AtomicUsize,
@@ -2002,6 +2030,10 @@ impl SidecarMetrics {
     fn set_tx_cache_snapshot(&self, snapshot: &TxCacheSnapshot) {
         self.tx_cache_entries
             .store(snapshot.entries, Ordering::Relaxed);
+        self.tx_cache_confirmed_entries
+            .store(snapshot.confirmed_entries, Ordering::Relaxed);
+        self.tx_cache_confirmed_evicted_entries_total
+            .store(snapshot.confirmed_evicted_entries_total, Ordering::Relaxed);
         self.tx_cache_bytes.store(snapshot.bytes, Ordering::Relaxed);
         self.tx_cache_max_entries
             .store(snapshot.max_entries, Ordering::Relaxed);
@@ -2117,6 +2149,10 @@ impl SidecarMetrics {
             self.raw_segment_incomplete_blocks.load(Ordering::Relaxed);
         let raw_segment_payload_bytes = self.raw_segment_payload_bytes.load(Ordering::Relaxed);
         let tx_cache_entries = self.tx_cache_entries.load(Ordering::Relaxed);
+        let tx_cache_confirmed_entries = self.tx_cache_confirmed_entries.load(Ordering::Relaxed);
+        let tx_cache_confirmed_evicted_entries_total = self
+            .tx_cache_confirmed_evicted_entries_total
+            .load(Ordering::Relaxed);
         let tx_cache_bytes = self.tx_cache_bytes.load(Ordering::Relaxed);
         let tx_cache_max_entries = self.tx_cache_max_entries.load(Ordering::Relaxed);
         let tx_cache_max_bytes = self.tx_cache_max_bytes.load(Ordering::Relaxed);
@@ -2212,6 +2248,10 @@ impl SidecarMetrics {
                 "sovright_relay_sidecar_raw_segment_incomplete_blocks {raw_segment_incomplete_blocks}\n",
                 "# TYPE sovright_relay_sidecar_raw_segment_payload_bytes gauge\n",
                 "sovright_relay_sidecar_raw_segment_payload_bytes {raw_segment_payload_bytes}\n",
+                "# TYPE sovright_relay_sidecar_tx_cache_confirmed_entries gauge\n",
+                "sovright_relay_sidecar_tx_cache_confirmed_entries {tx_cache_confirmed_entries}\n",
+                "# TYPE sovright_relay_sidecar_tx_cache_confirmed_evicted_entries_total counter\n",
+                "sovright_relay_sidecar_tx_cache_confirmed_evicted_entries_total {tx_cache_confirmed_evicted_entries_total}\n",
                 "# TYPE sovright_relay_sidecar_tx_cache_entries gauge\n",
                 "sovright_relay_sidecar_tx_cache_entries {tx_cache_entries}\n",
                 "# TYPE sovright_relay_sidecar_tx_cache_bytes gauge\n",
@@ -2283,6 +2323,8 @@ impl SidecarMetrics {
             raw_segment_incomplete_blocks = raw_segment_incomplete_blocks,
             raw_segment_payload_bytes = raw_segment_payload_bytes,
             tx_cache_entries = tx_cache_entries,
+            tx_cache_confirmed_entries = tx_cache_confirmed_entries,
+            tx_cache_confirmed_evicted_entries_total = tx_cache_confirmed_evicted_entries_total,
             tx_cache_bytes = tx_cache_bytes,
             tx_cache_max_entries = tx_cache_max_entries,
             tx_cache_max_bytes = tx_cache_max_bytes,
@@ -3795,6 +3837,8 @@ mod tests {
             evicted_entries_total: 1,
             evicted_bytes_total: 128,
             dropped_too_large_total: 2,
+            confirmed_entries: 2,
+            confirmed_evicted_entries_total: 7,
         });
 
         let text = metrics.render_prometheus_text();
@@ -3850,6 +3894,8 @@ mod tests {
         assert!(text.contains("sovright_relay_sidecar_raw_segment_incomplete_blocks 2"));
         assert!(text.contains("sovright_relay_sidecar_raw_segment_payload_bytes 4096"));
         assert!(text.contains("sovright_relay_sidecar_tx_cache_entries 3"));
+        assert!(text.contains("sovright_relay_sidecar_tx_cache_confirmed_entries 2"));
+        assert!(text.contains("sovright_relay_sidecar_tx_cache_confirmed_evicted_entries_total 7"));
         assert!(text.contains("sovright_relay_sidecar_tx_cache_bytes 2048"));
         assert!(text.contains("sovright_relay_sidecar_tx_cache_max_entries 8"));
         assert!(text.contains("sovright_relay_sidecar_tx_cache_max_bytes 4096"));

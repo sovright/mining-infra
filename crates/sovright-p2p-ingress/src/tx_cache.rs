@@ -220,6 +220,8 @@ mod tests {
                 evicted_entries_total: 1,
                 evicted_bytes_total: 2,
                 dropped_too_large_total: 1,
+                confirmed_entries: 0,
+                confirmed_evicted_entries_total: 0,
             }
         );
     }

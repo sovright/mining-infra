@@ -119,6 +119,16 @@ pub struct BlockHeaderInfo {
     pub confirmations: Option<i64>,
 }
 
+/// Canonical block data needed by transaction-cache maintenance.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CacheBlock {
+    pub hash: String,
+    pub height: u64,
+    #[serde(rename = "previousblockhash")]
+    pub previous_block_hash: Option<String>,
+    pub tx: Vec<String>,
+}
+
 /// Subset of verbose `getrawtransaction` used by the mempool-sync task. Extra
 /// fields are ignored. `authdigest` is absent for pre-v5 transactions.
 #[derive(Debug, Clone, Deserialize)]
@@ -226,6 +236,28 @@ impl ZebraRpc {
             .request("getblockchaininfo", rpc_params![])
             .await?;
         Ok(info)
+    }
+
+    /// Resolve a height on the node's current canonical chain.
+    pub async fn get_block_hash(
+        &self,
+        height: u64,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .client
+            .request("getblockhash", rpc_params![height])
+            .await?)
+    }
+
+    /// Fetch transaction IDs for a block already resolved from a canonical height.
+    pub async fn get_cache_block(
+        &self,
+        hash: &str,
+    ) -> Result<CacheBlock, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(self
+            .client
+            .request("getblock", rpc_params![hash, 1])
+            .await?)
     }
 
     /// Fetch a block header by hash. Returns `Ok(Some(_))` if known, `Ok(None)`
