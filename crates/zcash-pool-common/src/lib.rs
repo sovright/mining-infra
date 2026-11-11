@@ -3,6 +3,8 @@
 //! This crate provides shared types used by both the pool server
 //! and the JD server, avoiding circular dependencies.
 
+#![forbid(unsafe_code)]
+
 pub mod block_hash;
 pub mod compact_size;
 #[cfg(any(test, feature = "test-support"))]

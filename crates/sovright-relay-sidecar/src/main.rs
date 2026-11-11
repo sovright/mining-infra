@@ -1,5 +1,7 @@
 //! Relay sidecar for Stratum V1 mining pools
 
+#![forbid(unsafe_code)]
+
 use clap::Parser;
 use sovright_relay::{
     ArrivalSink, BlockBodyError, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment,

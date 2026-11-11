@@ -5,6 +5,8 @@
 //! - Share difficulty validation
 //! - Adaptive variable difficulty (vardiff) algorithm
 
+#![forbid(unsafe_code)]
+
 pub mod difficulty;
 pub mod error;
 pub mod validator;
