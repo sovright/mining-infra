@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+# No default token permissions; each job asks for what it needs.
+permissions: {}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -12,26 +15,71 @@ jobs:
   test:
     name: Build and test
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master@2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master@2026-10-16
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  cargo-deny:
+    name: Cargo deny (advisories, bans, licenses, sources)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      # Config: deny.toml. The action runs with --all-features by default.
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+
+  cargo-vet:
+    name: Cargo vet (third-party crate audits)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master@2026-10-16
+        with:
+          toolchain: stable
+      # Same major series as librustzcash and Argos.
+      - run: cargo install cargo-vet --version "~0.10" --locked
+      # --locked uses the committed supply-chain/imports.lock and fetches
+      # nothing. Refreshing imports is a deliberate local step
+      # (`cargo vet regenerate imports`), so an upstream rewrite of an imported
+      # audits.toml cannot silently change what we trust.
+      - run: cargo vet --locked
 
   tier2-chain:
     # Full-chain mining integration test (pool + JDC + proxy + real CPU
@@ -44,11 +92,17 @@ jobs:
     name: Tier-2 full-chain mining (non-blocking)
     runs-on: ubuntu-latest
     continue-on-error: true
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master@2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Build workspace (produces proxy + miner binaries the test spawns)
-        run: cargo build --workspace --all-targets
+        run: cargo build --locked --workspace --all-targets
       - name: Run tier-2 chain test
-        run: cargo test -p zcash-jd-client --test tier2_chain_test -- --ignored --nocapture
+        run: cargo test --locked -p zcash-jd-client --test tier2_chain_test -- --ignored --nocapture
