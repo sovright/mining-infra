@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
-use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
+use crate::hash::{inventory_hash_from_header, inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::{ForwardMode, ForwardedBlock, RelayBridge};
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
@@ -562,28 +562,33 @@ fn received_block_display_hash(
     pending_block_responses: &mut RequestWindow<[u8; 32]>,
     block_payload: &[u8],
 ) -> Result<String> {
-    let actual_inventory_hash = raw_hash_from_header(block_payload)?;
-    let actual_hash = inventory_hash_to_display(&actual_inventory_hash);
-    if let Some(index) = pending_block_responses.complete(actual_inventory_hash) {
+    // Requests are keyed by the consensus hash peers announce in `inv`. The
+    // returned display hash stays the relay object hash, which the block
+    // events carry in their `hash` field.
+    let inventory_hash = inventory_hash_from_header(block_payload)?;
+    let event_hash = inventory_hash_to_display(&raw_hash_from_header(block_payload)?);
+    let consensus_hash = inventory_hash_to_display(&inventory_hash);
+    if let Some(index) = pending_block_responses.complete(inventory_hash) {
         if index != 0 {
             warn!(
-                actual_hash,
+                consensus_hash,
                 pending_index = index,
                 "Received requested block out of order"
             );
         }
-        return Ok(actual_hash);
+        return Ok(event_hash);
     }
 
     if let Some((hash, _)) = pending_block_responses.pending.front() {
         let requested_hash = inventory_hash_to_display(hash);
         warn!(
             requested_hash,
-            actual_hash, "Received block hash did not match any pending requested inventory hash"
+            consensus_hash,
+            "Received block hash did not match any pending requested inventory hash"
         );
     }
 
-    Ok(actual_hash)
+    Ok(event_hash)
 }
 
 fn version_payload(peer_addr: SocketAddr, network: Network) -> Vec<u8> {
@@ -739,7 +744,7 @@ mod tests {
 
         let block_payload = vec![0u8; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let actual_display = display_hash_from_header(&block_payload).unwrap();
-        let actual_inventory = inventory_hash_from_display(&actual_display);
+        let actual_inventory = inventory_hash_from_header(&block_payload).unwrap();
         assert!(pending.admit(actual_inventory, Instant::now()));
 
         let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
@@ -747,6 +752,49 @@ mod tests {
         assert_eq!(display, actual_display);
         assert_eq!(pending.pending.len(), 1);
         assert_eq!(pending.pending[0].0, [0x5c; 32]);
+    }
+
+    // A peer's `inv` names a block by its consensus hash (double-SHA256 of the
+    // header, internal byte order), and `getdata` echoes that hash. The block
+    // that arrives must complete that request. Uses a real mainnet header so
+    // the two hash functions cannot agree by construction.
+    #[test]
+    fn received_mainnet_block_completes_the_request_its_inv_announced() {
+        use zcash_pool_common::fixtures::{
+            MAINNET_BLOCK_3470793_HASH_DISPLAY, mainnet_serialized_header,
+        };
+        let block_payload = mainnet_serialized_header();
+        let inv_hash = inventory_hash_from_display(MAINNET_BLOCK_3470793_HASH_DISPLAY);
+        let mut pending = request_window([inv_hash]);
+
+        received_block_display_hash(&mut pending, &block_payload).unwrap();
+
+        assert!(
+            pending.pending.is_empty(),
+            "the delivered block must complete the request its inv announced"
+        );
+        assert!(pending.recent.keys.contains(&inv_hash));
+        assert!(
+            !pending.admit(inv_hash, Instant::now()),
+            "a re-announcement of a delivered block must not be fetched again"
+        );
+    }
+
+    // Event consumers join `p2p_block_received` to `p2p_relay_block_forwarded`
+    // on the `hash` field, so its value (the relay object hash) must not change.
+    #[test]
+    fn received_block_event_hash_stays_the_relay_object_hash() {
+        use zcash_pool_common::fixtures::{
+            MAINNET_BLOCK_3470793_HASH_DISPLAY, mainnet_serialized_header,
+        };
+        let block_payload = mainnet_serialized_header();
+        let inv_hash = inventory_hash_from_display(MAINNET_BLOCK_3470793_HASH_DISPLAY);
+        let mut pending = request_window([inv_hash]);
+
+        let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
+
+        assert_eq!(display, display_hash_from_header(&block_payload).unwrap());
+        assert_ne!(display, MAINNET_BLOCK_3470793_HASH_DISPLAY);
     }
 
     #[test]
@@ -2147,7 +2195,7 @@ mod tests {
         let payload = vec![0; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let block = Inventory {
             inv_type: crate::wire::MSG_BLOCK,
-            hash: raw_hash_from_header(&payload).unwrap(),
+            hash: inventory_hash_from_header(&payload).unwrap(),
             auth_digest: None,
         };
         let tx = TxInventoryKey::from_wtxid(&v6_wtxid()).to_inventory();
