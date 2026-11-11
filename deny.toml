@@ -1,0 +1,72 @@
+# cargo-deny configuration.
+#
+# CI runs `cargo deny --all-features check advisories bans licenses sources`
+# on every push and PR. Anything that fails here fails CI. Modelled on the
+# Argos and zebrad configurations; see supply-chain/README.md for the review
+# policy that goes with it.
+
+# ── Advisories ───────────────────────────────────────────────────────────────
+# Every entry in `ignore` names a RUSTSEC ID we have evaluated and chosen to
+# track rather than fail CI on. Revisit on every dependency bump.
+[advisories]
+version = 2
+# Any yanked dependency fails CI.
+yanked = "deny"
+
+ignore = [
+    # h2 0.3.x has no fixed release (the fix is >= 0.4.16). It reaches us
+    # only through sovright-telemetry: opentelemetry-otlp 0.14 -> tonic 0.9
+    # -> hyper 0.14 -> h2 0.3, which is the OTLP gRPC client talking to our
+    # own collector. The relay, sidecar and ingress use h2 0.4.20.
+    # Clear it by upgrading the opentelemetry stack.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no fix; only in the OTLP client to our own collector" },
+]
+
+# ── Licenses ─────────────────────────────────────────────────────────────────
+# Allow-list of SPDX identifiers, trimmed to those actually present in the
+# tree. Anything outside it fails CI, so no copyleft or unknown-licensed crate
+# arrives silently. Extend deliberately, with a reason, when a new dependency
+# needs it.
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+
+# ── Bans ─────────────────────────────────────────────────────────────────────
+# Duplicate versions are reported but do not fail: the Zcash stack pulls
+# several semver-incompatible duplicates. Wildcard requirements are denied;
+# workspace path dependencies are allowed because every crate is
+# `publish = false`.
+#
+# Argos also bans `openssl-sys`. We cannot yet: zcash-jd-client and
+# zcash-template-provider use reqwest's default native-tls. Moving them to
+# rustls would let us add `{ name = "openssl-sys" }` here.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+highlight = "all"
+deny = []
+
+# ── Sources ──────────────────────────────────────────────────────────────────
+# Every dependency resolves from crates.io or a path in this repository. No
+# git dependencies and no alternate registries. The vendored
+# reed-solomon-erasure is a path dependency (vendor/).
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -19,6 +19,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sovright/mining-infra"
+# Nothing here is published to crates.io. Also lets cargo-deny accept
+# path dependencies without version requirements.
+publish = false
 
 [workspace.dependencies]
 tokio = { version = "1.35", features = ["full"] }
