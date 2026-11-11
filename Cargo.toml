@@ -10,6 +10,8 @@ exclude = [
     "crates/bedrock-forge",
     "crates/bedrock-noise",
     "crates/forge-sidecar",
+    # Patched dependency, not a member (see vendor/reed-solomon-erasure/SOVRIGHT-PATCH.md).
+    "vendor/reed-solomon-erasure",
 ]
 
 [workspace.package]
@@ -41,3 +43,9 @@ sha2 = "0.10"
 zcash_encoding = { version = "=0.5.0", default-features = false, features = ["std"] }
 zcash_primitives = { version = "=0.31.0", default-features = false, features = ["std"] }
 zcash_protocol = { version = "=0.11.0", default-features = false }
+
+# reed-solomon-erasure 6.0.0 is unreleased upstream since 2022 and pins
+# lru 0.7 (RUSTSEC-2026-0253). Same version, patched dependencies.
+# See vendor/reed-solomon-erasure/SOVRIGHT-PATCH.md.
+[patch.crates-io]
+reed-solomon-erasure = { path = "vendor/reed-solomon-erasure" }

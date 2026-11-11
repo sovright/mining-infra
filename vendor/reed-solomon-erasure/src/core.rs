@@ -21,7 +21,12 @@ use spin::Mutex;
 use super::Field;
 use super::ReconstructShard;
 
-const DATA_DECODE_MATRIX_CACHE_CAPACITY: usize = 254;
+// lru 0.8+ takes a NonZeroUsize capacity.
+const DATA_DECODE_MATRIX_CACHE_CAPACITY: core::num::NonZeroUsize =
+    match core::num::NonZeroUsize::new(254) {
+        Some(n) => n,
+        None => panic!("capacity must be non-zero"),
+    };
 
 // /// Parameters for parallelism.
 // #[derive(PartialEq, Debug, Clone, Copy)]
