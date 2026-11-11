@@ -31,7 +31,7 @@ hex = "0.4"
 blake2b_simd = "1.0"
 byteorder = "1.5"
 # Retain the existing CPU solver and the compatibility-test oracle.
-equihash = "0.2"
+equihash = "0.3"
 # Verification-only optimization, shared with deployed Zakura 1.5.1.
 equihash-verifier = { package = "zakura-equihash", version = "=2.1.0" }
 sha2 = "0.10"
