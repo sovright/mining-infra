@@ -731,7 +731,9 @@ pub async fn start_metrics_server(addr: SocketAddr, metrics: Arc<PoolMetrics>) {
         }
     });
 
-    let server = Server::bind(&addr).serve(make_svc);
+    // HTTP/1 only: OpenTelemetry enables hyper's http2 feature workspace-wide,
+    // and h2 0.3 has an unfixed advisory (RUSTSEC-2026-0258).
+    let server = Server::bind(&addr).http1_only(true).serve(make_svc);
 
     info!("Metrics server listening on http://{}", addr);
 
@@ -993,5 +995,51 @@ mod tests {
 
         let encoded = metrics.encode();
         assert!(encoded.contains("sovright_pool_flagged_addresses 1"));
+    }
+
+    /// The OpenTelemetry stack turns on hyper's `http2` feature for the whole
+    /// workspace, and hyper 0.14 then also accepts HTTP/2 connections. That
+    /// would expose h2 0.3 (RUSTSEC-2026-0258, no fixed 0.3 release) on this
+    /// listener. It must speak HTTP/1 only.
+    #[tokio::test]
+    async fn metrics_server_refuses_http2() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+        tokio::spawn(start_metrics_server(addr, Arc::new(PoolMetrics::new())));
+
+        let mut stream = None;
+        for _ in 0..200 {
+            if let Ok(s) = tokio::net::TcpStream::connect(addr).await {
+                stream = Some(s);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut stream = stream.expect("server did not start listening");
+
+        // HTTP/2 connection preface followed by an empty SETTINGS frame.
+        stream
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        let mut buf = [0u8; 9];
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("server did not answer")
+            .unwrap_or(0);
+        // An HTTP/2 server answers with its own SETTINGS frame: frame type
+        // 0x04 in byte 3 of the 9-byte frame header.
+        assert!(
+            !(n == 9 && buf[3] == 0x04),
+            "server answered with an HTTP/2 frame: {:?}",
+            &buf[..n]
+        );
     }
 }

@@ -14,12 +14,15 @@ version = 2
 yanked = "deny"
 
 ignore = [
-    # h2 0.3.x has no fixed release (the fix is >= 0.4.16). It reaches us
-    # only through sovright-telemetry: opentelemetry-otlp 0.14 -> tonic 0.9
-    # -> hyper 0.14 -> h2 0.3, which is the OTLP gRPC client talking to our
-    # own collector. The relay, sidecar and ingress use h2 0.4.20.
-    # Clear it by upgrading the opentelemetry stack.
-    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no fix; only in the OTLP client to our own collector" },
+    # h2 0.3.x has no fixed release (the fix is >= 0.4.16). It is linked by
+    # sovright-telemetry and zcash-pool-server through hyper 0.14 and
+    # opentelemetry-otlp 0.14 -> tonic 0.9. tonic turns on hyper's http2
+    # feature for the whole workspace, which made the hyper 0.14 metrics and
+    # control servers accept HTTP/2 too. Both now set http1_only(true)
+    # (tests: *_refuses_http2), so h2 0.3 only runs in the OTLP gRPC client
+    # talking to our own collector. The relay, sidecar and ingress use h2
+    # 0.4.20. Clear this by upgrading the opentelemetry stack.
+    { id = "RUSTSEC-2026-0258", reason = "h2 0.3 has no fix; servers are HTTP/1-only, h2 0.3 remains only in the OTLP client to our own collector" },
 ]
 
 # ── Licenses ─────────────────────────────────────────────────────────────────
