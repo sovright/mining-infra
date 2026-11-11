@@ -273,7 +273,7 @@ version = "0.9.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.ctutils]]
-version = "0.4.8"
+version = "0.4.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.curve25519-dalek]]
@@ -645,7 +645,7 @@ version = "0.3.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl]]
-version = "0.10.82"
+version = "0.10.81"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl-probe]]
@@ -653,7 +653,7 @@ version = "0.2.1"
 criteria = "safe-to-deploy"
 
 [[exemptions.openssl-sys]]
-version = "0.9.118"
+version = "0.9.117"
 criteria = "safe-to-deploy"
 
 [[exemptions.opentelemetry]]
@@ -1185,7 +1185,7 @@ version = "0.26.11"
 criteria = "safe-to-deploy"
 
 [[exemptions.webpki-root-certs]]
-version = "1.0.12"
+version = "1.0.10"
 criteria = "safe-to-deploy"
 
 [[exemptions.winapi-util]]
