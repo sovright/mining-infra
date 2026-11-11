@@ -19,22 +19,27 @@ on:
         required: true
         type: string
 
-permissions:
-  contents: write
+# No default token permissions; the release job asks for what it needs.
+permissions: {}
 
 jobs:
   build:
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write          # create the GitHub release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master@2026-10-16
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-gnu
 
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+      # No build cache here: release binaries are built from scratch so a
+      # cache written by another workflow run cannot reach them.
 
       - name: Build release artifacts
         run: |
@@ -42,13 +47,13 @@ jobs:
           # zcash-pool-server is a library; the runnable entry point is the
           # `run_pool` example. Build it as the release artifact under the
           # crate's nominal name.
-          cargo build --release --target x86_64-unknown-linux-gnu \
+          cargo build --locked --release --target x86_64-unknown-linux-gnu \
             --example run_pool -p zcash-pool-server
 
-          cargo build --release --target x86_64-unknown-linux-gnu \
+          cargo build --locked --release --target x86_64-unknown-linux-gnu \
             -p bedrock-v1-proxy
 
-          cargo build --release --target x86_64-unknown-linux-gnu \
+          cargo build --locked --release --target x86_64-unknown-linux-gnu \
             -p zcash-test-miner
 
       - name: Stage artifacts
@@ -66,17 +71,26 @@ jobs:
 
       - name: Determine tag
         id: tag
+        # Inputs go through env, never ${{ }} inside the script, so a crafted
+        # workflow_dispatch tag cannot inject shell.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
         run: |
-          if [[ "${{ github.event_name }}" == "push" ]]; then
+          if [[ "${EVENT_NAME}" == "push" ]]; then
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
             echo "draft=false" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+            if [[ ! "${INPUT_TAG}" =~ ^v[0-9A-Za-z.+-]+$ ]]; then
+              echo "invalid tag: ${INPUT_TAG}" >&2
+              exit 1
+            fi
+            echo "tag=${INPUT_TAG}" >> "$GITHUB_OUTPUT"
             echo "draft=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create / update GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           draft: ${{ steps.tag.outputs.draft }}

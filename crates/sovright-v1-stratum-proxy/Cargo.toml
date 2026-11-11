@@ -2,6 +2,7 @@
 name = "sovright-v1-stratum-proxy"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 description = "Stratum V1 translation proxy for the Sovright Zcash mining pool"
 

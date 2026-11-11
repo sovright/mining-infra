@@ -19,6 +19,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sovright/mining-infra"
+# Nothing here is published to crates.io. Also lets cargo-deny accept
+# path dependencies without version requirements.
+publish = false
 
 [workspace.dependencies]
 tokio = { version = "1.35", features = ["full"] }
@@ -31,7 +34,7 @@ hex = "0.4"
 blake2b_simd = "1.0"
 byteorder = "1.5"
 # Retain the existing CPU solver and the compatibility-test oracle.
-equihash = "0.2"
+equihash = "0.3"
 # Verification-only optimization, shared with deployed Zakura 1.5.1.
 equihash-verifier = { package = "zakura-equihash", version = "=2.1.0" }
 sha2 = "0.10"

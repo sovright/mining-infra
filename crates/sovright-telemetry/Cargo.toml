@@ -2,6 +2,7 @@
 name = "sovright-telemetry"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 description = "Telemetry: monitoring and analytics layer for Sovright mining infrastructure"
 

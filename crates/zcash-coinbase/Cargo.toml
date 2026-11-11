@@ -2,6 +2,7 @@
 name = "zcash-coinbase"
 version.workspace = true
 edition.workspace = true
+publish.workspace = true
 license.workspace = true
 description = "Zcash coinbase transaction construction and validation"
 
