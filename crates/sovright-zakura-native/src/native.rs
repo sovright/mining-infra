@@ -13,6 +13,7 @@ use std::{
     future::Future,
     net::SocketAddr,
     path::PathBuf,
+    str::FromStr,
     sync::{
         Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicU64, Ordering},
@@ -23,7 +24,7 @@ use std::{
 use indexmap::IndexSet;
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore, mpsc},
-    task::{JoinHandle, JoinSet},
+    task::{JoinError, JoinHandle, JoinSet},
     time::timeout,
 };
 use tower::{Service, ServiceExt, util::BoxCloneService};
@@ -74,6 +75,22 @@ pub fn stateless_config(
         },
         ..Config::default()
     }
+}
+
+/// Checks one bootstrap peer, `node_id@ip:port`, the way `zakura-network` 15.0.0
+/// reads it: split at the first `@`, a node id in `zakura-quic`'s text form, then
+/// a socket address.
+///
+/// The endpoint skips an entry it cannot read with only a warning, and starts
+/// anyway, so an entry that fails here would otherwise go unnoticed.
+pub fn check_bootstrap_peer(entry: &str) -> Result<(), BoxError> {
+    let (node_id, address) = entry.split_once('@').ok_or("expected node_id@ip:port")?;
+    zakura_quic::NodeId::from_str(node_id)
+        .map_err(|error| format!("invalid node id {node_id:?}: {error:?}"))?;
+    address
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid address {address:?}: {error}"))?;
+    Ok(())
 }
 
 /// Starts a native endpoint with no header-sync driver, answering peers through `inbound`.
@@ -492,12 +509,64 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A spawned task whose end can be waited on, and that can still be stopped after
+/// that wait was given up.
+#[derive(Debug)]
+pub struct SupervisedTask {
+    handle: JoinHandle<()>,
+    ended: bool,
+}
+
+impl SupervisedTask {
+    /// Spawns `task`.
+    pub fn spawn(task: impl Future<Output = ()> + Send + 'static) -> Self {
+        Self {
+            handle: tokio::spawn(task),
+            ended: false,
+        }
+    }
+
+    /// Resolves when the task ends: it returned, panicked, or was aborted. Resolves
+    /// once; after that it never resolves again. Dropping the future leaves the task
+    /// as it was.
+    pub async fn ended(&mut self) -> Result<(), JoinError> {
+        if self.ended {
+            return std::future::pending().await;
+        }
+        let result = (&mut self.handle).await;
+        self.ended = true;
+        result
+    }
+
+    /// Aborts the task and waits for it, unless it already ended.
+    pub async fn stop(&mut self) {
+        if !self.ended {
+            self.handle.abort();
+            let _ = (&mut self.handle).await;
+            self.ended = true;
+        }
+    }
+
+    /// Aborts the task without waiting, as a test would see a crash.
+    #[cfg(feature = "test-support")]
+    pub fn abort(&self) {
+        self.handle.abort();
+    }
+}
+
+impl Drop for SupervisedTask {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// The Zcash network a native source joins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeNetwork {
     /// Mainnet.
     Mainnet,
-    /// The default public testnet.
+    /// The default public testnet. The ingress daemon refuses it; the tests use it
+    /// for the NU7 testnet fixture.
     Testnet,
 }
 
@@ -535,7 +604,7 @@ pub struct NativeSourceConfig {
 pub struct NativeSource {
     endpoint: ZakuraEndpoint,
     stats: Arc<NativeStats>,
-    fetcher: JoinHandle<()>,
+    fetcher: SupervisedTask,
 }
 
 impl NativeSource {
@@ -567,7 +636,7 @@ impl NativeSource {
 
         let (fetched_tx, fetched_rx) = mpsc::channel(limits.body_slots());
         let fetch_endpoint = endpoint.clone();
-        let fetcher = tokio::spawn(run_fetcher(
+        let fetcher = SupervisedTask::spawn(run_fetcher(
             advert_rx,
             move |advert: NativeAdvert| {
                 let endpoint = fetch_endpoint.clone();
@@ -599,6 +668,18 @@ impl NativeSource {
         &self.endpoint
     }
 
+    /// Resolves when the fetcher ends before [`Self::shutdown`]. It returns only
+    /// when the endpoint drops its inbound service, so any end is unexpected.
+    pub async fn fetcher_ended(&mut self) -> Result<(), JoinError> {
+        self.fetcher.ended().await
+    }
+
+    /// Aborts the fetcher without waiting, as a test would see a crash.
+    #[cfg(feature = "test-support")]
+    pub fn abort_fetcher(&self) {
+        self.fetcher.abort();
+    }
+
     /// Stops fetching, then shuts the endpoint down.
     ///
     /// The fetcher is aborted and awaited, which aborts the fetches in flight, so no
@@ -608,15 +689,8 @@ impl NativeSource {
     /// worker and the per-session readers, are not awaited: they end when their
     /// connection or their last input closes.
     pub async fn shutdown(mut self) {
-        self.fetcher.abort();
-        let _ = (&mut self.fetcher).await;
+        self.fetcher.stop().await;
         self.endpoint.shutdown().await;
-    }
-}
-
-impl Drop for NativeSource {
-    fn drop(&mut self) {
-        self.fetcher.abort();
     }
 }
 
@@ -1035,5 +1109,66 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(stats.adverts_source_busy.load(Ordering::Relaxed), 0);
         fetcher.abort();
+    }
+
+    #[tokio::test]
+    async fn a_supervised_task_reports_a_panic_and_a_return() {
+        let mut panics = SupervisedTask::spawn(async { panic!("forwarder broke") });
+        let error = timeout(STEP, panics.ended())
+            .await
+            .expect("the end is reported in time")
+            .expect_err("a panic is an error");
+        assert!(error.is_panic());
+        panics.stop().await;
+
+        let mut returns = SupervisedTask::spawn(async {});
+        timeout(STEP, returns.ended())
+            .await
+            .expect("the end is reported in time")
+            .expect("a return is not an error");
+        returns.stop().await;
+    }
+
+    /// Dropping the wait leaves the task running, and stopping it later works.
+    #[tokio::test]
+    async fn a_dropped_wait_leaves_the_task_to_stop() {
+        let mut task = SupervisedTask::spawn(std::future::pending());
+        assert!(
+            timeout(Duration::from_millis(50), task.ended())
+                .await
+                .is_err()
+        );
+        timeout(STEP, task.stop())
+            .await
+            .expect("the task stops in time");
+    }
+
+    #[test]
+    fn bootstrap_peers_are_checked_like_zakura_reads_them() {
+        for entry in zakura_network::zakura::DEFAULT_ZAKURA_BOOTSTRAP_PEERS {
+            check_bootstrap_peer(entry)
+                .unwrap_or_else(|error| panic!("{entry} is a default peer: {error}"));
+        }
+        let id = zakura_network::zakura::DEFAULT_ZAKURA_BOOTSTRAP_PEERS[0]
+            .split_once('@')
+            .unwrap()
+            .0;
+        check_bootstrap_peer(&format!("{id}@127.0.0.1:8234")).unwrap();
+        let refused = [
+            String::new(),
+            "@".to_string(),
+            "127.0.0.1:8234".to_string(),
+            "not-a-node@127.0.0.1:8234".to_string(),
+            format!("{id}@"),
+            format!("{id}@not-an-address"),
+            format!("{id}@127.0.0.1"),
+            format!("{id}@@127.0.0.1:8234"),
+        ];
+        for entry in &refused {
+            assert!(
+                check_bootstrap_peer(entry).is_err(),
+                "{entry:?} must be refused"
+            );
+        }
     }
 }

@@ -33,10 +33,9 @@ use super::nu7_fixture::Nu7Fixture;
 use super::nu7_transport_tests::{BridgeMode, LoopbackRelay};
 use super::*;
 use crate::config::ZakuraNativeConfig;
-use crate::wire::Network;
 use crate::zakura_native::{
-    self, ForwardStats, NativeIngress, RECENT_CAPACITY, RECENT_WINDOW, RecentNativeBlocks,
-    delivered_check, forward_fetched,
+    self, ForwardStats, NativeIngress, NativeRunner, RECENT_CAPACITY, RECENT_WINDOW,
+    RecentNativeBlocks, delivered_check, forward_fetched, run_with_native,
 };
 
 /// Upper bound for each step that waits on the network.
@@ -96,9 +95,10 @@ impl Ingress {
             max_concurrent_fetches: 2,
             fetch_timeout: FETCH_TIMEOUT,
         };
-        let native = zakura_native::start(&config, Network::Testnet, relay.clone(), None, events)
-            .await
-            .expect("the native source starts");
+        let native =
+            zakura_native::start(&config, NativeNetwork::Testnet, relay.clone(), None, events)
+                .await
+                .expect("the native source starts");
         for peer in peers {
             peer.wait_for_peer(STEP)
                 .await
@@ -479,7 +479,7 @@ async fn after_shutdown_no_advert_is_taken_and_no_request_starts() {
     relay.stop().await;
 }
 
-// ---- Review of #143: delivered-block record ----
+// ---- Review of #143: delivered-block record, failures, startup ----
 
 /// The native forwarder on its own, fed the way the fetcher feeds it, in front of
 /// a bridge from the block body tests: no network.
@@ -776,5 +776,156 @@ async fn a_delivered_block_is_not_fetched_again_for_another_peer() {
     assert_eq!(second.block_requests_received(), 0);
 
     ingress.native.shutdown().await;
+    relay.stop().await;
+}
+
+/// A forwarder that ends while the source runs is reported, and the source still
+/// shuts down afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_forwarder_is_reported() {
+    let relay = LoopbackRelay::start(PLAIN_RELAY).await;
+    let peer = fake_peer(serve_nothing()).await;
+    let mut ingress = Ingress::start(&relay.bridge, &[&peer]).await;
+
+    ingress.native.abort_forwarder();
+    let error = timeout(STEP, ingress.native.failed())
+        .await
+        .expect("the end is reported in time");
+    match &error {
+        IngressError::ZakuraNative(message) => assert!(message.contains("forwarder"), "{message}"),
+        other => panic!("expected a native error, got {other}"),
+    }
+    timeout(STEP, ingress.native.shutdown())
+        .await
+        .expect("the source shuts down after the failure");
+    relay.stop().await;
+}
+
+/// The same for the fetcher. Its end also closes the forwarder's input, so either
+/// may be the one reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_fetcher_is_reported() {
+    let relay = LoopbackRelay::start(PLAIN_RELAY).await;
+    let peer = fake_peer(serve_nothing()).await;
+    let mut ingress = Ingress::start(&relay.bridge, &[&peer]).await;
+
+    ingress.native.abort_fetcher();
+    let error = timeout(STEP, ingress.native.failed())
+        .await
+        .expect("the end is reported in time");
+    match &error {
+        IngressError::ZakuraNative(message) => {
+            assert!(
+                message.contains("ended while the source was running"),
+                "{message}"
+            )
+        }
+        other => panic!("expected a native error, got {other}"),
+    }
+    timeout(STEP, ingress.native.shutdown())
+        .await
+        .expect("the source shuts down after the failure");
+    relay.stop().await;
+}
+
+fn hanging_legacy(started: &Arc<AtomicBool>) -> impl Future<Output = Result<()>> + use<> {
+    let started = Arc::clone(started);
+    async move {
+        started.store(true, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+        Ok(())
+    }
+}
+
+/// A native start that hangs holds back nothing: the legacy side runs at once,
+/// and the run ends with a timeout error.
+#[tokio::test]
+async fn a_hanging_native_start_times_out_while_the_legacy_peers_run() {
+    let legacy_started = Arc::new(AtomicBool::new(false));
+    let runner = NativeRunner::spawn(
+        std::future::pending::<Result<NativeIngress>>(),
+        Duration::from_millis(200),
+    );
+
+    let outcome = timeout(
+        STEP,
+        run_with_native(hanging_legacy(&legacy_started), runner),
+    )
+    .await
+    .expect("the run ends in time");
+    assert!(legacy_started.load(Ordering::SeqCst));
+    match outcome {
+        Err(IngressError::ZakuraNative(message)) => {
+            assert!(message.contains("did not start within"), "{message}")
+        }
+        other => panic!("expected a start timeout, got {other:?}"),
+    }
+}
+
+/// A native start that fails ends the run with its error.
+#[tokio::test]
+async fn a_failed_native_start_ends_the_run_with_its_error() {
+    let legacy_started = Arc::new(AtomicBool::new(false));
+    let runner = NativeRunner::spawn(
+        async { Err(IngressError::ZakuraNative("bind failed".to_string())) },
+        STEP,
+    );
+
+    let outcome = timeout(
+        STEP,
+        run_with_native(hanging_legacy(&legacy_started), runner),
+    )
+    .await
+    .expect("the run ends in time");
+    match outcome {
+        Err(IngressError::ZakuraNative(message)) => assert_eq!(message, "bind failed"),
+        other => panic!("expected the start error, got {other:?}"),
+    }
+}
+
+/// The legacy peers ending first is their outcome, not a native failure, and the
+/// native start still in progress is stopped rather than waited for.
+#[tokio::test]
+async fn the_legacy_peers_ending_first_is_not_a_native_failure() {
+    let runner = NativeRunner::spawn(
+        std::future::pending::<Result<NativeIngress>>(),
+        Duration::from_secs(3600),
+    );
+    let legacy = async { Err(IngressError::PeersExhausted("none left".to_string())) };
+
+    let outcome = timeout(STEP, run_with_native(legacy, runner))
+        .await
+        .expect("the run ends without waiting for the native start");
+    assert!(matches!(outcome, Err(IngressError::PeersExhausted(_))));
+}
+
+/// A real start failure: the UDP address is already taken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_native_start_on_a_taken_address_fails() {
+    let taken = std::net::UdpSocket::bind("127.0.0.1:0").expect("a loopback UDP socket");
+    let identity = tempfile::tempdir().expect("a temporary identity directory");
+    let relay = LoopbackRelay::start(PLAIN_RELAY).await;
+    let config = ZakuraNativeConfig {
+        bootstrap_peers: Vec::new(),
+        listen_addr: taken.local_addr().unwrap(),
+        identity_dir: PathBuf::from(identity.path()),
+        advert_queue: 8,
+        max_concurrent_fetches: 2,
+        fetch_timeout: FETCH_TIMEOUT,
+    };
+
+    let started = timeout(
+        STEP,
+        zakura_native::start(
+            &config,
+            NativeNetwork::Testnet,
+            relay.bridge.clone(),
+            None,
+            EventSink::new(None).unwrap(),
+        ),
+    )
+    .await
+    .expect("the start ends in time");
+    assert!(matches!(started, Err(IngressError::ZakuraNative(_))));
     relay.stop().await;
 }

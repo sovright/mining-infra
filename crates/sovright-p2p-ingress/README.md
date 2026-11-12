@@ -451,17 +451,34 @@ cargo run -p sovright-p2p-ingress --features zakura-native --locked
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `SOVRIGHT_P2P_ZAKURA_ENABLED` | `false` | Turns the source on. In a build without the feature, `true` fails startup |
-| `SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS` | required | Comma-separated native peers, as `node_id@ip:port` |
+| `SOVRIGHT_P2P_ZAKURA_ENABLED` | `false` | Turns the source on. In a build without the feature, or with `SOVRIGHT_P2P_NETWORK=testnet`, `true` fails startup |
+| `SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS` | required | Comma-separated native peers, as `node_id@ip:port`. Every entry must parse the way `zakura-network` reads it, or startup fails |
 | `SOVRIGHT_P2P_ZAKURA_IDENTITY_DIR` | required | Directory for this source's native node key. Never a real node's identity directory |
 | `SOVRIGHT_P2P_ZAKURA_LISTEN_ADDR` | `0.0.0.0:0` | UDP address the native endpoint binds |
 | `SOVRIGHT_P2P_ZAKURA_ADVERT_QUEUE` | `64` | Announcements waiting for a fetch, 1 to 4096. Further ones are dropped |
 | `SOVRIGHT_P2P_ZAKURA_MAX_CONCURRENT_FETCHES` | `4` | Body requests running at once, 1 to 32 |
 | `SOVRIGHT_P2P_ZAKURA_FETCH_TIMEOUT_SECS` | `40` | Time for one body request, 1 to 120 |
 
-The source needs the relay bridge: enabling it without relay peers and an auth
-key fails startup. If the native endpoint itself fails to start, the daemon logs
-a warning and runs the legacy peers alone.
+### Failures
+
+An enabled source is a required part of the daemon:
+
+- Startup fails before anything runs if the build lacks the feature, the network
+  is not mainnet, a bootstrap peer does not parse, or there are no relay peers
+  and auth key.
+- The native endpoint starts in its own task, so the legacy peers connect without
+  waiting for it. If the start fails, or takes longer than 30 seconds, the
+  daemon exits with an error.
+- If the native fetcher or forwarder ends while the source runs, a panic
+  included, the daemon exits with an error. Nothing restarts them.
+- Errors for single blocks (a failed fetch, a refused body, a relay send error)
+  are logged and leave the daemon running, as for legacy peers.
+- When the legacy peers end, the daemon exits as before and stops the native
+  source on the way; that stop is not reported as a native failure.
+
+`zakura-network` 15.0.0 does not fail the start on every problem: an identity
+directory it cannot read or write gives a warning and a new node key on each
+start, not an error.
 
 ### How it behaves
 
@@ -537,18 +554,17 @@ bypassed body as `deduplicated`.
   permit, holds back the next one.
 - **Log volume.** Each failed fetch logs a warning, so a peer that announces
   blocks nobody serves raises one warning per failed fetch.
-- **Testnet.** Testnet is observation-only and rejects relay outputs, and the
-  source needs the relay bridge, so enabling it with
-  `SOVRIGHT_P2P_NETWORK=testnet` fails startup.
 - **Legacy peers decide the process lifetime.** When no legacy peer task is left
   and none can start, the daemon exits with an error as before, even while the
   native source still works.
-- **Shutdown.** When the legacy peers end, the daemon stops the fetcher and the
-  forwarder, waits for them, and calls `ZakuraEndpoint::shutdown`. That stops
-  the dial and discovery loops, closes the native connections and stops
-  accepting new ones. Tasks that `zakura-network` spawns detached, such as the
-  gossip worker and the per-session readers, are not awaited; they end with
-  their connections or when the process exits.
+- **Shutdown.** The daemon stops the fetcher and the forwarder, waits for them,
+  and calls `ZakuraEndpoint::shutdown`. That stops the dial and discovery loops,
+  closes the native connections and stops accepting new ones. Tasks that
+  `zakura-network` spawns detached, such as the gossip worker and the per-session
+  readers, are not awaited; they end with their connections or when the process
+  exits. A start still in progress is aborted.
+- **Endpoint internals.** Only the fetcher and the forwarder are watched. The
+  endpoint's own tasks give no signal if they stop.
 - **Compatibility.** Tested only on loopback, against fake native peers built
   on the published `zakura-network` endpoint. Compatibility with a stock
   `zakurad` node has not been tested.

@@ -2,10 +2,14 @@
 //!
 //! A body fetched from a native peer takes the same `RelayBridge::forward_block`
 //! path as a block from a legacy peer: the same checks, the same parse permits and
-//! the same dedup ring, which every clone of the bridge shares. A native failure
-//! never reaches the legacy peers, and `main` stops the source when they end.
+//! the same dedup ring, which every clone of the bridge shares. Per-block native
+//! failures never reach the legacy peers, and the legacy peers never wait on the
+//! native source. An enabled source that does not start in time, or whose fetcher
+//! or forwarder ends while it runs, ends the process with an error; see
+//! [`run_with_native`].
 
 use std::collections::VecDeque;
+use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
@@ -13,10 +17,10 @@ use std::time::{Duration, Instant};
 use sovright_relay::{MAX_BLOCK_BYTES, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display};
 use sovright_zakura_native::native::{
     BlockHash, DeliveredCheck, FetchedBlock, NativeNetwork, NativeSource, NativeSourceConfig,
-    NativeStats, SourceLimits,
+    NativeStats, SourceLimits, SupervisedTask,
 };
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tracing::{info, warn};
 
 use crate::config::ZakuraNativeConfig;
@@ -25,10 +29,12 @@ use crate::event::EventSink;
 use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::{ForwardMode, RelayBridge};
 use crate::tx_cache::TxCache;
-use crate::wire::Network;
 
 /// The peer name native blocks carry in events.
 pub const SOURCE: &str = "zakura-native";
+
+/// How long the native source may take to start before the process gives up.
+pub const START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Native blocks remembered as delivered: at most this many.
 ///
@@ -147,7 +153,7 @@ pub(crate) fn delivered_check(
 /// `NativeSource::shutdown` for what that does and does not stop.
 pub struct NativeIngress {
     source: NativeSource,
-    forwarder: AbortOnDrop,
+    forwarder: SupervisedTask,
     forward_stats: Arc<ForwardStats>,
 }
 
@@ -160,6 +166,32 @@ impl NativeIngress {
     /// The forwarder's counters. A clone stays readable after shutdown.
     pub fn forward_stats(&self) -> &Arc<ForwardStats> {
         &self.forward_stats
+    }
+
+    /// Resolves when the fetcher or the forwarder ends while the source runs.
+    ///
+    /// Neither ends on its own in normal operation: the fetcher returns only when
+    /// the endpoint drops its inbound service, and the forwarder only when the
+    /// fetcher is gone. Any end, a panic included, is a failure. Dropping this
+    /// future changes nothing, so [`Self::shutdown`] after it is not reported.
+    pub async fn failed(&mut self) -> IngressError {
+        let (task, ended) = tokio::select! {
+            ended = self.source.fetcher_ended() => ("fetcher", ended),
+            ended = self.forwarder.ended() => ("forwarder", ended),
+        };
+        task_ended(task, ended)
+    }
+
+    /// Aborts the forwarder without waiting, as a test would see a crash.
+    #[cfg(test)]
+    pub(crate) fn abort_forwarder(&self) {
+        self.forwarder.abort();
+    }
+
+    /// Aborts the fetcher without waiting, as a test would see a crash.
+    #[cfg(test)]
+    pub(crate) fn abort_fetcher(&self) {
+        self.source.abort_fetcher();
     }
 
     /// Logs the counters, stops fetching and forwarding, and closes the native
@@ -181,26 +213,28 @@ impl NativeIngress {
             "Stopping the Zakura native source"
         );
         self.source.shutdown().await;
-        self.forwarder.0.abort();
-        let _ = (&mut self.forwarder.0).await;
+        self.forwarder.stop().await;
     }
 }
 
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
+fn task_ended(task: &str, ended: std::result::Result<(), JoinError>) -> IngressError {
+    let how = match ended {
+        Ok(()) => "returned".to_string(),
+        Err(error) => error.to_string(),
+    };
+    IngressError::ZakuraNative(format!(
+        "the Zakura native {task} ended while the source was running: {how}"
+    ))
 }
 
 /// Starts the native source and forwards what it fetches through `relay`.
 ///
 /// `relay` is a clone of the bridge the legacy peers use, so both sources share its
-/// checks and dedup state.
+/// checks and dedup state. The ingress daemon passes [`NativeNetwork::Mainnet`]
+/// only; the tests use testnet for the NU7 fixture.
 pub async fn start(
     config: &ZakuraNativeConfig,
-    network: Network,
+    network: NativeNetwork,
     relay: RelayBridge,
     tx_cache: Option<TxCache>,
     events: EventSink,
@@ -211,7 +245,7 @@ pub async fn start(
     )));
     let (source, fetched) = NativeSource::start(
         NativeSourceConfig {
-            network: native_network(network),
+            network,
             identity_dir: config.identity_dir.clone(),
             listen_addr: config.listen_addr,
             bootstrap_peers: config.bootstrap_peers.clone(),
@@ -228,7 +262,7 @@ pub async fn start(
     .map_err(|error| IngressError::ZakuraNative(error.to_string()))?;
 
     let forward_stats = Arc::new(ForwardStats::default());
-    let forwarder = tokio::spawn(forward_fetched(
+    let forwarder = SupervisedTask::spawn(forward_fetched(
         fetched,
         relay,
         tx_cache,
@@ -238,16 +272,9 @@ pub async fn start(
     ));
     Ok(NativeIngress {
         source,
-        forwarder: AbortOnDrop(forwarder),
+        forwarder,
         forward_stats,
     })
-}
-
-fn native_network(network: Network) -> NativeNetwork {
-    match network {
-        Network::Mainnet => NativeNetwork::Mainnet,
-        Network::Testnet => NativeNetwork::Testnet,
-    }
 }
 
 /// Forwards each fetched block, one at a time, until the source closes.
@@ -344,4 +371,99 @@ fn log_event(written: Result<()>) {
     if let Err(error) = written {
         warn!(%error, "Failed to write a Zakura native block event");
     }
+}
+
+/// The native source from the moment its start is spawned.
+///
+/// The start runs in its own task, so nothing else waits for it; it fails if it
+/// takes longer than its time limit.
+pub struct NativeRunner {
+    state: RunnerState,
+}
+
+enum RunnerState {
+    Starting(JoinHandle<Result<NativeIngress>>),
+    Running(Box<NativeIngress>),
+    Ended,
+}
+
+impl NativeRunner {
+    /// Spawns `start` with `within` as its time limit and returns at once.
+    pub fn spawn(
+        start: impl Future<Output = Result<NativeIngress>> + Send + 'static,
+        within: Duration,
+    ) -> Self {
+        let handle = tokio::spawn(async move {
+            tokio::time::timeout(within, start).await.map_err(|_| {
+                IngressError::ZakuraNative(format!(
+                    "the Zakura native source did not start within {within:?}"
+                ))
+            })?
+        });
+        Self {
+            state: RunnerState::Starting(handle),
+        }
+    }
+
+    /// Resolves with the error that ends the source: a start that failed or timed
+    /// out, or a fetcher or forwarder that ended while it ran. Dropping this future
+    /// changes nothing, so a later [`Self::shutdown`] is not reported as a failure.
+    pub async fn failed(&mut self) -> IngressError {
+        loop {
+            match &mut self.state {
+                RunnerState::Starting(handle) => {
+                    let started = handle.await;
+                    match started {
+                        Ok(Ok(ingress)) => {
+                            info!("Zakura native source started");
+                            self.state = RunnerState::Running(Box::new(ingress));
+                        }
+                        Ok(Err(error)) => {
+                            self.state = RunnerState::Ended;
+                            return error;
+                        }
+                        Err(error) => {
+                            self.state = RunnerState::Ended;
+                            return task_ended("start", Err(error));
+                        }
+                    }
+                }
+                RunnerState::Running(ingress) => return ingress.failed().await,
+                RunnerState::Ended => return std::future::pending().await,
+            }
+        }
+    }
+
+    /// Stops the source in whatever state it is: a start in progress is aborted,
+    /// a running source is shut down.
+    pub async fn shutdown(self) {
+        match self.state {
+            RunnerState::Starting(handle) => {
+                handle.abort();
+                if let Ok(Ok(ingress)) = handle.await {
+                    ingress.shutdown().await;
+                }
+            }
+            RunnerState::Running(ingress) => (*ingress).shutdown().await,
+            RunnerState::Ended => {}
+        }
+    }
+}
+
+/// Runs the legacy peers with the native source beside them.
+///
+/// The outcome is the legacy peers' outcome, unless the native source fails first:
+/// then it is that failure, and the legacy peers are dropped with it. The legacy
+/// peers ending first is not a native failure. Either way the native source is
+/// stopped before this returns.
+pub async fn run_with_native(
+    legacy: impl Future<Output = Result<()>>,
+    mut native: NativeRunner,
+) -> Result<()> {
+    let outcome = tokio::select! {
+        outcome = legacy => outcome,
+        failure = native.failed() => Err(failure),
+    };
+    native.shutdown().await;
+    outcome
 }

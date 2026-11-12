@@ -426,9 +426,10 @@ fn is_loopback_http_url(value: &str) -> bool {
 
 /// Optional Zakura native block source (`zakura-native` feature).
 ///
-/// Off unless `SOVRIGHT_P2P_ZAKURA_ENABLED` is set. The source dials the configured
-/// native peers, but discovery may dial others and any peer may connect to it. It
-/// hands their blocks to the same relay bridge as the legacy peers.
+/// Off unless `SOVRIGHT_P2P_ZAKURA_ENABLED` is set, and mainnet only. The source
+/// dials the configured native peers, but discovery may dial others and any peer
+/// may connect to it. It hands their blocks to the same relay bridge as the legacy
+/// peers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(feature = "zakura-native"), allow(dead_code))]
 pub struct ZakuraNativeConfig {
@@ -448,7 +449,11 @@ pub struct ZakuraNativeConfig {
 }
 
 /// Reads the Zakura native source settings: `None` unless the source is enabled.
-pub fn zakura_native_from_env() -> Result<Option<ZakuraNativeConfig>> {
+///
+/// Enabling it is an error in a build without the feature and on any `network`
+/// but mainnet. Each bootstrap peer must be one `zakura-network` can read: it
+/// skips an entry it cannot read with only a warning.
+pub fn zakura_native_from_env(network: Network) -> Result<Option<ZakuraNativeConfig>> {
     if !env_bool("SOVRIGHT_P2P_ZAKURA_ENABLED", false)? {
         return Ok(None);
     }
@@ -458,6 +463,12 @@ pub fn zakura_native_from_env() -> Result<Option<ZakuraNativeConfig>> {
                 .to_string(),
         ));
     }
+    if network != Network::Mainnet {
+        return Err(IngressError::Config(format!(
+            "SOVRIGHT_P2P_ZAKURA_ENABLED is mainnet only; SOVRIGHT_P2P_NETWORK is {}",
+            network.name()
+        )));
+    }
 
     let bootstrap_peers: Vec<String> = env::var("SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS")
         .unwrap_or_default()
@@ -466,10 +477,17 @@ pub fn zakura_native_from_env() -> Result<Option<ZakuraNativeConfig>> {
         .filter(|peer| !peer.is_empty())
         .map(str::to_string)
         .collect();
-    if bootstrap_peers.is_empty() || bootstrap_peers.iter().any(|peer| !peer.contains('@')) {
+    if bootstrap_peers.is_empty() {
         return Err(IngressError::Config(
             "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS must list node_id@ip:port peers".to_string(),
         ));
+    }
+    for peer in &bootstrap_peers {
+        check_zakura_bootstrap_peer(peer).map_err(|error| {
+            IngressError::Config(format!(
+                "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS entry {peer:?} is not node_id@ip:port: {error}"
+            ))
+        })?;
     }
     let identity_dir = env::var("SOVRIGHT_P2P_ZAKURA_IDENTITY_DIR")
         .ok()
@@ -513,6 +531,17 @@ pub fn zakura_native_from_env() -> Result<Option<ZakuraNativeConfig>> {
         max_concurrent_fetches,
         fetch_timeout: Duration::from_secs(fetch_timeout_secs),
     }))
+}
+
+#[cfg(feature = "zakura-native")]
+fn check_zakura_bootstrap_peer(peer: &str) -> std::result::Result<(), String> {
+    sovright_zakura_native::native::check_bootstrap_peer(peer).map_err(|error| error.to_string())
+}
+
+/// Never reached: without the feature, enabling the source fails first.
+#[cfg(not(feature = "zakura-native"))]
+fn check_zakura_bootstrap_peer(_peer: &str) -> std::result::Result<(), String> {
+    Ok(())
 }
 
 pub fn default_seeds() -> Vec<String> {
@@ -832,6 +861,13 @@ mod tests {
         assert!(Config::from_env().is_err());
     }
 
+    /// Node ids from `zakura-network`'s default Mainnet bootstrap list, used here
+    /// with loopback addresses.
+    #[cfg(feature = "zakura-native")]
+    const NODE_ID_1: &str = "1398f62c6d1a457c51ba6a4b5f3dbd2f69fca93216218dc8997e416bd17d93ca";
+    #[cfg(feature = "zakura-native")]
+    const NODE_ID_2: &str = "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618";
+
     const ZAKURA_VARS: [&str; 7] = [
         "SOVRIGHT_P2P_ZAKURA_ENABLED",
         "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS",
@@ -846,15 +882,15 @@ mod tests {
     fn zakura_native_is_off_unless_enabled() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _clear = EnvGuard::remove(&ZAKURA_VARS);
-        assert_eq!(zakura_native_from_env().unwrap(), None);
+        assert_eq!(zakura_native_from_env(Network::Mainnet).unwrap(), None);
         // Settings alone do not turn it on.
         let _peers = EnvGuard::set(&[(
             "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS",
             "id@127.0.0.1:1".to_string(),
         )]);
-        assert_eq!(zakura_native_from_env().unwrap(), None);
+        assert_eq!(zakura_native_from_env(Network::Mainnet).unwrap(), None);
         let _off = EnvGuard::set(&[("SOVRIGHT_P2P_ZAKURA_ENABLED", "false".to_string())]);
-        assert_eq!(zakura_native_from_env().unwrap(), None);
+        assert_eq!(zakura_native_from_env(Network::Mainnet).unwrap(), None);
     }
 
     #[cfg(not(feature = "zakura-native"))]
@@ -874,7 +910,7 @@ mod tests {
             ),
         ]);
         assert!(matches!(
-            zakura_native_from_env(),
+            zakura_native_from_env(Network::Mainnet),
             Err(IngressError::Config(_))
         ));
     }
@@ -885,13 +921,16 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _clear = EnvGuard::remove(&ZAKURA_VARS);
         let _on = EnvGuard::set(&[("SOVRIGHT_P2P_ZAKURA_ENABLED", "true".to_string())]);
-        assert!(zakura_native_from_env().is_err(), "peers are required");
+        assert!(
+            zakura_native_from_env(Network::Mainnet).is_err(),
+            "peers are required"
+        );
         let _peers = EnvGuard::set(&[(
             "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS",
-            " id1@127.0.0.1:1 , ,id2@127.0.0.1:2 ".to_string(),
+            format!(" {NODE_ID_1}@127.0.0.1:1 , ,{NODE_ID_2}@127.0.0.1:2 "),
         )]);
         assert!(
-            zakura_native_from_env().is_err(),
+            zakura_native_from_env(Network::Mainnet).is_err(),
             "an identity directory is required"
         );
         let _identity = EnvGuard::set(&[(
@@ -899,9 +938,12 @@ mod tests {
             "/tmp/zakura-native-test-identity".to_string(),
         )]);
         assert_eq!(
-            zakura_native_from_env().unwrap(),
+            zakura_native_from_env(Network::Mainnet).unwrap(),
             Some(ZakuraNativeConfig {
-                bootstrap_peers: vec!["id1@127.0.0.1:1".to_string(), "id2@127.0.0.1:2".to_string()],
+                bootstrap_peers: vec![
+                    format!("{NODE_ID_1}@127.0.0.1:1"),
+                    format!("{NODE_ID_2}@127.0.0.1:2")
+                ],
                 listen_addr: "0.0.0.0:0".parse().unwrap(),
                 identity_dir: PathBuf::from("/tmp/zakura-native-test-identity"),
                 advert_queue: 64,
@@ -909,8 +951,21 @@ mod tests {
                 fetch_timeout: Duration::from_secs(40),
             })
         );
+        let bad_address = format!("{NODE_ID_1}@not-an-address");
+        let second_without_port = format!("{NODE_ID_1}@127.0.0.1:1,{NODE_ID_2}@127.0.0.1");
         for (name, value) in [
             ("SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS", "127.0.0.1:1"),
+            ("SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS", "@"),
+            ("SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS", "id@127.0.0.1:1"),
+            (
+                "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS",
+                "not-a-node@127.0.0.1:8233",
+            ),
+            ("SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS", bad_address.as_str()),
+            (
+                "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS",
+                second_without_port.as_str(),
+            ),
             ("SOVRIGHT_P2P_ZAKURA_LISTEN_ADDR", "not-an-address"),
             ("SOVRIGHT_P2P_ZAKURA_ADVERT_QUEUE", "0"),
             ("SOVRIGHT_P2P_ZAKURA_ADVERT_QUEUE", "4097"),
@@ -921,9 +976,34 @@ mod tests {
         ] {
             let _bad = EnvGuard::set(&[(name, value.to_string())]);
             assert!(
-                zakura_native_from_env().is_err(),
+                zakura_native_from_env(Network::Mainnet).is_err(),
                 "{name}={value} must be rejected"
             );
+        }
+    }
+
+    /// Review finding 9: enabling the source on testnet is refused with a reason,
+    /// whatever the relay settings, before anything starts.
+    #[cfg(feature = "zakura-native")]
+    #[test]
+    fn zakura_native_is_mainnet_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _clear = EnvGuard::remove(&ZAKURA_VARS);
+        let _on = EnvGuard::set(&[
+            ("SOVRIGHT_P2P_ZAKURA_ENABLED", "true".to_string()),
+            (
+                "SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS",
+                format!("{NODE_ID_1}@127.0.0.1:1"),
+            ),
+            (
+                "SOVRIGHT_P2P_ZAKURA_IDENTITY_DIR",
+                "/tmp/zakura-native-test-identity".to_string(),
+            ),
+        ]);
+        assert!(zakura_native_from_env(Network::Mainnet).unwrap().is_some());
+        match zakura_native_from_env(Network::Testnet) {
+            Err(IngressError::Config(message)) => assert!(message.contains("mainnet only")),
+            other => panic!("expected a mainnet-only error, got {other:?}"),
         }
     }
 

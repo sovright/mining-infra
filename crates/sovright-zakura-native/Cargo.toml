@@ -17,6 +17,7 @@ zakura-native = [
     "dep:tracing",
     "dep:zakura-chain",
     "dep:zakura-network",
+    "dep:zakura-quic",
 ]
 # A fake native peer for tests in other crates. It compiles only together with
 # `zakura-native`, so asking for it alone pulls in nothing.
@@ -32,6 +33,9 @@ tracing = { workspace = true, optional = true }
 # between releases. Both come from the v1.8.6 release.
 zakura-chain = { version = "=14.0.0", optional = true }
 zakura-network = { version = "=15.0.0", optional = true }
+# The node id parser `zakura-network` 15.0.0 reads bootstrap peers with. Already in
+# the lock through zakura-network; pinned to the version it uses.
+zakura-quic = { version = "=0.5.0", optional = true }
 
 [dev-dependencies]
 hex = { workspace = true }
