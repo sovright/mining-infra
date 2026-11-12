@@ -184,6 +184,18 @@ impl EventSink {
         }))
     }
 
+    /// A block announcement not requested because the block was already
+    /// received on some connection. The announcement itself is still logged as
+    /// `p2p_block_inv`.
+    pub fn p2p_block_getdata_skipped(&self, peer: &str, hash: &str) -> Result<()> {
+        self.write(json!({
+            "event": "p2p_block_getdata_skipped",
+            "peer": peer,
+            "hash": hash,
+            "observed_at_unix_ms": now_unix_ms(),
+        }))
+    }
+
     pub fn p2p_tx_inv(&self, peer: &str, kind: &str, hash: &str) -> Result<()> {
         self.write(json!({
             "event": "p2p_tx_inv",
