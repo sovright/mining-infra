@@ -2387,3 +2387,7 @@ pub(crate) mod block_body_tests;
 #[cfg(test)]
 #[path = "nu7_relay_path_tests.rs"]
 mod nu7_relay_path_tests;
+
+#[cfg(all(test, feature = "zakura-native"))]
+#[path = "zakura_native_tests.rs"]
+mod zakura_native_tests;

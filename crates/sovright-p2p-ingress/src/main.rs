@@ -15,6 +15,8 @@ mod tx_cache;
 mod tx_feed;
 mod wire;
 mod wtxid;
+#[cfg(feature = "zakura-native")]
+mod zakura_native;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -39,6 +41,9 @@ async fn main() -> Result<()> {
         .init();
 
     let config = Config::from_env()?;
+    // Fails when the source is enabled in a build without the feature.
+    #[cfg_attr(not(feature = "zakura-native"), allow(unused_variables))]
+    let zakura_native_config = config::zakura_native_from_env()?;
     let events = EventSink::for_network(config.event_log.clone(), config.network)?;
     let relay = RelayBridge::from_config(&config, events.clone()).await?;
     let tx_cache = config.tx_cache_enabled.then(|| {
@@ -59,6 +64,16 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
+    // Stopped once the legacy peers end, before main returns.
+    #[cfg(feature = "zakura-native")]
+    let native_source = start_zakura_native(
+        zakura_native_config.as_ref(),
+        &config,
+        &events,
+        &relay,
+        &tx_cache,
+    )
+    .await?;
     let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
     let peers = discover_peers(&config).await;
     let crawler = Crawler::new(&config, peers);
@@ -77,43 +92,98 @@ async fn main() -> Result<()> {
         relay_raw_fallback_with_tx_cache = config.relay_raw_fallback_with_tx_cache,
         "starting P2P ingress"
     );
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    // The legacy peers run as before; their outcome is main's result.
+    let outcome: Result<()> = async {
+        let mut handles: Vec<JoinHandle<()>> = Vec::new();
 
-    loop {
-        reap_finished(&mut handles).await;
+        loop {
+            reap_finished(&mut handles).await;
 
-        while handles.len() < config.max_peers {
-            let Some(peer) = crawler.next_peer() else {
-                break;
-            };
-            handles.push(spawn_peer(
-                peer,
-                config.clone(),
-                events.clone(),
-                relay.clone(),
-                tx_cache.clone(),
-                tx_feed.clone(),
-                crawler.clone(),
-            ));
-        }
-
-        if handles.is_empty() && (!config.crawler_enabled || crawler.queue_len() == 0) {
-            break;
-        }
-
-        if !config.crawler_enabled && crawler.queue_len() == 0 {
-            for handle in handles {
-                let _ = handle.await;
+            while handles.len() < config.max_peers {
+                let Some(peer) = crawler.next_peer() else {
+                    break;
+                };
+                handles.push(spawn_peer(
+                    peer,
+                    config.clone(),
+                    events.clone(),
+                    relay.clone(),
+                    tx_cache.clone(),
+                    tx_feed.clone(),
+                    crawler.clone(),
+                ));
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            return Err(peers_exhausted(&crawler));
+
+            if handles.is_empty() && (!config.crawler_enabled || crawler.queue_len() == 0) {
+                break;
+            }
+
+            if !config.crawler_enabled && crawler.queue_len() == 0 {
+                for handle in handles {
+                    let _ = handle.await;
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                return Err(peers_exhausted(&crawler));
+            }
+
+            tokio::time::sleep(config.crawler_drain_interval).await;
         }
 
-        tokio::time::sleep(config.crawler_drain_interval).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        Err(peers_exhausted(&crawler))
     }
+    .await;
 
-    tokio::time::sleep(Duration::from_secs(5)).await;
-    Err(peers_exhausted(&crawler))
+    #[cfg(feature = "zakura-native")]
+    if let Some(native) = native_source {
+        native.shutdown().await;
+    }
+    outcome
+}
+
+/// Starts the native source when it is configured. A configuration without a relay
+/// is an error; a source that fails to start is logged and left off, so the legacy
+/// peers run either way.
+#[cfg(feature = "zakura-native")]
+async fn start_zakura_native(
+    native: Option<&config::ZakuraNativeConfig>,
+    config: &Config,
+    events: &EventSink,
+    relay: &Option<RelayBridge>,
+    tx_cache: &Option<TxCache>,
+) -> Result<Option<zakura_native::NativeIngress>> {
+    let Some(native) = native else {
+        return Ok(None);
+    };
+    let relay = relay.clone().ok_or_else(|| {
+        error::IngressError::Config(
+            "SOVRIGHT_P2P_ZAKURA_ENABLED requires configured relay peers and auth key".to_string(),
+        )
+    })?;
+    let relay = relay.logging_block_events(events.clone(), zakura_native::SOURCE);
+    match zakura_native::start(
+        native,
+        config.network,
+        relay,
+        tx_cache.clone(),
+        events.clone(),
+    )
+    .await
+    {
+        Ok(ingress) => {
+            info!(
+                bootstrap_peers = native.bootstrap_peers.len(),
+                advert_queue = native.advert_queue,
+                max_concurrent_fetches = native.max_concurrent_fetches,
+                "Zakura native source started"
+            );
+            Ok(Some(ingress))
+        }
+        Err(error) => {
+            warn!(%error, "Zakura native source did not start; legacy peers continue");
+            Ok(None)
+        }
+    }
 }
 
 /// The ingress reaches this only when no peer task is left and none can be

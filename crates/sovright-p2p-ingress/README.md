@@ -335,3 +335,77 @@ connections under the new policy. This intentionally reduces the available
 pre-activation peer pool; qualify peer diversity and freshness before rollout.
 A claimed version is not proof of correct consensus behavior: full-node
 validation and NU7 block/submission qualification remain required.
+
+## Zakura native source (experimental)
+
+An optional second block source takes block announcements from Zakura native
+P2P peers and hands the bodies to the same relay bridge as the legacy peers. It
+sits behind the `zakura-native` Cargo feature, which is off by default and needs
+Rust 1.97 or newer; it was verified on 1.98.1. The Docker images build with Rust
+1.91 and do not include it.
+
+```sh
+cargo run -p sovright-p2p-ingress --features zakura-native --locked
+```
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `SOVRIGHT_P2P_ZAKURA_ENABLED` | `false` | Turns the source on. In a build without the feature, `true` fails startup |
+| `SOVRIGHT_P2P_ZAKURA_BOOTSTRAP_PEERS` | required | Comma-separated native peers, as `node_id@ip:port` |
+| `SOVRIGHT_P2P_ZAKURA_IDENTITY_DIR` | required | Directory for this source's native node key. Never a real node's identity directory |
+| `SOVRIGHT_P2P_ZAKURA_LISTEN_ADDR` | `0.0.0.0:0` | UDP address the native endpoint binds |
+| `SOVRIGHT_P2P_ZAKURA_ADVERT_QUEUE` | `64` | Announcements waiting for a fetch, 1 to 4096. Further ones are dropped |
+| `SOVRIGHT_P2P_ZAKURA_MAX_CONCURRENT_FETCHES` | `4` | Body requests running at once, 1 to 32 |
+| `SOVRIGHT_P2P_ZAKURA_FETCH_TIMEOUT_SECS` | `40` | Time for one body request, 1 to 120 |
+
+The source needs the relay bridge: enabling it without relay peers and an auth
+key fails startup. If the native endpoint itself fails to start, the daemon logs
+a warning and runs the legacy peers alone.
+
+How it behaves:
+
+- It is a native endpoint with no chain state. It dials the bootstrap peers, but
+  its discovery may also dial peers it learns of, and any native peer may connect
+  to it. Every connected peer can announce blocks to it.
+- A body is requested from the announcing peer first. `zakura-network` then
+  tries up to two other connected peers. The body arrives decoded and is
+  re-serialized before it is forwarded, so the bytes are the canonical encoding,
+  not necessarily the bytes the peer sent.
+- The forward takes the legacy path: the same body checks, parse permits and
+  dedup state. Events name the peer `zakura-native`.
+- One fetch per hash runs at a time; an announcement of a hash already in flight
+  is skipped. A failed fetch leaves the hash free for the next announcement.
+- Every native announcement is answered with an error, on purpose. After a
+  successful answer, `zakura-network` 15.0.0 would mark the hash seen for ten
+  minutes, dropping later announcements of it from every peer, and would pass
+  the announcement on to other peers although this source cannot serve the
+  block. The error causes neither, and costs no penalty or disconnect; Zakura
+  logs it at debug level. This relies on the pinned 15.0.0 behaviour.
+
+Known costs and limits:
+
+- **Repeated fetches (temporary).** The bridge keys its dedup state by a header
+  hash that an announcement does not carry, so the source cannot recognise a
+  known block before fetching it. A block a legacy peer already forwarded is
+  fetched again, and so is a block announced again after its fetch finished; the
+  bridge then drops the copy as a duplicate. Each copy is a full body transfer.
+  `SOVRIGHT_P2P_ZAKURA_MAX_CONCURRENT_FETCHES` limits fetches at once, not the
+  total: nothing limits how often one block is fetched again. A peer may repeat
+  an announcement up to Zakura's per-connection limit of 2048 messages a second.
+- **Log volume.** Each failed fetch logs a warning, so a peer that announces
+  blocks nobody serves raises one warning per failed fetch.
+- **Testnet.** Testnet is observation-only and rejects relay outputs, and the
+  source needs the relay bridge, so enabling it with
+  `SOVRIGHT_P2P_NETWORK=testnet` fails startup.
+- **Legacy peers decide the process lifetime.** When no legacy peer task is left
+  and none can start, the daemon exits with an error as before, even while the
+  native source still works.
+- **Shutdown.** When the legacy peers end, the daemon stops the fetcher and the
+  forwarder, waits for them, and calls `ZakuraEndpoint::shutdown`. That stops
+  the dial and discovery loops, closes the native connections and stops
+  accepting new ones. Tasks that `zakura-network` spawns detached, such as the
+  gossip worker and the per-session readers, are not awaited; they end with
+  their connections or when the process exits.
+- **Compatibility.** Tested only on loopback, against fake native peers built
+  on the published `zakura-network` endpoint. Compatibility with a stock
+  `zakurad` node has not been tested.

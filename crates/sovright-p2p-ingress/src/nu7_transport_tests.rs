@@ -186,9 +186,9 @@ async fn real_nu7_skeleton_from_cold_origin_cache_reconstructs_exact_block() {
 
 /// Bridge settings the qualification tests vary.
 #[derive(Clone, Copy)]
-struct BridgeMode {
-    compact_from_tx_cache: bool,
-    skeleton_first: bool,
+pub(super) struct BridgeMode {
+    pub(super) compact_from_tx_cache: bool,
+    pub(super) skeleton_first: bool,
 }
 
 async fn transport(raw: &[u8]) -> CompactBlock {
@@ -220,76 +220,112 @@ async fn relay_loopback(
     raw: &[u8],
     mode: BridgeMode,
     origin_cache: Option<&TxCache>,
-    mut take: impl FnMut(RelayPayload) -> bool,
+    take: impl FnMut(RelayPayload) -> bool,
 ) -> (ForwardedBlock, bool) {
-    use sovright_relay::{AuthKey, RelayConfig, RelayNode};
-    use tokio::time::{sleep, timeout};
-    let key = [0x67; 32]; // Disposable local test key, never a fleet credential.
-    let mut node = RelayNode::new(
-        RelayConfig::new("127.0.0.1:0".parse().unwrap())
-            .with_authorized_keys(vec![AuthKey::new("nu7-test", key)]),
-    )
-    .unwrap();
-    node.bind().await.unwrap();
-    let addr = node.local_addr().unwrap();
-    let node = Arc::new(node);
-    let config = ClientConfig::new(vec![addr], key)
-        .with_bind_addr("127.0.0.1:0".parse().unwrap())
-        .with_auth_required(true);
-    let mut receiver = RelayClient::new(config.clone()).unwrap();
-    receiver.bind().await.unwrap();
-    let (mut incoming, outgoing) = receiver.take_receiver().unwrap();
-    let mut origin = RelayClient::new(config).unwrap();
-    origin.bind().await.unwrap();
-    let bridge = RelayBridge {
-        sender: origin.sender(),
-        data_shards: 10,
-        parity_shards: 3,
-        chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
-        compact_from_tx_cache: mode.compact_from_tx_cache,
-        skeleton_first: mode.skeleton_first,
-        raw_fallback_with_tx_cache: false,
-        raw_segment_send_rounds: 1,
-        raw_segment_round_delay: Duration::ZERO,
-        recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
-            4,
-            Duration::from_secs(30),
-        ))),
-        parse_permits: ParsePermits::new(),
-        block_body_rejections: Default::default(),
-        peer_pow_limit: None,
-        block_log: None,
-        forward_unreadable_blocks: false,
-        unverified_forwards: Default::default(),
-    };
-    // Drop aborts all tasks, including on a failed assertion or timeout.
-    let mut tasks = tokio::task::JoinSet::new();
-    let runner = Arc::clone(&node);
-    tasks.spawn(async move { runner.run().await });
-    tasks.spawn(async move { origin.run().await });
-    tasks.spawn(async move { receiver.run_with_outgoing(outgoing).await });
-    timeout(Duration::from_secs(5), async {
-        while node.session_count().await != 2 {
-            sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("both authenticated sessions must register");
-    let forwarded = bridge.forward_block(raw, origin_cache).await.unwrap();
-    let finished = timeout(Duration::from_secs(5), async {
-        while let Some(payload) = incoming.recv_payload().await {
-            if take(payload) {
-                return true;
-            }
-        }
-        false
-    })
-    .await
-    .unwrap_or(false);
-    assert!(node.metrics().snapshot().packets_received > 0);
-    tasks.abort_all();
-    while tasks.join_next().await.is_some() {}
+    let mut relay = LoopbackRelay::start(mode).await;
+    let forwarded = relay.bridge.forward_block(raw, origin_cache).await.unwrap();
+    let finished = relay.receive(take).await;
+    assert!(relay.packets_received() > 0);
+    relay.stop().await;
     (forwarded, finished)
+}
+
+/// An authenticated loopback relay: a relay node, a receiving client, and a
+/// bridge that sends through an origin client. Dropping it aborts all tasks,
+/// including on a failed assertion or timeout.
+pub(super) struct LoopbackRelay {
+    pub(super) bridge: RelayBridge,
+    incoming: sovright_relay::BlockReceiver,
+    node: Arc<sovright_relay::RelayNode>,
+    tasks: tokio::task::JoinSet<std::result::Result<(), TransportError>>,
+}
+
+impl LoopbackRelay {
+    /// Starts the relay and waits until both clients hold authenticated sessions.
+    pub(super) async fn start(mode: BridgeMode) -> Self {
+        use sovright_relay::{AuthKey, RelayConfig, RelayNode};
+        use tokio::time::{sleep, timeout};
+        let key = [0x67; 32]; // Disposable local test key, never a fleet credential.
+        let mut node = RelayNode::new(
+            RelayConfig::new("127.0.0.1:0".parse().unwrap())
+                .with_authorized_keys(vec![AuthKey::new("nu7-test", key)]),
+        )
+        .unwrap();
+        node.bind().await.unwrap();
+        let addr = node.local_addr().unwrap();
+        let node = Arc::new(node);
+        let config = ClientConfig::new(vec![addr], key)
+            .with_bind_addr("127.0.0.1:0".parse().unwrap())
+            .with_auth_required(true);
+        let mut receiver = RelayClient::new(config.clone()).unwrap();
+        receiver.bind().await.unwrap();
+        let (incoming, outgoing) = receiver.take_receiver().unwrap();
+        let mut origin = RelayClient::new(config).unwrap();
+        origin.bind().await.unwrap();
+        let bridge = RelayBridge {
+            sender: origin.sender(),
+            data_shards: 10,
+            parity_shards: 3,
+            chunker: Arc::new(BlockChunker::new(10, 3).unwrap()),
+            compact_from_tx_cache: mode.compact_from_tx_cache,
+            skeleton_first: mode.skeleton_first,
+            raw_fallback_with_tx_cache: false,
+            raw_segment_send_rounds: 1,
+            raw_segment_round_delay: Duration::ZERO,
+            recent_forwarded: Arc::new(std::sync::Mutex::new(RecentForwardedHashes::new(
+                4,
+                Duration::from_secs(30),
+            ))),
+            parse_permits: ParsePermits::new(),
+            block_body_rejections: Default::default(),
+            peer_pow_limit: None,
+            block_log: None,
+            forward_unreadable_blocks: false,
+            unverified_forwards: Default::default(),
+        };
+        let mut tasks = tokio::task::JoinSet::new();
+        let runner = Arc::clone(&node);
+        tasks.spawn(async move { runner.run().await });
+        tasks.spawn(async move { origin.run().await });
+        tasks.spawn(async move { receiver.run_with_outgoing(outgoing).await });
+        timeout(Duration::from_secs(5), async {
+            while node.session_count().await != 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both authenticated sessions must register");
+        Self {
+            bridge,
+            incoming,
+            node,
+            tasks,
+        }
+    }
+
+    /// Hands each payload the receiver gets to `take` until it returns true.
+    /// Returns whether `take` finished within 5 s.
+    pub(super) async fn receive(&mut self, mut take: impl FnMut(RelayPayload) -> bool) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(payload) = self.incoming.recv_payload().await {
+                if take(payload) {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    pub(super) fn packets_received(&self) -> u64 {
+        self.node.metrics().snapshot().packets_received
+    }
+
+    pub(super) async fn stop(mut self) {
+        self.tasks.abort_all();
+        while self.tasks.join_next().await.is_some() {}
+    }
 }
 
 /// Explicit operator-only qualification against an isolated testnet node.
