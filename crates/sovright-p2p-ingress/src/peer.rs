@@ -67,6 +67,49 @@ impl<K: Copy + Eq + Hash> RecentInventory<K> {
     }
 }
 
+/// How many received block hashes every connection shares. Zcash makes a block
+/// about every 75 s, so this covers well over ten hours of blocks plus any
+/// orphans; once a hash falls out, the worst case is one redundant fetch.
+pub const RECEIVED_BLOCKS_CAPACITY: usize = 512;
+
+/// Consensus hashes (double-SHA256 of the header, wire order: the hash `inv`
+/// announces) of blocks this process has already received and accepted, shared
+/// by every peer connection. A connection checks it before asking for a block,
+/// so a block that arrived on one connection is not fetched again from each of
+/// the other peers that announce it afterwards.
+///
+/// Only a delivery that passed this process's checks is recorded (see
+/// `run_peer`), never an announcement: an `inv` is free to forge, and recording
+/// a bad copy would stop every other connection fetching the good one.
+#[derive(Clone)]
+pub struct ReceivedBlocks {
+    inner: std::sync::Arc<std::sync::Mutex<RecentInventory<[u8; 32]>>>,
+}
+
+impl ReceivedBlocks {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(RecentInventory::new(capacity))),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RecentInventory<[u8; 32]>> {
+        // The set holds only hashes; a panic elsewhere cannot leave it
+        // inconsistent in a way that matters, so recover rather than abort.
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn contains(&self, hash: &[u8; 32]) -> bool {
+        self.lock().keys.contains(hash)
+    }
+
+    pub fn insert(&self, hash: [u8; 32]) {
+        self.lock().insert(hash);
+    }
+}
+
 /// Per-connection request state. Rejected inventories are never queued, and
 /// only completed requests enter the bounded recent cache. A timeout or
 /// notfound therefore permits retry without leaving lifetime history behind.
@@ -144,6 +187,7 @@ pub async fn run_peer(
     tx_feed: Option<TxFeedClient>,
     crawler: Crawler,
     observer: Option<crate::observation::Observer>,
+    received_blocks: ReceivedBlocks,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
     let relay = relay.map(|relay| relay.logging_block_events(events.clone(), &peer));
@@ -333,7 +377,8 @@ pub async fn run_peer(
                         }
                     }
                     if inv.is_block() {
-                        if seen_inv.insert(inv.hash) {
+                        let first_sight = seen_inv.insert(inv.hash);
+                        if first_sight {
                             if let (Some(observer), Some(stamp)) = (&observer, observed) {
                                 if block_announcements.take(now) {
                                     observer.inventory(&inv, stamp);
@@ -347,7 +392,17 @@ pub async fn run_peer(
                             // capacity; the crawler also deduplicates awards.
                             crawler.score_block_announcement(peer_addr, inv.hash, &events)?;
                         }
-                        if blocks.admit(inv.hash, now) {
+                        // Checked before `admit`: a skipped block never enters
+                        // the request window, so it can neither expire nor count
+                        // as undelivered against this peer.
+                        if received_blocks.contains(&inv.hash) {
+                            if first_sight {
+                                events.p2p_block_getdata_skipped(
+                                    &peer,
+                                    &inventory_hash_to_display(&inv.hash),
+                                )?;
+                            }
+                        } else if blocks.admit(inv.hash, now) {
                             block_requests.push(inv);
                         }
                     } else if inv.is_transaction()
@@ -463,10 +518,26 @@ pub async fn run_peer(
                                 .p2p_peer_error(&peer, &format!("relay forward failed: {error}"))?;
                         }
                     }
+                    // Only a body the relay validated and sent marks the block
+                    // received. A bad body can carry the real header, so a header
+                    // check alone would let one bad copy hide the good one.
+                    if validated_new_send(&outcome)
+                        && let Ok(hash) = inventory_hash_from_header(&msg.payload)
+                    {
+                        received_blocks.insert(hash);
+                    }
                     for (delta, reason) in delivery_scores(&config, &outcome) {
                         crawler.score_peer(peer_addr, delta, reason, &events)?;
                     }
                 } else {
+                    // No relay: the observer's proof-of-work check is the only
+                    // judgement made of a delivery, and nothing here consumes
+                    // the body. With no observer either, nothing is recorded.
+                    if header_valid == Some(true)
+                        && let Ok(hash) = inventory_hash_from_header(&msg.payload)
+                    {
+                        received_blocks.insert(hash);
+                    }
                     let coinbase = coinbase_telemetry_off_workers(&msg.payload).await;
                     events.p2p_block_coinbase_unverified(
                         &peer,
@@ -544,14 +615,7 @@ pub async fn run_peer(
 /// not the peer's doing.
 fn delivery_scores(config: &Config, outcome: &Result<ForwardedBlock>) -> Vec<(i64, &'static str)> {
     match outcome {
-        Ok(forwarded)
-            if matches!(
-                forwarded.mode,
-                ForwardMode::Deduplicated | ForwardMode::RawBlockSegmentsUnverified
-            ) =>
-        {
-            Vec::new()
-        }
+        Ok(_) if !validated_new_send(outcome) => Vec::new(),
         Ok(_) => vec![
             (config.peer_score_block_received, "block_received"),
             (config.peer_score_relay_forwarded, "relay_forwarded"),
@@ -561,6 +625,19 @@ fn delivery_scores(config: &Config, outcome: &Result<ForwardedBlock>) -> Vec<(i6
         }
         Err(_) => Vec::new(),
     }
+}
+
+/// The relay validated this body and sent it on: not a deduplicated copy (never
+/// parsed), not an unverified forward (Merkle and duplicate checks skipped), not
+/// a failure.
+fn validated_new_send(outcome: &Result<ForwardedBlock>) -> bool {
+    matches!(
+        outcome,
+        Ok(forwarded) if !matches!(
+            forwarded.mode,
+            ForwardMode::Deduplicated | ForwardMode::RawBlockSegmentsUnverified
+        )
+    )
 }
 
 /// A valid block in a layout this reader does not know fails with one of these.
@@ -923,6 +1000,7 @@ mod tests {
             None,
             crawler,
             Some(observer),
+            ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY),
         ));
         let (mut stream, _) = listener.accept().await.unwrap();
         let version = read_message(&mut stream, Network::Mainnet).await.unwrap();
@@ -1322,6 +1400,7 @@ mod tests {
             None,
             crawler,
             Some(observer),
+            ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY),
         ));
         let (mut stream, _) = listener.accept().await.unwrap();
         let version = read_message(&mut stream, Network::Mainnet).await.unwrap();
@@ -1810,6 +1889,42 @@ mod tests {
             cache_config: crate::tx_cache::TxCacheConfig,
             relay: Option<RelayBridge>,
         ) -> Self {
+            let received = ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY);
+            Self::start_shared(
+                name,
+                config,
+                remote_version,
+                cache_config,
+                relay,
+                received,
+                None,
+            )
+            .await
+        }
+
+        /// A connection that shares `received` (and optionally an observer)
+        /// with other connections, as every connection in one process does.
+        async fn start_sharing(
+            name: &str,
+            config: Config,
+            relay: Option<RelayBridge>,
+            received: ReceivedBlocks,
+            observer: Option<crate::observation::Observer>,
+        ) -> Self {
+            let version = config.network.protocol_version();
+            let cache = default_test_cache();
+            Self::start_shared(name, config, version, cache, relay, received, observer).await
+        }
+
+        async fn start_shared(
+            name: &str,
+            config: Config,
+            remote_version: i32,
+            cache_config: crate::tx_cache::TxCacheConfig,
+            relay: Option<RelayBridge>,
+            received: ReceivedBlocks,
+            observer: Option<crate::observation::Observer>,
+        ) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let log = temp_log_path(name);
@@ -1826,7 +1941,8 @@ mod tests {
                 Some(cache.clone()),
                 tx_feed,
                 crawler,
-                None,
+                observer,
+                received,
             ));
             let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
                 .await
@@ -2577,7 +2693,15 @@ mod tests {
         let events = EventSink::new(Some(log.clone())).unwrap();
         let crawler = Crawler::new(&config, [address]);
         let task = tokio::spawn(run_peer(
-            address, config, events, relay, None, tx_feed, crawler, None,
+            address,
+            config,
+            events,
+            relay,
+            None,
+            tx_feed,
+            crawler,
+            None,
+            ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY),
         ));
         let (mut stream, _) = listener.accept().await.unwrap();
         read_message(&mut stream, Network::Mainnet).await.unwrap();
@@ -3035,5 +3159,193 @@ mod tests {
         );
         assert_eq!(scores[0]["score"], 100);
         assert_eq!(scores[1]["score"], 200);
+    }
+
+    #[test]
+    fn received_blocks_are_shared_between_clones_and_bounded() {
+        let received = ReceivedBlocks::new(2);
+        let other_connection = received.clone();
+        received.insert([1; 32]);
+        received.insert([2; 32]);
+        assert!(other_connection.contains(&[1; 32]));
+        // A repeat does not refresh or duplicate an entry.
+        received.insert([1; 32]);
+        received.insert([3; 32]);
+        assert!(!other_connection.contains(&[1; 32]), "oldest evicted");
+        assert!(other_connection.contains(&[2; 32]));
+        assert!(other_connection.contains(&[3; 32]));
+        assert_eq!(received.lock().order.len(), 2);
+    }
+
+    /// Two connections sharing one relay and one received set, as in a process.
+    async fn sharing_pair(
+        name: &str,
+        bridge: RelayBridge,
+        config: Config,
+    ) -> (TestPeer, TestPeer, ReceivedBlocks) {
+        let received = ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY);
+        let first = TestPeer::start_sharing(
+            &format!("{name}-first"),
+            config.clone(),
+            Some(bridge.clone()),
+            received.clone(),
+            None,
+        )
+        .await;
+        let second = TestPeer::start_sharing(
+            &format!("{name}-second"),
+            config,
+            Some(bridge),
+            received.clone(),
+            None,
+        )
+        .await;
+        (first, second, received)
+    }
+
+    #[tokio::test]
+    async fn a_block_received_on_one_connection_is_not_requested_on_another() {
+        let (good, _) = good_and_bad();
+        // Held: dropping the harness closes the relay's outgoing channel.
+        let relay = harness();
+        let (mut first, mut second, received) =
+            sharing_pair("skip-received", relay.bridge.clone(), scored_config()).await;
+        let good_inv = block_inventory(&good);
+        let unseen = numbered_inventory(crate::wire::MSG_BLOCK, 1);
+
+        assert_eq!(first.announce(&[good_inv]).await, [good_inv]);
+        first.deliver(&good).await;
+        assert!(received.contains(&good_inv.hash), "keyed by the inv hash");
+
+        // The received block is skipped; an unseen one is still requested.
+        assert_eq!(second.announce(&[good_inv, unseen]).await, [unseen]);
+
+        // The announcement is still on record and still ranked.
+        let display = inventory_hash_to_display(&good_inv.hash);
+        let invs = second.events("p2p_block_inv");
+        assert!(invs.iter().any(|event| event["hash"] == display.as_str()));
+        assert!(
+            second
+                .score_reasons()
+                .iter()
+                .any(|reason| reason.starts_with("block_inv")),
+            "{:?}",
+            second.score_reasons()
+        );
+        let skipped = second.events("p2p_block_getdata_skipped");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert_eq!(skipped[0]["hash"], display.as_str());
+        let requested: Vec<_> = second
+            .events("p2p_getdata_sent")
+            .iter()
+            .map(|event| event["hash"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(requested, [inventory_hash_to_display(&unseen.hash)]);
+
+        // Re-announcing on the same connection logs no second skip.
+        assert!(second.announce(&[good_inv]).await.is_empty());
+        assert_eq!(second.events("p2p_block_getdata_skipped").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bad_copy_does_not_stop_other_connections_fetching_the_block() {
+        let (good, bad) = good_and_bad();
+        let relay = harness();
+        let (mut first, mut second, received) =
+            sharing_pair("skip-bad-copy", relay.bridge.clone(), scored_config()).await;
+        let inv = block_inventory(&good);
+        assert_eq!(block_inventory(&bad), inv, "same header, other body");
+
+        first.deliver(&bad).await;
+        assert_eq!(first.events("p2p_block_body_rejected").len(), 1);
+        assert!(!received.contains(&inv.hash));
+        assert_eq!(second.announce(&[inv]).await, [inv]);
+
+        // The good copy, once delivered, is recorded.
+        second.deliver(&good).await;
+        assert!(received.contains(&inv.hash));
+    }
+
+    #[tokio::test]
+    async fn a_block_the_relay_failed_to_send_is_still_requested_elsewhere() {
+        let (good, _) = good_and_bad();
+        let Harness {
+            bridge, outgoing, ..
+        } = harness();
+        drop(outgoing);
+        let (mut first, mut second, received) =
+            sharing_pair("skip-relay-down", bridge, scored_config()).await;
+        let inv = block_inventory(&good);
+
+        first.deliver(&good).await;
+        assert_eq!(first.events("p2p_peer_error").len(), 1);
+        assert!(!received.contains(&inv.hash));
+        assert_eq!(second.announce(&[inv]).await, [inv]);
+    }
+
+    #[tokio::test]
+    async fn without_a_relay_only_a_header_with_proof_of_work_is_recorded() {
+        use crate::observation::Observer;
+        let mut config = peer_test_config();
+        config.inventory_limits.timeout = Duration::from_millis(50);
+        let path = temp_log_path("skip-observer");
+        let observer = Observer::start(observation_config(path.clone())).unwrap();
+        let received = ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY);
+        let start = |name: &'static str| {
+            TestPeer::start_sharing(
+                name,
+                config.clone(),
+                None,
+                received.clone(),
+                Some(observer.clone()),
+            )
+        };
+        let mut first = start("skip-observer-first").await;
+        let mut second = start("skip-observer-second").await;
+
+        let junk = junk_header(1);
+        let junk_inv = block_inventory(&junk);
+        first.deliver(&junk).await;
+        assert!(!received.contains(&junk_inv.hash), "no proof of work");
+
+        let block = nu7_block();
+        let inv = block_inventory(&block);
+        first.deliver(&block).await;
+        assert!(received.contains(&inv.hash));
+
+        assert_eq!(second.announce(&[junk_inv, inv]).await, [junk_inv]);
+        // Let the junk request expire; only it counts against the peer, so the
+        // skipped block cannot add to the undelivered count.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(second.announce(&[inv]).await.is_empty());
+        assert!(!second.task.is_finished(), "still connected");
+        // The skipped announcement is still observed (fails by timeout if not).
+        let display = inventory_hash_to_display(&inv.hash);
+        wait_for_events(&path, |events| {
+            events.iter().any(|e| {
+                e["event"] == "block_seen"
+                    && e["stage"] == "announcement"
+                    && e["block_hash"] == display.as_str()
+            })
+        })
+        .await;
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn with_neither_relay_nor_observer_nothing_is_recorded() {
+        let received = ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY);
+        let start = |name: &'static str| {
+            TestPeer::start_sharing(name, peer_test_config(), None, received.clone(), None)
+        };
+        let mut first = start("skip-none-first").await;
+        let mut second = start("skip-none-second").await;
+        let block = nu7_block();
+        let inv = block_inventory(&block);
+
+        first.deliver(&block).await;
+        assert_eq!(first.events("p2p_block_received").len(), 1);
+        assert!(!received.contains(&inv.hash), "no check ran, so no record");
+        assert_eq!(second.announce(&[inv]).await, [inv]);
     }
 }

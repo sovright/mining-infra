@@ -68,6 +68,8 @@ async fn main() -> Result<()> {
     let tx_feed = config.tx_feed_addr.map(TxFeedClient::new);
     let peers = discover_peers(&config).await;
     let crawler = Crawler::new(&config, peers);
+    // One for the process: every connection skips blocks another already got.
+    let received_blocks = peer::ReceivedBlocks::new(peer::RECEIVED_BLOCKS_CAPACITY);
 
     info!(
         network = config.network.name(),
@@ -101,6 +103,7 @@ async fn main() -> Result<()> {
                 tx_feed.clone(),
                 crawler.clone(),
                 observer.clone(),
+                received_blocks.clone(),
             ));
         }
 
@@ -144,6 +147,7 @@ fn spawn_peer(
     tx_feed: Option<TxFeedClient>,
     crawler: Crawler,
     observer: Option<observation::Observer>,
+    received_blocks: peer::ReceivedBlocks,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let peer_text = peer.to_string();
@@ -159,6 +163,7 @@ fn spawn_peer(
                 tx_feed,
                 crawler.clone(),
                 observer,
+                received_blocks,
             )
             .await
         } else {
@@ -173,6 +178,7 @@ fn spawn_peer(
                     tx_feed,
                     crawler.clone(),
                     observer,
+                    received_blocks,
                 ),
             )
             .await
