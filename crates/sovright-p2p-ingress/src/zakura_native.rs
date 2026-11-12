@@ -19,6 +19,7 @@ use tracing::{info, warn};
 use crate::config::ZakuraNativeConfig;
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
+use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::{ForwardMode, RelayBridge};
 use crate::tx_cache::TxCache;
 use crate::wire::Network;
@@ -141,7 +142,9 @@ fn native_network(network: Network) -> NativeNetwork {
 /// Forwards each fetched block, one at a time, until the source closes.
 ///
 /// Events are best effort, as for legacy peers: a write error is logged and the
-/// block is still forwarded.
+/// block is still forwarded. Their hash fields mean what they mean for legacy
+/// blocks (`peer.rs`): `hash` is the relay object hash, the join key between
+/// the received and forwarded events, and `consensus_hash` is the chain's hash.
 async fn forward_fetched(
     mut fetched: mpsc::Receiver<FetchedBlock>,
     relay: RelayBridge,
@@ -150,7 +153,9 @@ async fn forward_fetched(
     stats: Arc<ForwardStats>,
 ) {
     while let Some(block) = fetched.recv().await {
-        let hash = block.hash.to_string();
+        let hash = raw_hash_from_header(&block.bytes)
+            .map(|raw| inventory_hash_to_display(&raw))
+            .unwrap_or_default();
         let consensus_hash = block
             .bytes
             .get(..ZCASH_FULL_HEADER_SIZE)
@@ -178,7 +183,12 @@ async fn forward_fetched(
             }
             Err(error) => {
                 stats.failed.fetch_add(1, Ordering::Relaxed);
-                warn!(%hash, source = ?block.source, %error, "Zakura native block forward failed");
+                warn!(
+                    %consensus_hash,
+                    source = ?block.source,
+                    %error,
+                    "Zakura native block forward failed"
+                );
                 if let IngressError::InvalidBlockBody(rejection) = &error {
                     log_event(events.p2p_block_body_rejected(
                         SOURCE,

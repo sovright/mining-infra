@@ -372,7 +372,8 @@ How it behaves:
   re-serialized before it is forwarded, so the bytes are the canonical encoding,
   not necessarily the bytes the peer sent.
 - The forward takes the legacy path: the same body checks, parse permits and
-  dedup state. Events name the peer `zakura-native`.
+  dedup state. Events name the peer `zakura-native`; their `hash` and
+  `consensus_hash` fields mean what they mean for legacy blocks.
 - One fetch per hash runs at a time; an announcement of a hash already in flight
   is skipped. A failed fetch leaves the hash free for the next announcement.
 - Every native announcement is answered with an error, on purpose. After a

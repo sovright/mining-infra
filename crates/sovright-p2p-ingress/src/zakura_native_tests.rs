@@ -3,7 +3,7 @@
 //! The fake native peers run the published `zakura-network` endpoint, but their
 //! behaviour is ours (`sovright_zakura_native::test_support`). Nothing here is
 //! evidence of compatibility with stock zakurad.
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
@@ -59,6 +59,14 @@ struct Ingress {
 
 impl Ingress {
     async fn start(relay: &RelayBridge, peers: &[&FakePeer]) -> Self {
+        Self::start_with_events(relay, peers, EventSink::new(None).unwrap()).await
+    }
+
+    async fn start_with_events(
+        relay: &RelayBridge,
+        peers: &[&FakePeer],
+        events: EventSink,
+    ) -> Self {
         let mut bootstrap_peers = Vec::new();
         for peer in peers {
             bootstrap_peers.push(
@@ -77,15 +85,9 @@ impl Ingress {
             max_concurrent_fetches: 2,
             fetch_timeout: FETCH_TIMEOUT,
         };
-        let native = zakura_native::start(
-            &config,
-            Network::Testnet,
-            relay.clone(),
-            None,
-            EventSink::new(None).unwrap(),
-        )
-        .await
-        .expect("the native source starts");
+        let native = zakura_native::start(&config, Network::Testnet, relay.clone(), None, events)
+            .await
+            .expect("the native source starts");
         for peer in peers {
             peer.wait_for_peer(STEP)
                 .await
@@ -112,6 +114,31 @@ async fn wait_for(counter: &AtomicU64, at_least: u64, what: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("{what} within {STEP:?}"));
+}
+
+/// The native events named `name` in the event log. A line still being written
+/// is skipped; the next read sees it whole.
+fn native_events(log: &Path, name: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["event"] == name && event["peer"] == zakura_native::SOURCE)
+        .collect()
+}
+
+/// The first native event named `name`, waiting for it to be written.
+async fn wait_for_event(log: &Path, name: &str) -> serde_json::Value {
+    timeout(STEP, async {
+        loop {
+            if let Some(event) = native_events(log, name).into_iter().next() {
+                return event;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("a native {name} event within {STEP:?}"))
 }
 
 /// The first acceptance test: a native peer's NU7 block reaches `submitblock` with
@@ -168,6 +195,50 @@ async fn native_nu7_block_reaches_submitblock_with_the_fixture_bytes() {
     // after the native one is not sent again.
     let legacy = relay.bridge.forward_block(&raw, None).await.unwrap();
     assert_eq!(legacy.mode, ForwardMode::Deduplicated);
+
+    timeout(STEP, ingress.native.shutdown())
+        .await
+        .expect("the native tasks stop in time");
+    relay.stop().await;
+}
+
+/// Native block events fill `hash` and `consensus_hash` the way legacy block events
+/// do. `hash` is the relay object hash, the join key between the received and
+/// forwarded events; `consensus_hash` is the chain's hash. The expected values are
+/// the expressions the legacy event tests in `peer.rs` assert, plus the consensus
+/// hash the fixture records.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_block_events_fill_the_hash_fields_like_legacy_events() {
+    let fixture = Nu7Fixture::load();
+    let raw = fixture.raw.clone();
+    let block = block_from_bytes(&raw).expect("the fixture is a valid serialized block");
+    let relay = LoopbackRelay::start(PLAIN_RELAY).await;
+    let peer = fake_peer(serve_block(Arc::clone(&block))).await;
+    let log_dir = tempfile::tempdir().expect("a temporary event directory");
+    let log = log_dir.path().join("events.jsonl");
+    let events = EventSink::new(Some(log.clone())).expect("the event log opens");
+    let ingress = Ingress::start_with_events(&relay.bridge, &[&peer], events).await;
+
+    peer.advertise(block.hash(), raw.len())
+        .await
+        .expect("the fake peer advertises the fixture");
+    let forwarded = wait_for_event(&log, "p2p_relay_block_forwarded").await;
+    let received = native_events(&log, "p2p_block_received");
+    let [received] = received.as_slice() else {
+        panic!("expected one native p2p_block_received event, got {received:?}");
+    };
+
+    let relay_object_hash = crate::hash::display_hash_from_header(&raw).unwrap();
+    assert_eq!(received["hash"], relay_object_hash.as_str());
+    assert_eq!(forwarded["hash"], relay_object_hash.as_str());
+    assert_eq!(
+        received["consensus_hash"],
+        sovright_relay::consensus_block_hash_display(
+            &raw[..sovright_relay::ZCASH_FULL_HEADER_SIZE]
+        )
+    );
+    assert_eq!(received["consensus_hash"], fixture.consensus_hash());
+    assert_ne!(relay_object_hash, fixture.consensus_hash());
 
     timeout(STEP, ingress.native.shutdown())
         .await
