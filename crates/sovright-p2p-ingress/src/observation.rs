@@ -16,6 +16,55 @@ const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_PAYLOAD_STALE_MS: u64 = 600_000;
 /// Default window for decoded transaction payloads when tx fetch is enabled.
 pub const DEFAULT_TX_PAYLOAD_STALE_MS: u64 = 1_800_000;
+/// Per-connection observed-announcement budgets: a burst, then one per period.
+/// Honest peers announce a block about every 25 s.
+pub const BLOCK_ANNOUNCEMENT_BURST: u32 = 6;
+pub const BLOCK_ANNOUNCEMENT_PERIOD: Duration = Duration::from_secs(20);
+pub const TX_ANNOUNCEMENT_BURST: u32 = 256;
+pub const TX_ANNOUNCEMENT_PERIOD: Duration = Duration::from_millis(50);
+/// Announced blocks a connection may fail to deliver before it is dropped.
+pub const MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS: usize = 2;
+
+/// Token bucket for observed announcements on one connection.
+#[derive(Debug)]
+pub struct TokenBucket {
+    capacity: u32,
+    period: Duration,
+    tokens: u32,
+    last: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(capacity: u32, period: Duration, now: Instant) -> Self {
+        Self {
+            capacity,
+            period,
+            tokens: capacity,
+            last: now,
+        }
+    }
+
+    pub fn take(&mut self, now: Instant) -> bool {
+        let elapsed = now.saturating_duration_since(self.last);
+        let refill = (elapsed.as_nanos() / self.period.as_nanos().max(1))
+            .min(u128::from(self.capacity)) as u32;
+        if refill > 0 {
+            self.tokens = (self.tokens + refill).min(self.capacity);
+            // A full bucket does not bank idle time.
+            self.last = if self.tokens == self.capacity {
+                now
+            } else {
+                self.last + self.period * refill
+            };
+        }
+        if self.tokens == 0 {
+            return false;
+        }
+        self.tokens -= 1;
+        true
+    }
+}
+
 /// Payload clocks store monotonic ms + 1, so 0 means "none since start".
 const NEVER: u64 = 0;
 
@@ -41,7 +90,7 @@ impl ObservationConfig {
         if self.sensor_id.trim().is_empty()
             || self.sensor_id.len() > 128
             || self.sensor_id.chars().any(char::is_control)
-            || self.queue_capacity == 0
+            || self.queue_capacity < 2
             || self.queue_capacity > 1_000_000
             || self.max_bytes < 4096
             || self.max_files == 0
@@ -131,7 +180,7 @@ impl Observer {
                     tx_payload_stale_after_ms: config.tx_payload_stale_after.as_millis() as u64,
                     require_tx_payloads: config.require_tx_payloads,
                     queued: Arc::new(AtomicUsize::new(0)),
-                    reserved: (config.queue_capacity / 8).min(64),
+                    reserved: (config.queue_capacity / 8).clamp(1, 64),
                     capacity: config.queue_capacity,
                     capped_inventory: AtomicU64::new(0),
                 }),
@@ -454,7 +503,7 @@ mod tests {
                 .join(format!("observation-{name}-{}-{id}", std::process::id())),
             sensor_id: "independent-1".into(),
             network: Network::Mainnet,
-            queue_capacity: 2,
+            queue_capacity: 8,
             max_bytes: 4096,
             max_files: 2,
             heartbeat_interval: Duration::from_millis(20),
@@ -527,7 +576,7 @@ mod tests {
     #[test]
     fn bounded_queue_reports_cumulative_drops_and_sequence_gaps() {
         let mut cfg = config("drops");
-        cfg.queue_capacity = 1;
+        cfg.queue_capacity = 2;
         let (observer, rx) = Observer::channel(&cfg);
         let inv = Inventory {
             inv_type: MSG_TX,
@@ -716,6 +765,45 @@ mod tests {
             "sensor_heartbeat",
             "reserved capacity keeps the heartbeat"
         );
+    }
+
+    #[test]
+    fn token_bucket_allows_a_burst_then_one_per_period() {
+        let start = Instant::now();
+        let period = Duration::from_secs(20);
+        let mut bucket = TokenBucket::new(3, period, start);
+        assert!((0..3).all(|_| bucket.take(start)));
+        assert!(!bucket.take(start));
+        assert!(!bucket.take(start + period / 2));
+        assert!(bucket.take(start + period));
+        assert!(!bucket.take(start + period));
+        // A long idle period refills to the burst, never beyond it.
+        let later = start + period * 100;
+        assert!((0..3).all(|_| bucket.take(later)));
+        assert!(!bucket.take(later));
+    }
+
+    #[test]
+    fn small_queues_still_reserve_a_heartbeat_slot() {
+        let mut cfg = config("tiny");
+        cfg.queue_capacity = 1;
+        assert!(
+            cfg.validate().is_err(),
+            "no room for both events and heartbeats"
+        );
+        cfg.queue_capacity = 2;
+        let (observer, rx) = Observer::channel(&cfg);
+        let inv = Inventory {
+            inv_type: MSG_TX,
+            hash: [1; 32],
+            auth_digest: None,
+        };
+        observer.inventory(&inv, observer.capture());
+        observer.inventory(&inv, observer.capture());
+        observer.heartbeat();
+        let events: Vec<Value> = rx.try_iter().collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1]["event"], "sensor_heartbeat");
     }
 
     #[test]

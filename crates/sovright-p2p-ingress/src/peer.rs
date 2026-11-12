@@ -117,10 +117,14 @@ impl<K: Copy + Eq + Hash> RequestWindow<K> {
         self.pending.front().map(|(_, deadline)| *deadline)
     }
 
-    fn expire(&mut self, now: Instant) {
+    /// Drops requests past their deadline and returns how many were dropped.
+    fn expire(&mut self, now: Instant) -> usize {
+        let mut expired = 0;
         while self.deadline().is_some_and(|deadline| deadline <= now) {
             self.pending.pop_front();
+            expired += 1;
         }
+        expired
     }
 }
 
@@ -170,6 +174,22 @@ pub async fn run_peer(
     let mut blocks = RequestWindow::new(limits.blocks, limits.recent_entries, limits.timeout);
     let mut transactions =
         RequestWindow::new(limits.transactions, limits.recent_entries, limits.timeout);
+    // Observation budgets and delivery accounting for this connection.
+    use crate::observation::{
+        BLOCK_ANNOUNCEMENT_BURST, BLOCK_ANNOUNCEMENT_PERIOD, TX_ANNOUNCEMENT_BURST,
+        TX_ANNOUNCEMENT_PERIOD, TokenBucket,
+    };
+    let mut block_announcements = TokenBucket::new(
+        BLOCK_ANNOUNCEMENT_BURST,
+        BLOCK_ANNOUNCEMENT_PERIOD,
+        handshake_started,
+    );
+    let mut tx_announcements = TokenBucket::new(
+        TX_ANNOUNCEMENT_BURST,
+        TX_ANNOUNCEMENT_PERIOD,
+        handshake_started,
+    );
+    let mut undelivered_blocks = 0usize;
 
     loop {
         // Keep the same read future alive across expiry. Cancelling a partial
@@ -195,16 +215,18 @@ pub async fn run_peer(
                     }
                 } => {
                     let now = Instant::now();
-                    blocks.expire(now);
+                    undelivered_blocks += blocks.expire(now);
                     transactions.expire(now);
+                    refuse_undelivering_observed_peer(observer.is_some(), undelivered_blocks)?;
                 }
             }
         };
         // Observation time is captured before any parsing or cache work.
         let observed = observer.as_ref().map(|o| o.capture());
         let now = Instant::now();
-        blocks.expire(now);
+        undelivered_blocks += blocks.expire(now);
         transactions.expire(now);
+        refuse_undelivering_observed_peer(observer.is_some(), undelivered_blocks)?;
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
         if (!sent_verack || !saw_verack) && !matches!(msg.command.as_str(), "version" | "verack") {
@@ -277,11 +299,9 @@ pub async fn run_peer(
             }
             "inv" => {
                 let invs = parse_inventory(&msg.payload)?;
-                // Announcements are observed before fetch selection, but bounded:
-                // blocks once per connection (after dedup) and at most a fixed
-                // number of entries of each kind per message.
-                let mut observed_blocks = 0;
-                let mut observed_txs = 0;
+                // Announcements are observed before fetch selection, but bounded
+                // per connection: blocks once each (after dedup), and both kinds
+                // through token buckets that span messages.
                 let mut capped = 0u64;
                 let mut block_requests = Vec::new();
                 let mut tx_requests = Vec::new();
@@ -289,9 +309,8 @@ pub async fn run_peer(
                     if inv.is_transaction()
                         && let (Some(observer), Some(stamp)) = (&observer, observed)
                     {
-                        if observed_txs < MAX_OBSERVED_TX_INV_PER_MESSAGE {
+                        if tx_announcements.take(now) {
                             observer.inventory(&inv, stamp);
-                            observed_txs += 1;
                         } else {
                             capped += 1;
                         }
@@ -299,9 +318,8 @@ pub async fn run_peer(
                     if inv.is_block() {
                         if seen_inv.insert(inv.hash) {
                             if let (Some(observer), Some(stamp)) = (&observer, observed) {
-                                if observed_blocks < MAX_OBSERVED_BLOCK_INV_PER_MESSAGE {
+                                if block_announcements.take(now) {
                                     observer.inventory(&inv, stamp);
-                                    observed_blocks += 1;
                                 } else {
                                     capped += 1;
                                 }
@@ -359,7 +377,13 @@ pub async fn run_peer(
             "notfound" => {
                 for inv in parse_inventory(&msg.payload)? {
                     if inv.is_block() {
-                        blocks.remove(inv.hash);
+                        if blocks.remove(inv.hash).is_some() {
+                            undelivered_blocks += 1;
+                            refuse_undelivering_observed_peer(
+                                observer.is_some(),
+                                undelivered_blocks,
+                            )?;
+                        }
                     } else if let Some(key) = TxInventoryKey::from_inventory(&inv) {
                         transactions.remove(key);
                     }
@@ -674,9 +698,17 @@ fn received_block(
     Ok((event_hash, false))
 }
 
-/// Per inv message, at most this many entries of each kind are observed.
-const MAX_OBSERVED_BLOCK_INV_PER_MESSAGE: usize = 16;
-const MAX_OBSERVED_TX_INV_PER_MESSAGE: usize = 256;
+/// An observer drops a peer that announces blocks it then never delivers
+/// (expired or notfound requests): each such hash would hold the collector in
+/// an unresolved chain transition. Relay-only ingress keeps its old behaviour.
+fn refuse_undelivering_observed_peer(observing: bool, undelivered: usize) -> Result<()> {
+    if observing && undelivered >= crate::observation::MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS {
+        return Err(IngressError::Wire(format!(
+            "peer announced {undelivered} blocks it never delivered"
+        )));
+    }
+    Ok(())
+}
 
 /// `relay` is the BIP37 transaction-relay flag; observation needs tx gossip.
 fn version_payload(peer_addr: SocketAddr, network: Network, relay: bool) -> Vec<u8> {
@@ -832,12 +864,23 @@ mod tests {
         tokio::task::JoinHandle<Result<()>>,
         tokio::net::TcpStream,
     ) {
+        observed_peer_with(name, remote_version, peer_test_config()).await
+    }
+
+    async fn observed_peer_with(
+        name: &str,
+        remote_version: i32,
+        config: Config,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::net::TcpStream,
+    ) {
         use crate::observation::Observer;
         let path = temp_log_path(name);
         let observer = Observer::start(observation_config(path.clone())).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let config = peer_test_config();
         let crawler = Crawler::new(&config, [address]);
         let task = tokio::spawn(run_peer(
             address,
@@ -926,35 +969,35 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    fn numbered(inv_type: u32, i: u32, tag: u8) -> Inventory {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&i.to_le_bytes());
+        hash[31] = tag;
+        Inventory {
+            inv_type,
+            hash,
+            auth_digest: None,
+        }
+    }
+
+    fn announcement_count(events: &[serde_json::Value], kind: &str) -> usize {
+        events
+            .iter()
+            .filter(|e| e["event"] == kind && e["stage"] == "announcement")
+            .count()
+    }
+
     #[tokio::test]
-    async fn announcements_are_deduplicated_and_capped_per_message() {
+    async fn announcements_are_deduplicated_and_rate_limited_per_connection() {
         // One large inv must not flood the collector with unknown block hashes
         // (it treats them as an unresolved chain transition) or the queue.
         let (path, task, mut stream) = observed_peer("inv-cap", 170_190).await;
-        let block = |i: u32| Inventory {
-            inv_type: crate::wire::MSG_BLOCK,
-            hash: {
-                let mut h = [0u8; 32];
-                h[..4].copy_from_slice(&i.to_le_bytes());
-                h[31] = 0xb1;
-                h
-            },
-            auth_digest: None,
-        };
-        let tx = |i: u32| Inventory {
-            inv_type: crate::wire::MSG_TX,
-            hash: {
-                let mut h = [0u8; 32];
-                h[..4].copy_from_slice(&i.to_le_bytes());
-                h[31] = 0x7c;
-                h
-            },
-            auth_digest: None,
-        };
         // 20 unique blocks, each announced twice, plus 300 transactions.
-        let mut entries: Vec<Inventory> = (0..20).map(block).collect();
-        entries.extend((0..20).map(block));
-        entries.extend((0..300).map(tx));
+        let mut entries: Vec<Inventory> = (0..20)
+            .map(|i| numbered(crate::wire::MSG_BLOCK, i, 0xb1))
+            .collect();
+        entries.extend((0..20).map(|i| numbered(crate::wire::MSG_BLOCK, i, 0xb1)));
+        entries.extend((0..300).map(|i| numbered(crate::wire::MSG_TX, i, 0x7c)));
         write_message(
             &mut stream,
             Network::Mainnet,
@@ -968,31 +1011,129 @@ mod tests {
             &mut stream,
             Network::Mainnet,
             "inv",
-            &encode_inventory(&[block(0)]),
+            &encode_inventory(&[numbered(crate::wire::MSG_BLOCK, 0, 0xb1)]),
         )
         .await
         .unwrap();
         let events = wait_for_events(&path, |events| {
             events.iter().any(|e| {
-                e["event"] == "sensor_heartbeat" && e["capped_inventory"].as_u64() == Some(48)
+                e["event"] == "sensor_heartbeat" && e["capped_inventory"].as_u64() == Some(58)
             })
         })
         .await;
         task.abort();
-        let count = |kind: &str| {
-            events
-                .iter()
-                .filter(|e| e["event"] == kind && e["stage"] == "announcement")
-                .count()
-        };
-        assert_eq!(count("block_seen"), MAX_OBSERVED_BLOCK_INV_PER_MESSAGE);
-        assert_eq!(count("tx_seen"), MAX_OBSERVED_TX_INV_PER_MESSAGE);
+        assert_eq!(
+            announcement_count(&events, "block_seen"),
+            crate::observation::BLOCK_ANNOUNCEMENT_BURST as usize
+        );
+        assert_eq!(
+            announcement_count(&events, "tx_seen"),
+            crate::observation::TX_ANNOUNCEMENT_BURST as usize
+        );
         assert!(
             events
                 .iter()
                 .all(|e| e["event"] != "sensor_heartbeat" || e["dropped_events"] == 0)
         );
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_trickle_of_block_announcements_is_rate_limited_across_messages() {
+        // Small invs used to bypass the per-message cap entirely.
+        let (path, task, mut stream) = observed_peer("inv-trickle", 170_190).await;
+        for i in 0..10 {
+            let inv = encode_inventory(&[numbered(crate::wire::MSG_BLOCK, i, 0xb2)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+        }
+        for i in 0..600 {
+            let inv = encode_inventory(&[numbered(crate::wire::MSG_TX, i, 0x7d)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+        }
+        let events = wait_for_events(&path, |events| {
+            events.iter().any(|e| {
+                e["event"] == "sensor_heartbeat"
+                    && e["capped_inventory"].as_u64().is_some_and(|c| c >= 4 + 300)
+            })
+        })
+        .await;
+        task.abort();
+        assert_eq!(
+            announcement_count(&events, "block_seen"),
+            crate::observation::BLOCK_ANNOUNCEMENT_BURST as usize
+        );
+        assert!(announcement_count(&events, "tx_seen") < 300);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_announced_blocks_never_arrive_is_disconnected() {
+        let mut config = peer_test_config();
+        config.inventory_limits.timeout = Duration::from_millis(50);
+        let (path, task, mut stream) = observed_peer_with("undelivered", 170_190, config).await;
+        for i in 0..crate::observation::MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS as u32 {
+            let inv = encode_inventory(&[numbered(crate::wire::MSG_BLOCK, i, 0xb3)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+        }
+        // Never deliver; keep the connection otherwise alive.
+        let error = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("an undelivering peer must be dropped")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never delivered"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn notfound_for_announced_blocks_counts_as_undelivered() {
+        let (path, task, mut stream) = observed_peer("notfound", 170_190).await;
+        let blocks: Vec<Inventory> = (0..crate::observation::MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS
+            as u32)
+            .map(|i| numbered(crate::wire::MSG_BLOCK, i, 0xb4))
+            .collect();
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&blocks),
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&blocks),
+        )
+        .await
+        .unwrap();
+        let error = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("an undelivering peer must be dropped")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never delivered"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn block_requests_report_how_many_expired() {
+        let start = Instant::now();
+        let mut window: RequestWindow<[u8; 32]> =
+            RequestWindow::new(8, 8, Duration::from_millis(10));
+        assert!(window.admit([1; 32], start));
+        assert!(window.admit([2; 32], start));
+        assert_eq!(window.expire(start), 0);
+        assert_eq!(window.expire(start + Duration::from_millis(10)), 2);
     }
 
     /// A real NU7 block (public testnet activation block 4465026, branch

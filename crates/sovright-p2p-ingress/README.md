@@ -354,10 +354,12 @@ RUST_LOG=info cargo run -p sovright-p2p-ingress --locked
 Observation mode sets the handshake transaction relay flag and, like the relay
 and tx-feed paths, refuses peers below the network's protocol version (170190 on
 mainnet). Announcements are recorded before fetch selection, even when caching
-and transaction forwarding are disabled. Block announcements are recorded once
-per connection, and each `inv` message contributes at most 16 block and 256
-transaction entries; skipped entries are counted in the heartbeat's
-`capped_inventory`. Observation mode does not itself enable
+and transaction forwarding are disabled, within per-connection budgets: block
+announcements once each, a burst of 6 then one per 20 s; transaction
+announcements a burst of 256 then 20 per second. Skipped entries are counted in
+the heartbeat's `capped_inventory`. A peer whose announced blocks expire or come
+back `notfound` twice is disconnected, since each such hash would hold the
+collector in an unresolved chain transition. Observation mode does not itself enable
 transaction fetches: enable the existing transaction cache or feed to acquire
 payloads needed for forecasting. Existing per-inventory fetch limits still apply.
 
@@ -410,7 +412,8 @@ Announcements and unsolicited payloads are recorded but do not refresh health.
 Heartbeats also carry `payload_stale`, `last_payload_age_ms`, `tx_payload_stale`
 and `last_tx_payload_age_ms` (ages are null until the first payload). A stale
 sensor keeps writing every event; only a writer failure stops the stream. The
-last eighth of the queue (at most 64 slots) is reserved for heartbeats. Clock quality is unknown, so consumers must disable
+last eighth of the queue (at least 1, at most 64 slots) is reserved for
+heartbeats, so the queue capacity must be at least 2. Clock quality is unknown, so consumers must disable
 cross-sensor source-time spread. A heartbeat alone does not establish gossip
 coverage. Queue overflow increments drop totals and leaves detectable sequence
 gaps. Writer errors stop the observation worker, mark it unhealthy and emit an
