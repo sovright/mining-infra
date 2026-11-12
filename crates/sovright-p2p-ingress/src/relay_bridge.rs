@@ -214,6 +214,20 @@ impl RecentForwardedHashes {
         self.entries.iter().any(|(h, _)| h == hash)
     }
 
+    /// When `hash` was recorded, if the record is still inside the window.
+    #[cfg_attr(not(feature = "zakura-native"), allow(dead_code))]
+    fn recorded_at(
+        &mut self,
+        hash: &[u8; 32],
+        now: std::time::Instant,
+    ) -> Option<std::time::Instant> {
+        self.evict_expired(now);
+        self.entries
+            .iter()
+            .find(|(h, _)| h == hash)
+            .map(|(_, recorded_at)| *recorded_at)
+    }
+
     fn record(&mut self, hash: [u8; 32], now: std::time::Instant) {
         self.evict_expired(now);
         if self.capacity == 0 {
@@ -696,6 +710,25 @@ impl RelayBridge {
         ) {
             warn!(%write_error, %consensus_hash, "Failed to write the unverified forward event");
         }
+    }
+
+    /// When this bridge recorded a forward of the block whose relay object hash is
+    /// `header_hash`, if it still holds the record (inside the dedup window and not
+    /// pushed out by capacity).
+    ///
+    /// Only [`ForwardClaim::commit`] writes the record: for a body that passed every
+    /// check and whose send finished, from any source sharing this bridge. A refused
+    /// body, a failed or cancelled send, and a body sent under the emergency bypass
+    /// leave none, even when the bypass reports a repeat of it as `Deduplicated`.
+    /// The record is this bridge's own state. It does not say that a relay peer
+    /// received the block, that a node accepted it, or that every copy of the
+    /// header carried the right body.
+    #[cfg_attr(not(feature = "zakura-native"), allow(dead_code))]
+    pub(crate) fn forwarded_at(&self, header_hash: &[u8; 32]) -> Option<std::time::Instant> {
+        self.recent_forwarded
+            .lock()
+            .expect("recent_forwarded mutex poisoned")
+            .recorded_at(header_hash, std::time::Instant::now())
     }
 
     fn forward_state(&self, header_hash: &[u8; 32]) -> ForwardState {
@@ -2388,3 +2421,7 @@ pub(crate) mod block_body_tests;
 #[cfg(test)]
 #[path = "nu7_relay_path_tests.rs"]
 mod nu7_relay_path_tests;
+
+#[cfg(all(test, feature = "zakura-native"))]
+#[path = "zakura_native_tests.rs"]
+mod zakura_native_tests;

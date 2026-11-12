@@ -1,0 +1,469 @@
+//! Zakura native peers as an extra block source (`zakura-native` feature).
+//!
+//! A body fetched from a native peer takes the same `RelayBridge::forward_block`
+//! path as a block from a legacy peer: the same checks, the same parse permits and
+//! the same dedup ring, which every clone of the bridge shares. Per-block native
+//! failures never reach the legacy peers, and the legacy peers never wait on the
+//! native source. An enabled source that does not start in time, or whose fetcher
+//! or forwarder ends while it runs, ends the process with an error; see
+//! [`run_with_native`].
+
+use std::collections::VecDeque;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
+
+use sovright_relay::{MAX_BLOCK_BYTES, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display};
+use sovright_zakura_native::native::{
+    BlockHash, DeliveredCheck, FetchedBlock, NativeNetwork, NativeSource, NativeSourceConfig,
+    NativeStats, SourceLimits, SupervisedTask,
+};
+use tokio::sync::mpsc;
+use tokio::task::{JoinError, JoinHandle};
+use tracing::{info, warn};
+
+use crate::config::ZakuraNativeConfig;
+use crate::error::{IngressError, Result};
+use crate::event::EventSink;
+use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
+use crate::relay_bridge::{ForwardMode, RelayBridge};
+use crate::tx_cache::TxCache;
+
+/// The peer name native blocks carry in events.
+pub const SOURCE: &str = "zakura-native";
+
+/// How long the native source may take to start before the process gives up.
+pub const START_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Native blocks remembered as delivered: at most this many.
+///
+/// This and [`RECENT_WINDOW`] are starting values that match the bridge's default
+/// dedup ring (64 entries, 30 s). They have not been tuned in production.
+pub const RECENT_CAPACITY: usize = 64;
+
+/// How long a native block stays remembered as delivered, counted from the bridge's
+/// own record of it; see [`RECENT_CAPACITY`].
+pub const RECENT_WINDOW: Duration = Duration::from_secs(30);
+
+/// What the bridge did with native blocks.
+#[derive(Debug, Default)]
+pub struct ForwardStats {
+    /// Sent to the relay.
+    pub forwarded: AtomicU64,
+    /// Already sent, from either source, within the dedup window.
+    pub deduplicated: AtomicU64,
+    /// Refused by the bridge's checks, or lost to a relay error.
+    pub failed: AtomicU64,
+}
+
+/// Native blocks the bridge holds a forward record for, by the hash their
+/// advertisement carried.
+///
+/// The bridge keys its dedup ring by the relay object hash of the header, which an
+/// advertisement does not carry, so this maps the advertised hash to it. An entry
+/// is written only from the bridge's record (see [`RelayBridge::forwarded_at`]) and
+/// keeps the bridge's record time. It is never refreshed: a repeated advertisement
+/// does not extend it. It counts only while the bridge still holds the same record,
+/// so it never outlasts the bridge's own dedup window or capacity.
+#[derive(Debug)]
+pub(crate) struct RecentNativeBlocks {
+    capacity: usize,
+    window: Duration,
+    /// Advertised hash, relay object hash, the bridge's record time.
+    entries: VecDeque<(BlockHash, [u8; 32], Instant)>,
+}
+
+impl RecentNativeBlocks {
+    pub(crate) fn new(capacity: usize, window: Duration) -> Self {
+        Self {
+            capacity,
+            window,
+            entries: VecDeque::new(),
+        }
+    }
+
+    fn expire(&mut self, now: Instant) {
+        let window = self.window;
+        self.entries
+            .retain(|(_, _, recorded_at)| now.saturating_duration_since(*recorded_at) <= window);
+    }
+
+    /// Remembers `hash`, unless it is already remembered: an existing entry keeps
+    /// its time.
+    pub(crate) fn record(
+        &mut self,
+        hash: BlockHash,
+        relay_hash: [u8; 32],
+        recorded_at: Instant,
+        now: Instant,
+    ) {
+        self.expire(now);
+        if self.capacity == 0 || self.entries.iter().any(|(entry, _, _)| *entry == hash) {
+            return;
+        }
+        if self.entries.len() >= self.capacity {
+            self.entries.pop_front();
+        }
+        self.entries.push_back((hash, relay_hash, recorded_at));
+    }
+
+    /// The relay object hash remembered for `hash`, inside the window.
+    pub(crate) fn relay_hash(&mut self, hash: &BlockHash, now: Instant) -> Option<[u8; 32]> {
+        self.expire(now);
+        self.entries
+            .iter()
+            .find(|(entry, _, _)| entry == hash)
+            .map(|(_, relay_hash, _)| *relay_hash)
+    }
+
+    /// The bridge record time remembered for `hash`, inside the window.
+    #[cfg(test)]
+    pub(crate) fn recorded_at(&mut self, hash: &BlockHash, now: Instant) -> Option<Instant> {
+        self.expire(now);
+        self.entries
+            .iter()
+            .find(|(entry, _, _)| entry == hash)
+            .map(|(_, _, recorded_at)| *recorded_at)
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The fetcher's check: a native block counts as delivered while it is remembered
+/// and the bridge still holds its forward record.
+pub(crate) fn delivered_check(
+    recent: Arc<Mutex<RecentNativeBlocks>>,
+    relay: RelayBridge,
+) -> DeliveredCheck {
+    Arc::new(move |hash| {
+        let Some(relay_hash) = lock(&recent).relay_hash(hash, Instant::now()) else {
+            return false;
+        };
+        relay.forwarded_at(&relay_hash).is_some()
+    })
+}
+
+/// A running native source and the task that forwards its blocks.
+///
+/// Dropping it aborts the fetcher and the forwarder but leaves the endpoint
+/// running. [`Self::shutdown`] also waits for both and shuts the endpoint down; see
+/// `NativeSource::shutdown` for what that does and does not stop.
+pub struct NativeIngress {
+    source: NativeSource,
+    forwarder: SupervisedTask,
+    forward_stats: Arc<ForwardStats>,
+}
+
+impl NativeIngress {
+    /// The native source's counters. A clone stays readable after shutdown.
+    pub fn source_stats(&self) -> &Arc<NativeStats> {
+        self.source.stats()
+    }
+
+    /// The forwarder's counters. A clone stays readable after shutdown.
+    pub fn forward_stats(&self) -> &Arc<ForwardStats> {
+        &self.forward_stats
+    }
+
+    /// Resolves when the fetcher or the forwarder ends while the source runs.
+    ///
+    /// Neither ends on its own in normal operation: the fetcher returns only when
+    /// the endpoint drops its inbound service, and the forwarder only when the
+    /// fetcher is gone. Any end, a panic included, is a failure. Dropping this
+    /// future changes nothing, so [`Self::shutdown`] after it is not reported.
+    pub async fn failed(&mut self) -> IngressError {
+        let (task, ended) = tokio::select! {
+            ended = self.source.fetcher_ended() => ("fetcher", ended),
+            ended = self.forwarder.ended() => ("forwarder", ended),
+        };
+        task_ended(task, ended)
+    }
+
+    /// Aborts the forwarder without waiting, as a test would see a crash.
+    #[cfg(test)]
+    pub(crate) fn abort_forwarder(&self) {
+        self.forwarder.abort();
+    }
+
+    /// Aborts the fetcher without waiting, as a test would see a crash.
+    #[cfg(test)]
+    pub(crate) fn abort_fetcher(&self) {
+        self.source.abort_fetcher();
+    }
+
+    /// Logs the counters, stops fetching and forwarding, and closes the native
+    /// connections.
+    pub async fn shutdown(mut self) {
+        let source = self.source_stats();
+        let forward = self.forward_stats();
+        info!(
+            adverts_received = source.adverts_received.load(Ordering::Relaxed),
+            adverts_dropped = source.adverts_dropped.load(Ordering::Relaxed),
+            adverts_coalesced = source.adverts_coalesced.load(Ordering::Relaxed),
+            adverts_delivered = source.adverts_delivered.load(Ordering::Relaxed),
+            adverts_source_busy = source.adverts_source_busy.load(Ordering::Relaxed),
+            fetches_ok = source.fetches_ok.load(Ordering::Relaxed),
+            fetches_failed = source.fetches_failed.load(Ordering::Relaxed),
+            forwarded = forward.forwarded.load(Ordering::Relaxed),
+            deduplicated = forward.deduplicated.load(Ordering::Relaxed),
+            forward_failed = forward.failed.load(Ordering::Relaxed),
+            "Stopping the Zakura native source"
+        );
+        self.source.shutdown().await;
+        self.forwarder.stop().await;
+    }
+}
+
+fn task_ended(task: &str, ended: std::result::Result<(), JoinError>) -> IngressError {
+    let how = match ended {
+        Ok(()) => "returned".to_string(),
+        Err(error) => error.to_string(),
+    };
+    IngressError::ZakuraNative(format!(
+        "the Zakura native {task} ended while the source was running: {how}"
+    ))
+}
+
+/// Starts the native source and forwards what it fetches through `relay`.
+///
+/// `relay` is a clone of the bridge the legacy peers use, so both sources share its
+/// checks and dedup state. The ingress daemon passes [`NativeNetwork::Mainnet`]
+/// only; the tests use testnet for the NU7 fixture.
+pub async fn start(
+    config: &ZakuraNativeConfig,
+    network: NativeNetwork,
+    relay: RelayBridge,
+    tx_cache: Option<TxCache>,
+    events: EventSink,
+) -> Result<NativeIngress> {
+    let recent = Arc::new(Mutex::new(RecentNativeBlocks::new(
+        RECENT_CAPACITY,
+        RECENT_WINDOW,
+    )));
+    let (source, fetched) = NativeSource::start(
+        NativeSourceConfig {
+            network,
+            identity_dir: config.identity_dir.clone(),
+            listen_addr: config.listen_addr,
+            bootstrap_peers: config.bootstrap_peers.clone(),
+            limits: SourceLimits {
+                advert_queue: config.advert_queue,
+                max_concurrent_fetches: config.max_concurrent_fetches,
+                fetch_timeout: config.fetch_timeout,
+                max_body_bytes: MAX_BLOCK_BYTES,
+            },
+        },
+        delivered_check(Arc::clone(&recent), relay.clone()),
+    )
+    .await
+    .map_err(|error| IngressError::ZakuraNative(error.to_string()))?;
+
+    let forward_stats = Arc::new(ForwardStats::default());
+    let forwarder = SupervisedTask::spawn(forward_fetched(
+        fetched,
+        relay,
+        tx_cache,
+        events,
+        Arc::clone(&forward_stats),
+        recent,
+    ));
+    Ok(NativeIngress {
+        source,
+        forwarder,
+        forward_stats,
+    })
+}
+
+/// Forwards each fetched block, one at a time, until the source closes.
+///
+/// After a successful forward, the block is remembered as delivered if the bridge
+/// now holds a forward record for its header. The bridge writes that record only
+/// for a validated copy whose send finished, its own or another source's, so a
+/// refused body, a failed or cancelled send, and a body sent under the emergency
+/// bypass leave nothing to remember, whatever mode the forward reported. The record
+/// is the bridge's local state: it does not say a relay peer received the block or
+/// a node accepted it.
+///
+/// The block's delivery is dropped only after that, so its hash never leaves the
+/// source's in-progress set before it is remembered. A cancelled or panicking
+/// forward drops the delivery without remembering anything.
+///
+/// Events are best effort, as for legacy peers: a write error is logged and the
+/// block is still forwarded. Their hash fields mean what they mean for legacy
+/// blocks (`peer.rs`): `hash` is the relay object hash, the join key between
+/// the received and forwarded events, and `consensus_hash` is the chain's hash.
+pub(crate) async fn forward_fetched(
+    mut fetched: mpsc::Receiver<FetchedBlock>,
+    relay: RelayBridge,
+    tx_cache: Option<TxCache>,
+    events: EventSink,
+    stats: Arc<ForwardStats>,
+    recent: Arc<Mutex<RecentNativeBlocks>>,
+) {
+    while let Some(block) = fetched.recv().await {
+        let FetchedBlock {
+            hash: advertised,
+            source,
+            bytes,
+            delivery,
+        } = block;
+        let relay_hash = raw_hash_from_header(&bytes).ok();
+        let hash = relay_hash
+            .map(|raw| inventory_hash_to_display(&raw))
+            .unwrap_or_default();
+        let consensus_hash = bytes
+            .get(..ZCASH_FULL_HEADER_SIZE)
+            .map(consensus_block_hash_display)
+            .unwrap_or_default();
+        let size = bytes.len();
+        log_event(events.p2p_block_received(SOURCE, &hash, &consensus_hash, size));
+
+        match relay.forward_block(&bytes, tx_cache.as_ref()).await {
+            Ok(forwarded) => {
+                let counter = if forwarded.mode == ForwardMode::Deduplicated {
+                    &stats.deduplicated
+                } else {
+                    &stats.forwarded
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+                if let Some(relay_hash) = relay_hash
+                    && let Some(recorded_at) = relay.forwarded_at(&relay_hash)
+                {
+                    lock(&recent).record(advertised, relay_hash, recorded_at, Instant::now());
+                }
+                log_event(events.p2p_relay_block_forwarded(
+                    SOURCE,
+                    &hash,
+                    forwarded.bytes,
+                    forwarded.tx_count,
+                    forwarded.mode.as_str(),
+                    forwarded.relay_objects,
+                ));
+            }
+            Err(error) => {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    %consensus_hash,
+                    ?source,
+                    %error,
+                    "Zakura native block forward failed"
+                );
+                if let IngressError::InvalidBlockBody(rejection) = &error {
+                    log_event(events.p2p_block_body_rejected(
+                        SOURCE,
+                        &hash,
+                        &consensus_hash,
+                        rejection,
+                        size,
+                    ));
+                }
+                log_event(events.p2p_peer_error(SOURCE, &format!("relay forward failed: {error}")));
+            }
+        }
+        drop(delivery);
+    }
+}
+
+fn log_event(written: Result<()>) {
+    if let Err(error) = written {
+        warn!(%error, "Failed to write a Zakura native block event");
+    }
+}
+
+/// The native source from the moment its start is spawned.
+///
+/// The start runs in its own task, so nothing else waits for it; it fails if it
+/// takes longer than its time limit.
+pub struct NativeRunner {
+    state: RunnerState,
+}
+
+enum RunnerState {
+    Starting(JoinHandle<Result<NativeIngress>>),
+    Running(Box<NativeIngress>),
+    Ended,
+}
+
+impl NativeRunner {
+    /// Spawns `start` with `within` as its time limit and returns at once.
+    pub fn spawn(
+        start: impl Future<Output = Result<NativeIngress>> + Send + 'static,
+        within: Duration,
+    ) -> Self {
+        let handle = tokio::spawn(async move {
+            tokio::time::timeout(within, start).await.map_err(|_| {
+                IngressError::ZakuraNative(format!(
+                    "the Zakura native source did not start within {within:?}"
+                ))
+            })?
+        });
+        Self {
+            state: RunnerState::Starting(handle),
+        }
+    }
+
+    /// Resolves with the error that ends the source: a start that failed or timed
+    /// out, or a fetcher or forwarder that ended while it ran. Dropping this future
+    /// changes nothing, so a later [`Self::shutdown`] is not reported as a failure.
+    pub async fn failed(&mut self) -> IngressError {
+        loop {
+            match &mut self.state {
+                RunnerState::Starting(handle) => {
+                    let started = handle.await;
+                    match started {
+                        Ok(Ok(ingress)) => {
+                            info!("Zakura native source started");
+                            self.state = RunnerState::Running(Box::new(ingress));
+                        }
+                        Ok(Err(error)) => {
+                            self.state = RunnerState::Ended;
+                            return error;
+                        }
+                        Err(error) => {
+                            self.state = RunnerState::Ended;
+                            return task_ended("start", Err(error));
+                        }
+                    }
+                }
+                RunnerState::Running(ingress) => return ingress.failed().await,
+                RunnerState::Ended => return std::future::pending().await,
+            }
+        }
+    }
+
+    /// Stops the source in whatever state it is: a start in progress is aborted,
+    /// a running source is shut down.
+    pub async fn shutdown(self) {
+        match self.state {
+            RunnerState::Starting(handle) => {
+                handle.abort();
+                if let Ok(Ok(ingress)) = handle.await {
+                    ingress.shutdown().await;
+                }
+            }
+            RunnerState::Running(ingress) => (*ingress).shutdown().await,
+            RunnerState::Ended => {}
+        }
+    }
+}
+
+/// Runs the legacy peers with the native source beside them.
+///
+/// The outcome is the legacy peers' outcome, unless the native source fails first:
+/// then it is that failure, and the legacy peers are dropped with it. The legacy
+/// peers ending first is not a native failure. Either way the native source is
+/// stopped before this returns.
+pub async fn run_with_native(
+    legacy: impl Future<Output = Result<()>>,
+    mut native: NativeRunner,
+) -> Result<()> {
+    let outcome = tokio::select! {
+        outcome = legacy => outcome,
+        failure = native.failed() => Err(failure),
+    };
+    native.shutdown().await;
+    outcome
+}
