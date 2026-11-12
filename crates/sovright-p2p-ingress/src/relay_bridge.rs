@@ -1849,6 +1849,7 @@ mod tests {
             tx_request_limit_per_inv: 256,
             inventory_limits: Default::default(),
             event_log: Some(PathBuf::from("/tmp/test.jsonl")),
+            observation: None,
             metrics_textfile: None,
             relay_peers: vec!["127.0.0.1:1".parse().unwrap()],
             relay_bind_addr: "127.0.0.1:0".parse().unwrap(),

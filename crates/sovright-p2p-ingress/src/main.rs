@@ -8,6 +8,7 @@ mod error;
 mod event;
 mod hash;
 mod metrics;
+mod observation;
 mod peer;
 mod relay_bridge;
 mod submitblock_rpc;
@@ -40,6 +41,11 @@ async fn main() -> Result<()> {
 
     let config = Config::from_env()?;
     let events = EventSink::for_network(config.event_log.clone(), config.network)?;
+    let observer = config
+        .observation
+        .clone()
+        .map(observation::Observer::start)
+        .transpose()?;
     let relay = RelayBridge::from_config(&config, events.clone()).await?;
     let tx_cache = config.tx_cache_enabled.then(|| {
         TxCache::new(TxCacheConfig {
@@ -94,6 +100,7 @@ async fn main() -> Result<()> {
                 tx_cache.clone(),
                 tx_feed.clone(),
                 crawler.clone(),
+                observer.clone(),
             ));
         }
 
@@ -127,6 +134,7 @@ fn peers_exhausted(crawler: &Crawler) -> error::IngressError {
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_peer(
     peer: SocketAddr,
     config: Config,
@@ -135,6 +143,7 @@ fn spawn_peer(
     tx_cache: Option<TxCache>,
     tx_feed: Option<TxFeedClient>,
     crawler: Crawler,
+    observer: Option<observation::Observer>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let peer_text = peer.to_string();
@@ -149,6 +158,7 @@ fn spawn_peer(
                 tx_cache,
                 tx_feed,
                 crawler.clone(),
+                observer,
             )
             .await
         } else {
@@ -162,6 +172,7 @@ fn spawn_peer(
                     tx_cache,
                     tx_feed,
                     crawler.clone(),
+                    observer,
                 ),
             )
             .await

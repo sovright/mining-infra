@@ -507,6 +507,7 @@ mod tests {
             tx_request_limit_per_inv: 256,
             inventory_limits: Default::default(),
             event_log: None::<PathBuf>,
+            observation: None,
             metrics_textfile: None,
             relay_peers: Vec::new(),
             relay_bind_addr: "0.0.0.0:0".parse().unwrap(),
