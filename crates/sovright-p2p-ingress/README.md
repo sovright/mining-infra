@@ -463,7 +463,7 @@ The source needs the relay bridge: enabling it without relay peers and an auth
 key fails startup. If the native endpoint itself fails to start, the daemon logs
 a warning and runs the legacy peers alone.
 
-How it behaves:
+### How it behaves
 
 - It is a native endpoint with no chain state. It dials the bootstrap peers, but
   its discovery may also dial peers it learns of, and any native peer may connect
@@ -475,25 +475,49 @@ How it behaves:
 - The forward takes the legacy path: the same body checks, parse permits and
   dedup state. Events name the peer `zakura-native`; their `hash` and
   `consensus_hash` fields mean what they mean for legacy blocks.
-- One fetch per hash runs at a time; an announcement of a hash already in flight
-  is skipped. A failed fetch leaves the hash free for the next announcement.
-- Every native announcement is answered with an error, on purpose. After a
-  successful answer, `zakura-network` 15.0.0 would mark the hash seen for ten
-  minutes, dropping later announcements of it from every peer, and would pass
-  the announcement on to other peers although this source cannot serve the
-  block. The error causes neither, and costs no penalty or disconnect; Zakura
-  logs it at debug level. This relies on the pinned 15.0.0 behaviour.
+- An announcement is skipped, without a fetch, when its hash is already being
+  fetched or forwarded, or when its peer already has a block in progress. A
+  failed fetch or forward frees the hash and the peer for the next announcement.
+- Every block announcement is answered with an error, on purpose, whatever its
+  source. After a successful answer, `zakura-network` 15.0.0 would mark the hash
+  seen for ten minutes, dropping later announcements of it from every peer, and
+  would pass the announcement on to other peers although this source cannot
+  serve the block. The error causes neither, and costs no penalty or disconnect;
+  Zakura logs it at debug level. This relies on the pinned 15.0.0 behaviour.
 
-Known costs and limits:
+### Bounds
 
-- **Repeated fetches (temporary).** The bridge keys its dedup state by a header
-  hash that an announcement does not carry, so the source cannot recognise a
-  known block before fetching it. A block a legacy peer already forwarded is
-  fetched again, and so is a block announced again after its fetch finished; the
-  bridge then drops the copy as a duplicate. Each copy is a full body transfer.
-  `SOVRIGHT_P2P_ZAKURA_MAX_CONCURRENT_FETCHES` limits fetches at once, not the
-  total: nothing limits how often one block is fetched again. A peer may repeat
-  an announcement up to Zakura's per-connection limit of 2048 messages a second.
+With `N` = `SOVRIGHT_P2P_ZAKURA_MAX_CONCURRENT_FETCHES`:
+
+| What | Limit | Where it is enforced |
+| --- | --- | --- |
+| Announcements waiting | `SOVRIGHT_P2P_ZAKURA_ADVERT_QUEUE` | The queue between the endpoint and the fetcher; a full queue drops |
+| Blocks in progress per peer | 1 | The fetcher, before it waits for anything; a busy peer's announcement is skipped at once |
+| Body requests at once | `N` | Fetch permits, held only while the request runs |
+| Bodies held at once | `2 × N` | Body slots, taken before the request and given back when the forwarder is done with the body. They cover bodies being fetched, fetched bodies waiting in the channel and the one being forwarded. A cancelled or failed fetch or forward gives its slot back |
+| Size of one held body | 2,000,000 bytes | Checked after the fetch, on the re-serialized bytes. A larger body is dropped as a failed fetch |
+
+The size check runs after Zakura has decoded the block and the source has
+re-serialized it, so those two copies exist briefly before it; the bridge also
+copies a body while preparing it. The table bounds the bodies the source holds,
+not the process's total memory.
+
+When every body slot or fetch permit is taken, the fetcher waits and the
+announcement queue fills. One peer cannot cause that, but many peer identities
+can.
+
+### Known costs and limits
+
+- **Repeated fetches.** The bridge keys its dedup state by a header hash that an
+  announcement does not carry, and the source keeps no record of blocks it
+  delivered. A block a legacy peer already forwarded is fetched again, and so is
+  a block announced again after its forward finished; the bridge then drops the
+  copy as a duplicate. Each copy is a full body transfer. An announcing peer that
+  answers missing makes `zakura-network` ask up to two other peers each time; one
+  block in progress per peer limits how fast one peer can do this, not how often.
+- **Head-of-line.** The forwarder handles one body at a time. A body waiting
+  behind a legacy copy of the same block, or behind the bridge's one P2P parse
+  permit, holds back the next one.
 - **Log volume.** Each failed fetch logs a warning, so a peer that announces
   blocks nobody serves raises one warning per failed fetch.
 - **Testnet.** Testnet is observation-only and rejects relay outputs, and the

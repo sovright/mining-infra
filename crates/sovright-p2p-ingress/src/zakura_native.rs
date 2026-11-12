@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use sovright_relay::{ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display};
+use sovright_relay::{MAX_BLOCK_BYTES, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display};
 use sovright_zakura_native::native::{
     FetchedBlock, NativeNetwork, NativeSource, NativeSourceConfig, NativeStats, SourceLimits,
 };
@@ -69,6 +69,7 @@ impl NativeIngress {
             adverts_received = source.adverts_received.load(Ordering::Relaxed),
             adverts_dropped = source.adverts_dropped.load(Ordering::Relaxed),
             adverts_coalesced = source.adverts_coalesced.load(Ordering::Relaxed),
+            adverts_source_busy = source.adverts_source_busy.load(Ordering::Relaxed),
             fetches_ok = source.fetches_ok.load(Ordering::Relaxed),
             fetches_failed = source.fetches_failed.load(Ordering::Relaxed),
             forwarded = forward.forwarded.load(Ordering::Relaxed),
@@ -112,6 +113,7 @@ pub async fn start(
             advert_queue: config.advert_queue,
             max_concurrent_fetches: config.max_concurrent_fetches,
             fetch_timeout: config.fetch_timeout,
+            max_body_bytes: MAX_BLOCK_BYTES,
         },
     })
     .await
@@ -141,6 +143,9 @@ fn native_network(network: Network) -> NativeNetwork {
 
 /// Forwards each fetched block, one at a time, until the source closes.
 ///
+/// Each block's delivery is dropped once its forward ends, however it ends; that
+/// gives its body slot back and frees its hash and peer in the source.
+///
 /// Events are best effort, as for legacy peers: a write error is logged and the
 /// block is still forwarded. Their hash fields mean what they mean for legacy
 /// blocks (`peer.rs`): `hash` is the relay object hash, the join key between
@@ -153,18 +158,23 @@ async fn forward_fetched(
     stats: Arc<ForwardStats>,
 ) {
     while let Some(block) = fetched.recv().await {
-        let hash = raw_hash_from_header(&block.bytes)
+        let FetchedBlock {
+            source,
+            bytes,
+            delivery,
+            ..
+        } = block;
+        let hash = raw_hash_from_header(&bytes)
             .map(|raw| inventory_hash_to_display(&raw))
             .unwrap_or_default();
-        let consensus_hash = block
-            .bytes
+        let consensus_hash = bytes
             .get(..ZCASH_FULL_HEADER_SIZE)
             .map(consensus_block_hash_display)
             .unwrap_or_default();
-        let bytes = block.bytes.len();
-        log_event(events.p2p_block_received(SOURCE, &hash, &consensus_hash, bytes));
+        let size = bytes.len();
+        log_event(events.p2p_block_received(SOURCE, &hash, &consensus_hash, size));
 
-        match relay.forward_block(&block.bytes, tx_cache.as_ref()).await {
+        match relay.forward_block(&bytes, tx_cache.as_ref()).await {
             Ok(forwarded) => {
                 let counter = if forwarded.mode == ForwardMode::Deduplicated {
                     &stats.deduplicated
@@ -185,7 +195,7 @@ async fn forward_fetched(
                 stats.failed.fetch_add(1, Ordering::Relaxed);
                 warn!(
                     %consensus_hash,
-                    source = ?block.source,
+                    ?source,
                     %error,
                     "Zakura native block forward failed"
                 );
@@ -195,12 +205,13 @@ async fn forward_fetched(
                         &hash,
                         &consensus_hash,
                         rejection,
-                        bytes,
+                        size,
                     ));
                 }
                 log_event(events.p2p_peer_error(SOURCE, &format!("relay forward failed: {error}")));
             }
         }
+        drop(delivery);
     }
 }
 
