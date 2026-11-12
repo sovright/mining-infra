@@ -3331,4 +3331,21 @@ mod tests {
         .await;
         let _ = fs::remove_file(path);
     }
+
+    #[tokio::test]
+    async fn with_neither_relay_nor_observer_nothing_is_recorded() {
+        let received = ReceivedBlocks::new(RECEIVED_BLOCKS_CAPACITY);
+        let start = |name: &'static str| {
+            TestPeer::start_sharing(name, peer_test_config(), None, received.clone(), None)
+        };
+        let mut first = start("skip-none-first").await;
+        let mut second = start("skip-none-second").await;
+        let block = nu7_block();
+        let inv = block_inventory(&block);
+
+        first.deliver(&block).await;
+        assert_eq!(first.events("p2p_block_received").len(), 1);
+        assert!(!received.contains(&inv.hash), "no check ran, so no record");
+        assert_eq!(second.announce(&[inv]).await, [inv]);
+    }
 }
