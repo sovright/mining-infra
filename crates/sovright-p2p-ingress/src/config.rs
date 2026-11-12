@@ -100,6 +100,8 @@ pub struct Config {
     pub tx_request_limit_per_inv: usize,
     pub inventory_limits: InventoryLimits,
     pub event_log: Option<PathBuf>,
+    /// Passive inclusion observation stream; off unless SOVRIGHT_P2P_OBSERVATION_LOG is set.
+    pub observation: Option<crate::observation::ObservationConfig>,
     /// Optional Prometheus textfile for the relay bridge's metrics.
     pub metrics_textfile: Option<PathBuf>,
     pub relay_peers: Vec<SocketAddr>,
@@ -327,6 +329,7 @@ impl Config {
             tx_request_limit_per_inv,
             inventory_limits,
             event_log,
+            observation: observation_from_env(network)?,
             metrics_textfile,
             relay_peers,
             relay_bind_addr,
@@ -514,6 +517,35 @@ fn env_optional_socket(name: &str) -> Result<Option<SocketAddr>> {
     })
 }
 
+fn observation_from_env(network: Network) -> Result<Option<crate::observation::ObservationConfig>> {
+    let Ok(path) = env::var("SOVRIGHT_P2P_OBSERVATION_LOG") else {
+        return Ok(None);
+    };
+    if path.is_empty() {
+        return Ok(None);
+    }
+    let config = crate::observation::ObservationConfig {
+        path: path.into(),
+        sensor_id: env::var("SOVRIGHT_P2P_OBSERVATION_SENSOR_ID").unwrap_or_default(),
+        network,
+        queue_capacity: env_usize("SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY", 4096)?,
+        max_bytes: env_u64("SOVRIGHT_P2P_OBSERVATION_MAX_BYTES", 64 * 1024 * 1024)?,
+        max_files: env_usize("SOVRIGHT_P2P_OBSERVATION_MAX_FILES", 8)?,
+        heartbeat_interval: Duration::from_millis(env_u64(
+            "SOVRIGHT_P2P_OBSERVATION_HEARTBEAT_MS",
+            5000,
+        )?),
+        payload_stale_after: Duration::from_millis(env_u64(
+            "SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS",
+            crate::observation::DEFAULT_PAYLOAD_STALE_MS,
+        )?),
+    };
+    config
+        .validate()
+        .map_err(|e| IngressError::Config(format!("invalid SOVRIGHT_P2P_OBSERVATION_*: {e}")))?;
+    Ok(Some(config))
+}
+
 fn env_usize(name: &str, default: usize) -> Result<usize> {
     match env::var(name) {
         Ok(value) => value
@@ -685,6 +717,49 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _guard = EnvGuard::set(&[("SOVRIGHT_P2P_NETWORK", "tesnet".to_string())]);
         assert!(Config::from_env().is_err());
+    }
+
+    #[test]
+    fn observation_requires_identity_and_positive_bounds_when_enabled() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _guard = EnvGuard::set(&[
+            (
+                "SOVRIGHT_P2P_OBSERVATION_LOG",
+                "/tmp/observation-config-test".to_string(),
+            ),
+            ("SOVRIGHT_P2P_OBSERVATION_SENSOR_ID", "".to_string()),
+            (
+                "SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY",
+                "4096".to_string(),
+            ),
+            (
+                "SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS",
+                "600000".to_string(),
+            ),
+        ]);
+        assert!(Config::from_env().is_err(), "blank sensor id");
+        unsafe {
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_SENSOR_ID", "ingress-region-1");
+        }
+        let observation = Config::from_env().unwrap().observation.unwrap();
+        assert_eq!(observation.network, Network::Mainnet);
+        assert_eq!(observation.payload_stale_after, Duration::from_secs(600));
+        unsafe {
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY", "0");
+        }
+        assert!(Config::from_env().is_err(), "zero queue");
+        unsafe {
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY", "4096");
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS", "0");
+        }
+        assert!(Config::from_env().is_err(), "zero stale window");
+        unsafe {
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_LOG", "");
+        }
+        assert!(
+            Config::from_env().unwrap().observation.is_none(),
+            "empty path disables"
+        );
     }
 
     #[test]

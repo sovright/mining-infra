@@ -335,3 +335,77 @@ connections under the new policy. This intentionally reduces the available
 pre-activation peer pool; qualify peer diversity and freshness before rollout.
 A claimed version is not proof of correct consensus behavior: full-node
 validation and NU7 block/submission qualification remain required.
+
+## Passive inclusion observations
+
+The observation stream is disabled unless `SOVRIGHT_P2P_OBSERVATION_LOG` names a
+file. It is separate from the existing operational event log and contains no
+peer IP addresses. Supply a stable, independently configured sensor identity.
+Events carry the configured `SOVRIGHT_P2P_NETWORK` (`mainnet` by default).
+
+```sh
+mkdir -p /tmp/ingress-observations
+SOVRIGHT_P2P_OBSERVATION_LOG=/tmp/ingress-observations/mainnet.jsonl \
+SOVRIGHT_P2P_OBSERVATION_SENSOR_ID=ingress-region-1 \
+SOVRIGHT_P2P_TX_CACHE_ENABLED=true \
+RUST_LOG=info cargo run -p sovright-p2p-ingress --locked
+```
+
+Observation mode sets the handshake transaction relay flag. Every transaction
+and block announcement is recorded before fetch selection, even when caching
+and transaction forwarding are disabled. Observation mode does not itself enable
+transaction fetches: enable the existing transaction cache or feed to acquire
+payloads needed for forecasting. Existing per-inventory fetch limits still apply.
+
+Optional bounds (defaults shown):
+
+```text
+SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY=4096
+SOVRIGHT_P2P_OBSERVATION_MAX_BYTES=67108864
+SOVRIGHT_P2P_OBSERVATION_MAX_FILES=8
+SOVRIGHT_P2P_OBSERVATION_HEARTBEAT_MS=5000
+SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS=600000
+```
+
+`MAX_FILES` includes the current file; archives are `mainnet.jsonl.1` (newest)
+through `.7`. Use a dedicated path and one process per path. The writer owns this
+numeric archive namespace and removes older archives when retention shrinks;
+existing files larger than the configured byte bound are discarded. Records are
+never split during rotation, and no record exceeds 4 MiB. Configuration rejects
+blank/control-character sensor IDs, zero bounds, excessive queue/file counts,
+and heartbeat intervals outside 1 ms through 1 hour, and payload stale windows
+outside 1 ms through 24 hours. File size is at least 4096
+bytes. The worker uses a bounded channel and never waits for file I/O on peer
+tasks. Source sequence allocation and enqueue are serialized in a short critical
+section so concurrent peers and heartbeats preserve order.
+
+The JSONL v1 stream emits `tx_seen`, `block_seen` and `sensor_heartbeat`, with
+`schema_version`, `network`, stable `sensor_id`, per-start `boot_id`, `sequence`,
+wall-clock `observed_at_ms` and process-relative `monotonic_ms`. Message timestamps
+are captured before inventory parsing or payload/cache work. Identifiers use
+lowercase, 64-character display hex; transaction ID and authorization digest are
+separate fields. Valid v5/v6 payloads include derived IDs, `tx_version`,
+`expiry_height`, `size_bytes` and a structural `action_count`: transparent inputs
+plus outputs, Sapling spends plus outputs, Orchard actions and Ironwood actions.
+This count is not ZIP-317 logical actions or a fee measurement. Malformed,
+trailing-byte and unsupported payloads produce no payload observation.
+
+Heartbeats report handshaken active peers, health, cumulative drops and
+`clock_uncertainty_ms:null`. `healthy` is false when the writer has failed or when
+no transaction or block payload has been decoded within
+`SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS` (default 10 minutes, 24 blocks at the
+25 s NU7 spacing; the window also applies from process start). Announcements
+alone do not count. Heartbeats also carry `payload_stale` and
+`last_payload_age_ms`. A stale sensor keeps writing every event; only a writer
+failure stops the stream. Clock quality is unknown, so consumers must disable
+cross-sensor source-time spread. A heartbeat alone does not establish gossip
+coverage. Queue overflow increments drop totals and leaves detectable sequence
+gaps. Writer errors stop the observation worker, mark it unhealthy and emit an
+operational error; subsequent observations are dropped. These failures do not
+return errors to or disconnect P2P peers. Missing heartbeats must make downstream
+coverage stale. Restart after fixing the output path to begin a new boot epoch.
+
+This is best-effort telemetry: there is no fsync or durable shutdown guarantee,
+and rotation bounds retained history. Collector ingestion must supply
+`collector_received_at_ms`; offline replay requires collected availability times.
+The ingress does not emit validated blocks or canonical chain tips.
