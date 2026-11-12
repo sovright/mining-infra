@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::crawler::Crawler;
 use crate::error::{IngressError, Result};
 use crate::event::EventSink;
-use crate::hash::{inventory_hash_to_display, raw_hash_from_header};
+use crate::hash::{inventory_hash_from_header, inventory_hash_to_display, raw_hash_from_header};
 use crate::relay_bridge::{ForwardMode, ForwardedBlock, RelayBridge};
 use crate::tx_cache::{TxCache, TxInventoryKey};
 use crate::tx_feed::TxFeedClient;
@@ -21,6 +21,7 @@ use crate::wire::{
     read_message, write_message,
 };
 use crate::wire::{MIN_ACCEPTABLE_REMOTE_VERSION, Network};
+#[cfg(test)]
 use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 use sovright_relay::{BlockBodyError, WtxId};
 
@@ -116,13 +117,24 @@ impl<K: Copy + Eq + Hash> RequestWindow<K> {
         self.pending.front().map(|(_, deadline)| *deadline)
     }
 
-    fn expire(&mut self, now: Instant) {
+    /// Drops requests past their deadline and returns how many were dropped.
+    fn expire(&mut self, now: Instant) -> usize {
+        self.expire_keys(now).len()
+    }
+
+    /// Drops requests past their deadline and returns their keys.
+    fn expire_keys(&mut self, now: Instant) -> Vec<K> {
+        let mut expired = Vec::new();
         while self.deadline().is_some_and(|deadline| deadline <= now) {
-            self.pending.pop_front();
+            if let Some((key, _)) = self.pending.pop_front() {
+                expired.push(key);
+            }
         }
+        expired
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_peer(
     peer_addr: SocketAddr,
     config: Config,
@@ -131,13 +143,15 @@ pub async fn run_peer(
     tx_cache: Option<TxCache>,
     tx_feed: Option<TxFeedClient>,
     crawler: Crawler,
+    observer: Option<crate::observation::Observer>,
 ) -> Result<()> {
     let peer = peer_addr.to_string();
     let relay = relay.map(|relay| relay.logging_block_events(events.clone(), &peer));
     // This is a capability filter, not consensus validation. Apply it for the
     // whole connection lifetime, before/at/after activation and across reorgs.
     // Peer-reported heights never control admission; only configuration does.
-    let minimum_version = if relay.is_some() || tx_feed.is_some() {
+    // The observer decodes current-era payloads, so it needs the same floor.
+    let minimum_version = if relay.is_some() || tx_feed.is_some() || observer.is_some() {
         config.forwarding_min_peer_version()
     } else {
         MIN_ACCEPTABLE_REMOTE_VERSION
@@ -152,9 +166,10 @@ pub async fn run_peer(
     info!(%peer, "connected to Zcash P2P peer");
 
     let (mut reader, mut writer) = stream.into_split();
-    let version = version_payload(peer_addr, config.network);
+    let version = version_payload(peer_addr, config.network, observer.is_some());
     write_message(&mut writer, config.network, "version", &version).await?;
 
+    let mut _active_observation_peer = None;
     let mut saw_verack = false;
     let mut sent_verack = false;
     let handshake_started = Instant::now();
@@ -165,8 +180,31 @@ pub async fn run_peer(
     let mut blocks = RequestWindow::new(limits.blocks, limits.recent_entries, limits.timeout);
     let mut transactions =
         RequestWindow::new(limits.transactions, limits.recent_entries, limits.timeout);
+    // Observation budgets and delivery accounting for this connection.
+    use crate::observation::{
+        BLOCK_ANNOUNCEMENT_BURST, BLOCK_ANNOUNCEMENT_PERIOD, TX_ANNOUNCEMENT_BURST,
+        TX_ANNOUNCEMENT_PERIOD, TokenBucket,
+    };
+    let mut block_announcements = TokenBucket::new(
+        BLOCK_ANNOUNCEMENT_BURST,
+        BLOCK_ANNOUNCEMENT_PERIOD,
+        handshake_started,
+    );
+    let mut tx_announcements = TokenBucket::new(
+        TX_ANNOUNCEMENT_BURST,
+        TX_ANNOUNCEMENT_PERIOD,
+        handshake_started,
+    );
+    // Requested blocks that expired undelivered. Reset by any validated
+    // delivery of a requested block, including a late one (see `late_blocks`).
+    let mut undelivered_blocks = 0usize;
+    let mut late_blocks = RecentInventory::new(64);
 
     loop {
+        // Checked once per message, after it was processed, so a slow large
+        // block is matched before its own expiry counts. A silent peer is
+        // dropped by the read timeout instead.
+        refuse_undelivering_observed_peer(observer.is_some(), undelivered_blocks)?;
         // Keep the same read future alive across expiry. Cancelling a partial
         // frame read on each deadline would desynchronise the wire decoder.
         let read = timeout(
@@ -190,13 +228,21 @@ pub async fn run_peer(
                     }
                 } => {
                     let now = Instant::now();
-                    blocks.expire(now);
+                    for expired in blocks.expire_keys(now) {
+                        undelivered_blocks += 1;
+                        late_blocks.insert(expired);
+                    }
                     transactions.expire(now);
                 }
             }
         };
+        // Observation time is captured before any parsing or cache work.
+        let observed = observer.as_ref().map(|o| o.capture());
         let now = Instant::now();
-        blocks.expire(now);
+        for expired in blocks.expire_keys(now) {
+            undelivered_blocks += 1;
+            late_blocks.insert(expired);
+        }
         transactions.expire(now);
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
@@ -237,6 +283,7 @@ pub async fn run_peer(
                     return Err(IngressError::Wire("duplicate verack message".to_string()));
                 }
                 saw_verack = true;
+                _active_observation_peer = observer.as_ref().map(|o| o.peer_active());
                 events.p2p_handshake_complete(&peer)?;
                 events.p2p_handshake_timing(&peer, handshake_started.elapsed().as_millis())?;
                 let nonce = nonce();
@@ -269,11 +316,31 @@ pub async fn run_peer(
             }
             "inv" => {
                 let invs = parse_inventory(&msg.payload)?;
+                // Announcements are observed before fetch selection, but bounded
+                // per connection: blocks once each (after dedup), and both kinds
+                // through token buckets that span messages.
+                let mut capped = 0u64;
                 let mut block_requests = Vec::new();
                 let mut tx_requests = Vec::new();
                 for inv in invs {
+                    if inv.is_transaction()
+                        && let (Some(observer), Some(stamp)) = (&observer, observed)
+                    {
+                        if tx_announcements.take(now) {
+                            observer.inventory(&inv, stamp);
+                        } else {
+                            capped += 1;
+                        }
+                    }
                     if inv.is_block() {
                         if seen_inv.insert(inv.hash) {
+                            if let (Some(observer), Some(stamp)) = (&observer, observed) {
+                                if block_announcements.take(now) {
+                                    observer.inventory(&inv, stamp);
+                                } else {
+                                    capped += 1;
+                                }
+                            }
                             let display = inventory_hash_to_display(&inv.hash);
                             events.p2p_block_inv(&peer, &display)?;
                             // Announcement rank remains independent of request
@@ -295,6 +362,11 @@ pub async fn run_peer(
                     {
                         events.p2p_tx_inv(&peer, key.kind(), &key.display_hash())?;
                     }
+                }
+                if capped > 0
+                    && let Some(observer) = &observer
+                {
+                    observer.inventory_capped(capped);
                 }
                 if !block_requests.is_empty() {
                     let requested_hashes: Vec<String> = block_requests
@@ -322,19 +394,45 @@ pub async fn run_peer(
             "notfound" => {
                 for inv in parse_inventory(&msg.payload)? {
                     if inv.is_block() {
-                        blocks.remove(inv.hash);
+                        if blocks.remove(inv.hash).is_some() {
+                            undelivered_blocks += 1;
+                        }
                     } else if let Some(key) = TxInventoryKey::from_inventory(&inv) {
                         transactions.remove(key);
                     }
                 }
             }
             "block" => {
-                let display = received_block_display_hash(&mut blocks, &msg.payload)?;
+                // Observer mode: a header without valid proof of work is junk.
+                // It is not observed and counts as an undelivered block.
+                let header_valid = observer
+                    .as_ref()
+                    .map(|o| o.validate_block_header(&msg.payload));
+                if header_valid == Some(false) {
+                    if let Ok(hash) = inventory_hash_from_header(&msg.payload) {
+                        blocks.remove(hash);
+                    }
+                    undelivered_blocks += 1;
+                    continue;
+                }
+                let late = header_valid.is_some()
+                    && inventory_hash_from_header(&msg.payload)
+                        .is_ok_and(|hash| late_blocks.keys.contains(&hash));
+                let (display, solicited) = received_block(&mut blocks, &msg.payload)?;
+                let solicited = solicited || late;
+                if header_valid == Some(true) && solicited {
+                    undelivered_blocks = 0;
+                }
                 let consensus_hash = msg
                     .payload
                     .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
                     .map(sovright_relay::consensus_block_hash_display)
                     .unwrap_or_default();
+                if let (Some(observer), Some(stamp)) = (&observer, observed)
+                    && !consensus_hash.is_empty()
+                {
+                    observer.block_payload(&consensus_hash, solicited, stamp);
+                }
                 // Nothing here needs parsing, so the receipt is on record before
                 // anything can wait, and survives whatever happens to the forward.
                 events.p2p_block_received(&peer, &display, &consensus_hash, msg.payload.len())?;
@@ -385,7 +483,18 @@ pub async fn run_peer(
                 }
             }
             "tx" => {
-                if let Some(wtxid) = wtxid_for_received_tx(&mut transactions, &msg.payload) {
+                let received = received_tx(&mut transactions, &msg.payload);
+                if let (Some(observer), Some(stamp), Some(received)) =
+                    (&observer, observed, &received)
+                {
+                    observer.tx_payload(
+                        &received.metadata,
+                        msg.payload.len(),
+                        received.solicited,
+                        stamp,
+                    );
+                }
+                if let Some(wtxid) = received.map(|r| r.wtxid) {
                     let key = TxInventoryKey::from_wtxid(&wtxid);
                     if let Some(cache) = &tx_cache {
                         let outcome = cache.insert(wtxid, msg.payload.clone());
@@ -531,16 +640,33 @@ fn pong_nonce(payload: &[u8]) -> Option<u64> {
 /// wtxid) and for anything malformed. Those are NOT cached: a guessed key is
 /// worse than a cache miss, which merely costs a getblocktxn round trip. The
 /// sidecar's own mempool sync skips pre-v5 for the same reason.
+struct ReceivedTx {
+    wtxid: WtxId,
+    metadata: crate::wtxid::TxMetadata,
+    /// The payload completed an outstanding request.
+    solicited: bool,
+}
+
+#[cfg(test)]
 fn wtxid_for_received_tx(
     pending_tx_responses: &mut RequestWindow<TxInventoryKey>,
     payload: &[u8],
 ) -> Option<WtxId> {
-    let derived = wtxid_from_tx_bytes(payload, TX_READER_BRANCH_HINT)?;
+    received_tx(pending_tx_responses, payload).map(|r| r.wtxid)
+}
+
+/// Parses a received transaction once and completes any matching request.
+fn received_tx(
+    pending_tx_responses: &mut RequestWindow<TxInventoryKey>,
+    payload: &[u8],
+) -> Option<ReceivedTx> {
+    let (derived, metadata) = crate::wtxid::parse_tx_bytes(payload)?;
 
     let wtx_match = pending_tx_responses.complete(TxInventoryKey::from_wtxid(&derived));
     // MSG_TX names only the txid. The payload-derived wtxid still supplies the
     // cache identity, but also satisfies a request made using that older form.
     let tx_match = pending_tx_responses.complete(TxInventoryKey::tx(*derived.txid().as_bytes()));
+    let solicited = wtx_match.or(tx_match).is_some();
     if let Some(index) = wtx_match.or(tx_match) {
         if index != 0 {
             warn!(
@@ -555,38 +681,69 @@ fn wtxid_for_received_tx(
         warn!("Received transaction matching no pending request");
     }
 
-    Some(derived)
+    Some(ReceivedTx {
+        wtxid: derived,
+        metadata,
+        solicited,
+    })
 }
 
+#[cfg(test)]
 fn received_block_display_hash(
     pending_block_responses: &mut RequestWindow<[u8; 32]>,
     block_payload: &[u8],
 ) -> Result<String> {
-    let actual_inventory_hash = raw_hash_from_header(block_payload)?;
-    let actual_hash = inventory_hash_to_display(&actual_inventory_hash);
-    if let Some(index) = pending_block_responses.complete(actual_inventory_hash) {
+    received_block(pending_block_responses, block_payload).map(|(display, _)| display)
+}
+
+/// Returns the block's display hash and whether it completed a request.
+fn received_block(
+    pending_block_responses: &mut RequestWindow<[u8; 32]>,
+    block_payload: &[u8],
+) -> Result<(String, bool)> {
+    // Requests are keyed by the consensus hash peers announce in `inv`. The
+    // returned display hash stays the relay object hash, which the block
+    // events carry in their `hash` field.
+    let inventory_hash = inventory_hash_from_header(block_payload)?;
+    let event_hash = inventory_hash_to_display(&raw_hash_from_header(block_payload)?);
+    let consensus_hash = inventory_hash_to_display(&inventory_hash);
+    if let Some(index) = pending_block_responses.complete(inventory_hash) {
         if index != 0 {
             warn!(
-                actual_hash,
+                consensus_hash,
                 pending_index = index,
                 "Received requested block out of order"
             );
         }
-        return Ok(actual_hash);
+        return Ok((event_hash, true));
     }
 
     if let Some((hash, _)) = pending_block_responses.pending.front() {
         let requested_hash = inventory_hash_to_display(hash);
         warn!(
             requested_hash,
-            actual_hash, "Received block hash did not match any pending requested inventory hash"
+            consensus_hash,
+            "Received block hash did not match any pending requested inventory hash"
         );
     }
 
-    Ok(actual_hash)
+    Ok((event_hash, false))
 }
 
-fn version_payload(peer_addr: SocketAddr, network: Network) -> Vec<u8> {
+/// An observer drops a peer that announces blocks it then never delivers
+/// (expired or notfound requests): each such hash would hold the collector in
+/// an unresolved chain transition. Relay-only ingress keeps its old behaviour.
+fn refuse_undelivering_observed_peer(observing: bool, undelivered: usize) -> Result<()> {
+    if observing && undelivered >= crate::observation::MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS {
+        return Err(IngressError::Wire(format!(
+            "peer announced {undelivered} blocks it never delivered"
+        )));
+    }
+    Ok(())
+}
+
+/// `relay` is the BIP37 transaction-relay flag; observation needs tx gossip.
+fn version_payload(peer_addr: SocketAddr, network: Network, relay: bool) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&network.protocol_version().to_le_bytes());
     out.extend_from_slice(&0u64.to_le_bytes());
@@ -599,7 +756,7 @@ fn version_payload(peer_addr: SocketAddr, network: Network) -> Vec<u8> {
     out.extend_from_slice(&nonce().to_le_bytes());
     encode_var_str(USER_AGENT, &mut out);
     out.extend_from_slice(&0i32.to_le_bytes());
-    out.push(0);
+    out.push(u8::from(relay));
     out
 }
 
@@ -680,7 +837,7 @@ mod tests {
     // the first i32 of the version payload to decide whether to disconnect us.
     #[test]
     fn outgoing_version_satisfies_nu7_mainnet_peer_floor() {
-        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet, false);
         let advertised = i32::from_le_bytes(payload[..4].try_into().unwrap());
         assert_eq!(advertised, 170_190);
         assert_eq!(
@@ -692,14 +849,561 @@ mod tests {
 
     #[test]
     fn testnet_advertises_its_own_version_with_unchanged_services() {
-        let payload = version_payload("127.0.0.1:18233".parse().unwrap(), Network::Testnet);
+        let payload = version_payload("127.0.0.1:18233".parse().unwrap(), Network::Testnet, false);
         assert_eq!(i32::from_le_bytes(payload[..4].try_into().unwrap()), 170180);
         assert_eq!(u64::from_le_bytes(payload[4..12].try_into().unwrap()), 0);
     }
 
     #[test]
+    fn observation_sets_transaction_relay_flag_without_changing_default() {
+        let peer = "127.0.0.1:8233".parse().unwrap();
+        assert_eq!(
+            *version_payload(peer, Network::Mainnet, false)
+                .last()
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            *version_payload(peer, Network::Mainnet, true)
+                .last()
+                .unwrap(),
+            1
+        );
+    }
+
+    fn observation_config(path: std::path::PathBuf) -> crate::observation::ObservationConfig {
+        crate::observation::ObservationConfig {
+            path,
+            sensor_id: "peer-test".into(),
+            network: Network::Mainnet,
+            queue_capacity: 4096,
+            max_bytes: 1 << 22,
+            max_files: 2,
+            heartbeat_interval: Duration::from_millis(20),
+            payload_stale_after: Duration::from_secs(600),
+            tx_payload_stale_after: Duration::from_secs(1800),
+            require_tx_payloads: false,
+        }
+    }
+
+    /// Starts `run_peer` with an observer against a scripted remote that
+    /// completes the handshake advertising `remote_version`.
+    async fn observed_peer(
+        name: &str,
+        remote_version: i32,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::net::TcpStream,
+    ) {
+        observed_peer_with(name, remote_version, peer_test_config()).await
+    }
+
+    async fn observed_peer_with(
+        name: &str,
+        remote_version: i32,
+        config: Config,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::net::TcpStream,
+    ) {
+        use crate::observation::Observer;
+        let path = temp_log_path(name);
+        let observer = Observer::start(observation_config(path.clone())).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let crawler = Crawler::new(&config, [address]);
+        let task = tokio::spawn(run_peer(
+            address,
+            config,
+            EventSink::new(None).unwrap(),
+            None,
+            None,
+            None,
+            crawler,
+            Some(observer),
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let version = read_message(&mut stream, Network::Mainnet).await.unwrap();
+        assert_eq!(*version.payload.last().unwrap(), 1, "relay flag set");
+        let mut remote = version_payload(address, Network::Mainnet, false);
+        remote[..4].copy_from_slice(&remote_version.to_le_bytes());
+        write_message(&mut stream, Network::Mainnet, "version", &remote)
+            .await
+            .unwrap();
+        write_message(&mut stream, Network::Mainnet, "verack", &[])
+            .await
+            .unwrap();
+        (path, task, stream)
+    }
+
+    fn observed_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect()
+    }
+
+    async fn wait_for_events(
+        path: &std::path::Path,
+        done: impl Fn(&[serde_json::Value]) -> bool,
+    ) -> Vec<serde_json::Value> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let events = observed_events(path);
+                if done(&events) {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("expected observation events")
+    }
+
+    #[tokio::test]
+    async fn standalone_observer_refuses_pre_nu7_peers() {
+        // Observation decodes NU7 payloads; a pre-NU7 peer cannot supply them.
+        let (path, task, _stream) = observed_peer("observer-floor", 170_160).await;
+        let error = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("pre-NU7 peer must be refused promptly")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too old"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    /// Restored from e337adc: announcements are recorded even when the
+    /// transaction cache and feed are both off (no tx getdata is ever sent).
+    #[tokio::test]
+    async fn observer_records_inventory_when_transaction_fetch_is_disabled() {
+        let (path, task, mut stream) = observed_peer("inv-no-fetch", 170_190).await;
+        let inv = encode_inventory(&[Inventory {
+            inv_type: crate::wire::MSG_TX,
+            hash: [0x37; 32],
+            auth_digest: None,
+        }]);
+        write_message(&mut stream, Network::Mainnet, "inv", &inv)
+            .await
+            .unwrap();
+        let events = wait_for_events(&path, |events| {
+            events.iter().any(|e| e["event"] == "tx_seen")
+        })
+        .await;
+        task.abort();
+        let seen = events.iter().find(|e| e["event"] == "tx_seen").unwrap();
+        assert_eq!(seen["stage"], "announcement");
+        assert_eq!(seen["txid"], "37".repeat(32));
+        let _ = fs::remove_file(path);
+    }
+
+    fn numbered(inv_type: u32, i: u32, tag: u8) -> Inventory {
+        let mut hash = [0u8; 32];
+        hash[..4].copy_from_slice(&i.to_le_bytes());
+        hash[31] = tag;
+        Inventory {
+            inv_type,
+            hash,
+            auth_digest: None,
+        }
+    }
+
+    fn announcement_count(events: &[serde_json::Value], kind: &str) -> usize {
+        events
+            .iter()
+            .filter(|e| e["event"] == kind && e["stage"] == "announcement")
+            .count()
+    }
+
+    #[tokio::test]
+    async fn announcements_are_deduplicated_and_rate_limited_per_connection() {
+        // One large inv must not flood the collector with unknown block hashes
+        // (it treats them as an unresolved chain transition) or the queue.
+        let (path, task, mut stream) = observed_peer("inv-cap", 170_190).await;
+        // 20 unique blocks, each announced twice, plus 300 transactions.
+        let mut entries: Vec<Inventory> = (0..20)
+            .map(|i| numbered(crate::wire::MSG_BLOCK, i, 0xb1))
+            .collect();
+        entries.extend((0..20).map(|i| numbered(crate::wire::MSG_BLOCK, i, 0xb1)));
+        entries.extend((0..300).map(|i| numbered(crate::wire::MSG_TX, i, 0x7c)));
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&entries),
+        )
+        .await
+        .unwrap();
+        // A later message repeating a seen block adds nothing.
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&[numbered(crate::wire::MSG_BLOCK, 0, 0xb1)]),
+        )
+        .await
+        .unwrap();
+        let events = wait_for_events(&path, |events| {
+            events.iter().any(|e| {
+                e["event"] == "sensor_heartbeat" && e["capped_inventory"].as_u64() == Some(18 + 44)
+            })
+        })
+        .await;
+        task.abort();
+        assert_eq!(
+            announcement_count(&events, "block_seen"),
+            crate::observation::BLOCK_ANNOUNCEMENT_BURST as usize
+        );
+        assert_eq!(
+            announcement_count(&events, "tx_seen"),
+            crate::observation::TX_ANNOUNCEMENT_BURST as usize
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e["event"] != "sensor_heartbeat" || e["dropped_events"] == 0)
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_trickle_of_block_announcements_is_rate_limited_across_messages() {
+        // Small invs used to bypass the per-message cap entirely.
+        let (path, task, mut stream) = observed_peer("inv-trickle", 170_190).await;
+        for i in 0..10 {
+            let inv = encode_inventory(&[numbered(crate::wire::MSG_BLOCK, i, 0xb2)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+        }
+        for i in 0..600 {
+            let inv = encode_inventory(&[numbered(crate::wire::MSG_TX, i, 0x7d)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+        }
+        let events = wait_for_events(&path, |events| {
+            events.iter().any(|e| {
+                e["event"] == "sensor_heartbeat"
+                    && e["capped_inventory"].as_u64().is_some_and(|c| c >= 8 + 300)
+            })
+        })
+        .await;
+        task.abort();
+        assert_eq!(
+            announcement_count(&events, "block_seen"),
+            crate::observation::BLOCK_ANNOUNCEMENT_BURST as usize
+        );
+        assert!(announcement_count(&events, "tx_seen") < 300);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_peer_whose_announced_blocks_never_arrive_is_disconnected() {
+        let mut config = peer_test_config();
+        config.inventory_limits.timeout = Duration::from_millis(50);
+        let (path, task, mut stream) = observed_peer_with("undelivered", 170_190, config).await;
+        for i in 0..crate::observation::MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS as u32 {
+            let inv = encode_inventory(&[numbered(crate::wire::MSG_BLOCK, i, 0xb3)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+        }
+        // Never deliver. The check runs after the next message (a silent
+        // peer is dropped by the 90 s read timeout instead).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write_message(&mut stream, Network::Mainnet, "ping", &7u64.to_le_bytes())
+            .await
+            .unwrap();
+        let error = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("an undelivering peer must be dropped")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never delivered"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    fn nu7_block() -> Vec<u8> {
+        hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap()
+    }
+
+    /// A 1487-byte header that hashes to whatever it hashes to, with a junk
+    /// Equihash solution: free to make, so it must never count as a block.
+    fn junk_header(tag: u8) -> Vec<u8> {
+        let mut header = nu7_block()[..sovright_relay::ZCASH_FULL_HEADER_SIZE].to_vec();
+        header[200] ^= tag;
+        header
+    }
+
+    fn block_inventory(header: &[u8]) -> Inventory {
+        Inventory {
+            inv_type: crate::wire::MSG_BLOCK,
+            hash: sovright_relay::consensus_block_hash(
+                &header[..sovright_relay::ZCASH_FULL_HEADER_SIZE],
+            ),
+            auth_digest: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn junk_block_deliveries_are_not_observed_and_count_as_undelivered() {
+        let (path, task, mut stream) = observed_peer("junk-block", 170_190).await;
+        for tag in [1u8, 2] {
+            let junk = junk_header(tag);
+            let inv = encode_inventory(&[block_inventory(&junk)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+            write_message(&mut stream, Network::Mainnet, "block", &junk)
+                .await
+                .unwrap();
+        }
+        let error = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("a peer delivering junk headers must be dropped")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never delivered"), "{error}");
+        let events = observed_events(&path);
+        assert!(
+            events
+                .iter()
+                .all(|e| !(e["event"] == "block_seen" && e["stage"] == "payload")),
+            "junk headers must not reach the collector"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_valid_delivery_even_late_resets_the_undelivered_count() {
+        let mut config = peer_test_config();
+        config.inventory_limits.timeout = Duration::from_millis(50);
+        let (path, task, mut stream) = observed_peer_with("late-block", 170_190, config).await;
+        let ping = 7u64.to_le_bytes();
+        // One undelivered fake, then a real block announced and delivered after
+        // its request expired (a slow large block), then another fake.
+        let fake = |i| encode_inventory(&[numbered(crate::wire::MSG_BLOCK, i, 0xb5)]);
+        write_message(&mut stream, Network::Mainnet, "inv", &fake(0))
+            .await
+            .unwrap();
+        let block = nu7_block();
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&[block_inventory(&block)]),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write_message(&mut stream, Network::Mainnet, "block", &block)
+            .await
+            .unwrap();
+        write_message(&mut stream, Network::Mainnet, "inv", &fake(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write_message(&mut stream, Network::Mainnet, "ping", &ping)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "an honest peer with a late block stays connected"
+        );
+        task.abort();
+        let events = observed_events(&path);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "block_seen" && e["stage"] == "payload")
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn notfound_for_announced_blocks_counts_as_undelivered() {
+        let (path, task, mut stream) = observed_peer("notfound", 170_190).await;
+        let blocks: Vec<Inventory> = (0..crate::observation::MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS
+            as u32)
+            .map(|i| numbered(crate::wire::MSG_BLOCK, i, 0xb4))
+            .collect();
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&blocks),
+        )
+        .await
+        .unwrap();
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "notfound",
+            &encode_inventory(&blocks),
+        )
+        .await
+        .unwrap();
+        let error = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("an undelivering peer must be dropped")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never delivered"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn block_requests_report_how_many_expired() {
+        let start = Instant::now();
+        let mut window: RequestWindow<[u8; 32]> =
+            RequestWindow::new(8, 8, Duration::from_millis(10));
+        assert!(window.admit([1; 32], start));
+        assert!(window.admit([2; 32], start));
+        assert_eq!(window.expire(start), 0);
+        assert_eq!(window.expire(start + Duration::from_millis(10)), 2);
+    }
+
+    /// A real NU7 block (public testnet activation block 4465026, branch
+    /// 0x77190ad9; provenance in tests/fixtures/NU7.md) and its transactions,
+    /// delivered by a peer, appear in the observation stream as payloads.
+    #[tokio::test]
+    async fn nu7_transactions_and_block_are_observed_as_payloads() {
+        use crate::observation::{ObservationConfig, Observer};
+        use crate::wire::{Inventory, MSG_TX, encode_inventory};
+        let block =
+            hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/testnet_nu7_4465026.json"))
+                .unwrap();
+        // 140-byte header, 3-byte-prefixed 1344-byte solution, 1-byte tx count.
+        let mut at = 140 + 3 + 1344 + 1;
+        let mut txs = Vec::new();
+        for m in meta["transactions"].as_array().unwrap() {
+            let size = m["size"].as_u64().unwrap() as usize;
+            txs.push(block[at..at + size].to_vec());
+            at += size;
+        }
+        assert_eq!(at, block.len());
+
+        let path = temp_log_path("nu7-observation");
+        let observer = Observer::start(ObservationConfig {
+            path: path.clone(),
+            sensor_id: "nu7-test".into(),
+            network: Network::Mainnet,
+            queue_capacity: 64,
+            max_bytes: 1 << 20,
+            max_files: 2,
+            heartbeat_interval: Duration::from_secs(3600),
+            payload_stale_after: Duration::from_secs(600),
+            tx_payload_stale_after: Duration::from_secs(1800),
+            require_tx_payloads: false,
+        })
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = peer_test_config();
+        let events = EventSink::new(None).unwrap();
+        let crawler = Crawler::new(&config, [address]);
+        let task = tokio::spawn(run_peer(
+            address,
+            config,
+            events,
+            None,
+            None,
+            None,
+            crawler,
+            Some(observer),
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let version = read_message(&mut stream, Network::Mainnet).await.unwrap();
+        assert_eq!(*version.payload.last().unwrap(), 1, "relay flag set");
+        let remote = version_payload(address, Network::Mainnet, false);
+        write_message(&mut stream, Network::Mainnet, "version", &remote)
+            .await
+            .unwrap();
+        write_message(&mut stream, Network::Mainnet, "verack", &[])
+            .await
+            .unwrap();
+        let mut txid = [0u8; 32];
+        hex::decode_to_slice(meta["transactions"][1]["txid"].as_str().unwrap(), &mut txid).unwrap();
+        txid.reverse();
+        let inv = encode_inventory(&[Inventory {
+            inv_type: MSG_TX,
+            hash: txid,
+            auth_digest: None,
+        }]);
+        write_message(&mut stream, Network::Mainnet, "inv", &inv)
+            .await
+            .unwrap();
+        for tx in &txs {
+            write_message(&mut stream, Network::Mainnet, "tx", tx)
+                .await
+                .unwrap();
+        }
+        write_message(&mut stream, Network::Mainnet, "block", &block)
+            .await
+            .unwrap();
+        let read_events = || -> Vec<serde_json::Value> {
+            fs::read_to_string(&path)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|s| serde_json::from_str(s).ok())
+                .collect()
+        };
+        let wanted = |events: &[serde_json::Value]| {
+            events.iter().filter(|e| e["stage"] == "payload").count() >= 3
+        };
+        timeout(Duration::from_secs(5), async {
+            while !wanted(&read_events()) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("NU7 payload observations must be written");
+        task.abort();
+        let events = read_events();
+        let payloads: Vec<_> = events
+            .iter()
+            .filter(|e| e["event"] == "tx_seen" && e["stage"] == "payload")
+            .collect();
+        assert_eq!(payloads.len(), 2);
+        for (i, want_version) in [(0usize, 6u64), (1, 5)] {
+            let m = &meta["transactions"][i];
+            let event = payloads
+                .iter()
+                .find(|e| e["txid"] == m["txid"])
+                .unwrap_or_else(|| panic!("tx {i} observed"));
+            assert_eq!(event["auth_digest"], m["authdigest"]);
+            assert_eq!(event["tx_version"], want_version);
+            assert_eq!(event["size_bytes"], m["size"]);
+            assert_eq!(event["network"], "mainnet");
+            assert_eq!(event["schema_version"], 1);
+        }
+        let announced = events
+            .iter()
+            .find(|e| e["event"] == "tx_seen" && e["stage"] == "announcement")
+            .expect("announcement observed");
+        assert_eq!(announced["txid"], meta["transactions"][1]["txid"]);
+        let block_seen = events
+            .iter()
+            .find(|e| e["event"] == "block_seen" && e["stage"] == "payload")
+            .expect("block payload observed");
+        assert_eq!(block_seen["block_hash"], meta["hash"]);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn version_payload_contains_user_agent() {
-        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        let payload = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet, false);
         assert!(
             payload
                 .windows(USER_AGENT.len())
@@ -739,7 +1443,7 @@ mod tests {
 
         let block_payload = vec![0u8; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let actual_display = display_hash_from_header(&block_payload).unwrap();
-        let actual_inventory = inventory_hash_from_display(&actual_display);
+        let actual_inventory = inventory_hash_from_header(&block_payload).unwrap();
         assert!(pending.admit(actual_inventory, Instant::now()));
 
         let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
@@ -747,6 +1451,49 @@ mod tests {
         assert_eq!(display, actual_display);
         assert_eq!(pending.pending.len(), 1);
         assert_eq!(pending.pending[0].0, [0x5c; 32]);
+    }
+
+    // A peer's `inv` names a block by its consensus hash (double-SHA256 of the
+    // header, internal byte order), and `getdata` echoes that hash. The block
+    // that arrives must complete that request. Uses a real mainnet header so
+    // the two hash functions cannot agree by construction.
+    #[test]
+    fn received_mainnet_block_completes_the_request_its_inv_announced() {
+        use zcash_pool_common::fixtures::{
+            MAINNET_BLOCK_3470793_HASH_DISPLAY, mainnet_serialized_header,
+        };
+        let block_payload = mainnet_serialized_header();
+        let inv_hash = inventory_hash_from_display(MAINNET_BLOCK_3470793_HASH_DISPLAY);
+        let mut pending = request_window([inv_hash]);
+
+        received_block_display_hash(&mut pending, &block_payload).unwrap();
+
+        assert!(
+            pending.pending.is_empty(),
+            "the delivered block must complete the request its inv announced"
+        );
+        assert!(pending.recent.keys.contains(&inv_hash));
+        assert!(
+            !pending.admit(inv_hash, Instant::now()),
+            "a re-announcement of a delivered block must not be fetched again"
+        );
+    }
+
+    // Event consumers join `p2p_block_received` to `p2p_relay_block_forwarded`
+    // on the `hash` field, so its value (the relay object hash) must not change.
+    #[test]
+    fn received_block_event_hash_stays_the_relay_object_hash() {
+        use zcash_pool_common::fixtures::{
+            MAINNET_BLOCK_3470793_HASH_DISPLAY, mainnet_serialized_header,
+        };
+        let block_payload = mainnet_serialized_header();
+        let inv_hash = inventory_hash_from_display(MAINNET_BLOCK_3470793_HASH_DISPLAY);
+        let mut pending = request_window([inv_hash]);
+
+        let display = received_block_display_hash(&mut pending, &block_payload).unwrap();
+
+        assert_eq!(display, display_hash_from_header(&block_payload).unwrap());
+        assert_ne!(display, MAINNET_BLOCK_3470793_HASH_DISPLAY);
     }
 
     #[test]
@@ -981,6 +1728,7 @@ mod tests {
             inventory_limits: Default::default(),
             event_log: None,
             metrics_textfile: None,
+            observation: None,
             relay_peers: Vec::new(),
             relay_bind_addr: "127.0.0.1:0".parse().unwrap(),
             relay_auth_key: None,
@@ -1080,6 +1828,7 @@ mod tests {
                 Some(cache.clone()),
                 tx_feed,
                 crawler,
+                None,
             ));
             let (mut stream, _) = timeout(Duration::from_secs(5), listener.accept())
                 .await
@@ -1090,7 +1839,7 @@ mod tests {
                 read_message(&mut stream, network).await.unwrap().command,
                 "version"
             );
-            let mut remote_payload = version_payload(address, network);
+            let mut remote_payload = version_payload(address, network, false);
             remote_payload[..4].copy_from_slice(&remote_version.to_le_bytes());
             write_message(&mut stream, network, "version", &remote_payload)
                 .await
@@ -1830,7 +2579,7 @@ mod tests {
         let events = EventSink::new(Some(log.clone())).unwrap();
         let crawler = Crawler::new(&config, [address]);
         let task = tokio::spawn(run_peer(
-            address, config, events, relay, None, tx_feed, crawler,
+            address, config, events, relay, None, tx_feed, crawler, None,
         ));
         let (mut stream, _) = listener.accept().await.unwrap();
         read_message(&mut stream, Network::Mainnet).await.unwrap();
@@ -1865,7 +2614,7 @@ mod tests {
         let mut config = peer_test_config();
         config.tx_feed_addr = Some("127.0.0.1:9".parse().unwrap());
         let mut peer = TestPeer::start("no-downgrade", config).await;
-        let mut old = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        let mut old = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet, false);
         old[..4].copy_from_slice(&170160i32.to_le_bytes());
         write_message(&mut peer.stream, Network::Mainnet, "version", &old)
             .await
@@ -1890,7 +2639,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwarding_rejects_pre_nu7_peer_even_before_activation() {
-        let mut version = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        let mut version =
+            version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet, false);
         version[..4].copy_from_slice(&170160i32.to_le_bytes());
         for use_relay in [false, true] {
             for claimed_height in [0i32, i32::MAX] {
@@ -1918,7 +2668,8 @@ mod tests {
 
     #[tokio::test]
     async fn forwarding_floor_override_still_rejects_peers_below_it() {
-        let mut version = version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet);
+        let mut version =
+            version_payload("127.0.0.1:8233".parse().unwrap(), Network::Mainnet, false);
         version[..4].copy_from_slice(&170_150i32.to_le_bytes());
         for use_relay in [false, true] {
             let mut config = peer_test_config();
@@ -2149,7 +2900,7 @@ mod tests {
         let payload = vec![0; sovright_relay::ZCASH_FULL_HEADER_SIZE];
         let block = Inventory {
             inv_type: crate::wire::MSG_BLOCK,
-            hash: raw_hash_from_header(&payload).unwrap(),
+            hash: inventory_hash_from_header(&payload).unwrap(),
             auth_digest: None,
         };
         let tx = TxInventoryKey::from_wtxid(&v6_wtxid()).to_inventory();

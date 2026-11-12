@@ -1,0 +1,31 @@
+name: GitHub Actions security (zizmor)
+
+# Runs zizmor (https://github.com/zizmorcore/zizmor) on our workflow files to
+# catch Actions supply-chain misconfigurations: broad `permissions:` blocks,
+# `persist-credentials: true` on checkout, template injection from untrusted
+# event payloads, unpinned actions, cache poisoning. Same setup as Argos and
+# librustzcash.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: ["**"]
+
+permissions: {}
+
+jobs:
+  zizmor:
+    name: Run zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # upload-sarif (used by zizmor-action) publishes results to the
+      # Security tab.
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6

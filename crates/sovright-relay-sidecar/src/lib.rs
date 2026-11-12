@@ -1,5 +1,7 @@
 //! Relay sidecar library - exposes modules for fuzzing and testing
 
+#![forbid(unsafe_code)]
+
 pub mod chain_view;
 pub mod compact;
 pub mod config;

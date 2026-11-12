@@ -3,6 +3,8 @@
 //! This crate implements compact block relay (BIP 152 adapted for Zcash)
 //! for bandwidth-efficient block propagation.
 
+#![forbid(unsafe_code)]
+
 pub mod builder;
 pub mod compact_block;
 pub mod error;

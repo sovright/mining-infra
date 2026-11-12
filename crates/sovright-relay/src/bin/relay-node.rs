@@ -1,3 +1,6 @@
+// The tests set auth-key env vars, which edition 2024 marks unsafe.
+// The shipped binary stays unsafe-free.
+#![cfg_attr(not(test), forbid(unsafe_code))]
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
