@@ -351,9 +351,13 @@ SOVRIGHT_P2P_TX_CACHE_ENABLED=true \
 RUST_LOG=info cargo run -p sovright-p2p-ingress --locked
 ```
 
-Observation mode sets the handshake transaction relay flag. Every transaction
-and block announcement is recorded before fetch selection, even when caching
-and transaction forwarding are disabled. Observation mode does not itself enable
+Observation mode sets the handshake transaction relay flag and, like the relay
+and tx-feed paths, refuses peers below the network's protocol version (170190 on
+mainnet). Announcements are recorded before fetch selection, even when caching
+and transaction forwarding are disabled. Block announcements are recorded once
+per connection, and each `inv` message contributes at most 16 block and 256
+transaction entries; skipped entries are counted in the heartbeat's
+`capped_inventory`. Observation mode does not itself enable
 transaction fetches: enable the existing transaction cache or feed to acquire
 payloads needed for forecasting. Existing per-inventory fetch limits still apply.
 
@@ -365,6 +369,7 @@ SOVRIGHT_P2P_OBSERVATION_MAX_BYTES=67108864
 SOVRIGHT_P2P_OBSERVATION_MAX_FILES=8
 SOVRIGHT_P2P_OBSERVATION_HEARTBEAT_MS=5000
 SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS=600000
+SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS=1800000
 ```
 
 `MAX_FILES` includes the current file; archives are `mainnet.jsonl.1` (newest)
@@ -374,7 +379,7 @@ existing files larger than the configured byte bound are discarded. Records are
 never split during rotation, and no record exceeds 4 MiB. Configuration rejects
 blank/control-character sensor IDs, zero bounds, excessive queue/file counts,
 and heartbeat intervals outside 1 ms through 1 hour, and payload stale windows
-outside 1 ms through 24 hours. File size is at least 4096
+(both) outside 1 ms through 24 hours. File size is at least 4096
 bytes. The worker uses a bounded channel and never waits for file I/O on peer
 tasks. Source sequence allocation and enqueue are serialized in a short critical
 section so concurrent peers and heartbeats preserve order.
@@ -391,13 +396,21 @@ This count is not ZIP-317 logical actions or a fee measurement. Malformed,
 trailing-byte and unsupported payloads produce no payload observation.
 
 Heartbeats report handshaken active peers, health, cumulative drops and
-`clock_uncertainty_ms:null`. `healthy` is false when the writer has failed or when
-no transaction or block payload has been decoded within
-`SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS` (default 10 minutes, 24 blocks at the
-25 s NU7 spacing; the window also applies from process start). Announcements
-alone do not count. Heartbeats also carry `payload_stale` and
-`last_payload_age_ms`. A stale sensor keeps writing every event; only a writer
-failure stops the stream. Clock quality is unknown, so consumers must disable
+`clock_uncertainty_ms:null`. `healthy` is false when:
+
+- the writer has failed;
+- no requested transaction or block payload has arrived within
+  `SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS` (default 10 minutes, 24 blocks at
+  the 25 s NU7 spacing), including before the first one after start; or
+- transaction fetch is enabled (cache or feed) and no requested transaction has
+  decoded within `SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS` (default 30
+  minutes), so arriving blocks cannot mask broken transaction decoding.
+
+Announcements and unsolicited payloads are recorded but do not refresh health.
+Heartbeats also carry `payload_stale`, `last_payload_age_ms`, `tx_payload_stale`
+and `last_tx_payload_age_ms` (ages are null until the first payload). A stale
+sensor keeps writing every event; only a writer failure stops the stream. The
+last eighth of the queue (at most 64 slots) is reserved for heartbeats. Clock quality is unknown, so consumers must disable
 cross-sensor source-time spread. A heartbeat alone does not establish gossip
 coverage. Queue overflow increments drop totals and leaves detectable sequence
 gaps. Writer errors stop the observation worker, mark it unhealthy and emit an
