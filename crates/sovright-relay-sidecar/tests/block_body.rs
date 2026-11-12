@@ -1262,3 +1262,413 @@ async fn an_unanswered_zebra_call_ends_at_the_rpc_timeout() {
 fn the_real_client_is_bounded_at_thirty_seconds() {
     assert_eq!(ZEBRA_RPC_REQUEST_TIMEOUT, Duration::from_secs(30));
 }
+
+// ---------------------------------------------------------------------------
+// #130 PR B characterization. A `known_gap_` test pins what the code does today:
+// it passes because the gap is open, and is not a behaviour to preserve.
+// ---------------------------------------------------------------------------
+
+/// Block 3470793 with a byte of transaction 2 changed where no txid covers it, so
+/// every txid and the merkle root hold and the strict reader cannot tell it from
+/// the genuine block. `Zebra` above refuses it only because the bytes differ: that
+/// stands in for a refusal and says nothing about what a node would decide.
+fn transactions_the_stand_in_refuses() -> Vec<Vec<u8>> {
+    let header = fixtures::mainnet_serialized_header();
+    let genuine = fixtures::mainnet_transactions();
+    let mut txs = genuine.clone();
+    txs[2][70] ^= 0x01;
+    assert_ne!(txs[2], genuine[2]);
+    assert_eq!(
+        sovright_relay::txid_from_tx_bytes(&txs[2]),
+        sovright_relay::txid_from_tx_bytes(&genuine[2]),
+        "the change must leave the txid alone"
+    );
+    assert_eq!(raw_block(&header, &genuine), fixtures::mainnet_raw_block());
+    assert_eq!(
+        sovright_relay::validate_block_body(&raw_block(&header, &txs)),
+        Ok(txs.len()),
+        "the first body must pass the strict reader, or this is not the case under test"
+    );
+    txs
+}
+
+fn assert_refused_by_the_stand_in(outcome: Result<SubmissionOutcome, RelayBlockError>) {
+    assert!(
+        matches!(outcome, Err(RelayBlockError::SubmitRejected(..))),
+        "expected the stand-in's refusal, got {outcome:?}"
+    );
+}
+
+/// On the competing-body gate, a body Zebra refuses leaves the block open, so the real one
+/// still gets its turn.
+#[tokio::test]
+async fn a_refused_raw_body_leaves_the_gate_open_for_the_real_block() {
+    let mode = SubmitBlockMode::Live;
+    let look_up = || async { Some(parent()) };
+    let hash = Some(block_hash());
+    let header = fixtures::mainnet_serialized_header();
+    let refused = raw_block(&header, &transactions_the_stand_in_refuses());
+    let real = fixtures::mainnet_raw_block();
+
+    let zebra = Zebra::new();
+    let gated = competing_gate();
+    let first = validate_then_gate_raw_block(&zebra, &refused, hash, mode, &gated, look_up).await;
+    assert_refused_by_the_stand_in(first);
+    assert_eq!(zebra.calls(), 1);
+
+    let second = validate_then_gate_raw_block(&zebra, &real, hash, mode, &gated, look_up).await;
+    assert_submitted(second);
+    assert_eq!(zebra.calls(), 2);
+
+    // Zebra has it now, so that closes the block, for this body and any other.
+    let third = validate_then_gate_raw_block(&zebra, &refused, hash, mode, &gated, look_up).await;
+    assert_gate_rejected(third, RejectReason::DuplicateSubmit);
+    assert_eq!(zebra.calls(), 2);
+}
+
+#[tokio::test]
+async fn a_refused_compact_body_leaves_the_gate_open_for_the_real_block() {
+    let mode = SubmitBlockMode::Live;
+    let look_up = || async { Some(parent()) };
+    let refused = compact(&transactions_the_stand_in_refuses());
+    let real = compact(&fixtures::mainnet_transactions());
+
+    let zebra = Zebra::new();
+    let gated = competing_gate();
+    let first = validate_then_gate_compact_block(&zebra, &refused, mode, &gated, look_up).await;
+    assert_refused_by_the_stand_in(first);
+    assert_eq!(zebra.calls(), 1);
+
+    let second = validate_then_gate_compact_block(&zebra, &real, mode, &gated, look_up).await;
+    assert_submitted(second);
+    assert_eq!(zebra.calls(), 2);
+}
+
+/// The legacy gate, as it always was with the #130 switches off: the first body to pass the
+/// gate marks the block, so after a refused body the real one stops at the gate. This is the
+/// gap #130 is about, kept here so the legacy path is shown unchanged.
+#[tokio::test]
+async fn the_legacy_gate_still_lets_a_refused_body_close_the_block() {
+    let mode = SubmitBlockMode::Live;
+    let look_up = || async { Some(parent()) };
+    let hash = Some(block_hash());
+    let header = fixtures::mainnet_serialized_header();
+    let refused = raw_block(&header, &transactions_the_stand_in_refuses());
+    let real = fixtures::mainnet_raw_block();
+
+    let zebra = Zebra::new();
+    let gated = tokio::sync::Mutex::new(gate());
+    let first = validate_then_gate_raw_block(&zebra, &refused, hash, mode, &gated, look_up).await;
+    assert_refused_by_the_stand_in(first);
+
+    let second = validate_then_gate_raw_block(&zebra, &real, hash, mode, &gated, look_up).await;
+    assert_gate_rejected(second, RejectReason::DuplicateSubmit);
+    assert_eq!(zebra.calls(), 1);
+}
+
+/// With the gate off the sidecar builds no gate at all, so nothing was recorded.
+#[tokio::test]
+async fn gate_off_a_refused_raw_body_does_not_stop_the_real_block() {
+    let mode = SubmitBlockMode::Live;
+    let hash = Some(block_hash());
+    let header = fixtures::mainnet_serialized_header();
+    let refused = raw_block(&header, &transactions_the_stand_in_refuses());
+
+    let zebra = Zebra::new();
+    let first = handle_relay_raw_block(&zebra, &refused, hash, mode).await;
+    assert_refused_by_the_stand_in(first);
+    assert_eq!(zebra.calls(), 1);
+
+    let real = fixtures::mainnet_raw_block();
+    assert_submitted(handle_relay_raw_block(&zebra, &real, hash, mode).await);
+    assert_eq!(zebra.calls(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// #130 PR B: the gate on the real submit path. Only Zebra's answer closes a block, and
+// the gate lock is not held while Zebra thinks. The stand-ins here answer as they are
+// told to, which says nothing about what a node would decide.
+// ---------------------------------------------------------------------------
+
+/// Another body of the real header that the strict reader passes, told apart by `mark`.
+fn strict_body(mark: u8) -> Vec<u8> {
+    let header = fixtures::mainnet_serialized_header();
+    let mut txs = fixtures::mainnet_transactions();
+    txs[2][70] ^= mark;
+    let body = raw_block(&header, &txs);
+    assert_eq!(
+        sovright_relay::validate_block_body(&body),
+        Ok(txs.len()),
+        "the strict reader must pass it, or this is not the case under test"
+    );
+    body
+}
+
+/// Every call waits for a permit.
+struct PausedZebra {
+    entered: AtomicUsize,
+    permits: tokio::sync::Semaphore,
+}
+
+impl PausedZebra {
+    fn new() -> Self {
+        Self {
+            entered: AtomicUsize::new(0),
+            permits: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn calls_reach(&self, count: usize) {
+        while self.entered.load(Ordering::SeqCst) < count {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+impl SubmitBlock for PausedZebra {
+    fn submit_block<'a>(&'a self, _block_hex: &'a str) -> SubmitFuture<'a> {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async move {
+            self.permits.acquire().await.expect("never closed").forget();
+            Ok(None)
+        })
+    }
+}
+
+/// Refuses every copy, and has the block.
+struct LosingRaceZebra;
+
+impl SubmitBlock for LosingRaceZebra {
+    fn submit_block<'a>(&'a self, _block_hex: &'a str) -> SubmitFuture<'a> {
+        Box::pin(async move { Ok(Some("rejected".to_string())) })
+    }
+
+    fn block_known<'a>(
+        &'a self,
+        _block_hash_hex: &'a str,
+    ) -> sovright_relay_sidecar::submit::BlockKnownFuture<'a> {
+        Box::pin(async move { Some(true) })
+    }
+}
+
+fn gate_with(bodies: usize) -> tokio::sync::Mutex<SubmitGate<View>> {
+    tokio::sync::Mutex::new(SubmitGate::new(
+        GateConfig {
+            enabled: true,
+            competing_bodies: true,
+            strict_bodies_per_block: bodies,
+            ..GateConfig::default()
+        },
+        View,
+    ))
+}
+
+/// The #130 competing-body gate, as the bound raw path runs it.
+fn competing_gate() -> tokio::sync::Mutex<SubmitGate<View>> {
+    gate_with(sovright_relay_sidecar::submit_gate::DEFAULT_STRICT_BODIES_PER_BLOCK)
+}
+
+const LIVE: SubmitBlockMode = SubmitBlockMode::Live;
+
+/// Two bodies of one block at Zebra at once. With the gate held through the call the
+/// second would never get there, and this would time out.
+#[tokio::test]
+async fn a_body_at_zebra_stops_no_other_body() {
+    let (zebra, gated) = (PausedZebra::new(), competing_gate());
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let (real, other) = (fixtures::mainnet_raw_block(), strict_body(1));
+
+    let both = async {
+        tokio::join!(
+            validate_then_gate_raw_block(&zebra, &other, hash, LIVE, &gated, look_up),
+            validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up),
+            async {
+                zebra.calls_reach(2).await;
+                zebra.permits.add_permits(2);
+            },
+        )
+    };
+    let (first, second, ()) = timeout(Duration::from_secs(5), both)
+        .await
+        .expect("the gate is not held through the call");
+
+    assert_submitted(first);
+    assert_submitted(second);
+}
+
+#[tokio::test]
+async fn the_same_bytes_wait_for_the_answer_at_zebra() {
+    let (zebra, gated) = (PausedZebra::new(), competing_gate());
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let real = fixtures::mainnet_raw_block();
+
+    let first = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up);
+    let second = async {
+        zebra.calls_reach(1).await;
+        let copy = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+        zebra.permits.add_permits(1);
+        copy
+    };
+    let (first, second) = tokio::join!(first, second);
+
+    assert_submitted(first);
+    assert_gate_rejected(second, RejectReason::DuplicateSubmit);
+    assert_eq!(zebra.entered.load(Ordering::SeqCst), 1);
+}
+
+/// A caller that goes away in the middle of the call leaves nothing behind it.
+#[tokio::test]
+async fn a_cancelled_call_leaves_the_block_open() {
+    let (zebra, gated) = (PausedZebra::new(), competing_gate());
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let real = fixtures::mainnet_raw_block();
+    {
+        let first = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up);
+        tokio::pin!(first);
+        tokio::select! {
+            _ = &mut first => panic!("nothing has answered it"),
+            () = zebra.calls_reach(1) => {}
+        }
+    }
+
+    zebra.permits.add_permits(1);
+    let again = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+
+    assert_submitted(again);
+}
+
+/// A call that failed in transit is not Zebra's answer, so it records nothing and the same
+/// bytes can try again.
+#[tokio::test]
+async fn a_failed_call_records_nothing() {
+    for reply in [Reply::RpcError, Reply::Timeout] {
+        let zebra = ScriptedZebra::new(&[reply]);
+        let gated = competing_gate();
+        let hash = Some(block_hash());
+        let look_up = || async { Some(parent()) };
+        let real = fixtures::mainnet_raw_block();
+
+        let first = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+        assert!(first.is_err(), "{reply:?}");
+
+        let again = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+        assert_submitted(again);
+    }
+}
+
+/// Review item 1 on #134, as a test of what was missing: the transient errors of a stalled
+/// Zebra never use up the block's places, however many copies come while it stalls.
+#[tokio::test]
+async fn transient_errors_never_exhaust_the_strict_limit() {
+    let stalls = [Reply::RpcError; 32];
+    let zebra = ScriptedZebra::new(&stalls);
+    let gated = gate_with(1);
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let real = fixtures::mainnet_raw_block();
+
+    for _ in 0..stalls.len() {
+        let failed = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+        assert!(matches!(failed, Err(RelayBlockError::SubmitFailed(_))));
+    }
+    let recovered = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert_submitted(recovered);
+}
+
+/// `duplicate`, and a refusal of a block Zebra turns out to have, both say it has it.
+#[tokio::test]
+async fn what_zebra_says_it_has_closes_the_block_whichever_way_it_says_it() {
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let real = fixtures::mainnet_raw_block();
+
+    let zebra = ScriptedZebra::new(&[Reply::Duplicate]);
+    let gated = competing_gate();
+    let first = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert!(first.is_ok());
+    let next = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert_gate_rejected(next, RejectReason::DuplicateSubmit);
+
+    let zebra = LosingRaceZebra;
+    let gated = competing_gate();
+    let first = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert!(matches!(
+        first,
+        Err(RelayBlockError::SubmitRejected(
+            _,
+            sovright_relay_sidecar::submit::SubmitRejectionClass::RaceLost
+        ))
+    ));
+    let next = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert_gate_rejected(next, RejectReason::DuplicateSubmit);
+}
+
+/// A dry run says nothing about Zebra, so it never stops a live candidate.
+#[tokio::test]
+async fn a_dry_run_leaves_no_mark_on_a_live_candidate() {
+    let zebra = Zebra::new();
+    let gated = competing_gate();
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let real = fixtures::mainnet_raw_block();
+    let dry = SubmitBlockMode::DryRun;
+
+    let first = validate_then_gate_raw_block(&zebra, &real, hash, dry, &gated, look_up).await;
+    assert!(matches!(first, Ok(SubmissionOutcome::DryRun(_))));
+    let again = validate_then_gate_raw_block(&zebra, &real, hash, dry, &gated, look_up).await;
+    assert_gate_rejected(again, RejectReason::DuplicateSubmit);
+    assert_eq!(zebra.calls(), 0);
+
+    let live = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert_submitted(live);
+}
+
+/// Review item 1 on #134: one body Zebra refused, replayed any number of times, reaches
+/// Zebra once and spends one place, so the valid body still gets through.
+#[tokio::test]
+async fn a_replayed_refused_body_never_locks_out_the_real_one() {
+    let zebra = ScriptedZebra::new(&[Reply::Reject]);
+    let gated = gate_with(2);
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+    let bad = strict_body(1);
+
+    let refused = validate_then_gate_raw_block(&zebra, &bad, hash, LIVE, &gated, look_up).await;
+    assert!(matches!(refused, Err(RelayBlockError::SubmitRejected(..))));
+    for _ in 0..16 {
+        let replay = validate_then_gate_raw_block(&zebra, &bad, hash, LIVE, &gated, look_up).await;
+        assert_gate_rejected(replay, RejectReason::RefusedBody);
+    }
+    assert_eq!(zebra.calls(), 1);
+
+    let real = fixtures::mainnet_raw_block();
+    let real = validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert_submitted(real);
+}
+
+/// What stays open, and what no value of the limit takes away: anyone holding a real
+/// header can spend it with bodies the strict reader passes, and the real body is then
+/// refused until the window ends.
+#[tokio::test]
+async fn known_gap_bodies_can_use_up_the_limit_before_the_real_one_comes() {
+    let zebra = ScriptedZebra::new(&[Reply::Reject, Reply::Reject]);
+    let gated = gate_with(2);
+    let hash = Some(block_hash());
+    let look_up = || async { Some(parent()) };
+
+    for mark in [1, 2] {
+        let body = strict_body(mark);
+        let refused =
+            validate_then_gate_raw_block(&zebra, &body, hash, LIVE, &gated, look_up).await;
+        assert!(matches!(refused, Err(RelayBlockError::SubmitRejected(..))));
+    }
+
+    let real = fixtures::mainnet_raw_block();
+    let turned_away =
+        validate_then_gate_raw_block(&zebra, &real, hash, LIVE, &gated, look_up).await;
+    assert_gate_rejected(turned_away, RejectReason::StrictLimit);
+    assert_eq!(zebra.calls(), 2);
+}

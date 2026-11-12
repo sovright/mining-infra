@@ -306,6 +306,7 @@ fn enabled_gate_config() -> GateConfig {
         dedup_window: std::time::Duration::from_secs(60),
         dedup_capacity: 8,
         unreadable_attempts_per_block: 4,
+        ..GateConfig::default()
     }
 }
 
@@ -650,11 +651,17 @@ fn no_submit_path_classifies_by_hand() {
         !src.contains("classify_submitblock_result(result)?"),
         "a submit path is classifying without the block_known lookup"
     );
+    // Every call to Zebra, less the one that only forwards through a reference, has to be
+    // classified by the shared helper. Six since the competing-body gate got its own call.
+    let calls =
+        src.matches(".submit_block(").count() - src.matches("(**self).submit_block(").count();
+    let classified = src
+        .matches("classify_submitblock_outcome(result, submitter")
+        .count();
+    assert_eq!(calls, 6, "a submit_block call site was added or removed");
     assert_eq!(
-        src.matches("classify_submitblock_outcome(result, submitter")
-            .count(),
-        5,
-        "expected all five submit_block call sites to use the shared classifier"
+        classified, calls,
+        "expected every submit_block call site to use the shared classifier"
     );
 }
 

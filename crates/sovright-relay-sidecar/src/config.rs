@@ -5,7 +5,32 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 /// Error type alias for config operations
-type ConfigError = Box<dyn std::error::Error + Send + Sync>;
+pub type ConfigError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Bound raw blocks (and retried copies of them) worked on at once. Research value.
+pub const DEFAULT_BOUND_TASKS_RUNNING: usize = 4;
+/// Seconds one bound task may wait in all. Research value, past what a parent lookup and two
+/// Zebra calls of 30 s can take.
+pub const DEFAULT_BOUND_TASKS_BUDGET_SECS: u64 = 120;
+/// Copies of a block under way kept in the shared room. Research value.
+pub const DEFAULT_BOUND_TASKS_HELD: usize = 4;
+
+/// The checks on the bound task limits, from the config file or the command line.
+pub fn validate_bound_task_limits(
+    running: usize,
+    budget_secs: u64,
+    held: usize,
+) -> Result<(), ConfigError> {
+    // `held` is unsigned, so any value is at least zero: zero means no shared room.
+    let _ = held;
+    if running == 0 {
+        return Err("bound_tasks_running must be at least 1".into());
+    }
+    if budget_secs == 0 {
+        return Err("bound_tasks_budget_secs must be greater than 0".into());
+    }
+    Ok(())
+}
 
 /// Configuration loaded from file
 #[derive(Debug, Deserialize)]
@@ -139,6 +164,21 @@ pub struct Config {
     /// every reassembled candidate without forwarding anything upstream.
     #[serde(default)]
     pub submit_gate: SubmitGateConfig,
+
+    /// Bound raw path (`SOVRIGHT_RELAY_BOUND_RAW`): blocks worked on at once, bound blocks and
+    /// retried copies together. At least 1.
+    #[serde(default = "default_bound_tasks_running")]
+    pub bound_tasks_running: usize,
+
+    /// Bound raw path: seconds one task may wait, at its parent lookup, the gate and Zebra
+    /// together, before it gives way to a copy. Greater than 0.
+    #[serde(default = "default_bound_tasks_budget_secs")]
+    pub bound_tasks_budget_secs: u64,
+
+    /// Bound raw path: copies of a block under way kept in the shared room while its task runs.
+    /// 0 keeps only the copies that are a running task's own bytes.
+    #[serde(default = "default_bound_tasks_held")]
+    pub bound_tasks_held: usize,
 }
 
 /// Configuration for the safety gate in front of `submit_block`.
@@ -177,6 +217,16 @@ pub struct SubmitGateConfig {
     /// an attempt can run past this. Default 10.
     #[serde(default = "default_submit_gate_unreadable_budget_secs")]
     pub unreadable_submit_budget_secs: u64,
+    /// #130 competing-body rules, off by default, which keeps the legacy gate. When on,
+    /// only Zebra's answer closes a block, the gate is not held across the Zebra call,
+    /// and `strict_bodies_per_block` bounds the bodies of one block. The bound raw switch
+    /// turns this on by itself.
+    #[serde(default)]
+    pub competing_bodies: bool,
+    /// With `competing_bodies`: different bodies of one block that may get an answer from
+    /// Zebra per dedup window. Default 4.
+    #[serde(default = "default_submit_gate_strict_bodies")]
+    pub strict_bodies_per_block: usize,
 }
 
 impl Default for SubmitGateConfig {
@@ -189,6 +239,8 @@ impl Default for SubmitGateConfig {
             submit_unreadable_blocks: false,
             unreadable_attempts_per_block: default_submit_gate_unreadable_attempts(),
             unreadable_submit_budget_secs: default_submit_gate_unreadable_budget_secs(),
+            competing_bodies: false,
+            strict_bodies_per_block: default_submit_gate_strict_bodies(),
         }
     }
 }
@@ -202,8 +254,32 @@ impl SubmitGateConfig {
             dedup_window: std::time::Duration::from_secs(self.dedup_window_secs),
             dedup_capacity: self.dedup_capacity,
             unreadable_attempts_per_block: self.unreadable_attempts_per_block,
+            competing_bodies: self.competing_bodies,
+            strict_bodies_per_block: self.strict_bodies_per_block,
         }
     }
+
+    /// Settings no gate can run with. Checked when the config is loaded.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.dedup_capacity == 0 {
+            return Err(
+                "submit_gate.dedup_capacity must be at least 1: a gate with no room remembers \
+                 nothing, so every copy of a block would reach Zebra"
+                    .to_string(),
+            );
+        }
+        if self.competing_bodies && self.strict_bodies_per_block == 0 {
+            return Err(
+                "submit_gate.strict_bodies_per_block must be at least 1 with competing_bodies"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn default_submit_gate_strict_bodies() -> usize {
+    crate::submit_gate::DEFAULT_STRICT_BODIES_PER_BLOCK
 }
 
 fn default_submit_gate_unreadable_budget_secs() -> u64 {
@@ -224,6 +300,18 @@ fn default_submit_gate_dedup_window_secs() -> u64 {
 
 fn default_submit_gate_dedup_capacity() -> usize {
     256
+}
+
+fn default_bound_tasks_running() -> usize {
+    DEFAULT_BOUND_TASKS_RUNNING
+}
+
+fn default_bound_tasks_budget_secs() -> u64 {
+    DEFAULT_BOUND_TASKS_BUDGET_SECS
+}
+
+fn default_bound_tasks_held() -> usize {
+    DEFAULT_BOUND_TASKS_HELD
 }
 
 fn default_zebra_mempool_sync_interval_ms() -> u64 {
@@ -283,7 +371,18 @@ impl Config {
     pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path)?;
         let config: Config = toml::from_str(&contents)?;
+        config.validate()?;
         Ok(config)
+    }
+
+    /// The checks a loaded config has to pass before anything runs on it.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.submit_gate.validate()?;
+        validate_bound_task_limits(
+            self.bound_tasks_running,
+            self.bound_tasks_budget_secs,
+            self.bound_tasks_held,
+        )
     }
 
     /// Parse relay peers to SocketAddr
@@ -460,6 +559,41 @@ mod tests {
         assert_eq!(config.send_burst_delay_micros, 1000);
     }
 
+    /// Review item 9 on #134: a gate that cannot remember is refused at load.
+    #[test]
+    fn a_zero_dedup_capacity_is_refused_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sidecar.toml");
+        std::fs::write(
+            &path,
+            "relay_peers = []\n[submit_gate]\nenabled = true\ndedup_capacity = 0\n",
+        )
+        .unwrap();
+        let error = Config::from_file(&path).unwrap_err().to_string();
+        assert!(error.contains("dedup_capacity"), "{error}");
+
+        std::fs::write(
+            &path,
+            "relay_peers = []\n[submit_gate]\nenabled = true\ndedup_capacity = 1\n",
+        )
+        .unwrap();
+        assert!(Config::from_file(&path).is_ok());
+    }
+
+    #[test]
+    fn the_competing_body_gate_is_off_by_default_and_can_be_turned_on() {
+        let gate = SubmitGateConfig::default().to_gate_config();
+        assert!(!gate.competing_bodies);
+        let config: SubmitGateConfig =
+            toml::from_str("competing_bodies = true\nstrict_bodies_per_block = 2").unwrap();
+        let gate = config.to_gate_config();
+        assert!(gate.competing_bodies);
+        assert_eq!(gate.strict_bodies_per_block, 2);
+        let config: SubmitGateConfig =
+            toml::from_str("competing_bodies = true\nstrict_bodies_per_block = 0").unwrap();
+        assert!(config.validate().is_err());
+    }
+
     #[test]
     fn the_emergency_bypass_is_off_unless_set() {
         assert!(!SubmitGateConfig::default().submit_unreadable_blocks);
@@ -610,5 +744,53 @@ mod ab_config_tests {
             cfg.submit_log_path.as_deref(),
             Some("/var/log/bedrock/submit-calls.jsonl")
         );
+    }
+
+    #[test]
+    fn bound_task_limits_default_and_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, "relay_peers = []\n").unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert_eq!(cfg.bound_tasks_running, DEFAULT_BOUND_TASKS_RUNNING);
+        assert_eq!(cfg.bound_tasks_budget_secs, DEFAULT_BOUND_TASKS_BUDGET_SECS);
+        assert_eq!(cfg.bound_tasks_held, DEFAULT_BOUND_TASKS_HELD);
+        assert_eq!(
+            (
+                DEFAULT_BOUND_TASKS_RUNNING,
+                DEFAULT_BOUND_TASKS_BUDGET_SECS,
+                DEFAULT_BOUND_TASKS_HELD
+            ),
+            (4, 120, 4),
+            "the defaults stay what they were"
+        );
+
+        std::fs::write(
+            &path,
+            "relay_peers = []\n\
+             bound_tasks_running = 2\n\
+             bound_tasks_budget_secs = 30\n\
+             bound_tasks_held = 0\n",
+        )
+        .unwrap();
+        let cfg = Config::from_file(&path).unwrap();
+        assert_eq!(cfg.bound_tasks_running, 2);
+        assert_eq!(cfg.bound_tasks_budget_secs, 30);
+        assert_eq!(cfg.bound_tasks_held, 0);
+    }
+
+    #[test]
+    fn bound_task_limits_are_checked_at_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.toml");
+        for (bad, says) in [
+            ("bound_tasks_running = 0", "bound_tasks_running"),
+            ("bound_tasks_budget_secs = 0", "bound_tasks_budget_secs"),
+            ("bound_tasks_held = -1", "bound_tasks_held"),
+        ] {
+            std::fs::write(&path, format!("relay_peers = []\n{bad}\n")).unwrap();
+            let error = Config::from_file(&path).expect_err(bad).to_string();
+            assert!(error.contains(says), "{bad}: {error}");
+        }
     }
 }

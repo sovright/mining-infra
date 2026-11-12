@@ -1,6 +1,8 @@
 //! Sovright relay client wrapper for sidecar
 
-use sovright_relay::{BlockReceiver, BlockSender, ClientConfig, CompactBlock, RelayClient};
+use sovright_relay::{
+    BlockReceiver, BlockSender, BoundRawConfig, ClientConfig, CompactBlock, RelayClient,
+};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -15,6 +17,7 @@ pub struct RelayWrapper {
 
 impl RelayWrapper {
     /// Create a new relay with explicit FEC profile.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_fec(
         relay_peers: Vec<SocketAddr>,
         auth_key: [u8; 32],
@@ -23,12 +26,14 @@ impl RelayWrapper {
         parity_shards: usize,
         send_burst_packets: usize,
         send_burst_delay: Duration,
+        bound_raw: Option<BoundRawConfig>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let config = ClientConfig::new(relay_peers, auth_key)
             .with_bind_addr(bind_addr)
             .with_fec(data_shards, parity_shards)
             .with_send_pacing(send_burst_packets, send_burst_delay);
-        let config = config.with_auth_required(true);
+        let mut config = config.with_auth_required(true);
+        config.bound_raw = bound_raw;
 
         let client = RelayClient::new(config)?;
         let sender = client.sender();
@@ -103,7 +108,7 @@ mod tests {
         let bind_addr = "0.0.0.0:0".parse().unwrap();
 
         let relay =
-            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO);
+            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO, None);
         assert!(relay.is_ok());
     }
 
@@ -113,7 +118,7 @@ mod tests {
         let auth_key = [0x42; 32];
         let bind_addr = "127.0.0.1:0".parse().unwrap();
         let relay =
-            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO)
+            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 10, 3, 0, Duration::ZERO, None)
                 .unwrap();
         relay.init().await.unwrap();
 
@@ -133,7 +138,7 @@ mod tests {
         let bind_addr = "127.0.0.1:0".parse().unwrap();
 
         let relay =
-            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 255, 2, 0, Duration::ZERO);
+            RelayWrapper::new_with_fec(peers, auth_key, bind_addr, 255, 2, 0, Duration::ZERO, None);
 
         assert!(relay.is_err());
     }
