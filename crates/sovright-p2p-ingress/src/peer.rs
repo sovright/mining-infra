@@ -21,6 +21,7 @@ use crate::wire::{
     read_message, write_message,
 };
 use crate::wire::{MIN_ACCEPTABLE_REMOTE_VERSION, Network};
+#[cfg(test)]
 use crate::wtxid::{TX_READER_BRANCH_HINT, wtxid_from_tx_bytes};
 use sovright_relay::{BlockBodyError, WtxId};
 
@@ -139,7 +140,8 @@ pub async fn run_peer(
     // This is a capability filter, not consensus validation. Apply it for the
     // whole connection lifetime, before/at/after activation and across reorgs.
     // Peer-reported heights never control admission; only configuration does.
-    let minimum_version = if relay.is_some() || tx_feed.is_some() {
+    // The observer decodes current-era payloads, so it needs the same floor.
+    let minimum_version = if relay.is_some() || tx_feed.is_some() || observer.is_some() {
         config.forwarding_min_peer_version()
     } else {
         MIN_ACCEPTABLE_REMOTE_VERSION
@@ -275,17 +277,35 @@ pub async fn run_peer(
             }
             "inv" => {
                 let invs = parse_inventory(&msg.payload)?;
-                // Record every announcement before fetch selection.
-                if let (Some(observer), Some(stamp)) = (&observer, observed) {
-                    for inv in &invs {
-                        observer.inventory(inv, stamp);
-                    }
-                }
+                // Announcements are observed before fetch selection, but bounded:
+                // blocks once per connection (after dedup) and at most a fixed
+                // number of entries of each kind per message.
+                let mut observed_blocks = 0;
+                let mut observed_txs = 0;
+                let mut capped = 0u64;
                 let mut block_requests = Vec::new();
                 let mut tx_requests = Vec::new();
                 for inv in invs {
+                    if inv.is_transaction()
+                        && let (Some(observer), Some(stamp)) = (&observer, observed)
+                    {
+                        if observed_txs < MAX_OBSERVED_TX_INV_PER_MESSAGE {
+                            observer.inventory(&inv, stamp);
+                            observed_txs += 1;
+                        } else {
+                            capped += 1;
+                        }
+                    }
                     if inv.is_block() {
                         if seen_inv.insert(inv.hash) {
+                            if let (Some(observer), Some(stamp)) = (&observer, observed) {
+                                if observed_blocks < MAX_OBSERVED_BLOCK_INV_PER_MESSAGE {
+                                    observer.inventory(&inv, stamp);
+                                    observed_blocks += 1;
+                                } else {
+                                    capped += 1;
+                                }
+                            }
                             let display = inventory_hash_to_display(&inv.hash);
                             events.p2p_block_inv(&peer, &display)?;
                             // Announcement rank remains independent of request
@@ -307,6 +327,11 @@ pub async fn run_peer(
                     {
                         events.p2p_tx_inv(&peer, key.kind(), &key.display_hash())?;
                     }
+                }
+                if capped > 0
+                    && let Some(observer) = &observer
+                {
+                    observer.inventory_capped(capped);
                 }
                 if !block_requests.is_empty() {
                     let requested_hashes: Vec<String> = block_requests
@@ -341,7 +366,7 @@ pub async fn run_peer(
                 }
             }
             "block" => {
-                let display = received_block_display_hash(&mut blocks, &msg.payload)?;
+                let (display, solicited) = received_block(&mut blocks, &msg.payload)?;
                 let consensus_hash = msg
                     .payload
                     .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
@@ -350,7 +375,7 @@ pub async fn run_peer(
                 if let (Some(observer), Some(stamp)) = (&observer, observed)
                     && !consensus_hash.is_empty()
                 {
-                    observer.block(&consensus_hash, "payload", stamp);
+                    observer.block_payload(&consensus_hash, solicited, stamp);
                 }
                 // Nothing here needs parsing, so the receipt is on record before
                 // anything can wait, and survives whatever happens to the forward.
@@ -402,10 +427,18 @@ pub async fn run_peer(
                 }
             }
             "tx" => {
-                if let (Some(observer), Some(stamp)) = (&observer, observed) {
-                    observer.payload(&msg.payload, stamp);
+                let received = received_tx(&mut transactions, &msg.payload);
+                if let (Some(observer), Some(stamp), Some(received)) =
+                    (&observer, observed, &received)
+                {
+                    observer.tx_payload(
+                        &received.metadata,
+                        msg.payload.len(),
+                        received.solicited,
+                        stamp,
+                    );
                 }
-                if let Some(wtxid) = wtxid_for_received_tx(&mut transactions, &msg.payload) {
+                if let Some(wtxid) = received.map(|r| r.wtxid) {
                     let key = TxInventoryKey::from_wtxid(&wtxid);
                     if let Some(cache) = &tx_cache {
                         let outcome = cache.insert(wtxid, msg.payload.clone());
@@ -551,16 +584,33 @@ fn pong_nonce(payload: &[u8]) -> Option<u64> {
 /// wtxid) and for anything malformed. Those are NOT cached: a guessed key is
 /// worse than a cache miss, which merely costs a getblocktxn round trip. The
 /// sidecar's own mempool sync skips pre-v5 for the same reason.
+struct ReceivedTx {
+    wtxid: WtxId,
+    metadata: crate::wtxid::TxMetadata,
+    /// The payload completed an outstanding request.
+    solicited: bool,
+}
+
+#[cfg(test)]
 fn wtxid_for_received_tx(
     pending_tx_responses: &mut RequestWindow<TxInventoryKey>,
     payload: &[u8],
 ) -> Option<WtxId> {
-    let derived = wtxid_from_tx_bytes(payload, TX_READER_BRANCH_HINT)?;
+    received_tx(pending_tx_responses, payload).map(|r| r.wtxid)
+}
+
+/// Parses a received transaction once and completes any matching request.
+fn received_tx(
+    pending_tx_responses: &mut RequestWindow<TxInventoryKey>,
+    payload: &[u8],
+) -> Option<ReceivedTx> {
+    let (derived, metadata) = crate::wtxid::parse_tx_bytes(payload)?;
 
     let wtx_match = pending_tx_responses.complete(TxInventoryKey::from_wtxid(&derived));
     // MSG_TX names only the txid. The payload-derived wtxid still supplies the
     // cache identity, but also satisfies a request made using that older form.
     let tx_match = pending_tx_responses.complete(TxInventoryKey::tx(*derived.txid().as_bytes()));
+    let solicited = wtx_match.or(tx_match).is_some();
     if let Some(index) = wtx_match.or(tx_match) {
         if index != 0 {
             warn!(
@@ -575,13 +625,26 @@ fn wtxid_for_received_tx(
         warn!("Received transaction matching no pending request");
     }
 
-    Some(derived)
+    Some(ReceivedTx {
+        wtxid: derived,
+        metadata,
+        solicited,
+    })
 }
 
+#[cfg(test)]
 fn received_block_display_hash(
     pending_block_responses: &mut RequestWindow<[u8; 32]>,
     block_payload: &[u8],
 ) -> Result<String> {
+    received_block(pending_block_responses, block_payload).map(|(display, _)| display)
+}
+
+/// Returns the block's display hash and whether it completed a request.
+fn received_block(
+    pending_block_responses: &mut RequestWindow<[u8; 32]>,
+    block_payload: &[u8],
+) -> Result<(String, bool)> {
     // Requests are keyed by the consensus hash peers announce in `inv`. The
     // returned display hash stays the relay object hash, which the block
     // events carry in their `hash` field.
@@ -596,7 +659,7 @@ fn received_block_display_hash(
                 "Received requested block out of order"
             );
         }
-        return Ok(event_hash);
+        return Ok((event_hash, true));
     }
 
     if let Some((hash, _)) = pending_block_responses.pending.front() {
@@ -608,8 +671,12 @@ fn received_block_display_hash(
         );
     }
 
-    Ok(event_hash)
+    Ok((event_hash, false))
 }
+
+/// Per inv message, at most this many entries of each kind are observed.
+const MAX_OBSERVED_BLOCK_INV_PER_MESSAGE: usize = 16;
+const MAX_OBSERVED_TX_INV_PER_MESSAGE: usize = 256;
 
 /// `relay` is the BIP37 transaction-relay flag; observation needs tx gossip.
 fn version_payload(peer_addr: SocketAddr, network: Network, relay: bool) -> Vec<u8> {
@@ -740,6 +807,194 @@ mod tests {
         );
     }
 
+    fn observation_config(path: std::path::PathBuf) -> crate::observation::ObservationConfig {
+        crate::observation::ObservationConfig {
+            path,
+            sensor_id: "peer-test".into(),
+            network: Network::Mainnet,
+            queue_capacity: 4096,
+            max_bytes: 1 << 22,
+            max_files: 2,
+            heartbeat_interval: Duration::from_millis(20),
+            payload_stale_after: Duration::from_secs(600),
+            tx_payload_stale_after: Duration::from_secs(1800),
+            require_tx_payloads: false,
+        }
+    }
+
+    /// Starts `run_peer` with an observer against a scripted remote that
+    /// completes the handshake advertising `remote_version`.
+    async fn observed_peer(
+        name: &str,
+        remote_version: i32,
+    ) -> (
+        std::path::PathBuf,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::net::TcpStream,
+    ) {
+        use crate::observation::Observer;
+        let path = temp_log_path(name);
+        let observer = Observer::start(observation_config(path.clone())).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let config = peer_test_config();
+        let crawler = Crawler::new(&config, [address]);
+        let task = tokio::spawn(run_peer(
+            address,
+            config,
+            EventSink::new(None).unwrap(),
+            None,
+            None,
+            None,
+            crawler,
+            Some(observer),
+        ));
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let version = read_message(&mut stream, Network::Mainnet).await.unwrap();
+        assert_eq!(*version.payload.last().unwrap(), 1, "relay flag set");
+        let mut remote = version_payload(address, Network::Mainnet, false);
+        remote[..4].copy_from_slice(&remote_version.to_le_bytes());
+        write_message(&mut stream, Network::Mainnet, "version", &remote)
+            .await
+            .unwrap();
+        write_message(&mut stream, Network::Mainnet, "verack", &[])
+            .await
+            .unwrap();
+        (path, task, stream)
+    }
+
+    fn observed_events(path: &std::path::Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect()
+    }
+
+    async fn wait_for_events(
+        path: &std::path::Path,
+        done: impl Fn(&[serde_json::Value]) -> bool,
+    ) -> Vec<serde_json::Value> {
+        timeout(Duration::from_secs(5), async {
+            loop {
+                let events = observed_events(path);
+                if done(&events) {
+                    return events;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("expected observation events")
+    }
+
+    #[tokio::test]
+    async fn standalone_observer_refuses_pre_nu7_peers() {
+        // Observation decodes NU7 payloads; a pre-NU7 peer cannot supply them.
+        let (path, task, _stream) = observed_peer("observer-floor", 170_160).await;
+        let error = timeout(Duration::from_secs(2), task)
+            .await
+            .expect("pre-NU7 peer must be refused promptly")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too old"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    /// Restored from e337adc: announcements are recorded even when the
+    /// transaction cache and feed are both off (no tx getdata is ever sent).
+    #[tokio::test]
+    async fn observer_records_inventory_when_transaction_fetch_is_disabled() {
+        let (path, task, mut stream) = observed_peer("inv-no-fetch", 170_190).await;
+        let inv = encode_inventory(&[Inventory {
+            inv_type: crate::wire::MSG_TX,
+            hash: [0x37; 32],
+            auth_digest: None,
+        }]);
+        write_message(&mut stream, Network::Mainnet, "inv", &inv)
+            .await
+            .unwrap();
+        let events = wait_for_events(&path, |events| {
+            events.iter().any(|e| e["event"] == "tx_seen")
+        })
+        .await;
+        task.abort();
+        let seen = events.iter().find(|e| e["event"] == "tx_seen").unwrap();
+        assert_eq!(seen["stage"], "announcement");
+        assert_eq!(seen["txid"], "37".repeat(32));
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn announcements_are_deduplicated_and_capped_per_message() {
+        // One large inv must not flood the collector with unknown block hashes
+        // (it treats them as an unresolved chain transition) or the queue.
+        let (path, task, mut stream) = observed_peer("inv-cap", 170_190).await;
+        let block = |i: u32| Inventory {
+            inv_type: crate::wire::MSG_BLOCK,
+            hash: {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h[31] = 0xb1;
+                h
+            },
+            auth_digest: None,
+        };
+        let tx = |i: u32| Inventory {
+            inv_type: crate::wire::MSG_TX,
+            hash: {
+                let mut h = [0u8; 32];
+                h[..4].copy_from_slice(&i.to_le_bytes());
+                h[31] = 0x7c;
+                h
+            },
+            auth_digest: None,
+        };
+        // 20 unique blocks, each announced twice, plus 300 transactions.
+        let mut entries: Vec<Inventory> = (0..20).map(block).collect();
+        entries.extend((0..20).map(block));
+        entries.extend((0..300).map(tx));
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&entries),
+        )
+        .await
+        .unwrap();
+        // A later message repeating a seen block adds nothing.
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&[block(0)]),
+        )
+        .await
+        .unwrap();
+        let events = wait_for_events(&path, |events| {
+            events.iter().any(|e| {
+                e["event"] == "sensor_heartbeat" && e["capped_inventory"].as_u64() == Some(48)
+            })
+        })
+        .await;
+        task.abort();
+        let count = |kind: &str| {
+            events
+                .iter()
+                .filter(|e| e["event"] == kind && e["stage"] == "announcement")
+                .count()
+        };
+        assert_eq!(count("block_seen"), MAX_OBSERVED_BLOCK_INV_PER_MESSAGE);
+        assert_eq!(count("tx_seen"), MAX_OBSERVED_TX_INV_PER_MESSAGE);
+        assert!(
+            events
+                .iter()
+                .all(|e| e["event"] != "sensor_heartbeat" || e["dropped_events"] == 0)
+        );
+        let _ = fs::remove_file(path);
+    }
+
     /// A real NU7 block (public testnet activation block 4465026, branch
     /// 0x77190ad9; provenance in tests/fixtures/NU7.md) and its transactions,
     /// delivered by a peer, appear in the observation stream as payloads.
@@ -772,6 +1027,8 @@ mod tests {
             max_files: 2,
             heartbeat_interval: Duration::from_secs(3600),
             payload_stale_after: Duration::from_secs(600),
+            tx_payload_stale_after: Duration::from_secs(1800),
+            require_tx_payloads: false,
         })
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

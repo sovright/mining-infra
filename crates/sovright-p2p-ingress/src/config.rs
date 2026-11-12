@@ -329,7 +329,7 @@ impl Config {
             tx_request_limit_per_inv,
             inventory_limits,
             event_log,
-            observation: observation_from_env(network)?,
+            observation: observation_from_env(network, tx_cache_enabled || tx_feed_addr.is_some())?,
             metrics_textfile,
             relay_peers,
             relay_bind_addr,
@@ -517,7 +517,11 @@ fn env_optional_socket(name: &str) -> Result<Option<SocketAddr>> {
     })
 }
 
-fn observation_from_env(network: Network) -> Result<Option<crate::observation::ObservationConfig>> {
+/// `require_tx_payloads` is true when tx fetch (cache or feed) is enabled.
+fn observation_from_env(
+    network: Network,
+    require_tx_payloads: bool,
+) -> Result<Option<crate::observation::ObservationConfig>> {
     let Ok(path) = env::var("SOVRIGHT_P2P_OBSERVATION_LOG") else {
         return Ok(None);
     };
@@ -539,6 +543,11 @@ fn observation_from_env(network: Network) -> Result<Option<crate::observation::O
             "SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS",
             crate::observation::DEFAULT_PAYLOAD_STALE_MS,
         )?),
+        tx_payload_stale_after: Duration::from_millis(env_u64(
+            "SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS",
+            crate::observation::DEFAULT_TX_PAYLOAD_STALE_MS,
+        )?),
+        require_tx_payloads,
     };
     config
         .validate()
@@ -729,6 +738,11 @@ mod tests {
             ),
             ("SOVRIGHT_P2P_OBSERVATION_SENSOR_ID", "".to_string()),
             (
+                "SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS",
+                "1800000".to_string(),
+            ),
+            ("SOVRIGHT_P2P_TX_CACHE_ENABLED", "false".to_string()),
+            (
                 "SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY",
                 "4096".to_string(),
             ),
@@ -754,12 +768,43 @@ mod tests {
         }
         assert!(Config::from_env().is_err(), "zero stale window");
         unsafe {
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_PAYLOAD_STALE_MS", "600000");
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS", "0");
+        }
+        assert!(Config::from_env().is_err(), "zero tx stale window");
+        unsafe {
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS", "900000");
+            env::set_var("SOVRIGHT_P2P_TX_CACHE_ENABLED", "true");
+        }
+        let observation = Config::from_env().unwrap().observation.unwrap();
+        assert_eq!(observation.tx_payload_stale_after, Duration::from_secs(900));
+        assert!(
+            observation.require_tx_payloads,
+            "tx fetch on requires tx payloads"
+        );
+        unsafe {
+            env::set_var("SOVRIGHT_P2P_TX_CACHE_ENABLED", "false");
+        }
+        assert!(
+            !Config::from_env()
+                .unwrap()
+                .observation
+                .unwrap()
+                .require_tx_payloads
+        );
+        unsafe {
             env::set_var("SOVRIGHT_P2P_OBSERVATION_LOG", "");
         }
         assert!(
             Config::from_env().unwrap().observation.is_none(),
             "empty path disables"
         );
+        // Restored from e337adc: observation bounds are not read when it is off.
+        unsafe {
+            env::remove_var("SOVRIGHT_P2P_OBSERVATION_LOG");
+            env::set_var("SOVRIGHT_P2P_OBSERVATION_QUEUE_CAPACITY", "broken");
+        }
+        assert!(Config::from_env().unwrap().observation.is_none());
     }
 
     #[test]

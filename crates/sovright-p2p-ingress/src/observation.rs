@@ -14,6 +14,10 @@ const MAX_RECORD_BYTES: usize = 4 * 1024 * 1024;
 /// Default window after which a sensor that has decoded no transaction or block
 /// payload reports itself unhealthy (24 blocks at the 25 s NU7 spacing).
 pub const DEFAULT_PAYLOAD_STALE_MS: u64 = 600_000;
+/// Default window for decoded transaction payloads when tx fetch is enabled.
+pub const DEFAULT_TX_PAYLOAD_STALE_MS: u64 = 1_800_000;
+/// Payload clocks store monotonic ms + 1, so 0 means "none since start".
+const NEVER: u64 = 0;
 
 #[derive(Debug, Clone)]
 pub struct ObservationConfig {
@@ -26,6 +30,10 @@ pub struct ObservationConfig {
     pub heartbeat_interval: Duration,
     /// No decoded tx or block payload within this window makes heartbeats unhealthy.
     pub payload_stale_after: Duration,
+    /// No solicited, decoded tx payload within this window makes heartbeats
+    /// unhealthy, but only when `require_tx_payloads` (tx fetch enabled).
+    pub tx_payload_stale_after: Duration,
+    pub require_tx_payloads: bool,
 }
 
 impl ObservationConfig {
@@ -42,6 +50,8 @@ impl ObservationConfig {
             || self.heartbeat_interval > Duration::from_secs(3600)
             || self.payload_stale_after.is_zero()
             || self.payload_stale_after > Duration::from_secs(86_400)
+            || self.tx_payload_stale_after.is_zero()
+            || self.tx_payload_stale_after > Duration::from_secs(86_400)
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -70,10 +80,19 @@ struct Inner {
     /// Writer health. Clearing it stops the stream, so staleness never touches it.
     healthy: AtomicBool,
     active_peers: AtomicUsize,
-    /// Monotonic ms of the last decoded tx or block payload (0 = process start,
-    /// which gives a startup grace of one stale window).
+    /// Monotonic ms + 1 of the last solicited tx or block payload; NEVER until one.
     last_payload_ms: AtomicU64,
+    /// Monotonic ms + 1 of the last solicited, decoded tx payload; NEVER until one.
+    last_tx_payload_ms: AtomicU64,
     payload_stale_after_ms: u64,
+    tx_payload_stale_after_ms: u64,
+    require_tx_payloads: bool,
+    /// Events enqueued and not yet taken by the writer.
+    queued: Arc<AtomicUsize>,
+    /// Queue slots only heartbeats may use, so a flood cannot silence them.
+    reserved: usize,
+    capacity: usize,
+    capped_inventory: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -106,8 +125,15 @@ impl Observer {
                     dropped: AtomicU64::new(0),
                     healthy: AtomicBool::new(true),
                     active_peers: AtomicUsize::new(0),
-                    last_payload_ms: AtomicU64::new(0),
+                    last_payload_ms: AtomicU64::new(NEVER),
+                    last_tx_payload_ms: AtomicU64::new(NEVER),
                     payload_stale_after_ms: config.payload_stale_after.as_millis() as u64,
+                    tx_payload_stale_after_ms: config.tx_payload_stale_after.as_millis() as u64,
+                    require_tx_payloads: config.require_tx_payloads,
+                    queued: Arc::new(AtomicUsize::new(0)),
+                    reserved: (config.queue_capacity / 8).min(64),
+                    capacity: config.queue_capacity,
+                    capped_inventory: AtomicU64::new(0),
                 }),
             },
             receiver,
@@ -118,6 +144,7 @@ impl Observer {
         config.validate()?;
         let (observer, receiver) = Self::channel(&config);
         let weak = Arc::downgrade(&observer.inner);
+        let queued = observer.inner.queued.clone();
         std::thread::Builder::new()
             .name("ingress-observation".into())
             .spawn(move || {
@@ -136,6 +163,7 @@ impl Observer {
                             .recv_timeout(next_heartbeat.saturating_duration_since(Instant::now()))
                         {
                             Ok(event) => {
+                                queued.fetch_sub(1, Ordering::Relaxed);
                                 in_flight = true;
                                 let mut record = serde_json::to_vec(&event)?;
                                 record.push(b'\n');
@@ -188,11 +216,24 @@ impl Observer {
         event["observed_at_ms"] = json!(stamp.wall_ms);
         event["monotonic_ms"] = json!(stamp.monotonic_ms);
         *sequence += 1;
-        if event["event"] == "sensor_heartbeat" {
+        let heartbeat = event["event"] == "sensor_heartbeat";
+        if heartbeat {
             event["dropped_events"] = json!(self.inner.dropped.load(Ordering::Relaxed));
         }
-        if !self.inner.healthy.load(Ordering::Relaxed) || self.inner.sender.try_send(event).is_err()
-        {
+        // Only heartbeats may use the reserved slots.
+        let admitted = self.inner.healthy.load(Ordering::Relaxed)
+            && (heartbeat
+                || self.inner.queued.load(Ordering::Relaxed)
+                    < self.inner.capacity - self.inner.reserved)
+            && {
+                self.inner.queued.fetch_add(1, Ordering::Relaxed);
+                let sent = self.inner.sender.try_send(event).is_ok();
+                if !sent {
+                    self.inner.queued.fetch_sub(1, Ordering::Relaxed);
+                }
+                sent
+            };
+        if !admitted {
             let count = self.inner.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if count == 1 || count.is_power_of_two() {
                 tracing::warn!(dropped_events = count, "observation event dropped");
@@ -200,22 +241,41 @@ impl Observer {
         }
     }
 
-    /// `healthy` is false when the writer failed or when no tx/block payload has
-    /// been decoded within the stale window (announcements alone do not count).
+    /// `healthy` is false when the writer failed, when no solicited tx or block
+    /// payload has been seen within the stale window (or ever), or, with tx fetch
+    /// enabled, when no solicited tx payload has decoded within its own window.
+    /// Announcements and unsolicited payloads do not count.
     pub fn heartbeat(&self) {
         let stamp = self.capture();
-        let age = stamp
-            .monotonic_ms
-            .saturating_sub(self.inner.last_payload_ms.load(Ordering::Relaxed));
-        let stale = age > self.inner.payload_stale_after_ms;
+        let age = |last: &AtomicU64| match last.load(Ordering::Relaxed) {
+            NEVER => None,
+            at => Some(stamp.monotonic_ms.saturating_sub(at - 1)),
+        };
+        let payload_age = age(&self.inner.last_payload_ms);
+        let tx_age = age(&self.inner.last_tx_payload_ms);
+        let stale = payload_age.is_none_or(|a| a > self.inner.payload_stale_after_ms);
+        let tx_stale = tx_age.is_none_or(|a| a > self.inner.tx_payload_stale_after_ms);
         let writer_ok = self.inner.healthy.load(Ordering::Relaxed);
-        self.emit(json!({"event":"sensor_heartbeat", "healthy":writer_ok && !stale, "payload_stale":stale, "last_payload_age_ms":age, "dropped_events":self.inner.dropped.load(Ordering::Relaxed), "clock_uncertainty_ms":null, "active_peers":self.inner.active_peers.load(Ordering::Relaxed)}), stamp);
+        let healthy = writer_ok && !stale && !(self.inner.require_tx_payloads && tx_stale);
+        self.emit(
+            json!({
+                "event": "sensor_heartbeat",
+                "healthy": healthy,
+                "payload_stale": stale,
+                "last_payload_age_ms": payload_age,
+                "tx_payload_stale": tx_stale,
+                "last_tx_payload_age_ms": tx_age,
+                "capped_inventory": self.inner.capped_inventory.load(Ordering::Relaxed),
+                "dropped_events": self.inner.dropped.load(Ordering::Relaxed),
+                "clock_uncertainty_ms": null,
+                "active_peers": self.inner.active_peers.load(Ordering::Relaxed),
+            }),
+            stamp,
+        );
     }
 
-    fn payload_decoded(&self, stamp: ObservationTime) {
-        self.inner
-            .last_payload_ms
-            .fetch_max(stamp.monotonic_ms, Ordering::Relaxed);
+    fn mark(last: &AtomicU64, stamp: ObservationTime) {
+        last.fetch_max(stamp.monotonic_ms + 1, Ordering::Relaxed);
     }
 
     pub fn peer_active(&self) -> ActivePeer {
@@ -231,24 +291,51 @@ impl Observer {
             }
             self.emit(event, stamp);
         } else if inv.is_block() {
-            self.block(&inventory_hash_to_display(&inv.hash), "announcement", stamp);
+            self.emit(
+                json!({"event":"block_seen", "block_hash":inventory_hash_to_display(&inv.hash), "stage":"announcement"}),
+                stamp,
+            );
         }
     }
 
-    pub fn block(&self, hash: &str, stage: &str, stamp: ObservationTime) {
-        if stage == "payload" {
-            self.payload_decoded(stamp);
+    /// Inventory entries skipped by the per-message cap.
+    pub fn inventory_capped(&self, count: u64) {
+        self.inner
+            .capped_inventory
+            .fetch_add(count, Ordering::Relaxed);
+    }
+
+    /// A received block. Only one that completes a request refreshes health.
+    pub fn block_payload(&self, hash: &str, solicited: bool, stamp: ObservationTime) {
+        if solicited {
+            Self::mark(&self.inner.last_payload_ms, stamp);
         }
         self.emit(
-            json!({"event":"block_seen", "block_hash":hash, "stage":stage}),
+            json!({"event":"block_seen", "block_hash":hash, "stage":"payload"}),
             stamp,
         );
     }
 
+    /// A decoded transaction. Only one that completes a request refreshes health.
+    pub fn tx_payload(
+        &self,
+        metadata: &crate::wtxid::TxMetadata,
+        size: usize,
+        solicited: bool,
+        stamp: ObservationTime,
+    ) {
+        if solicited {
+            Self::mark(&self.inner.last_payload_ms, stamp);
+            Self::mark(&self.inner.last_tx_payload_ms, stamp);
+        }
+        self.emit(json!({"event":"tx_seen", "source_kind":"p2p", "stage":"payload", "txid":metadata.txid, "auth_digest":metadata.auth_digest, "size_bytes":size, "tx_version":metadata.version, "expiry_height":metadata.expiry_height, "action_count":metadata.action_count}), stamp);
+    }
+
+    /// Test shorthand: decode and record a solicited payload.
+    #[cfg(test)]
     pub fn payload(&self, payload: &[u8], stamp: ObservationTime) {
-        if let Some(metadata) = crate::wtxid::metadata_from_tx_bytes(payload) {
-            self.payload_decoded(stamp);
-            self.emit(json!({"event":"tx_seen", "source_kind":"p2p", "stage":"payload", "txid":metadata.txid, "auth_digest":metadata.auth_digest, "size_bytes":payload.len(), "tx_version":metadata.version, "expiry_height":metadata.expiry_height, "action_count":metadata.action_count}), stamp);
+        if let Some((_, metadata)) = crate::wtxid::parse_tx_bytes(payload) {
+            self.tx_payload(&metadata, payload.len(), true, stamp);
         }
     }
 }
@@ -372,6 +459,8 @@ mod tests {
             max_files: 2,
             heartbeat_interval: Duration::from_millis(20),
             payload_stale_after: Duration::from_secs(600),
+            tx_payload_stale_after: Duration::from_secs(1800),
+            require_tx_payloads: false,
         }
     }
 
@@ -484,6 +573,33 @@ mod tests {
             .expect("heartbeats are emitted even when stale")
     }
 
+    fn block_hash() -> String {
+        "ab".repeat(32)
+    }
+
+    fn v6_tx() -> Vec<u8> {
+        hex::decode(include_str!("../tests/fixtures/mainnet_v6_tx.hex").trim()).unwrap()
+    }
+
+    fn drain(rx: &Receiver<Value>) {
+        let _ = rx.try_iter().count();
+    }
+
+    #[test]
+    fn heartbeat_is_not_healthy_until_the_first_payload() {
+        // A fresh process has observed nothing; it must not claim coverage.
+        let (observer, rx) = Observer::channel(&config("warming"));
+        let beat = heartbeat_health(&observer, &rx);
+        assert_eq!(beat["healthy"], false);
+        assert_eq!(beat["payload_stale"], true);
+        assert_eq!(beat["last_payload_age_ms"], Value::Null);
+        observer.block_payload(&block_hash(), true, observer.capture());
+        drain(&rx);
+        let beat = heartbeat_health(&observer, &rx);
+        assert_eq!(beat["healthy"], true);
+        assert_eq!(beat["payload_stale"], false);
+    }
+
     #[test]
     fn heartbeat_turns_unhealthy_without_decoded_payloads() {
         // Post-NU7 the deployed observer decoded nothing for days while every
@@ -492,9 +608,9 @@ mod tests {
         cfg.queue_capacity = 64;
         cfg.payload_stale_after = Duration::from_millis(250);
         let (observer, rx) = Observer::channel(&cfg);
-        let beat = heartbeat_health(&observer, &rx);
-        assert_eq!(beat["healthy"], true, "startup grace");
-        assert_eq!(beat["payload_stale"], false);
+        observer.block_payload(&block_hash(), true, observer.capture());
+        drain(&rx);
+        assert_eq!(heartbeat_health(&observer, &rx)["healthy"], true);
         std::thread::sleep(Duration::from_millis(300));
         observer.inventory(
             &Inventory {
@@ -504,8 +620,15 @@ mod tests {
             },
             observer.capture(),
         );
-        observer.block(&"ab".repeat(32), "announcement", observer.capture());
-        let _ = rx.try_iter().count();
+        observer.inventory(
+            &Inventory {
+                inv_type: crate::wire::MSG_BLOCK,
+                hash: [2; 32],
+                auth_digest: None,
+            },
+            observer.capture(),
+        );
+        drain(&rx);
         let beat = heartbeat_health(&observer, &rx);
         assert_eq!(beat["healthy"], false);
         assert_eq!(beat["payload_stale"], true);
@@ -516,27 +639,90 @@ mod tests {
     }
 
     #[test]
-    fn decoded_block_or_tx_payload_restores_heartbeat_health() {
-        let mut cfg = config("fresh");
+    fn unsolicited_payloads_are_recorded_but_do_not_refresh_health() {
+        let (observer, rx) = Observer::channel(&config("unsolicited"));
+        observer.block_payload(&block_hash(), false, observer.capture());
+        let tx = v6_tx();
+        let (_, metadata) = crate::wtxid::parse_tx_bytes(&tx).unwrap();
+        observer.tx_payload(&metadata, tx.len(), false, observer.capture());
+        let events: Vec<Value> = rx.try_iter().collect();
+        assert_eq!(events.len(), 2, "unsolicited payloads are still observed");
+        assert_eq!(heartbeat_health(&observer, &rx)["healthy"], false);
+    }
+
+    #[test]
+    fn blocks_without_decoded_transactions_are_unhealthy_when_tx_fetch_is_on() {
+        // Blocks need only header bytes; a sensor whose tx decoding is broken
+        // must not stay healthy on block arrivals alone.
+        let mut cfg = config("tx-required");
         cfg.queue_capacity = 64;
-        cfg.payload_stale_after = Duration::from_millis(250);
+        cfg.require_tx_payloads = true;
+        cfg.tx_payload_stale_after = Duration::from_millis(250);
         let (observer, rx) = Observer::channel(&cfg);
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(heartbeat_health(&observer, &rx)["healthy"], false);
-        observer.block(&"ab".repeat(32), "payload", observer.capture());
-        let _ = rx.try_iter().count();
-        assert_eq!(heartbeat_health(&observer, &rx)["healthy"], true);
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(heartbeat_health(&observer, &rx)["healthy"], false);
-        // An undecodable tx payload does not count; a decodable one does.
-        observer.payload(&[0xff; 3], observer.capture());
-        assert_eq!(heartbeat_health(&observer, &rx)["healthy"], false);
-        let tx = hex::decode(include_str!("../tests/fixtures/mainnet_v6_tx.hex").trim()).unwrap();
-        observer.payload(&tx, observer.capture());
-        let _ = rx.try_iter().count();
+        observer.block_payload(&block_hash(), true, observer.capture());
+        drain(&rx);
         let beat = heartbeat_health(&observer, &rx);
-        assert_eq!(beat["healthy"], true);
         assert_eq!(beat["payload_stale"], false);
+        assert_eq!(beat["tx_payload_stale"], true);
+        assert_eq!(beat["last_tx_payload_age_ms"], Value::Null);
+        assert_eq!(beat["healthy"], false);
+        let tx = v6_tx();
+        let (_, metadata) = crate::wtxid::parse_tx_bytes(&tx).unwrap();
+        observer.tx_payload(&metadata, tx.len(), true, observer.capture());
+        drain(&rx);
+        let beat = heartbeat_health(&observer, &rx);
+        assert_eq!(beat["tx_payload_stale"], false);
+        assert_eq!(beat["healthy"], true);
+        std::thread::sleep(Duration::from_millis(300));
+        observer.block_payload(&block_hash(), true, observer.capture());
+        drain(&rx);
+        let beat = heartbeat_health(&observer, &rx);
+        assert_eq!(beat["payload_stale"], false);
+        assert_eq!(beat["tx_payload_stale"], true);
+        assert!(beat["last_tx_payload_age_ms"].as_u64().unwrap() >= 250);
+        assert_eq!(beat["healthy"], false);
+    }
+
+    #[test]
+    fn tx_payload_age_does_not_gate_health_when_tx_fetch_is_off() {
+        let mut cfg = config("tx-optional");
+        cfg.queue_capacity = 64;
+        let (observer, rx) = Observer::channel(&cfg);
+        observer.block_payload(&block_hash(), true, observer.capture());
+        drain(&rx);
+        let beat = heartbeat_health(&observer, &rx);
+        assert_eq!(beat["tx_payload_stale"], true);
+        assert_eq!(beat["healthy"], true);
+    }
+
+    #[test]
+    fn heartbeats_are_not_dropped_by_an_event_flood() {
+        let mut cfg = config("flood");
+        cfg.queue_capacity = 64;
+        let (observer, rx) = Observer::channel(&cfg);
+        let inv = Inventory {
+            inv_type: MSG_TX,
+            hash: [1; 32],
+            auth_digest: None,
+        };
+        for _ in 0..1000 {
+            observer.inventory(&inv, observer.capture());
+        }
+        assert!(observer.inner.dropped.load(Ordering::Relaxed) > 0);
+        observer.heartbeat();
+        let events: Vec<Value> = rx.try_iter().collect();
+        assert_eq!(
+            events.last().unwrap()["event"],
+            "sensor_heartbeat",
+            "reserved capacity keeps the heartbeat"
+        );
+    }
+
+    #[test]
+    fn capped_inventory_is_reported_in_heartbeats() {
+        let (observer, rx) = Observer::channel(&config("capped"));
+        observer.inventory_capped(7);
+        assert_eq!(heartbeat_health(&observer, &rx)["capped_inventory"], 7);
     }
 
     #[test]
@@ -547,6 +733,12 @@ mod tests {
         cfg.payload_stale_after = Duration::from_secs(86_401);
         assert!(cfg.validate().is_err());
         cfg.payload_stale_after = Duration::from_millis(DEFAULT_PAYLOAD_STALE_MS);
+        assert!(cfg.validate().is_ok());
+        cfg.tx_payload_stale_after = Duration::ZERO;
+        assert!(cfg.validate().is_err());
+        cfg.tx_payload_stale_after = Duration::from_secs(86_401);
+        assert!(cfg.validate().is_err());
+        cfg.tx_payload_stale_after = Duration::from_millis(DEFAULT_TX_PAYLOAD_STALE_MS);
         assert!(cfg.validate().is_ok());
     }
 

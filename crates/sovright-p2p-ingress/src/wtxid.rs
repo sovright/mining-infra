@@ -97,11 +97,17 @@ pub struct TxMetadata {
     pub action_count: usize,
 }
 
-/// Structural count: transparent inputs/outputs, Sapling spends/outputs,
-/// Orchard actions and Ironwood actions; this is not ZIP-317 logical actions.
-/// v5/v6 embed their own branch, so the reader hint never affects the result.
-pub fn metadata_from_tx_bytes(tx_bytes: &[u8]) -> Option<TxMetadata> {
+/// One parse of a received transaction: its relay `WtxId` plus display-order
+/// metadata for the observation stream. v5/v6 embed their own branch, so the
+/// reader hint never affects the result. Returns `None` exactly when
+/// `wtxid_from_tx_bytes` does.
+///
+/// `action_count` is structural: transparent inputs/outputs, Sapling
+/// spends/outputs, Orchard actions and Ironwood actions; not ZIP-317 actions.
+pub fn parse_tx_bytes(tx_bytes: &[u8]) -> Option<(WtxId, TxMetadata)> {
     let tx = read_supported_tx(tx_bytes, TX_READER_BRANCH_HINT)?;
+    let txid_wire: [u8; 32] = *tx.txid().as_ref();
+    let auth_wire: [u8; 32] = tx.auth_commitment().as_bytes().try_into().ok()?;
     let action_count = tx
         .transparent_bundle()
         .map_or(0, |b| b.vin.len() + b.vout.len())
@@ -110,14 +116,20 @@ pub fn metadata_from_tx_bytes(tx_bytes: &[u8]) -> Option<TxMetadata> {
         })
         + tx.orchard_bundle().map_or(0, |b| b.actions().len())
         + tx.ironwood_bundle().map_or(0, |b| b.actions().len());
-    let auth: [u8; 32] = tx.auth_commitment().as_bytes().try_into().ok()?;
-    Some(TxMetadata {
-        txid: crate::hash::inventory_hash_to_display(tx.txid().as_ref()),
-        auth_digest: crate::hash::inventory_hash_to_display(&auth),
+    let metadata = TxMetadata {
+        txid: crate::hash::inventory_hash_to_display(&txid_wire),
+        auth_digest: crate::hash::inventory_hash_to_display(&auth_wire),
         version: if tx.version() == TxVersion::V5 { 5 } else { 6 },
         expiry_height: u32::from(tx.expiry_height()),
         action_count,
-    })
+    };
+    Some((
+        WtxId::new(
+            TxId::from_bytes(txid_wire),
+            AuthDigest::from_bytes(auth_wire),
+        ),
+        metadata,
+    ))
 }
 
 #[cfg(test)]
@@ -148,13 +160,14 @@ mod tests {
     #[test]
     fn v5_metadata_matches_zip244_display_identifiers() {
         let payload = hex::decode(VECTOR_V5_TX_HEX).unwrap();
-        let metadata = metadata_from_tx_bytes(&payload).unwrap();
+        let (wtxid, metadata) = parse_tx_bytes(&payload).unwrap();
+        assert_eq!(Some(wtxid), wtxid_from_tx_bytes(&payload, BranchId::Nu5));
         assert_eq!(metadata.version, 5);
         assert_eq!(metadata.txid, VECTOR_TXID_DISPLAY_HEX);
         assert_eq!(metadata.auth_digest, VECTOR_AUTH_DISPLAY_HEX);
         assert_eq!(metadata.expiry_height, 36466477);
         assert!(metadata.action_count > 0);
-        assert!(metadata_from_tx_bytes(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
+        assert!(parse_tx_bytes(&[1, 0, 0, 0, 0, 0, 0, 0, 0, 0]).is_none());
     }
 
     fn wtxid_from_hex_vector() -> WtxId {
