@@ -476,8 +476,9 @@ a warning and runs the legacy peers alone.
   dedup state. Events name the peer `zakura-native`; their `hash` and
   `consensus_hash` fields mean what they mean for legacy blocks.
 - An announcement is skipped, without a fetch, when its hash is already being
-  fetched or forwarded, or when its peer already has a block in progress. A
-  failed fetch or forward frees the hash and the peer for the next announcement.
+  fetched or forwarded, when the block was delivered recently (below), or when
+  its peer already has a block in progress. A failed fetch or forward frees the
+  hash and the peer for the next announcement.
 - Every block announcement is answered with an error, on purpose, whatever its
   source. After a successful answer, `zakura-network` 15.0.0 would mark the hash
   seen for ten minutes, dropping later announcements of it from every peer, and
@@ -506,15 +507,31 @@ When every body slot or fetch permit is taken, the fetcher waits and the
 announcement queue fills. One peer cannot cause that, but many peer identities
 can.
 
+### Delivered blocks
+
+After a forward, a block is remembered as delivered if the bridge now holds its
+own forward record for the header. The bridge writes that record only for a
+body that passed its checks and whose send finished, from either source. So a
+refused body, a failed or cancelled send, and a body sent under the emergency
+bypass leave nothing to remember, even when the bridge reports a repeat of the
+bypassed body as `deduplicated`.
+
+- At most 64 blocks are remembered, each for 30 seconds from the bridge's
+  record time. These are starting values matching the bridge's default dedup
+  ring, not values tuned in production.
+- A repeated announcement does not extend an entry.
+- An entry counts only while the bridge still holds the same record, so a shorter
+  bridge window, or the bridge's ring pushing the record out, ends it too.
+- The bridge record is local state: it does not mean a relay peer received the
+  block or a node accepted it.
+
 ### Known costs and limits
 
-- **Repeated fetches.** The bridge keys its dedup state by a header hash that an
-  announcement does not carry, and the source keeps no record of blocks it
-  delivered. A block a legacy peer already forwarded is fetched again, and so is
-  a block announced again after its forward finished; the bridge then drops the
-  copy as a duplicate. Each copy is a full body transfer. An announcing peer that
-  answers missing makes `zakura-network` ask up to two other peers each time; one
-  block in progress per peer limits how fast one peer can do this, not how often.
+- **Repeated fetches.** A block announced again after its 30 seconds, or after
+  the bridge dropped its record, is fetched again in full. So is a block no
+  forward recorded, such as one whose forward failed. An announcing peer that
+  answers missing makes `zakura-network` ask up to two other peers each time;
+  one peer at a time limits how fast one peer can do this, not how often.
 - **Head-of-line.** The forwarder handles one body at a time. A body waiting
   behind a legacy copy of the same block, or behind the bridge's one P2P parse
   permit, holds back the next one.

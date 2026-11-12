@@ -207,6 +207,8 @@ pub struct NativeStats {
     pub adverts_dropped: AtomicU64,
     /// Advertisements skipped because the same hash was being fetched or delivered.
     pub adverts_coalesced: AtomicU64,
+    /// Advertisements skipped because the consumer reported the block delivered.
+    pub adverts_delivered: AtomicU64,
     /// Advertisements skipped because their source already had a block in progress.
     pub adverts_source_busy: AtomicU64,
     /// Fetches that returned the advertised block within the size limit.
@@ -238,6 +240,16 @@ impl SourceLimits {
     pub fn body_slots(&self) -> usize {
         self.max_concurrent_fetches.saturating_mul(2)
     }
+}
+
+/// Says whether a block counts as delivered, by its advertised hash. An
+/// advertisement of a delivered block is skipped. The consumer decides what
+/// delivered means and keeps the record.
+pub type DeliveredCheck = Arc<dyn Fn(&block::Hash) -> bool + Send + Sync>;
+
+/// A check under which nothing counts as delivered.
+pub fn nothing_delivered() -> DeliveredCheck {
+    Arc::new(|_| false)
 }
 
 /// A block body fetched from a native peer.
@@ -283,7 +295,9 @@ impl Drop for Reservation {
 /// source busy.
 ///
 /// Dropping it gives all three back, whether the consumer forwarded the block,
-/// failed, was cancelled or panicked.
+/// failed, was cancelled or panicked. A consumer that records the block as
+/// delivered must do so before dropping this, so that no advertisement finds the
+/// hash neither in flight nor delivered.
 pub struct Delivery {
     reservation: Reservation,
     _slot: OwnedSemaphorePermit,
@@ -297,11 +311,63 @@ impl std::fmt::Debug for Delivery {
     }
 }
 
+/// Makes [`FetchedBlock`]s the way [`run_fetcher`] hands them over, without a
+/// network, and shows whether their hashes are still in progress. For consumer
+/// tests in other crates.
+#[cfg(feature = "test-support")]
+#[derive(Default)]
+pub struct DeliveryProbe {
+    in_progress: Arc<Mutex<InProgress>>,
+}
+
+#[cfg(feature = "test-support")]
+impl DeliveryProbe {
+    /// A probe with nothing in progress.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// A fetched block for `hash`, holding its place as a real one would.
+    pub fn fetched(&self, hash: block::Hash, bytes: Vec<u8>) -> FetchedBlock {
+        let source = PeerSource::Zakura(
+            zakura_network::zakura::ZakuraPeerId::new([0x5a; 32])
+                .expect("32 bytes is a valid peer id"),
+        );
+        {
+            let mut entries = lock(&self.in_progress);
+            entries.hashes.insert(hash);
+            entries.sources.insert(source.clone());
+        }
+        let slot = Arc::new(Semaphore::new(1))
+            .try_acquire_owned()
+            .expect("a new semaphore has a permit");
+        FetchedBlock {
+            hash,
+            source: source.clone(),
+            bytes,
+            delivery: Delivery {
+                reservation: Reservation {
+                    in_progress: Arc::clone(&self.in_progress),
+                    hash,
+                    source,
+                },
+                _slot: slot,
+            },
+        }
+    }
+
+    /// Whether `hash` is still in progress: its delivery has not been dropped.
+    pub fn in_progress(&self, hash: &block::Hash) -> bool {
+        lock(&self.in_progress).hashes.contains(hash)
+    }
+}
+
 /// Fetches advertised blocks and sends the bodies to `fetched`.
 ///
 /// Each advertisement is decided under one lock, in this order:
 /// - its hash is in progress (being fetched, queued or with the consumer): skipped
 ///   as coalesced;
+/// - `delivered` says the consumer already has the block: skipped;
 /// - its source already has a block in progress: skipped, so one peer holds at most
 ///   one body slot and one fetch at a time and its later advertisements wait on
 ///   nothing;
@@ -318,9 +384,7 @@ impl std::fmt::Debug for Delivery {
 /// that alone, but many peer identities can.
 ///
 /// A failed fetch frees its hash and its source at once, so a later advertisement
-/// fetches again. So does a delivery the consumer drops after a successful fetch:
-/// nothing here records delivered blocks, so a later advertisement of one fetches
-/// it again. Returns when `adverts` closes; the fetches still running are then
+/// fetches again. Returns when `adverts` closes; the fetches still running are then
 /// aborted.
 pub async fn run_fetcher<F, Fut>(
     mut adverts: mpsc::Receiver<NativeAdvert>,
@@ -328,6 +392,7 @@ pub async fn run_fetcher<F, Fut>(
     fetched: mpsc::Sender<FetchedBlock>,
     limits: SourceLimits,
     stats: Arc<NativeStats>,
+    delivered: DeliveredCheck,
 ) where
     F: Fn(NativeAdvert) -> Fut + Clone + Send + 'static,
     Fut: Future<Output = Result<Vec<u8>, BoxError>> + Send + 'static,
@@ -344,6 +409,12 @@ pub async fn run_fetcher<F, Fut>(
             let mut entries = lock(&in_progress);
             if entries.hashes.contains(&advert.hash) {
                 stats.adverts_coalesced.fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+            // Checked while the hash cannot leave the in-progress set, so a block
+            // the consumer records and then releases is found one way or the other.
+            if delivered(&advert.hash) {
+                stats.adverts_delivered.fetch_add(1, Ordering::Relaxed);
                 continue;
             }
             if entries.sources.contains(&advert.source) {
@@ -469,9 +540,10 @@ pub struct NativeSource {
 
 impl NativeSource {
     /// Starts the endpoint and the fetcher. Fetched bodies arrive on the returned
-    /// receiver.
+    /// receiver; `delivered` is the consumer's record of blocks it already has.
     pub async fn start(
         config: NativeSourceConfig,
+        delivered: DeliveredCheck,
     ) -> Result<(Self, mpsc::Receiver<FetchedBlock>), BoxError> {
         let limits = config.limits;
         if limits.advert_queue == 0 || limits.max_concurrent_fetches == 0 {
@@ -504,6 +576,7 @@ impl NativeSource {
             fetched_tx,
             limits,
             Arc::clone(&stats),
+            delivered,
         ));
 
         Ok((
@@ -549,7 +622,7 @@ impl Drop for NativeSource {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use tokio::sync::Notify;
     use zakura_network::zakura::ZakuraPeerId;
@@ -701,6 +774,7 @@ mod tests {
             fetched_tx,
             limits(4, 4),
             Arc::clone(&stats),
+            nothing_delivered(),
         ));
 
         advert_tx.send(advert_from(1, 1)).await.unwrap();
@@ -747,6 +821,7 @@ mod tests {
             fetched_tx,
             limits(4, 1),
             Arc::clone(&stats),
+            nothing_delivered(),
         ));
 
         advert_tx.send(advert(2)).await.unwrap();
@@ -799,6 +874,7 @@ mod tests {
             fetched_tx,
             limits(8, 2),
             Arc::clone(&stats),
+            nothing_delivered(),
         ));
 
         advert_tx.send(advert_from(1, 1)).await.unwrap();
@@ -842,6 +918,7 @@ mod tests {
             fetched_tx,
             limits,
             Arc::clone(&stats),
+            nothing_delivered(),
         ));
 
         for byte in 1..=3 {
@@ -878,6 +955,7 @@ mod tests {
             fetched_tx,
             limits,
             Arc::clone(&stats),
+            nothing_delivered(),
         ));
 
         advert_tx.send(advert(5)).await.unwrap();
@@ -887,6 +965,47 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(stats.fetches_ok.load(Ordering::Relaxed), 0);
         assert!(fetched_rx.try_recv().is_err(), "no body was delivered");
+        fetcher.abort();
+    }
+
+    /// The hash stays in progress until the consumer drops the delivery, so an
+    /// advertisement meanwhile is coalesced. A consumer that records the block
+    /// before dropping it leaves no gap: the next advertisement is skipped as
+    /// delivered. Once the record no longer holds, the hash is fetched again.
+    #[tokio::test]
+    async fn a_hash_stays_in_progress_until_its_delivery_is_dropped() {
+        let stats = Arc::new(NativeStats::default());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let recorded = Arc::new(AtomicBool::new(false));
+        let delivered: DeliveredCheck = {
+            let recorded = Arc::clone(&recorded);
+            Arc::new(move |_| recorded.load(Ordering::SeqCst))
+        };
+        let (advert_tx, advert_rx) = mpsc::channel(4);
+        let (fetched_tx, mut fetched_rx) = mpsc::channel(4);
+        let fetcher = tokio::spawn(run_fetcher(
+            advert_rx,
+            counting_fetch(Arc::clone(&calls), vec![1]),
+            fetched_tx,
+            limits(4, 1),
+            Arc::clone(&stats),
+            delivered,
+        ));
+
+        advert_tx.send(advert_from(3, 1)).await.unwrap();
+        let block = timeout(STEP, fetched_rx.recv()).await.unwrap().unwrap();
+        advert_tx.send(advert_from(3, 2)).await.unwrap();
+        wait_for(&stats.adverts_coalesced, 1, "coalesced while held").await;
+
+        recorded.store(true, Ordering::SeqCst);
+        drop(block);
+        advert_tx.send(advert_from(3, 2)).await.unwrap();
+        wait_for(&stats.adverts_delivered, 1, "skipped as delivered").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        recorded.store(false, Ordering::SeqCst);
+        advert_tx.send(advert_from(3, 2)).await.unwrap();
+        wait_for_calls(&calls, 2, "fetched again once the record is gone").await;
         fetcher.abort();
     }
 
@@ -904,6 +1023,7 @@ mod tests {
             fetched_tx,
             limits(4, 1),
             Arc::clone(&stats),
+            nothing_delivered(),
         ));
 
         advert_tx.send(advert_from(4, 1)).await.unwrap();
