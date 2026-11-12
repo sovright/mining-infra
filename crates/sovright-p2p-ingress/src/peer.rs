@@ -119,10 +119,16 @@ impl<K: Copy + Eq + Hash> RequestWindow<K> {
 
     /// Drops requests past their deadline and returns how many were dropped.
     fn expire(&mut self, now: Instant) -> usize {
-        let mut expired = 0;
+        self.expire_keys(now).len()
+    }
+
+    /// Drops requests past their deadline and returns their keys.
+    fn expire_keys(&mut self, now: Instant) -> Vec<K> {
+        let mut expired = Vec::new();
         while self.deadline().is_some_and(|deadline| deadline <= now) {
-            self.pending.pop_front();
-            expired += 1;
+            if let Some((key, _)) = self.pending.pop_front() {
+                expired.push(key);
+            }
         }
         expired
     }
@@ -189,9 +195,16 @@ pub async fn run_peer(
         TX_ANNOUNCEMENT_PERIOD,
         handshake_started,
     );
+    // Requested blocks that expired undelivered. Reset by any validated
+    // delivery of a requested block, including a late one (see `late_blocks`).
     let mut undelivered_blocks = 0usize;
+    let mut late_blocks = RecentInventory::new(64);
 
     loop {
+        // Checked once per message, after it was processed, so a slow large
+        // block is matched before its own expiry counts. A silent peer is
+        // dropped by the read timeout instead.
+        refuse_undelivering_observed_peer(observer.is_some(), undelivered_blocks)?;
         // Keep the same read future alive across expiry. Cancelling a partial
         // frame read on each deadline would desynchronise the wire decoder.
         let read = timeout(
@@ -215,18 +228,22 @@ pub async fn run_peer(
                     }
                 } => {
                     let now = Instant::now();
-                    undelivered_blocks += blocks.expire(now);
+                    for expired in blocks.expire_keys(now) {
+                        undelivered_blocks += 1;
+                        late_blocks.insert(expired);
+                    }
                     transactions.expire(now);
-                    refuse_undelivering_observed_peer(observer.is_some(), undelivered_blocks)?;
                 }
             }
         };
         // Observation time is captured before any parsing or cache work.
         let observed = observer.as_ref().map(|o| o.capture());
         let now = Instant::now();
-        undelivered_blocks += blocks.expire(now);
+        for expired in blocks.expire_keys(now) {
+            undelivered_blocks += 1;
+            late_blocks.insert(expired);
+        }
         transactions.expire(now);
-        refuse_undelivering_observed_peer(observer.is_some(), undelivered_blocks)?;
         debug!(%peer, command = %msg.command, bytes = msg.payload.len(), "received P2P message");
 
         if (!sent_verack || !saw_verack) && !matches!(msg.command.as_str(), "version" | "verack") {
@@ -379,10 +396,6 @@ pub async fn run_peer(
                     if inv.is_block() {
                         if blocks.remove(inv.hash).is_some() {
                             undelivered_blocks += 1;
-                            refuse_undelivering_observed_peer(
-                                observer.is_some(),
-                                undelivered_blocks,
-                            )?;
                         }
                     } else if let Some(key) = TxInventoryKey::from_inventory(&inv) {
                         transactions.remove(key);
@@ -390,7 +403,26 @@ pub async fn run_peer(
                 }
             }
             "block" => {
+                // Observer mode: a header without valid proof of work is junk.
+                // It is not observed and counts as an undelivered block.
+                let header_valid = observer
+                    .as_ref()
+                    .map(|o| o.validate_block_header(&msg.payload));
+                if header_valid == Some(false) {
+                    if let Ok(hash) = inventory_hash_from_header(&msg.payload) {
+                        blocks.remove(hash);
+                    }
+                    undelivered_blocks += 1;
+                    continue;
+                }
+                let late = header_valid.is_some()
+                    && inventory_hash_from_header(&msg.payload)
+                        .is_ok_and(|hash| late_blocks.keys.contains(&hash));
                 let (display, solicited) = received_block(&mut blocks, &msg.payload)?;
+                let solicited = solicited || late;
+                if header_valid == Some(true) && solicited {
+                    undelivered_blocks = 0;
+                }
                 let consensus_hash = msg
                     .payload
                     .get(..sovright_relay::ZCASH_FULL_HEADER_SIZE)
@@ -1017,7 +1049,7 @@ mod tests {
         .unwrap();
         let events = wait_for_events(&path, |events| {
             events.iter().any(|e| {
-                e["event"] == "sensor_heartbeat" && e["capped_inventory"].as_u64() == Some(58)
+                e["event"] == "sensor_heartbeat" && e["capped_inventory"].as_u64() == Some(18 + 44)
             })
         })
         .await;
@@ -1057,7 +1089,7 @@ mod tests {
         let events = wait_for_events(&path, |events| {
             events.iter().any(|e| {
                 e["event"] == "sensor_heartbeat"
-                    && e["capped_inventory"].as_u64().is_some_and(|c| c >= 4 + 300)
+                    && e["capped_inventory"].as_u64().is_some_and(|c| c >= 8 + 300)
             })
         })
         .await;
@@ -1081,7 +1113,12 @@ mod tests {
                 .await
                 .unwrap();
         }
-        // Never deliver; keep the connection otherwise alive.
+        // Never deliver. The check runs after the next message (a silent
+        // peer is dropped by the 90 s read timeout instead).
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write_message(&mut stream, Network::Mainnet, "ping", &7u64.to_le_bytes())
+            .await
+            .unwrap();
         let error = timeout(Duration::from_secs(3), task)
             .await
             .expect("an undelivering peer must be dropped")
@@ -1089,6 +1126,105 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("never delivered"), "{error}");
+        let _ = fs::remove_file(path);
+    }
+
+    fn nu7_block() -> Vec<u8> {
+        hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap()
+    }
+
+    /// A 1487-byte header that hashes to whatever it hashes to, with a junk
+    /// Equihash solution: free to make, so it must never count as a block.
+    fn junk_header(tag: u8) -> Vec<u8> {
+        let mut header = nu7_block()[..sovright_relay::ZCASH_FULL_HEADER_SIZE].to_vec();
+        header[200] ^= tag;
+        header
+    }
+
+    fn block_inventory(header: &[u8]) -> Inventory {
+        Inventory {
+            inv_type: crate::wire::MSG_BLOCK,
+            hash: sovright_relay::consensus_block_hash(
+                &header[..sovright_relay::ZCASH_FULL_HEADER_SIZE],
+            ),
+            auth_digest: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn junk_block_deliveries_are_not_observed_and_count_as_undelivered() {
+        let (path, task, mut stream) = observed_peer("junk-block", 170_190).await;
+        for tag in [1u8, 2] {
+            let junk = junk_header(tag);
+            let inv = encode_inventory(&[block_inventory(&junk)]);
+            write_message(&mut stream, Network::Mainnet, "inv", &inv)
+                .await
+                .unwrap();
+            write_message(&mut stream, Network::Mainnet, "block", &junk)
+                .await
+                .unwrap();
+        }
+        let error = timeout(Duration::from_secs(3), task)
+            .await
+            .expect("a peer delivering junk headers must be dropped")
+            .unwrap()
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("never delivered"), "{error}");
+        let events = observed_events(&path);
+        assert!(
+            events
+                .iter()
+                .all(|e| !(e["event"] == "block_seen" && e["stage"] == "payload")),
+            "junk headers must not reach the collector"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn a_valid_delivery_even_late_resets_the_undelivered_count() {
+        let mut config = peer_test_config();
+        config.inventory_limits.timeout = Duration::from_millis(50);
+        let (path, task, mut stream) = observed_peer_with("late-block", 170_190, config).await;
+        let ping = 7u64.to_le_bytes();
+        // One undelivered fake, then a real block announced and delivered after
+        // its request expired (a slow large block), then another fake.
+        let fake = |i| encode_inventory(&[numbered(crate::wire::MSG_BLOCK, i, 0xb5)]);
+        write_message(&mut stream, Network::Mainnet, "inv", &fake(0))
+            .await
+            .unwrap();
+        let block = nu7_block();
+        write_message(
+            &mut stream,
+            Network::Mainnet,
+            "inv",
+            &encode_inventory(&[block_inventory(&block)]),
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write_message(&mut stream, Network::Mainnet, "block", &block)
+            .await
+            .unwrap();
+        write_message(&mut stream, Network::Mainnet, "inv", &fake(1))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        write_message(&mut stream, Network::Mainnet, "ping", &ping)
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !task.is_finished(),
+            "an honest peer with a late block stays connected"
+        );
+        task.abort();
+        let events = observed_events(&path);
+        assert!(
+            events
+                .iter()
+                .any(|e| e["event"] == "block_seen" && e["stage"] == "payload")
+        );
         let _ = fs::remove_file(path);
     }
 

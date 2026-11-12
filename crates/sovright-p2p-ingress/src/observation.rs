@@ -18,12 +18,39 @@ pub const DEFAULT_PAYLOAD_STALE_MS: u64 = 600_000;
 pub const DEFAULT_TX_PAYLOAD_STALE_MS: u64 = 1_800_000;
 /// Per-connection observed-announcement budgets: a burst, then one per period.
 /// Honest peers announce a block about every 25 s.
-pub const BLOCK_ANNOUNCEMENT_BURST: u32 = 6;
+pub const BLOCK_ANNOUNCEMENT_BURST: u32 = 2;
 pub const BLOCK_ANNOUNCEMENT_PERIOD: Duration = Duration::from_secs(20);
 pub const TX_ANNOUNCEMENT_BURST: u32 = 256;
 pub const TX_ANNOUNCEMENT_PERIOD: Duration = Duration::from_millis(50);
 /// Announced blocks a connection may fail to deliver before it is dropped.
 pub const MAX_UNDELIVERED_BLOCK_ANNOUNCEMENTS: usize = 2;
+
+/// A delivered header must claim at least 1/FACTOR of the hardest difficulty
+/// among the last WINDOW accepted headers, so a self-chosen easy nBits fails.
+pub const DIFFICULTY_FLOOR_FACTOR: f64 = 4.0;
+pub const DIFFICULTY_WINDOW: usize = 64;
+
+#[derive(Debug, Default)]
+pub struct DifficultyFloor {
+    recent: Mutex<std::collections::VecDeque<f64>>,
+}
+
+impl DifficultyFloor {
+    /// Admits and records `difficulty` unless it is below the floor. The first
+    /// header after start is accepted to bootstrap the reference.
+    pub fn admit(&self, difficulty: f64) -> bool {
+        let mut recent = self.recent.lock().unwrap_or_else(|e| e.into_inner());
+        let hardest = recent.iter().copied().fold(0.0, f64::max);
+        if !(difficulty.is_finite() && difficulty >= hardest / DIFFICULTY_FLOOR_FACTOR) {
+            return false;
+        }
+        recent.push_back(difficulty);
+        if recent.len() > DIFFICULTY_WINDOW {
+            recent.pop_front();
+        }
+        true
+    }
+}
 
 /// Token bucket for observed announcements on one connection.
 #[derive(Debug)]
@@ -142,6 +169,8 @@ struct Inner {
     reserved: usize,
     capacity: usize,
     capped_inventory: AtomicU64,
+    pow_limit: zcash_equihash_validator::Target,
+    difficulty_floor: DifficultyFloor,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +212,8 @@ impl Observer {
                     reserved: (config.queue_capacity / 8).clamp(1, 64),
                     capacity: config.queue_capacity,
                     capped_inventory: AtomicU64::new(0),
+                    pow_limit: config.network.pow_limit(),
+                    difficulty_floor: DifficultyFloor::default(),
                 }),
             },
             receiver,
@@ -325,6 +356,41 @@ impl Observer {
 
     fn mark(last: &AtomicU64, stamp: ObservationTime) {
         last.fetch_max(stamp.monotonic_ms + 1, Ordering::Relaxed);
+    }
+
+    /// A delivered block counts only if its header carries a valid Equihash
+    /// solution, its hash meets the stated target, the stated target is within
+    /// the network's pow limit, and the stated difficulty clears the floor.
+    /// This is header proof of work only, not block validity.
+    pub fn validate_block_header(&self, block: &[u8]) -> bool {
+        use sovright_relay::{
+            TargetCheck, ZCASH_FULL_HEADER_SIZE, ZCASH_HEADER_SIZE, header_meets_stated_target,
+        };
+        use zcash_equihash_validator::{
+            EquihashValidator, compact_to_target, difficulty::target_to_difficulty_with_max,
+        };
+        let Some(header) = block.get(..ZCASH_FULL_HEADER_SIZE) else {
+            return false;
+        };
+        // CompactSize prefix of the 1344-byte solution.
+        if header[ZCASH_HEADER_SIZE..ZCASH_HEADER_SIZE + 3] != [0xfd, 0x40, 0x05] {
+            return false;
+        }
+        if EquihashValidator::new()
+            .verify_solution(
+                &header[..ZCASH_HEADER_SIZE],
+                &header[ZCASH_HEADER_SIZE + 3..],
+            )
+            .is_err()
+            || header_meets_stated_target(header, &self.inner.pow_limit) != TargetCheck::Met
+        {
+            return false;
+        }
+        let at = zcash_pool_common::BITS_OFFSET;
+        let bits = u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+        let difficulty =
+            target_to_difficulty_with_max(&compact_to_target(bits), &self.inner.pow_limit);
+        self.inner.difficulty_floor.admit(difficulty)
     }
 
     pub fn peer_active(&self) -> ActivePeer {
@@ -806,6 +872,45 @@ mod tests {
         assert_eq!(events[1]["event"], "sensor_heartbeat");
     }
 
+    fn nu7_block() -> Vec<u8> {
+        hex::decode(include_str!("../tests/fixtures/testnet_nu7_4465026.hex").trim()).unwrap()
+    }
+
+    #[test]
+    fn only_headers_with_valid_equihash_and_target_pass() {
+        let (observer, _rx) = Observer::channel(&config("header"));
+        let block = nu7_block();
+        assert!(observer.validate_block_header(&block));
+        let mut bad_solution = block.clone();
+        bad_solution[600] ^= 1;
+        assert!(!observer.validate_block_header(&bad_solution));
+        let mut bad_nonce = block.clone();
+        bad_nonce[120] ^= 1;
+        assert!(!observer.validate_block_header(&bad_nonce));
+        assert!(!observer.validate_block_header(&block[..1000]));
+        let mut bad_prefix = block.clone();
+        bad_prefix[140] = 0xfc;
+        assert!(!observer.validate_block_header(&bad_prefix));
+    }
+
+    #[test]
+    fn self_chosen_easy_difficulty_is_refused_below_the_floor() {
+        let gate = DifficultyFloor::default();
+        assert!(gate.admit(1000.0), "bootstrap accepts the first header");
+        assert!(gate.admit(1000.0 / DIFFICULTY_FLOOR_FACTOR));
+        assert!(!gate.admit(1000.0 / DIFFICULTY_FLOOR_FACTOR - 1.0));
+        assert!(gate.admit(4000.0));
+        assert!(
+            !gate.admit(999.0),
+            "the floor follows the hardest recent header"
+        );
+        // The reference is the hardest of a bounded recent window.
+        for _ in 0..DIFFICULTY_WINDOW {
+            assert!(gate.admit(1000.0));
+        }
+        assert!(gate.admit(999.0));
+    }
+
     #[test]
     fn capped_inventory_is_reported_in_heartbeats() {
         let (observer, rx) = Observer::channel(&config("capped"));
@@ -922,7 +1027,9 @@ mod tests {
         let path = cfg.path.clone();
         let observer = Observer::start(cfg).unwrap();
         let mut events = Vec::new();
-        for _ in 0..100 {
+        // Generous deadline: a loaded test host can delay the writer thread.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
             events = std::fs::read_to_string(&path)
                 .unwrap_or_default()
                 .lines()

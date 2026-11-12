@@ -355,11 +355,21 @@ Observation mode sets the handshake transaction relay flag and, like the relay
 and tx-feed paths, refuses peers below the network's protocol version (170190 on
 mainnet). Announcements are recorded before fetch selection, even when caching
 and transaction forwarding are disabled, within per-connection budgets: block
-announcements once each, a burst of 6 then one per 20 s; transaction
+announcements once each, a burst of 2 then one per 20 s; transaction
 announcements a burst of 256 then 20 per second. Skipped entries are counted in
-the heartbeat's `capped_inventory`. A peer whose announced blocks expire or come
-back `notfound` twice is disconnected, since each such hash would hold the
-collector in an unresolved chain transition. Observation mode does not itself enable
+the heartbeat's `capped_inventory`.
+
+A delivered block is observed only if its header carries a valid Equihash
+solution, its hash meets its stated target, that target is within the network's
+pow limit, and its stated difficulty is at least a quarter of the hardest of the
+last 64 accepted headers (the first header after start sets the reference). This
+is header proof of work, not block validation. A requested block that expires,
+comes back `notfound`, or arrives with an invalid header counts as undelivered;
+two undelivered blocks disconnect the peer, since each such hash would hold the
+collector in an unresolved chain transition. A valid delivery of a requested
+block, including one that arrives after its request expired, resets the count.
+The count is checked after each message, so a silent peer is dropped by the 90 s
+read timeout. Observation mode does not itself enable
 transaction fetches: enable the existing transaction cache or feed to acquire
 payloads needed for forecasting. Existing per-inventory fetch limits still apply.
 
@@ -408,7 +418,8 @@ Heartbeats report handshaken active peers, health, cumulative drops and
   decoded within `SOVRIGHT_P2P_OBSERVATION_TX_PAYLOAD_STALE_MS` (default 30
   minutes), so arriving blocks cannot mask broken transaction decoding.
 
-Announcements and unsolicited payloads are recorded but do not refresh health.
+Announcements and unsolicited payloads are recorded but do not refresh health,
+and a block payload is recorded only if its header passes the check above.
 Heartbeats also carry `payload_stale`, `last_payload_age_ms`, `tx_payload_stale`
 and `last_tx_payload_age_ms` (ages are null until the first payload). A stale
 sensor keeps writing every event; only a writer failure stops the stream. The
