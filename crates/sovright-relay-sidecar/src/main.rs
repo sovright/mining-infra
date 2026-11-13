@@ -6,7 +6,8 @@ use clap::Parser;
 use sovright_relay::{
     ArrivalSink, BlockBodyError, BlockReceiver, CompactBlock, MempoolProvider, RawBlockSegment,
     RelayPayload, TxCache, TxCacheConfig, TxCacheInsertOutcome, TxCacheSnapshot, TxFeedRecord,
-    WtxId, ZCASH_FULL_HEADER_SIZE, reassemble_raw_block, zcash_block_hash,
+    WtxId, ZCASH_FULL_HEADER_SIZE, consensus_block_hash_display, reassemble_raw_block,
+    zcash_block_hash,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -649,6 +650,7 @@ async fn submit_compact_fast_path<S, M>(
         return;
     }
 
+    let started = Instant::now();
     let outcome = if is_skeleton {
         metrics.inc_skeleton_received();
         // A skeleton submits ONLY on complete mempool reconstruction; it never
@@ -665,6 +667,28 @@ async fn submit_compact_fast_path<S, M>(
         )
         .await
     };
+
+    // One line per fast-path block, success or not, saying where its
+    // transactions came from. `elapsed_ms` includes the submitblock RPC in live
+    // mode (submit-calls.jsonl carries the RPC's own latency).
+    let path = if is_skeleton {
+        FastPath::Skeleton
+    } else {
+        FastPath::Compact
+    };
+    let summary = summarize_compact_reconstruction(compact, &outcome);
+    metrics.record_fast_path_reconstruction(path, &summary);
+    info!(
+        consensus_block_hash = %consensus_block_hash_display(&compact.header),
+        path = path.label(),
+        outcome = summary.outcome.label(),
+        txs_total = summary.txs_total,
+        txs_prefilled = summary.txs_prefilled,
+        txs_from_cache = summary.txs_from_cache,
+        txs_missing = summary.txs_missing,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "Relay compact reconstruction"
+    );
 
     match &outcome {
         Ok(SubmissionOutcome::Submitted { .. }) | Ok(SubmissionOutcome::DryRun(_)) => {
@@ -1650,6 +1674,124 @@ fn classify_invalid_assembly(error: &BlockBodyError) -> &'static str {
     }
 }
 
+/// The relay object a fast-path reconstruction came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FastPath {
+    Skeleton,
+    Compact,
+}
+
+impl FastPath {
+    const ALL: [FastPath; 2] = [FastPath::Skeleton, FastPath::Compact];
+
+    fn label(self) -> &'static str {
+        match self {
+            FastPath::Skeleton => "skeleton",
+            FastPath::Compact => "compact",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// How one fast-path reconstruction ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconstructionOutcome {
+    /// Every slot filled and the block was built (submitted, dry-run or gated).
+    Complete,
+    /// At least one short_id did not resolve from the tx cache.
+    Incomplete,
+    /// The slots filled but the block was malformed or failed body validation.
+    Invalid,
+    /// The block was built, but submitblock failed or Zebra rejected it.
+    SubmitError,
+    /// Anything else that stopped the path before a judgement.
+    Error,
+}
+
+impl ReconstructionOutcome {
+    const ALL: [ReconstructionOutcome; 5] = [
+        ReconstructionOutcome::Complete,
+        ReconstructionOutcome::Incomplete,
+        ReconstructionOutcome::Invalid,
+        ReconstructionOutcome::SubmitError,
+        ReconstructionOutcome::Error,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ReconstructionOutcome::Complete => "complete",
+            ReconstructionOutcome::Incomplete => "incomplete",
+            ReconstructionOutcome::Invalid => "invalid",
+            ReconstructionOutcome::SubmitError => "submit_error",
+            ReconstructionOutcome::Error => "error",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
+/// Where the transactions of one fast-path block came from: prefilled by the
+/// origin, resolved from this sidecar's tx cache (relay tx-feed plus Zebra
+/// mempool sync), or missing. Without this split a completed block cannot say
+/// whether the cache did the work or the origin shipped the bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReconstructionSummary {
+    txs_total: usize,
+    txs_prefilled: usize,
+    txs_from_cache: usize,
+    txs_missing: usize,
+    outcome: ReconstructionOutcome,
+}
+
+fn summarize_compact_reconstruction(
+    compact: &CompactBlock,
+    outcome: &Result<SubmissionOutcome, RelayBlockError>,
+) -> ReconstructionSummary {
+    let short_ids = compact.short_ids.len();
+    let (outcome, txs_missing, txs_from_cache) = match outcome {
+        Ok(SubmissionOutcome::NeedsTransactions {
+            missing_indexes, ..
+        }) => (
+            ReconstructionOutcome::Incomplete,
+            *missing_indexes,
+            short_ids.saturating_sub(*missing_indexes),
+        ),
+        Ok(_) => (ReconstructionOutcome::Complete, 0, short_ids),
+        Err(RelayBlockError::ReconstructionIncomplete {
+            missing_indexes, ..
+        }) => (
+            ReconstructionOutcome::Incomplete,
+            missing_indexes.len(),
+            short_ids.saturating_sub(missing_indexes.len()),
+        ),
+        // Reconstruction disabled: no short_id was looked up at all.
+        Err(RelayBlockError::MissingTransactions { short_ids }) => {
+            (ReconstructionOutcome::Incomplete, *short_ids, 0)
+        }
+        Err(RelayBlockError::SubmitRejected(..) | RelayBlockError::SubmitFailed(_)) => {
+            (ReconstructionOutcome::SubmitError, 0, short_ids)
+        }
+        // Every slot filled (from the cache) but the body failed validation.
+        Err(RelayBlockError::InvalidBlockBody(_)) => (ReconstructionOutcome::Invalid, 0, short_ids),
+        Err(RelayBlockError::ReconstructionInvalid { .. }) => {
+            (ReconstructionOutcome::Invalid, 0, 0)
+        }
+        Err(_) => (ReconstructionOutcome::Error, 0, 0),
+    };
+    ReconstructionSummary {
+        txs_total: short_ids + compact.prefilled_txs.len(),
+        txs_prefilled: compact.prefilled_txs.len(),
+        txs_from_cache,
+        txs_missing,
+        outcome,
+    }
+}
+
 fn record_compact_reconstruction_outcome(
     outcome: &Result<SubmissionOutcome, RelayBlockError>,
     metrics: &SidecarMetrics,
@@ -1754,6 +1896,12 @@ struct SidecarMetrics {
     /// Full compact blocks dropped because a skeleton already submitted the
     /// block -- the no-double-submit path when the skeleton wins.
     full_block_deduplicated: AtomicU64,
+    /// Fast-path reconstructions by [`FastPath`] and [`ReconstructionOutcome`].
+    fast_path_reconstructions: [[AtomicU64; ReconstructionOutcome::ALL.len()]; FastPath::ALL.len()],
+    /// Fast-path transactions by [`FastPath`], split by where they came from.
+    fast_path_txs_from_cache: [AtomicU64; FastPath::ALL.len()],
+    fast_path_txs_prefilled: [AtomicU64; FastPath::ALL.len()],
+    fast_path_txs_missing: [AtomicU64; FastPath::ALL.len()],
     raw_segments_received: AtomicU64,
     raw_segment_sets_completed: AtomicU64,
     raw_segment_drops: AtomicU64,
@@ -1889,6 +2037,15 @@ impl SidecarMetrics {
 
     fn inc_skeleton_incomplete(&self) {
         self.skeleton_incomplete.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_fast_path_reconstruction(&self, path: FastPath, summary: &ReconstructionSummary) {
+        let p = path.index();
+        self.fast_path_reconstructions[p][summary.outcome.index()].fetch_add(1, Ordering::Relaxed);
+        self.fast_path_txs_from_cache[p]
+            .fetch_add(summary.txs_from_cache as u64, Ordering::Relaxed);
+        self.fast_path_txs_prefilled[p].fetch_add(summary.txs_prefilled as u64, Ordering::Relaxed);
+        self.fast_path_txs_missing[p].fetch_add(summary.txs_missing as u64, Ordering::Relaxed);
     }
 
     fn inc_skeleton_submit_errors(&self) {
@@ -2324,6 +2481,33 @@ impl SidecarMetrics {
                 kind.label(),
                 count.load(Ordering::Relaxed)
             ));
+        }
+        text.push_str("# TYPE sovright_relay_sidecar_fast_path_reconstructions_total counter\n");
+        for path in FastPath::ALL {
+            for outcome in ReconstructionOutcome::ALL {
+                text.push_str(&format!(
+                    "sovright_relay_sidecar_fast_path_reconstructions_total{{path=\"{}\",outcome=\"{}\"}} {}\n",
+                    path.label(),
+                    outcome.label(),
+                    self.fast_path_reconstructions[path.index()][outcome.index()]
+                        .load(Ordering::Relaxed)
+                ));
+            }
+        }
+        text.push_str("# TYPE sovright_relay_sidecar_fast_path_transactions_total counter\n");
+        for path in FastPath::ALL {
+            for (source, counters) in [
+                ("cache", &self.fast_path_txs_from_cache),
+                ("prefilled", &self.fast_path_txs_prefilled),
+                ("missing", &self.fast_path_txs_missing),
+            ] {
+                text.push_str(&format!(
+                    "sovright_relay_sidecar_fast_path_transactions_total{{path=\"{}\",source=\"{}\"}} {}\n",
+                    path.label(),
+                    source,
+                    counters[path.index()].load(Ordering::Relaxed)
+                ));
+            }
         }
         text
     }
@@ -3299,6 +3483,197 @@ mod tests {
             "late skeleton must not resubmit"
         );
         assert_eq!(metrics.skeleton_deduplicated.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn fast_path_counts_where_each_transaction_came_from() {
+        // A skeleton whose short_id resolves from the tx cache is counted as one
+        // cache transaction plus the prefilled coinbase, by path and outcome.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let nonce = 9;
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
+        let header = header_committing_to(&[coinbase.clone(), tx1.clone()]);
+        let wtxid = make_wtxid(0x41);
+        let short_id = ShortId::compute(&wtxid, &zcash_block_hash(&header), nonce);
+        let skeleton = CompactBlock::new(
+            header,
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase,
+            }],
+        );
+        let mut mempool = TestMempool::new();
+        mempool.insert(wtxid, tx1);
+
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_reconstructions_total{path=\"skeleton\",outcome=\"complete\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"skeleton\",source=\"cache\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"skeleton\",source=\"prefilled\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"skeleton\",source=\"missing\"} 0"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"compact\",source=\"cache\"} 0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fast_path_counts_a_cache_miss_and_the_prefilled_fallback() {
+        // The skeleton misses its one short_id; the full compact block then
+        // carries the transaction prefilled. Neither touches the cache.
+        let submitter = CountingSubmitter::default();
+        let metrics = SidecarMetrics::default();
+        let mut dedup = HashDedupRing::new(16, Duration::from_secs(60));
+        let now = Instant::now();
+
+        let coinbase = parseable_transaction(1);
+        let tx1 = parseable_transaction(2);
+        let header = committed_header(0xab, &[coinbase.clone(), tx1.clone()]);
+        let nonce = 3;
+        let short_id = ShortId::compute(&make_wtxid(0x42), &zcash_block_hash(&header), nonce);
+        let empty_mempool = TestMempool::new();
+        let skeleton = CompactBlock::new(
+            header.clone(),
+            nonce,
+            vec![short_id],
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase.clone(),
+            }],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &skeleton,
+            SubmitBlockMode::Live,
+            true,
+            &empty_mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            true,
+        )
+        .await;
+        let full = CompactBlock::new(
+            header,
+            nonce,
+            Vec::new(),
+            vec![
+                PrefilledTx {
+                    index: 0,
+                    tx_data: coinbase,
+                },
+                PrefilledTx {
+                    index: 0,
+                    tx_data: tx1,
+                },
+            ],
+        );
+        submit_compact_fast_path(
+            &submitter,
+            &full,
+            SubmitBlockMode::Live,
+            true,
+            &empty_mempool,
+            &metrics,
+            &mut dedup,
+            now,
+            false,
+        )
+        .await;
+
+        let text = metrics.render_prometheus_text();
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_reconstructions_total{path=\"skeleton\",outcome=\"incomplete\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"skeleton\",source=\"missing\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"skeleton\",source=\"cache\"} 0"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_reconstructions_total{path=\"compact\",outcome=\"complete\"} 1"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"compact\",source=\"prefilled\"} 2"
+        ));
+        assert!(text.contains(
+            "sovright_relay_sidecar_fast_path_transactions_total{path=\"compact\",source=\"cache\"} 0"
+        ));
+    }
+
+    #[test]
+    fn reconstruction_summary_separates_cache_prefilled_and_missing() {
+        let coinbase = parseable_transaction(1);
+        let header = committed_header(0x01, std::slice::from_ref(&coinbase));
+        let short_ids: Vec<ShortId> = (0..5)
+            .map(|i| ShortId::compute(&make_wtxid(i), &zcash_block_hash(&header), 0))
+            .collect();
+        let compact = CompactBlock::new(
+            header,
+            0,
+            short_ids,
+            vec![PrefilledTx {
+                index: 0,
+                tx_data: coinbase,
+            }],
+        );
+
+        // Two of five short_ids unresolved: three came from the cache.
+        let incomplete = Err(RelayBlockError::ReconstructionIncomplete {
+            block_hash: sovright_relay::BlockHash::from_bytes([0; 32]),
+            missing_indexes: vec![2, 4],
+            missing_wtxids: Vec::new(),
+            unresolved_short_ids: Vec::new(),
+        });
+        assert_eq!(
+            summarize_compact_reconstruction(&compact, &incomplete),
+            ReconstructionSummary {
+                txs_total: 6,
+                txs_prefilled: 1,
+                txs_from_cache: 3,
+                txs_missing: 2,
+                outcome: ReconstructionOutcome::Incomplete,
+            }
+        );
+
+        // Reconstruction completed but Zebra refused the block: every short_id
+        // still resolved from the cache, and the outcome says submit, not cache.
+        let rejected = Err(RelayBlockError::SubmitRejected(
+            "bad".to_owned(),
+            SubmitRejectionClass::Unknown,
+        ));
+        let summary = summarize_compact_reconstruction(&compact, &rejected);
+        assert_eq!(summary.txs_from_cache, 5);
+        assert_eq!(summary.txs_missing, 0);
+        assert_eq!(summary.outcome, ReconstructionOutcome::SubmitError);
+        assert_eq!(summary.outcome.label(), "submit_error");
     }
 
     #[test]
