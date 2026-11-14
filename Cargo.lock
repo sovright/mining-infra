@@ -4531,6 +4531,9 @@ dependencies = [
  "sha2 0.10.9",
  "thiserror 2.0.18",
  "tracing",
+ "zcash-pool-common",
+ "zcash_primitives",
+ "zcash_protocol",
 ]
 
 [[package]]
