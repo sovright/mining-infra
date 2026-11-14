@@ -6,6 +6,8 @@ mod config;
 mod crawler;
 mod error;
 mod event;
+#[cfg(test)]
+mod fee_fields_tests;
 mod hash;
 mod metrics;
 mod observation;

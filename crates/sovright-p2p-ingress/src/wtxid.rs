@@ -27,6 +27,9 @@
 use std::io::Cursor;
 
 use sovright_relay::{AuthDigest, TxId, WtxId};
+use zcash_primitives::transaction::fees::zip317::{
+    P2PKH_STANDARD_INPUT_SIZE, P2PKH_STANDARD_OUTPUT_SIZE,
+};
 use zcash_primitives::transaction::{Transaction, TxVersion};
 use zcash_protocol::consensus::BranchId;
 
@@ -95,6 +98,123 @@ pub struct TxMetadata {
     pub version: u32,
     pub expiry_height: u32,
     pub action_count: usize,
+    pub fee_fields: Option<FeeFields>,
+}
+
+/// Version of the fee-field contract on `tx_seen` payload events.
+pub const FEE_FIELDS_VERSION: u32 = 1;
+
+/// At most this many outpoints are listed on one event; the count is uncapped.
+pub const MAX_FEE_FIELD_INPUTS: usize = 64;
+
+/// Everything a consumer needs to compute a transaction's ZIP-317 fee from the
+/// payload alone, except the transparent prevout values (which only the chain
+/// or a mempool can supply):
+///
+/// `fee = sum(prevout values) - transparent_out + sapling + orchard + ironwood + sprout`
+///
+/// Value balances are signed and exactly as encoded; an absent pool is 0.
+/// Built all-or-nothing by [`fee_fields`]: any failure yields `None`, so an
+/// event never carries a partial set.
+pub struct FeeFields {
+    /// ZIP-317 logical actions (revision 1, with the Ironwood term).
+    pub logical_actions: u64,
+    pub sapling_value_balance: i64,
+    pub orchard_value_balance: i64,
+    pub ironwood_value_balance: i64,
+    /// Sum over JoinSplits of `vpub_new - vpub_old`; 0 with no JoinSplits.
+    pub sprout_value_balance: i64,
+    /// Sum of transparent output values.
+    pub transparent_out: u64,
+    /// The first [`MAX_FEE_FIELD_INPUTS`] prevouts as (wire-order txid, index).
+    /// Hex formatting is deferred to the observer so the hot path stays cheap.
+    pub transparent_inputs: Vec<([u8; 32], u32)>,
+    pub transparent_input_count: usize,
+}
+
+/// Bytes of a Bitcoin CompactSize length prefix.
+fn compact_size_len(n: usize) -> usize {
+    match n {
+        0..=252 => 1,
+        253..=0xffff => 3,
+        0x1_0000..=0xffff_ffff => 5,
+        _ => 9,
+    }
+}
+
+/// ZIP-317 fee inputs, computed from an already-parsed transaction.
+///
+/// ZIP-317 logical actions =
+///   max(ceil(tx_in_total_size / 150), ceil(tx_out_total_size / 34))
+///   + 2 * nJoinSplit + max(nSpendsSapling, nOutputsSapling)
+///   + nActionsOrchard + nActionsIronwood
+///
+/// where `tx_in_total_size` / `tx_out_total_size` are the serialized byte sizes
+/// of the `tx_in` / `tx_out` fields' entries (no vector count prefix): an input
+/// is outpoint (36) + CompactSize + scriptSig + sequence (4); an output is
+/// value (8) + CompactSize + scriptPubKey. Matches librustzcash
+/// `fees::zip317::FeeRule` and the deployment repo's Python `logical_actions`.
+///
+/// Only v5/v6 transactions reach this today (`read_supported_tx`), so the
+/// Sprout term is always 0 in practice; it is implemented for completeness.
+pub fn fee_fields(tx: &Transaction) -> Option<FeeFields> {
+    let (mut in_size, mut out_size, mut transparent_out) = (0usize, 0usize, 0u64);
+    let mut transparent_inputs = Vec::new();
+    let mut transparent_input_count = 0;
+    if let Some(bundle) = tx.transparent_bundle() {
+        transparent_input_count = bundle.vin.len();
+        for input in &bundle.vin {
+            let script = input.script_sig().0.0.len();
+            in_size = in_size.checked_add(36 + compact_size_len(script) + script + 4)?;
+        }
+        transparent_inputs = bundle
+            .vin
+            .iter()
+            .take(MAX_FEE_FIELD_INPUTS)
+            .map(|input| (*input.prevout().hash(), input.prevout().n()))
+            .collect();
+        for output in &bundle.vout {
+            let script = output.script_pubkey().0.0.len();
+            out_size = out_size.checked_add(8 + compact_size_len(script) + script)?;
+            transparent_out = transparent_out.checked_add(u64::from(output.value()))?;
+        }
+    }
+    let (joinsplits, sprout_value_balance) = match tx.sprout_bundle() {
+        Some(bundle) => (bundle.joinsplits.len(), i64::from(bundle.value_balance()?)),
+        None => (0, 0),
+    };
+    let (sapling_spends, sapling_outputs, sapling_value_balance) = match tx.sapling_bundle() {
+        Some(b) => (
+            b.shielded_spends().len(),
+            b.shielded_outputs().len(),
+            i64::from(*b.value_balance()),
+        ),
+        None => (0, 0, 0),
+    };
+    let (orchard_actions, orchard_value_balance) = tx.orchard_bundle().map_or((0, 0), |b| {
+        (b.actions().len(), i64::from(*b.value_balance()))
+    });
+    let (ironwood_actions, ironwood_value_balance) = tx.ironwood_bundle().map_or((0, 0), |b| {
+        (b.actions().len(), i64::from(*b.value_balance()))
+    });
+    let transparent_actions = in_size
+        .div_ceil(P2PKH_STANDARD_INPUT_SIZE)
+        .max(out_size.div_ceil(P2PKH_STANDARD_OUTPUT_SIZE));
+    let logical_actions = transparent_actions
+        .checked_add(joinsplits.checked_mul(2)?)?
+        .checked_add(sapling_spends.max(sapling_outputs))?
+        .checked_add(orchard_actions)?
+        .checked_add(ironwood_actions)?;
+    Some(FeeFields {
+        logical_actions: u64::try_from(logical_actions).ok()?,
+        sapling_value_balance,
+        orchard_value_balance,
+        ironwood_value_balance,
+        sprout_value_balance,
+        transparent_out,
+        transparent_inputs,
+        transparent_input_count,
+    })
 }
 
 /// One parse of a received transaction: its relay `WtxId` plus display-order
@@ -104,6 +224,7 @@ pub struct TxMetadata {
 ///
 /// `action_count` is structural: transparent inputs/outputs, Sapling
 /// spends/outputs, Orchard actions and Ironwood actions; not ZIP-317 actions.
+/// ZIP-317 logical actions and the other fee inputs are in `fee_fields`.
 pub fn parse_tx_bytes(tx_bytes: &[u8]) -> Option<(WtxId, TxMetadata)> {
     let tx = read_supported_tx(tx_bytes, TX_READER_BRANCH_HINT)?;
     let txid_wire: [u8; 32] = *tx.txid().as_ref();
@@ -122,6 +243,7 @@ pub fn parse_tx_bytes(tx_bytes: &[u8]) -> Option<(WtxId, TxMetadata)> {
         version: if tx.version() == TxVersion::V5 { 5 } else { 6 },
         expiry_height: u32::from(tx.expiry_height()),
         action_count,
+        fee_fields: fee_fields(&tx),
     };
     Some((
         WtxId::new(
