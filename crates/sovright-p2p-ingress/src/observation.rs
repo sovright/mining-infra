@@ -443,7 +443,7 @@ impl Observer {
             Self::mark(&self.inner.last_payload_ms, stamp);
             Self::mark(&self.inner.last_tx_payload_ms, stamp);
         }
-        self.emit(json!({"event":"tx_seen", "source_kind":"p2p", "stage":"payload", "txid":metadata.txid, "auth_digest":metadata.auth_digest, "size_bytes":size, "tx_version":metadata.version, "expiry_height":metadata.expiry_height, "action_count":metadata.action_count}), stamp);
+        self.emit(tx_payload_event(metadata, size), stamp);
     }
 
     /// Test shorthand: decode and record a solicited payload.
@@ -453,6 +453,34 @@ impl Observer {
             self.tx_payload(&metadata, payload.len(), true, stamp);
         }
     }
+}
+
+/// The `tx_seen` payload event for a decoded transaction, before the writer
+/// stamps it with time, sequence and network.
+///
+/// ZIP-317 fee fields are added only when every one of them was derived from
+/// the payload; otherwise none are (see [`crate::wtxid::FeeFields`]).
+pub(crate) fn tx_payload_event(metadata: &crate::wtxid::TxMetadata, size: usize) -> Value {
+    let mut event = json!({"event":"tx_seen", "source_kind":"p2p", "stage":"payload", "txid":metadata.txid, "auth_digest":metadata.auth_digest, "size_bytes":size, "tx_version":metadata.version, "expiry_height":metadata.expiry_height, "action_count":metadata.action_count});
+    if let Some(fee) = &metadata.fee_fields {
+        let inputs: Vec<String> = fee
+            .transparent_inputs
+            .iter()
+            .map(|(hash, n)| format!("{}:{n}", inventory_hash_to_display(hash)))
+            .collect();
+        event["zip317_logical_actions"] = json!(fee.logical_actions);
+        event["value_balance_zat"] = json!({
+            "sapling": fee.sapling_value_balance,
+            "orchard": fee.orchard_value_balance,
+            "ironwood": fee.ironwood_value_balance,
+        });
+        event["sprout_vpub_new_minus_old_zat"] = json!(fee.sprout_value_balance);
+        event["transparent_out_zat"] = json!(fee.transparent_out);
+        event["transparent_inputs"] = json!(inputs);
+        event["transparent_input_count"] = json!(fee.transparent_input_count);
+        event["fee_fields_version"] = json!(crate::wtxid::FEE_FIELDS_VERSION);
+    }
+    event
 }
 
 pub struct ActivePeer(Observer);
@@ -602,6 +630,9 @@ mod tests {
         assert_eq!(event["monotonic_ms"], stamp.monotonic_ms);
         assert_eq!(event["network"], "mainnet");
         assert!(event.get("peer").is_none());
+        // Fee fields need the payload; announcements never carry them.
+        assert!(event.get("fee_fields_version").is_none());
+        assert!(event.get("zip317_logical_actions").is_none());
     }
 
     #[test]
@@ -675,6 +706,9 @@ mod tests {
             event["txid"],
             "b5e84a20ed799a4242f9f98a65f5654f02ab0e7dcd5ee6d5f54bee2d11affa63"
         );
+        // The written record carries the fee fields (contract v1).
+        assert_eq!(event["fee_fields_version"], 1);
+        assert!(event["zip317_logical_actions"].as_u64().unwrap() > 0);
         observer.payload(&[0xff; 3], observer.capture());
         let mut trailing = payload.clone();
         trailing.push(0);
