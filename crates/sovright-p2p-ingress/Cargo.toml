@@ -7,7 +7,13 @@ license.workspace = true
 description = "Native Zcash P2P ingress daemon for the Sovright relay network"
 repository.workspace = true
 
+[features]
+# Off by default: an extra block source from Zakura native P2P peers. It needs
+# Rust 1.97 and is enabled at run time by SOVRIGHT_P2P_ZAKURA_ENABLED.
+zakura-native = ["dep:sovright-zakura-native", "sovright-zakura-native/zakura-native"]
+
 [dependencies]
+sovright-zakura-native = { path = "../sovright-zakura-native", optional = true }
 sovright-relay = { path = "../sovright-relay" }
 sovright-relay-sidecar = { path = "../sovright-relay-sidecar" }
 zcash-equihash-validator = { path = "../zcash-equihash-validator" }
@@ -26,4 +32,7 @@ zcash_protocol = { workspace = true }
 
 [dev-dependencies]
 sovright-relay = { path = "../sovright-relay", features = ["test-support"] }
+# `test-support` compiles nothing unless `zakura-native` is also on.
+sovright-zakura-native = { path = "../sovright-zakura-native", features = ["test-support"] }
+tempfile = "3"
 zcash-pool-common = { path = "../zcash-pool-common", features = ["test-support"] }
