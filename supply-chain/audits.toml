@@ -2,3 +2,325 @@
 # cargo-vet audits file
 
 [audits]
+
+[[trusted.chrono]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2022-07-25"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.incrementalmerkletree]]
+criteria = "safe-to-deploy"
+user-id = 169181 # Kris Nuttycombe (nuttycom)
+start = "2023-02-28"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.quinn-proto]]
+criteria = "safe-to-deploy"
+user-id = 4556 # Dirkjan Ochtman (djc)
+start = "2019-09-09"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.ref-cast]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-05"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.ref-cast-impl]]
+criteria = "safe-to-deploy"
+user-id = 3618 # David Tolnay (dtolnay)
+start = "2019-05-05"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.toml_datetime]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2022-10-21"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.toml_edit]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2021-09-13"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.toml_parser]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2025-07-08"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.winnow]]
+criteria = "safe-to-deploy"
+user-id = 6743 # Ed Page (epage)
+start = "2023-02-22"
+end = "2027-11-15"
+notes = "Publisher already trusted for safe-to-deploy by the imported Mozilla, Bytecode Alliance, ISRG or Zcash audit sets."
+
+[[trusted.zakura-address]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-bellman]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-bento]]
+criteria = "safe-to-deploy"
+user-id = 1244 # Sean Bowe (ebfull)
+start = "2026-08-31"
+end = "2027-11-15"
+notes = "Zakura crate published by Sean Bowe (ebfull), whom zcash/librustzcash trusts for safe-to-deploy."
+
+[[trusted.zakura-bento-core]]
+criteria = "safe-to-deploy"
+user-id = 1244 # Sean Bowe (ebfull)
+start = "2026-09-29"
+end = "2027-11-15"
+notes = "Zakura crate published by Sean Bowe (ebfull), whom zcash/librustzcash trusts for safe-to-deploy."
+
+[[trusted.zakura-bento-macros]]
+criteria = "safe-to-deploy"
+user-id = 1244 # Sean Bowe (ebfull)
+start = "2026-09-29"
+end = "2027-11-15"
+notes = "Zakura crate published by Sean Bowe (ebfull), whom zcash/librustzcash trusts for safe-to-deploy."
+
+[[trusted.zakura-bls12-381]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-chain]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-08-22"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-equihash]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-halo2-gadgets]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-halo2-poseidon]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-halo2-proofs]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-header-chain]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-08-22"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-jsonl-trace]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-08-22"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-jubjub]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-mmr-tree]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-10-21"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-network]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-08-22"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-node-services]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-08-22"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-note-encryption]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-orchard]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-orchard-legacy]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-pairing]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-pasta-curves]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-primitives]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-protocol]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-quic]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-10-21"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-reddsa]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-redjubjub]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-rt]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/zakura"
+start = "2026-11-03"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-sapling-crypto]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-sensei]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-11-01"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-sensei-artifacts]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-11-01"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-sensei-macros]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-11-01"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-sensei-shared]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-11-01"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-sinsemilla]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-transparent]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-10-17"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-udon]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-11-01"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
+
+[[trusted.zakura-zcash-script]]
+criteria = "safe-to-deploy"
+trusted-publisher = "github:zakura-core/common"
+start = "2026-11-01"
+end = "2027-11-15"
+notes = "Zakura crate (Zakura native block source, #143). Published by Zakura's own release workflow via crates.io trusted publishing. Zakura releases a new major every few days, so publisher trust instead of per-version exemptions; zakura-equihash is on the critical-crate list (supply-chain/README.md) and must not be exempted."
