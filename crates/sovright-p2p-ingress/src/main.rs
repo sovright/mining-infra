@@ -1,3 +1,7 @@
+// Tests set environment variables, which edition 2024 marks `unsafe`; the
+// shipped binary must contain no unsafe code.
+#![cfg_attr(not(test), forbid(unsafe_code))]
+
 #[cfg(test)]
 mod attribution_tests;
 mod block;
