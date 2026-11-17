@@ -106,3 +106,26 @@ jobs:
         run: cargo build --locked --workspace --all-targets
       - name: Run tier-2 chain test
         run: cargo test --locked -p zcash-jd-client --test tier2_chain_test -- --ignored --nocapture
+
+  zakura-native:
+    # The Zakura native block source in sovright-p2p-ingress (`zakura-native`
+    # feature, off by default). The jobs above build the default features only,
+    # so they never compile it. Its Zakura crates need Rust 1.97 or newer; this
+    # job pins 1.98.1, the toolchain the feature was verified on. The default
+    # jobs keep their own toolchain. Actions are pinned like the jobs above.
+    name: Zakura native feature
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master@2026-10-16
+        with:
+          toolchain: "1.98.1"
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Loopback test
+        run: cargo test --locked -p sovright-zakura-native --features zakura-native,test-support
+      - name: Ingress integration tests
+        run: cargo test --locked -p sovright-p2p-ingress --features zakura-native zakura_native
