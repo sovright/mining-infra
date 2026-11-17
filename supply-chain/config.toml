@@ -246,11 +246,11 @@ criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-deque]]
 version = "0.8.6"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-epoch]]
 version = "0.9.21"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.crossbeam-utils]]
 version = "0.8.21"
@@ -258,7 +258,7 @@ criteria = "safe-to-deploy"
 
 [[exemptions.crunchy]]
 version = "0.2.4"
-criteria = "safe-to-run"
+criteria = "safe-to-deploy"
 
 [[exemptions.crypto-common]]
 version = "0.1.7"
@@ -492,10 +492,6 @@ criteria = "safe-to-deploy"
 version = "2.3.0"
 criteria = "safe-to-deploy"
 
-[[exemptions.incrementalmerkletree]]
-version = "0.9.0"
-criteria = "safe-to-deploy"
-
 [[exemptions.indexmap]]
 version = "1.9.3"
 criteria = "safe-to-deploy"
@@ -604,12 +600,20 @@ criteria = "safe-to-deploy"
 version = "0.7.3"
 criteria = "safe-to-deploy"
 
+[[exemptions.maybe-rayon]]
+version = "0.1.1"
+criteria = "safe-to-deploy"
+
 [[exemptions.memchr]]
 version = "2.8.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.memuse]]
 version = "0.2.2"
+criteria = "safe-to-deploy"
+
+[[exemptions.metrics]]
+version = "0.24.6"
 criteria = "safe-to-deploy"
 
 [[exemptions.mime]]
@@ -732,6 +736,10 @@ criteria = "safe-to-deploy"
 version = "0.6.2"
 criteria = "safe-to-deploy"
 
+[[exemptions.portable-atomic]]
+version = "1.15.0"
+criteria = "safe-to-deploy"
+
 [[exemptions.potential_utf]]
 version = "0.1.5"
 criteria = "safe-to-deploy"
@@ -742,6 +750,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.prettyplease]]
 version = "0.2.37"
+criteria = "safe-to-deploy"
+
+[[exemptions.proc-macro-crate]]
+version = "3.5.0"
 criteria = "safe-to-deploy"
 
 [[exemptions.prometheus]]
@@ -791,6 +803,10 @@ criteria = "safe-to-deploy"
 [[exemptions.rand_xorshift]]
 version = "0.4.0"
 criteria = "safe-to-run"
+
+[[exemptions.rapidhash]]
+version = "4.5.1"
+criteria = "safe-to-deploy"
 
 [[exemptions.reddsa]]
 version = "0.6.1"
@@ -924,6 +940,10 @@ criteria = "safe-to-deploy"
 version = "0.11.0"
 criteria = "safe-to-deploy"
 
+[[exemptions.sha2-asm]]
+version = "0.6.4"
+criteria = "safe-to-deploy"
+
 [[exemptions.signal-hook-registry]]
 version = "1.4.8"
 criteria = "safe-to-deploy"
@@ -1048,14 +1068,6 @@ criteria = "safe-to-deploy"
 version = "0.8.23"
 criteria = "safe-to-deploy"
 
-[[exemptions.toml_datetime]]
-version = "0.6.11"
-criteria = "safe-to-deploy"
-
-[[exemptions.toml_edit]]
-version = "0.22.27"
-criteria = "safe-to-deploy"
-
 [[exemptions.toml_write]]
 version = "0.1.2"
 criteria = "safe-to-deploy"
@@ -1110,6 +1122,10 @@ criteria = "safe-to-deploy"
 
 [[exemptions.typenum]]
 version = "1.19.0"
+criteria = "safe-to-deploy"
+
+[[exemptions.uint]]
+version = "0.10.2"
 criteria = "safe-to-deploy"
 
 [[exemptions.unicode-ident]]
@@ -1282,10 +1298,6 @@ criteria = "safe-to-deploy"
 
 [[exemptions.windows_x86_64_msvc]]
 version = "0.52.6"
-criteria = "safe-to-deploy"
-
-[[exemptions.winnow]]
-version = "0.7.15"
 criteria = "safe-to-deploy"
 
 [[exemptions.writeable]]

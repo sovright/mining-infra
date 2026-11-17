@@ -22,6 +22,10 @@ pub enum IngressError {
 
     #[error("peers exhausted: {0}")]
     PeersExhausted(String),
+
+    #[cfg(feature = "zakura-native")]
+    #[error("Zakura native source: {0}")]
+    ZakuraNative(String),
 }
 
 pub type Result<T> = std::result::Result<T, IngressError>;
