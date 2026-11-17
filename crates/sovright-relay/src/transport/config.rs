@@ -106,6 +106,9 @@ pub struct RelayConfig {
     /// Instantaneous burst allowed per source before the sustained rate
     /// applies. Sized so a new peer can authenticate promptly under loss.
     pub unauth_rate_limit_burst: f64,
+    /// Forward bound raw chunks as well. Off by default, and with it off every v4 datagram
+    /// is dropped at decode, as on a node that has never heard of them.
+    pub bound_raw: Option<crate::relay::BoundForwardConfig>,
 }
 
 impl Default for RelayConfig {
@@ -128,6 +131,7 @@ impl Default for RelayConfig {
             // enough that a legitimate peer authenticates on first contact.
             unauth_rate_limit_per_sec: 5.0,
             unauth_rate_limit_burst: 20.0,
+            bound_raw: None,
         }
     }
 }
@@ -159,6 +163,12 @@ impl RelayConfig {
     pub fn with_unauth_rate_limit(mut self, rate_per_sec: f64, burst: f64) -> Self {
         self.unauth_rate_limit_per_sec = rate_per_sec;
         self.unauth_rate_limit_burst = burst;
+        self
+    }
+
+    /// Builder method: forward bound raw chunks as well, with these research values
+    pub fn with_bound_raw(mut self, config: crate::relay::BoundForwardConfig) -> Self {
+        self.bound_raw = Some(config);
         self
     }
 
@@ -277,12 +287,19 @@ pub struct ClientConfig {
     pub send_burst_packets: usize,
     /// Optional delay after each outbound packet burst.
     pub send_burst_delay: Duration,
+    /// Datagrams of a bound body sent before each pause, and that pause. The bound path does
+    /// not use `send_burst_packets`, because what paces it is a relay's work on each object.
+    pub bound_send_burst_packets: usize,
+    pub bound_send_burst_delay: Duration,
     /// Emit adaptive (version-3) FEC chunks sized per block on the send path.
     ///
     /// When false (default) the client emits fixed-profile version-2 chunks.
     /// The receive path always decodes both v2 and v3 regardless of this flag,
     /// so a mixed-version fleet interoperates during rollout.
     pub adaptive_fec: bool,
+    /// Take bound raw chunks as well. Off by default, and with it off every v4 datagram
+    /// is dropped at decode, as on a client that has never heard of them.
+    pub bound_raw: Option<crate::relay::BoundRawConfig>,
 }
 
 impl ClientConfig {
@@ -298,7 +315,10 @@ impl ClientConfig {
             auth_required: false,
             send_burst_packets: 0,
             send_burst_delay: Duration::ZERO,
+            bound_send_burst_packets: crate::relay::BOUND_SEND_BURST_PACKETS,
+            bound_send_burst_delay: crate::relay::BOUND_SEND_BURST_DELAY,
             adaptive_fec: false,
+            bound_raw: None,
         }
     }
 
@@ -312,6 +332,12 @@ impl ClientConfig {
     /// Builder method: enable adaptive (version-3) FEC on the send path.
     pub fn with_adaptive_fec(mut self, adaptive: bool) -> Self {
         self.adaptive_fec = adaptive;
+        self
+    }
+
+    /// Builder method: take bound raw chunks as well, with these research values.
+    pub fn with_bound_raw(mut self, config: crate::relay::BoundRawConfig) -> Self {
+        self.bound_raw = Some(config);
         self
     }
 
@@ -331,6 +357,13 @@ impl ClientConfig {
     pub fn with_send_pacing(mut self, burst_packets: usize, burst_delay: Duration) -> Self {
         self.send_burst_packets = burst_packets;
         self.send_burst_delay = burst_delay;
+        self
+    }
+
+    /// Builder method: set the pacing of the bound path
+    pub fn with_bound_send_pacing(mut self, burst_packets: usize, burst_delay: Duration) -> Self {
+        self.bound_send_burst_packets = burst_packets;
+        self.bound_send_burst_delay = burst_delay;
         self
     }
 

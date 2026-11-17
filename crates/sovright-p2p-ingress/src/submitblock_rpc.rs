@@ -641,6 +641,29 @@ mod tests {
         (relay, zebra, state)
     }
 
+    /// The real bridge at the front door, with a bound send held past the default
+    /// `relay_timeout`. The clock stands still until nothing else can move, so preparing the
+    /// block cannot race it. The caller gets Zebra's answer, and the legacy copy has gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_bound_send_past_the_relay_timeout_leaves_zebras_answer() {
+        use crate::relay_bridge::RawWire;
+        use crate::relay_bridge::block_body_tests::{holding_bound_sends, two_valid_bodies};
+
+        let mut harness = holding_bound_sends(RawWire::Dual, 4);
+        let (_, zebra, mut state) = state_parts(false, 4, Arc::new(AcceptValidator));
+        state.relay = Arc::new(harness.bridge.clone());
+        let (block, _) = two_valid_bodies();
+
+        let out = handle_submitblock(&state, hex::encode(&block))
+            .await
+            .unwrap();
+
+        assert_eq!(out, None);
+        assert_eq!(zebra.calls.load(Ordering::SeqCst), 1);
+        assert!(!harness.sent().is_empty(), "the legacy copy went");
+        harness.next_bound_send().await.finish(Ok(()));
+    }
+
     #[tokio::test]
     async fn rate_limit_skips_relay_but_still_submits_to_zebra() {
         // Capacity 0 => the limiter always trips. A found block must still reach

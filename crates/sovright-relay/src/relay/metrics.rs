@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::bound_raw::BoundNodeUsage;
+
 /// Relay node metrics
 #[derive(Debug, Default)]
 pub struct RelayMetrics {
@@ -643,6 +645,221 @@ fn push_labeled_metric_family(
     }
 }
 
+/// What a node holds and has done on the bound path ([`BoundNodeUsage`]), in the
+/// Prometheus text format, for after [`render_prometheus_text`]. What it holds now is a gauge;
+/// the rest count from the node's start.
+pub fn render_bound_prometheus_text(usage: &BoundNodeUsage) -> String {
+    let mut text = String::new();
+    let mut gauge = |name: &str, help: &str, value: u64| {
+        push_metric(
+            &mut text,
+            &format!("sovright_relay_bound_{name}"),
+            help,
+            "gauge",
+            value,
+        );
+    };
+    let pool = &usage.pool;
+    gauge(
+        "pool_sessions",
+        "Bound sessions holding a place in the pool.",
+        pool.sessions as u64,
+    );
+    gauge(
+        "pool_objects",
+        "Open bound objects in the pool.",
+        pool.objects as u64,
+    );
+    gauge(
+        "pool_held_bytes",
+        "Bytes the pool holds for open and decoded objects.",
+        pool.held_bytes as u64,
+    );
+    gauge(
+        "pool_work_bytes",
+        "Bytes the pool has lent to decodes under way.",
+        pool.work_bytes as u64,
+    );
+    gauge(
+        "pool_spare_objects",
+        "Objects on the pool's shelves.",
+        pool.spare_objects as u64,
+    );
+    gauge(
+        "pool_spare_bytes",
+        "Bytes on the pool's shelves.",
+        pool.spare_bytes as u64,
+    );
+    gauge("peers", "Sessions with bound state.", usage.peers as u64);
+    gauge(
+        "forwarded_records",
+        "Records of objects sessions have had sent on.",
+        usage.forwarded_records as u64,
+    );
+    gauge(
+        "objects_waiting_for_segment_0",
+        "Decoded objects waiting for their segment 0.",
+        usage.objects_waiting_for_segment_0 as u64,
+    );
+    gauge(
+        "anchors",
+        "Bodies whose segment 0 passed the PoW check.",
+        usage.anchors as u64,
+    );
+    gauge(
+        "ingress_queue_peak",
+        "Most datagrams waiting between the socket and the work.",
+        usage.ingress.queue_peak,
+    );
+    gauge(
+        "ingress_queue_peak_bytes",
+        "Most bytes waiting between the socket and the work.",
+        usage.ingress.queue_peak_bytes,
+    );
+    gauge(
+        "ingress_longest_handling_micros",
+        "Longest a datagram took to handle, in microseconds.",
+        usage.ingress.longest_handling_micros,
+    );
+
+    let mut counter = |name: &str, help: &str, value: u64| {
+        let name = format!("sovright_relay_bound_{name}_total");
+        push_metric(&mut text, &name, help, "counter", value);
+    };
+    counter(
+        "datagrams_without_a_place",
+        "Datagrams dropped because their session has no place in the pool.",
+        usage.datagrams_without_a_place,
+    );
+    counter(
+        "frames_rejected",
+        "Decoded objects that were not valid frames.",
+        usage.frames_rejected,
+    );
+    counter(
+        "pow_refused",
+        "Segments 0 whose header failed the PoW check.",
+        usage.pow_refused,
+    );
+    counter(
+        "pow_indeterminate",
+        "Segments 0 whose PoW check could not decide.",
+        usage.pow_indeterminate,
+    );
+    counter(
+        "objects_released",
+        "Objects the node let go on.",
+        usage.objects_released,
+    );
+    counter(
+        "objects_sent_on",
+        "Objects that went out to at least one peer in full.",
+        usage.objects_sent_on,
+    );
+    counter(
+        "spares_revived",
+        "Spares decoded once room came back after a refusal.",
+        usage.spares_revived,
+    );
+    counter(
+        "waiting_pushed_out",
+        "Waiting objects pushed out by their session's limit.",
+        usage.waiting_pushed_out,
+    );
+    counter(
+        "waiting_gave_way",
+        "Waiting objects that gave way when the pool was short of bytes.",
+        usage.waiting_gave_way,
+    );
+    counter(
+        "waiting_expired",
+        "Objects that waited for their segment 0 until their time was up.",
+        usage.waiting_expired,
+    );
+    counter(
+        "anchors_refused_for_bodies",
+        "Segments 0 refused because their block had all its bodies.",
+        usage.anchors_refused_for_bodies,
+    );
+    counter(
+        "anchors_refused_for_key_bodies",
+        "Segments 0 refused because their key had all of its block's bodies it may.",
+        usage.anchors_refused_for_key_bodies,
+    );
+    counter(
+        "anchors_refused_for_room",
+        "Segments 0 refused for want of room for an anchor.",
+        usage.anchors_refused_for_room,
+    );
+    counter(
+        "anchors_refused_for_age",
+        "Segments 0 refused for a header too far behind the newest.",
+        usage.anchors_refused_for_age,
+    );
+    counter(
+        "anchors_refused_as_released",
+        "Segments 0 of a body a receiver refused.",
+        usage.anchors_refused_as_released,
+    );
+    counter(
+        "anchors_released",
+        "Anchors a receiver's refusal took away.",
+        usage.anchors_released,
+    );
+    counter(
+        "anchor_uses_without_room",
+        "Uses of an anchor by a key with no room to pay for it.",
+        usage.anchor_uses_without_room,
+    );
+    counter(
+        "sessions_lost_to_a_panic",
+        "Sessions that lost what they held to a panic.",
+        usage.sessions_lost_to_a_panic,
+    );
+    counter(
+        "panic_resets",
+        "Times the whole bound path started over after a panic.",
+        usage.panic_resets,
+    );
+    counter(
+        "ingress_handled",
+        "Datagrams handled from the ingress queue.",
+        usage.ingress.handled,
+    );
+    counter(
+        "ingress_handling_micros",
+        "Time spent handling those datagrams, in microseconds.",
+        usage.ingress.handling_micros,
+    );
+
+    let arrivals = &usage.arrivals;
+    let outcomes = [
+        ("datagram", arrivals.datagrams),
+        ("invalid", arrivals.invalid),
+        ("known_bad", arrivals.known_bad),
+        ("repeat", arrivals.repeats),
+        ("other_shape", arrivals.other_shape),
+        ("not_wanted", arrivals.not_wanted),
+        ("spare", arrivals.spares),
+        ("pending", arrivals.pending),
+        ("decoded", arrivals.decoded),
+        ("rejected", arrivals.rejected),
+        ("refused_for_objects", arrivals.refused_for_objects),
+        ("refused_for_bytes", arrivals.refused_for_bytes),
+        ("refused_for_work", arrivals.refused_for_work),
+        ("refused_by_pool", arrivals.refused_by_pool),
+        ("refused_otherwise", arrivals.refused_otherwise),
+    ];
+    let name = "sovright_relay_bound_arrivals_total";
+    text.push_str(&format!(
+        "# HELP {name} What the bound datagrams that reached the node came to; datagram counts them all.\n# TYPE {name} counter\n"
+    ));
+    for (outcome, value) in outcomes {
+        text.push_str(&format!("{name}{{outcome=\"{outcome}\"}} {value}\n"));
+    }
+    text
+}
+
 fn push_metric(text: &mut String, name: &str, help: &str, metric_type: &str, value: u64) {
     text.push_str("# HELP ");
     text.push_str(name);
@@ -833,5 +1050,32 @@ mod tests {
         assert!(!text.contains("sovright_relay_relay_sessions_created_by_key_total"));
         assert!(!text.contains("sovright_relay_relay_chunks_forwarded_by_key_total"));
         assert!(!text.contains("sovright_relay_relay_chunks_relayed_from_key_total"));
+    }
+
+    #[test]
+    fn bound_usage_renders_as_prometheus_text() {
+        let mut usage = BoundNodeUsage::default();
+        usage.pool.held_bytes = 4096;
+        usage.objects_sent_on = 7;
+        usage.spares_revived = 2;
+        usage.arrivals.datagrams = 13;
+        usage.arrivals.refused_by_pool = 1;
+
+        let text = render_bound_prometheus_text(&usage);
+
+        assert!(text.contains("# TYPE sovright_relay_bound_pool_held_bytes gauge\n"));
+        assert!(text.contains("sovright_relay_bound_pool_held_bytes 4096\n"));
+        assert!(text.contains("# TYPE sovright_relay_bound_objects_sent_on_total counter\n"));
+        assert!(text.contains("sovright_relay_bound_objects_sent_on_total 7\n"));
+        assert!(text.contains("sovright_relay_bound_spares_revived_total 2\n"));
+        assert!(text.contains("sovright_relay_bound_arrivals_total{outcome=\"datagram\"} 13\n"));
+        assert!(
+            text.contains("sovright_relay_bound_arrivals_total{outcome=\"refused_by_pool\"} 1\n")
+        );
+        assert_eq!(
+            text.matches("# TYPE sovright_relay_bound_arrivals_total")
+                .count(),
+            1
+        );
     }
 }

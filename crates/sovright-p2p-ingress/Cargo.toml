@@ -32,6 +32,7 @@ zcash_protocol = { workspace = true }
 
 [dev-dependencies]
 sovright-relay = { path = "../sovright-relay", features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util"] }
 # `test-support` compiles nothing unless `zakura-native` is also on.
 sovright-zakura-native = { path = "../sovright-zakura-native", features = ["test-support"] }
 tempfile = "3"
