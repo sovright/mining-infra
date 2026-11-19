@@ -42,20 +42,8 @@ fn test_config() -> JdServerConfig {
 }
 
 fn minimal_tx() -> Vec<u8> {
-    let mut tx = Vec::new();
-    tx.extend_from_slice(&1u32.to_le_bytes());
-    tx.push(0x01);
-    tx.extend_from_slice(&[0u8; 32]);
-    tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-    tx.push(0x01);
-    tx.push(0x00);
-    tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-    tx.push(0x01);
-    tx.extend_from_slice(&0u64.to_le_bytes());
-    tx.push(0x01);
-    tx.push(0x51);
-    tx.extend_from_slice(&0u32.to_le_bytes());
-    tx
+    // NU6 branch; readable by zcash_primitives, so it has a ZIP 244 txid.
+    zcash_coinbase::fixtures::v5_coinbase(0xc8e7_1055, &[0x00], &[0x51])
 }
 
 #[test]

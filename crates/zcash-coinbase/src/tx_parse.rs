@@ -1,6 +1,17 @@
 //! Zcash transaction parsing for coinbase transactions.
 //!
-//! Supports v4 (Sapling/overwinter+) transaction format.
+//! Reads the transparent part of v4, v5 (ZIP 225) and v6 (ZIP 230) transactions
+//! and records where input 0's scriptSig and the output list sit in the raw
+//! bytes, so callers can splice them without reserializing the rest.
+//!
+//! The two layouts differ in field order:
+//!
+//! - v4: header, version group, inputs, outputs, lock_time, expiry, shielded data.
+//! - v5/v6: header, version group, consensus branch, lock_time, expiry, inputs,
+//!   outputs, shielded data.
+//!
+//! This is not a validator. Shielded data is not parsed; use
+//! [`crate::digest`] (zcash_primitives) for txids and auth digests.
 
 use byteorder::{LittleEndian, ReadBytesExt};
 use std::io::Cursor;
@@ -14,6 +25,8 @@ pub enum ParseError {
     UnsupportedVersion(u32),
     #[error("invalid compact size at offset {0}")]
     InvalidCompactSize(usize),
+    #[error("v{0} transaction without the overwinter flag")]
+    MissingOverwinterFlag(u32),
 }
 
 #[derive(Debug, Clone)]
@@ -40,8 +53,15 @@ pub struct ParsedTx {
     pub lock_time: u32,
     pub expiry_height: Option<u32>,
     pub raw: Vec<u8>,
-    /// Byte offset where trailing data (Sapling, JoinSplit) begins in the raw tx.
+    /// Byte offset of whatever follows the transparent fields: v4 shielded data
+    /// after the expiry height, or v5/v6 shielded bundles after the outputs.
     pub trailing_data_offset: Option<usize>,
+    /// The consensus branch ID that v5 and later transactions carry.
+    pub consensus_branch_id: Option<u32>,
+    /// `[start, end)` of input 0's scriptSig, including its CompactSize length.
+    pub input0_script_span: Option<(usize, usize)>,
+    /// `[start, end)` of the outputs, from the output count to the last output.
+    pub outputs_span: (usize, usize),
 }
 
 /// Read a Bitcoin-style compact size integer from `data` at `*cursor`.
@@ -105,14 +125,18 @@ pub fn push_compact_size(buf: &mut Vec<u8>, n: u64) {
 
 /// Read exactly `n` bytes from `data` starting at `*cursor`.
 fn read_bytes(data: &[u8], cursor: &mut usize, n: usize) -> Result<Vec<u8>, ParseError> {
-    if *cursor + n > data.len() {
-        return Err(ParseError::TooShort {
-            need: *cursor + n,
-            have: data.len(),
-        });
-    }
-    let result = data[*cursor..*cursor + n].to_vec();
-    *cursor += n;
+    // `n` can come from a peer-supplied CompactSize, so the end must not wrap.
+    let end = match cursor.checked_add(n) {
+        Some(end) if end <= data.len() => end,
+        _ => {
+            return Err(ParseError::TooShort {
+                need: cursor.saturating_add(n),
+                have: data.len(),
+            });
+        }
+    };
+    let result = data[*cursor..end].to_vec();
+    *cursor = end;
     Ok(result)
 }
 
@@ -130,11 +154,7 @@ fn read_u64_le(data: &[u8], cursor: &mut usize) -> Result<u64, ParseError> {
     Ok(rdr.read_u64::<LittleEndian>().unwrap())
 }
 
-/// Parse a Zcash v4 (overwinter+) transaction from raw bytes.
-///
-/// This parses the transparent portion of the transaction (version, version_group_id,
-/// inputs, outputs, lock_time, expiry_height) and records the offset where trailing
-/// shielded data begins.
+/// Parse the transparent part of a v4, v5 or v6 transaction.
 pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
     if data.len() < 4 {
         return Err(ParseError::TooShort {
@@ -150,9 +170,12 @@ pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
     let is_overwinter_plus = (header >> 31) == 1;
     let version = header & 0x7fff_ffff;
 
-    if version != 4 && version != 5 {
-        return Err(ParseError::UnsupportedVersion(version));
-    }
+    let v5_layout = match version {
+        4 => false,
+        5 | 6 if is_overwinter_plus => true,
+        5 | 6 => return Err(ParseError::MissingOverwinterFlag(version)),
+        _ => return Err(ParseError::UnsupportedVersion(version)),
+    };
 
     // Version group ID (overwinter+)
     let version_group_id = if is_overwinter_plus {
@@ -161,18 +184,33 @@ pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
         None
     };
 
+    let mut consensus_branch_id = None;
+    let mut lock_time = 0;
+    let mut expiry_height = None;
+    if v5_layout {
+        consensus_branch_id = Some(read_u32_le(data, &mut cursor)?);
+        lock_time = read_u32_le(data, &mut cursor)?;
+        expiry_height = Some(read_u32_le(data, &mut cursor)?);
+    }
+
     // Inputs
     let input_count = read_compact_size(data, &mut cursor)? as usize;
-    let mut inputs = Vec::with_capacity(input_count);
-    for _ in 0..input_count {
+    // Each input is at least 41 bytes; never trust the count for allocation.
+    let mut inputs = Vec::with_capacity(input_count.min(data.len() / 41));
+    let mut input0_script_span = None;
+    for i in 0..input_count {
         let hash_bytes = read_bytes(data, &mut cursor, 32)?;
         let mut prevout_hash = [0u8; 32];
         prevout_hash.copy_from_slice(&hash_bytes);
 
         let prevout_index = read_u32_le(data, &mut cursor)?;
 
+        let script_start = cursor;
         let script_len = read_compact_size(data, &mut cursor)? as usize;
         let script_sig = read_bytes(data, &mut cursor, script_len)?;
+        if i == 0 {
+            input0_script_span = Some((script_start, cursor));
+        }
 
         let sequence = read_u32_le(data, &mut cursor)?;
 
@@ -185,8 +223,10 @@ pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
     }
 
     // Outputs
+    let outputs_start = cursor;
     let output_count = read_compact_size(data, &mut cursor)? as usize;
-    let mut outputs = Vec::with_capacity(output_count);
+    // Each output is at least 9 bytes.
+    let mut outputs = Vec::with_capacity(output_count.min(data.len() / 9));
     for _ in 0..output_count {
         let value = read_u64_le(data, &mut cursor)?;
 
@@ -198,16 +238,14 @@ pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
             script_pubkey,
         });
     }
+    let outputs_span = (outputs_start, cursor);
 
-    // Lock time
-    let lock_time = read_u32_le(data, &mut cursor)?;
-
-    // Expiry height (overwinter+)
-    let expiry_height = if is_overwinter_plus {
-        Some(read_u32_le(data, &mut cursor)?)
-    } else {
-        None
-    };
+    if !v5_layout {
+        lock_time = read_u32_le(data, &mut cursor)?;
+        if is_overwinter_plus {
+            expiry_height = Some(read_u32_le(data, &mut cursor)?);
+        }
+    }
 
     let trailing_data_offset = if cursor < data.len() {
         Some(cursor)
@@ -225,6 +263,9 @@ pub fn parse_transaction(data: &[u8]) -> Result<ParsedTx, ParseError> {
         expiry_height,
         raw: data.to_vec(),
         trailing_data_offset,
+        consensus_branch_id,
+        input0_script_span,
+        outputs_span,
     })
 }
 

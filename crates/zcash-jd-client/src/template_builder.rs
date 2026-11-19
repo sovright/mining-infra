@@ -5,7 +5,7 @@
 
 use crate::error::{JdClientError, Result};
 use sha2::{Digest, Sha256};
-use zcash_coinbase::auth_digest::{compute_auth_data_root, compute_coinbase_auth_digest};
+use zcash_coinbase::digest;
 use zcash_coinbase::tx_parse::parse_transaction;
 use zcash_template_provider::calculate_block_commitments_hash;
 use zcash_template_provider::types::{BlockTemplate, Hash256};
@@ -122,7 +122,12 @@ impl TemplateBuilder {
         }
 
         let mut txids = Vec::with_capacity(1 + template.transactions.len());
-        txids.push(compute_txid(coinbase));
+        txids.push(digest::txid(coinbase).map_err(|e| {
+            JdClientError::Protocol(format!(
+                "invalid coinbase transaction for merkle root: {}",
+                e
+            ))
+        })?);
         for tx in &template.transactions {
             let hash = Hash256::from_hex(&tx.hash)
                 .map_err(|e| JdClientError::Protocol(format!("invalid tx hash: {}", e)))?;
@@ -134,26 +139,15 @@ impl TemplateBuilder {
 
     /// Recompute the block commitments hash for a Coinbase-Only declaration.
     pub fn block_commitments(&self, template: &BlockTemplate, coinbase: &[u8]) -> Result<[u8; 32]> {
-        let parsed = parse_transaction(coinbase).map_err(|e| {
-            JdClientError::Protocol(format!(
-                "invalid coinbase transaction for block commitments: {}",
-                e
-            ))
-        })?;
-        if parsed.inputs.is_empty() {
-            return Err(JdClientError::Protocol(
-                "coinbase has no transparent inputs for block commitments".to_string(),
-            ));
-        }
-
-        let mut script_sigs = Vec::new();
-        for input in parsed.inputs {
-            script_sigs.extend_from_slice(&input.script_sig);
-        }
-
-        let coinbase_digest =
-            compute_coinbase_auth_digest(&script_sigs, template.consensus_branch_id);
-        let auth_data_root = compute_auth_data_root(&[coinbase_digest]);
+        let auth_data_root =
+            digest::coinbase_only_auth_data_root(coinbase, template.consensus_branch_id).map_err(
+                |e| {
+                    JdClientError::Protocol(format!(
+                        "invalid coinbase transaction for block commitments: {}",
+                        e
+                    ))
+                },
+            )?;
         Ok(
             calculate_block_commitments_hash(
                 &template.chain_history_root,
@@ -208,7 +202,8 @@ fn parse_script_hex(address: &str) -> Result<Vec<u8>> {
     }
 }
 
-fn compute_txid(data: &[u8]) -> [u8; 32] {
+/// SHA256d, the hash of block Merkle tree nodes (not of v5+ transactions).
+fn sha256d(data: &[u8]) -> [u8; 32] {
     let hash1 = Sha256::digest(data);
     let hash2 = Sha256::digest(hash1);
     let mut txid = [0u8; 32];
@@ -235,7 +230,7 @@ fn merkle_root_from_txids(txids: &[[u8; 32]]) -> [u8; 32] {
             let mut data = [0u8; 64];
             data[..32].copy_from_slice(&left);
             data[32..].copy_from_slice(&right);
-            next.push(compute_txid(&data));
+            next.push(sha256d(&data));
             i += 2;
         }
         layer = next;
@@ -243,118 +238,55 @@ fn merkle_root_from_txids(txids: &[[u8; 32]]) -> [u8; 32] {
     layer[0]
 }
 
-fn read_compact_size(data: &[u8], cursor: &mut usize) -> Result<u64> {
-    zcash_pool_common::read_compact_size(data, cursor)
-        .map_err(|e| JdClientError::Protocol(e.to_string()))
-}
-
 fn write_compact_size(value: u64, out: &mut Vec<u8>) {
     zcash_pool_common::write_compact_size(value, out);
 }
 
+/// Split a coinbase around its outputs: bytes before the output count, the
+/// outputs, and every byte after them. The shared parser handles the v4 and
+/// v5/v6 field orders, so the prefix and suffix are correct for either.
 fn parse_coinbase_outputs(tx: &[u8]) -> Result<CoinbaseOutputs> {
-    let mut cursor = 0usize;
-    if tx.len() < 4 {
-        return Err(JdClientError::Protocol("coinbase too short".to_string()));
-    }
-    let version = u32::from_le_bytes([tx[0], tx[1], tx[2], tx[3]]);
-    cursor += 4;
-    if (version & 0x8000_0000) != 0 {
-        if cursor + 4 > tx.len() {
-            return Err(JdClientError::Protocol(
-                "coinbase missing version group id".to_string(),
-            ));
-        }
-        cursor += 4;
-    }
-
-    let vin_count = read_compact_size(tx, &mut cursor)?;
-    for _ in 0..vin_count {
-        if cursor + 36 > tx.len() {
-            return Err(JdClientError::Protocol(
-                "coinbase input out of bounds".to_string(),
-            ));
-        }
-        cursor += 36;
-        let script_len = read_compact_size(tx, &mut cursor)? as usize;
-        if cursor + script_len + 4 > tx.len() {
-            return Err(JdClientError::Protocol(
-                "coinbase scriptSig out of bounds".to_string(),
-            ));
-        }
-        cursor += script_len;
-        cursor += 4;
-    }
-
-    let vout_count_offset = cursor;
-    let vout_count = read_compact_size(tx, &mut cursor)?;
-
-    // Cap pre-allocation to remaining data length to prevent OOM from malicious compact_size
-    let max_outputs = (tx.len() - cursor) / 9; // minimum output is 8 (value) + 1 (script_len)
-    let mut outputs = Vec::with_capacity((vout_count as usize).min(max_outputs));
-    for _ in 0..vout_count {
-        if cursor + 8 > tx.len() {
-            return Err(JdClientError::Protocol(
-                "coinbase output value out of bounds".to_string(),
-            ));
-        }
-        let value = u64::from_le_bytes([
-            tx[cursor],
-            tx[cursor + 1],
-            tx[cursor + 2],
-            tx[cursor + 3],
-            tx[cursor + 4],
-            tx[cursor + 5],
-            tx[cursor + 6],
-            tx[cursor + 7],
-        ]);
-        cursor += 8;
-
-        let script_len = read_compact_size(tx, &mut cursor)? as usize;
-        if cursor + script_len > tx.len() {
-            return Err(JdClientError::Protocol(
-                "coinbase output script out of bounds".to_string(),
-            ));
-        }
-        let script = tx[cursor..cursor + script_len].to_vec();
-        cursor += script_len;
-        outputs.push(TxOut { value, script });
-    }
-
-    let prefix = tx[..vout_count_offset].to_vec();
-    let suffix = tx[cursor..].to_vec();
-    Ok((prefix, vout_count, outputs, suffix))
+    let parsed = parse_transaction(tx)
+        .map_err(|e| JdClientError::Protocol(format!("invalid coinbase transaction: {}", e)))?;
+    let (start, end) = parsed.outputs_span;
+    let outputs = parsed
+        .outputs
+        .into_iter()
+        .map(|out| TxOut {
+            value: out.value,
+            script: out.script_pubkey,
+        })
+        .collect::<Vec<_>>();
+    Ok((
+        tx[..start].to_vec(),
+        outputs.len() as u64,
+        outputs,
+        tx[end..].to_vec(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zcash_coinbase::auth_digest::{compute_auth_data_root, compute_coinbase_auth_digest};
+    use zcash_coinbase::digest;
+    use zcash_coinbase::fixtures::{
+        NU7_BRANCH_ID, TESTNET_4465026_COINBASE_AUTHDIGEST_DISPLAY, internal_from_display,
+        testnet_nu7_coinbase,
+    };
     use zcash_coinbase::tx_parse::parse_transaction;
     use zcash_template_provider::calculate_block_commitments_hash;
     use zcash_template_provider::types::{BlockTemplate, EquihashHeader};
 
-    fn minimal_coinbase_with_script_sig(script_sig: &[u8]) -> Vec<u8> {
-        let mut tx = Vec::new();
-        tx.extend_from_slice(&5u32.to_le_bytes());
-        tx.push(1);
-        tx.extend_from_slice(&[0u8; 32]);
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-        write_compact_size(script_sig.len() as u64, &mut tx);
-        tx.extend_from_slice(script_sig);
-        tx.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
-        tx.push(1);
-        tx.extend_from_slice(&50_0000_0000u64.to_le_bytes());
-        tx.push(1);
-        tx.push(0x51);
-        tx.extend_from_slice(&0u32.to_le_bytes());
-        tx
-    }
+    /// Long enough not to occur by chance inside the fixture coinbase, which
+    /// would make `build_coinbase` return it unchanged.
+    const POOL_SCRIPT: &[u8] = &[0x76, 0xa9, 0x14, 0x5a, 0x5a, 0x5a, 0x5a, 0x88, 0xac];
 
-    fn template_for_commitment_test(coinbase: Vec<u8>) -> BlockTemplate {
+    /// A template whose coinbase is the real NU7 activation-block coinbase: a
+    /// v6 transaction with an Ironwood action.
+    fn nu7_template() -> BlockTemplate {
         BlockTemplate {
             template_id: 1,
-            height: 2_000_000,
+            height: 4_465_026,
             header: EquihashHeader {
                 version: 5,
                 prev_hash: Hash256([0xaa; 32]),
@@ -366,23 +298,11 @@ mod tests {
             },
             target: Hash256([0xff; 32]),
             transactions: vec![],
-            coinbase,
+            coinbase: testnet_nu7_coinbase(),
             chain_history_root: Hash256([0x42; 32]),
-            consensus_branch_id: 0xc8e7_1055,
+            consensus_branch_id: NU7_BRANCH_ID,
             total_fees: 0,
         }
-    }
-
-    fn expected_commitments_for_coinbase(template: &BlockTemplate, coinbase: &[u8]) -> [u8; 32] {
-        let parsed = parse_transaction(coinbase).unwrap();
-        let mut script_sigs = Vec::new();
-        for input in parsed.inputs {
-            script_sigs.extend_from_slice(&input.script_sig);
-        }
-        let coinbase_digest =
-            compute_coinbase_auth_digest(&script_sigs, template.consensus_branch_id);
-        let auth_root = compute_auth_data_root(&[coinbase_digest]);
-        calculate_block_commitments_hash(&template.chain_history_root, &Hash256(auth_root)).0
     }
 
     #[test]
@@ -417,18 +337,86 @@ mod tests {
     }
 
     #[test]
-    fn recomputes_coinbase_only_block_commitments_from_declared_coinbase() {
-        let template = template_for_commitment_test(minimal_coinbase_with_script_sig(&[
-            0x04, 0xff, 0xff, 0x10, 0x1d,
-        ]));
-        let builder = TemplateBuilder::new(vec![0x52], 256, None);
-        let coinbase = builder.build_coinbase(&template).unwrap();
-
-        let expected = expected_commitments_for_coinbase(&template, &coinbase);
-        assert_ne!(expected, template.header.hash_block_commitments.0);
+    fn block_commitments_of_a_shielded_nu7_coinbase_use_the_node_auth_digest() {
+        let template = nu7_template();
+        let builder = TemplateBuilder::new(vec![], 256, None);
+        // Zebra and Zakura reported this auth digest; with one leaf it is the
+        // auth data root.
+        let auth_root = internal_from_display(TESTNET_4465026_COINBASE_AUTHDIGEST_DISPLAY);
+        let expected =
+            calculate_block_commitments_hash(&template.chain_history_root, &Hash256(auth_root)).0;
         assert_eq!(
-            builder.block_commitments(&template, &coinbase).unwrap(),
+            builder
+                .block_commitments(&template, &template.coinbase)
+                .unwrap(),
             expected
+        );
+    }
+
+    #[test]
+    fn block_commitments_refuse_a_coinbase_for_another_branch() {
+        let mut template = nu7_template();
+        template.consensus_branch_id = 0x4dec_4df0; // NU6.1
+        let builder = TemplateBuilder::new(vec![], 256, None);
+        let err = builder
+            .block_commitments(&template, &template.coinbase)
+            .unwrap_err();
+        assert!(err.to_string().contains("does not match"), "{err}");
+    }
+
+    #[test]
+    fn rewriting_a_v6_coinbase_output_keeps_it_a_valid_transaction() {
+        let template = nu7_template();
+        let pool_script = POOL_SCRIPT.to_vec();
+        let builder = TemplateBuilder::new(pool_script.clone(), 256, None);
+        let rebuilt = builder.build_coinbase(&template).unwrap();
+        assert_ne!(rebuilt, template.coinbase);
+
+        let before = parse_transaction(&template.coinbase).unwrap();
+        let after = parse_transaction(&rebuilt).unwrap();
+        assert_eq!(after.outputs[0].script_pubkey, pool_script);
+        assert_eq!(after.outputs[0].value, before.outputs[0].value);
+        assert_eq!(after.outputs.len(), before.outputs.len());
+
+        // Bytes outside the outputs are unchanged, including the shielded bundles.
+        let (o0, o1) = before.outputs_span;
+        let (n0, n1) = after.outputs_span;
+        assert_eq!(rebuilt[..n0], template.coinbase[..o0]);
+        assert_eq!(rebuilt[n1..], template.coinbase[o1..]);
+
+        // zcash_primitives reads the whole result.
+        digest::txid(&rebuilt).expect("rebuilt coinbase is a readable transaction");
+    }
+
+    #[test]
+    fn merkle_root_of_a_coinbase_only_v6_block_is_its_zip244_txid() {
+        let template = nu7_template();
+        let builder = TemplateBuilder::new(POOL_SCRIPT.to_vec(), 256, None);
+        let rebuilt = builder.build_coinbase(&template).unwrap();
+        assert_ne!(rebuilt, template.coinbase);
+        assert_eq!(
+            builder.calculate_merkle_root(&template, &rebuilt).unwrap(),
+            digest::txid(&rebuilt).unwrap()
+        );
+    }
+
+    #[test]
+    fn rewriting_an_output_changes_the_txid_but_not_the_auth_digest() {
+        // ZIP 244 commits to outputs in the txid and to scriptSigs, proofs and
+        // signatures in the auth digest, so the declared block commitments of a
+        // rewritten coinbase equal the template coinbase's.
+        let template = nu7_template();
+        let builder = TemplateBuilder::new(POOL_SCRIPT.to_vec(), 256, None);
+        let rebuilt = builder.build_coinbase(&template).unwrap();
+        assert_ne!(
+            digest::txid(&rebuilt).unwrap(),
+            digest::txid(&template.coinbase).unwrap()
+        );
+        assert_eq!(
+            builder.block_commitments(&template, &rebuilt).unwrap(),
+            builder
+                .block_commitments(&template, &template.coinbase)
+                .unwrap()
         );
     }
 }
