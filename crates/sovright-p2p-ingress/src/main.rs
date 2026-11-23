@@ -16,6 +16,8 @@ mod hash;
 mod metrics;
 mod observation;
 mod peer;
+#[cfg(test)]
+mod peer_loop_tests;
 mod relay_bridge;
 mod submitblock_rpc;
 mod tx_cache;
@@ -125,16 +127,24 @@ async fn main() -> Result<()> {
                 ));
             }
 
-            if handles.is_empty() && (!config.crawler_enabled || crawler.queue_len() == 0) {
-                break;
-            }
-
-            if !config.crawler_enabled && crawler.queue_len() == 0 {
-                for handle in handles {
-                    let _ = handle.await;
+            match peer_loop_step(handles.len(), crawler.queue_len(), config.crawler_enabled) {
+                PeerLoopStep::Exhausted => break,
+                PeerLoopStep::DrainRunning => {
+                    for handle in handles.drain(..) {
+                        let _ = handle.await;
+                    }
+                    if crawler.queue_len() == 0 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        return Err(peers_exhausted(&crawler));
+                    }
+                    // Rotation requeued a peer that dropped. Retry it after the
+                    // drain interval like any other queued peer.
+                    warn!(
+                        queued = crawler.queue_len(),
+                        "all peer tasks ended, retrying requeued peers"
+                    );
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
-                return Err(peers_exhausted(&crawler));
+                PeerLoopStep::Wait => {}
             }
 
             tokio::time::sleep(config.crawler_drain_interval).await;
@@ -194,6 +204,32 @@ fn start_zakura_native(
         },
         zakura_native::START_TIMEOUT,
     )))
+}
+
+/// Next step of the legacy peer loop, after it has filled its free peer slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerLoopStep {
+    /// No peer task is running and no peer is queued.
+    Exhausted,
+    /// Crawler off and nothing queued: wait for the running peer tasks, which
+    /// rotation may requeue when they end.
+    DrainRunning,
+    /// Sleep for the drain interval, then fill the free slots again.
+    Wait,
+}
+
+/// A queued peer never ends the loop. With rotation on, `release_peer` requeues
+/// a peer that dropped, so a static peer list keeps reconnecting to a node that
+/// restarts. With rotation off the queue only shrinks, and the process still
+/// exits once the configured peers are used up.
+fn peer_loop_step(running: usize, queued: usize, crawler_enabled: bool) -> PeerLoopStep {
+    if running == 0 && queued == 0 {
+        PeerLoopStep::Exhausted
+    } else if !crawler_enabled && queued == 0 {
+        PeerLoopStep::DrainRunning
+    } else {
+        PeerLoopStep::Wait
+    }
 }
 
 /// The ingress reaches this only when no peer task is left and none can be
